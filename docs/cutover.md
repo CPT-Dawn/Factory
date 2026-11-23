@@ -5,7 +5,7 @@ in one command, and `factory cutover --rollback` gives it back.
 
 ```
 factory cutover [--json]                     # devlab becomes factory lab; the TS watcher stops
-factory cutover --rollback [--force] [--json] # devlab is today's devlab again; its watcher starts
+factory cutover --rollback [--force] [--json] # devlab is today's devlab again; its watcher starts (not with --force and no unit)
 ```
 
 ## Before you cut over

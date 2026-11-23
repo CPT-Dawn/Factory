@@ -271,13 +271,13 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
     if !force {
         lab_holds_nothing()?;
     }
-    let unit_gone = fs::symlink_metadata(&place.watcher).is_err();
-    // --force goes on without a unit the marker gives no link for, and says it did.
-    let mut skipped = false;
+    let unit_gone = !unit_present(&place)?;
+    // --force goes on without a unit it cannot link again, and says it did.
+    let mut skip_unit = false;
     let link_unit = match &marker.watcher {
         Unit::Link(text) if unit_gone => Some(text),
         Unit::Unrecorded | Unit::File if unit_gone && force => {
-            skipped = true;
+            skip_unit = true;
             None
         }
         Unit::Unrecorded | Unit::File if unit_gone => {
@@ -300,9 +300,14 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
         }
     }
     if let Some(text) = link_unit {
-        link_watcher(&place, text, "cutover --rollback")?;
+        match link_watcher(&place, text, "cutover --rollback") {
+            Err(_) if force => skip_unit = true,
+            linked => linked?,
+        }
     }
-    let retire = fs::symlink_metadata(&place.watcher).is_ok();
+    let retire = unit_present(&place)?;
+    // What was done decides what is said: a unit that came back meanwhile is enabled, not skipped.
+    let skipped = skip_unit && !retire;
     if retire {
         Systemctl
             .enable_now(WATCHER)
@@ -532,6 +537,19 @@ impl Undo<'_> {
             ),
         };
         self.marker(failure)
+    }
+}
+
+/// Whether the watcher's unit file (or link, even a dangling one) is there: only a missing one
+/// counts as gone, so a unit that cannot be looked at stops the rollback.
+fn unit_present(place: &Place) -> Result<bool, Failure> {
+    match fs::symlink_metadata(&place.watcher) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Failure::precondition(format!(
+            "cannot look at {}: {e}; check it, then run factory cutover --rollback again",
+            place.watcher.display()
+        ))),
     }
 }
 

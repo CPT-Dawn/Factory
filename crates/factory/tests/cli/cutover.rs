@@ -584,6 +584,20 @@ fn rollback_says_how_to_link_a_missing_unit_the_marker_does_not_name() {
     assert_eq!((old.code, old.stderr.as_str()), (3, REFUSAL));
 }
 
+/// Today's devlab answers, the marker is gone, and nothing started the watcher again.
+fn assert_rolled_back_without_watcher(sandbox: &Sandbox) {
+    let answers = old_devlab(sandbox, &["gc"]);
+    assert_eq!(answers.code, 0, "{answers:?}");
+    assert_eq!(watcher_state(sandbox).0, "not-found");
+    assert!(
+        !watcher_calls(sandbox)
+            .iter()
+            .any(|call| call.starts_with("--user enable ")),
+        "{:?}",
+        watcher_calls(sandbox)
+    );
+}
+
 #[test]
 fn rollback_force_goes_on_without_the_unit_and_says_it_skipped_it() {
     let (sandbox, _world) = machine();
@@ -606,12 +620,44 @@ fn rollback_force_goes_on_without_the_unit_and_says_it_skipped_it() {
             ""
         )
     );
-    assert_eq!(fs::read_link(link(&sandbox)).unwrap(), PathBuf::from(OLD));
-    assert!(!sandbox.path("state/devlab/cutover.json").exists());
-    assert!(fs::symlink_metadata(watcher_unit(&sandbox)).is_err());
-    // Today's devlab no longer refuses.
-    let old = old_devlab(&sandbox, &["status"]);
-    assert_ne!(old.stderr, REFUSAL);
+    // Today's devlab answers again, the marker is gone, and the watcher was left alone.
+    assert_rolled_back_without_watcher(&sandbox);
+    let again = sandbox.factory(&["cutover", "--rollback"]);
+    assert_eq!(
+        (again.code, again.stdout.as_str()),
+        (
+            0,
+            format!(
+                "not cut over: {} is today's devlab; nothing to roll back\n",
+                link(&sandbox).display()
+            )
+            .as_str()
+        )
+    );
+}
+
+#[test]
+fn rollback_force_skips_a_recorded_unit_it_cannot_link_again() {
+    let (sandbox, _world) = machine();
+    cut_over(&sandbox);
+    // The unit went missing, and its directory no longer lets the link be made again.
+    let unit = watcher_unit(&sandbox);
+    fs::remove_file(&unit).unwrap();
+    let dir = sandbox.path("config/systemd/user");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let refused = sandbox.factory(&["cutover", "--rollback"]);
+    assert_eq!(refused.code, 3, "{refused:?}");
+
+    let out = sandbox.factory(&["cutover", "--rollback", "--force"]);
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    assert!(
+        out.stdout.contains(&format!("skipped {}", unit.display())),
+        "{out:?}"
+    );
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_rolled_back_without_watcher(&sandbox);
 }
 
 #[test]
