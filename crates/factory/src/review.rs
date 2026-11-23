@@ -22,7 +22,7 @@ use factory_adapters::git::{GitError, GitRepo, Repo};
 use factory_adapters::reviewer::{Agy, Claude, Codex, Job, Reviewer, ReviewerError, home_of};
 use factory_core::exit::Exit;
 use factory_core::quota::Reset;
-use factory_core::review::{self, Bundle, Finding, Part, Previous, Reading, Record, Verdict};
+use factory_core::review::{self, Bundle, Finding, Fix, Part, Previous, Reading, Record, Verdict};
 use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
 
@@ -108,6 +108,7 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         report: &run.report,
         stream: &run.stream,
         findings: &run.findings,
+        from: &run.from,
         result: match (&run.reading, &failed) {
             (Some(reading), None) => Ok(reading),
             _ => Err(failed
@@ -175,6 +176,8 @@ struct Run {
     report: String,
     stream: String,
     findings: String,
+    /// On a fix round, the head the previous round reviewed.
+    from: String,
     reading: Option<Reading>,
 }
 
@@ -195,6 +198,10 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
     let inputs = Inputs::gather(&repo, args, &files)?;
     run.head = inputs.head.clone();
     run.notes.extend(inputs.notes.iter().cloned());
+    run.from = inputs
+        .fix
+        .as_ref()
+        .map_or_else(String::new, |fix| fix.head.clone());
     let spec = inputs.spec.as_ref().map_or("none", |(name, _)| name);
     run.spec = spec.to_owned();
     write(&files.bundle, &inputs.bundle(args).render())?;
@@ -266,10 +273,16 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
             Err(e) => return Err(reviewer_failed(reviewer.as_ref(), &e, &files.prompt)),
         }
         let prompt = review::prompt(
-            &reviewer.opening(&args.base),
+            &reviewer.opening(
+                inputs
+                    .fix
+                    .as_ref()
+                    .map_or(args.base.as_str(), |fix| short(&fix.head)),
+            ),
             &files.bundle.display().to_string(),
             spec,
             inputs.previous.as_ref().map(|(name, _)| name.as_str()),
+            inputs.fix.as_ref().is_some_and(|fix| fix.open.is_some()),
         );
         write(&files.prompt, &prompt)?;
         let stream = files.stream(reviewer.stream_extension());
@@ -313,6 +326,11 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
     let reading = Reading::of(&text).map_err(|e| {
         Failure::precondition(format!("{e}: {}; read it there", files.report.display()))
     })?;
+    // A fix round is held to its rules: old findings marked, new ones only on the fix's lines.
+    let reading = match inputs.fix.as_ref().and_then(|fix| fix.open.as_deref()) {
+        Some(open) => reading.within(open, &Fix::of_diff(&inputs.diff)),
+        None => reading,
+    };
     let ledger = json!({
         "label": args.label,
         "round": review::round(&args.label, args.previous.is_some()),
@@ -328,6 +346,14 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
             .as_ref()
             .map(|findings| findings.iter().map(Finding::to_value).collect::<Vec<_>>()),
     });
+    let mut ledger = ledger;
+    if !run.from.is_empty() {
+        ledger["from"] = run.from.clone().into();
+        ledger["fixed"] = reading.fixed.into();
+        ledger["still_present"] = reading.still_present.into();
+        ledger["dropped"] = reading.dropped.len().into();
+        ledger["dropped_findings"] = reading.dropped.iter().map(Finding::to_value).collect();
+    }
     write(&files.findings, &format!("{ledger:#}\n"))?;
     run.findings = files.findings.display().to_string();
     let cooled: Vec<Value> = run
@@ -351,6 +377,9 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
             "blocking": reading.counts.blocking,
             "advisory": reading.counts.advisory,
             "question": reading.counts.question,
+            "fixed": reading.fixed,
+            "still_present": reading.still_present,
+            "dropped": reading.dropped.len(),
             "report": run.report,
             "findings": run.findings,
             "blocking_findings": reading.blocking_lines(),
