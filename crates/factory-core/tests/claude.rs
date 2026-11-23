@@ -294,6 +294,8 @@ fn another_failure_is_no_limit() {
         "Could not load schedule presets: size limit exceeded",
         "proxy substatus 429 on a 500",
         "Failed to load resetsHourly: size limit exceeded",
+        "Failed to load resets_hourly: size limit exceeded",
+        "Failed to load hourly_resets: size limit exceeded",
         "Invalid API key",
     ] {
         assert_eq!(failure_limit(text), None, "{text}");

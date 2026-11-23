@@ -251,13 +251,18 @@ fn is_status(text: &str, code: &str) -> bool {
     })
 }
 
-/// Whether `text` ends with `word` as a whole word: no letter or digit just before it.
+/// Whether `text` ends with `word` as a whole word: no letter, digit or `_` just before it.
 fn ends_with_word(text: &str, word: &str) -> bool {
     text.strip_suffix(word)
-        .is_some_and(|head| !head.ends_with(|c: char| c.is_ascii_alphanumeric()))
+        .is_some_and(|head| !head.ends_with(is_word_char))
 }
 
-/// Where `lower` says `resets` as a whole word (not inside `presets` or `resetsHourly`), the
+/// A letter, digit or `_`: a character that carries a word or identifier on.
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Where `lower` says `resets` as a whole word (not inside `presets` or `resets_hourly`), the
 /// last first.
 fn resets_at(lower: &str) -> impl Iterator<Item = usize> + '_ {
     lower
@@ -265,8 +270,7 @@ fn resets_at(lower: &str) -> impl Iterator<Item = usize> + '_ {
         .map(|(at, _)| at)
         .filter(|at| {
             let end = at + "resets".len();
-            ends_with_word(&lower[..end], "resets")
-                && !lower[end..].starts_with(|c: char| c.is_ascii_alphanumeric())
+            ends_with_word(&lower[..end], "resets") && !lower[end..].starts_with(is_word_char)
         })
 }
 
