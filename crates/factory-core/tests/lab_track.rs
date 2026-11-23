@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use factory_core::lab::devices::{ListFraming, restart_delay};
+use factory_core::lab::devices::{ListFraming, restart_delay, same_devices};
 
 const BASE: Duration = Duration::from_secs(3);
 const CAP: Duration = Duration::from_secs(60);
@@ -68,4 +68,35 @@ fn a_length_that_is_not_hex_never_comes_whole() {
     let mut framing = ListFraming::default();
     assert_eq!(framing.feed(b"zzzz0000"), 0);
     assert!(framing.mid_list());
+}
+
+#[test]
+fn the_last_whole_list_is_kept_and_a_list_under_way_is_not() {
+    let mut framing = ListFraming::default();
+    assert_eq!(framing.last_list(), None);
+    framing.feed(b"0013FAKEPHONE01\tdevice\n0013FAKE");
+    assert_eq!(framing.last_list(), Some(&b"FAKEPHONE01\tdevice\n"[..]));
+    framing.feed(b"PHONE02\tdevice\n0000");
+    assert_eq!(framing.last_list(), Some(&b""[..]));
+}
+
+#[test]
+fn a_list_names_the_same_devices_as_adb_devices_whatever_their_order_and_properties() {
+    let list = b"FAKEPHONE01\tdevice usb:1-1 model:Pixel_8\nemulator-5580\toffline\n";
+    let devices = "List of devices attached\nemulator-5580          offline\nFAKEPHONE01            device usb:1-1 product:x model:Pixel_8\n";
+    assert!(same_devices(list, devices));
+}
+
+#[test]
+fn a_device_adb_lists_that_the_list_lacks_or_shows_in_another_state_differs() {
+    let list = b"FAKEPHONE01\tdevice\n";
+    assert!(!same_devices(
+        list,
+        "List of devices attached\nFAKEPHONE01 device\nFAKEPHONE02 device\n"
+    ));
+    assert!(!same_devices(
+        list,
+        "List of devices attached\nFAKEPHONE01 unauthorized\n"
+    ));
+    assert!(same_devices(b"", "List of devices attached\n\n"));
 }

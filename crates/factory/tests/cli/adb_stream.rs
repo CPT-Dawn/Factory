@@ -13,17 +13,18 @@ use crate::support::{Sandbox, kill_group, run};
 
 /// The sandbox's adb: each `track-devices` run is numbered, writes its pid to `adb/pid.<run>`, and
 /// then plays the part `script` gives it for that run (shell, with `$n` the run and `frame
-/// <lines>` writing one device list). `adb start-server`, which the daemon probes with, hangs
-/// while `adb/probe-hangs` exists (its pid is then in `adb/probe.pid`, and that of a child it
-/// left running in `adb/probe-child.pid`), and notes each call's pid in `adb/probes`.
+/// <lines>` writing one device list, which `adb/devices` then holds too). `adb devices -l`, which
+/// the daemon probes with, lists what `adb/devices` holds; it hangs while `adb/probe-hangs`
+/// exists (its pid is then in `adb/probe.pid`, and that of a child it left running in
+/// `adb/probe-child.pid`), and notes each call's pid in `adb/probes`.
 fn adb_playing(sandbox: &Sandbox, script: &str) -> PathBuf {
     let dir = sandbox.path("adb");
     fs::create_dir_all(&dir).expect("create the adb dir");
     let body = format!(
         r#"w='{dir}'
-frame() {{ printf '%04x' "$(printf '%s\n' "$1" | wc -c)"; printf '%s\n' "$1"; }}
+frame() {{ printf '%s\n' "$1" > "$w/devices"; printf '%04x' "$(printf '%s\n' "$1" | wc -c)"; printf '%s\n' "$1"; }}
 case "$1" in
-start-server)
+devices)
   echo "$$" >> "$w/probes"
   if [ -e "$w/probe-hangs" ]; then
     sleep 1000 &
@@ -31,6 +32,8 @@ start-server)
     echo "$$" > "$w/probe.pid"
     exec sleep 1000
   fi
+  echo 'List of devices attached'
+  cat "$w/devices" 2>/dev/null
   exit 0 ;;
 track-devices)
   n=$(( $(cat "$w/runs" 2>/dev/null || echo 0) + 1 ))
@@ -368,5 +371,42 @@ fn a_later_list_that_stops_halfway_is_cut_off_though_adb_still_answers() {
     assert!(
         !runs(&pid_of(&adb, 1)),
         "the stream that stopped halfway still runs"
+    );
+}
+
+#[test]
+fn a_stream_that_misses_a_change_adb_knows_of_is_cut_off_and_restarted() {
+    let sandbox = Sandbox::new()
+        .env("FACTORY_ADB_BACKOFF_MS", "50")
+        .env("FACTORY_ADB_LIST_MS", "300")
+        .env("FACTORY_ADB_PROBE_MS", "200");
+    let (sandbox, wt) = setup(sandbox);
+    // Run 1 shows phone A, then adb sees phone B come, and the stream never says so.
+    let adb = adb_playing(
+        &sandbox,
+        &format!(
+            r#"if [ "$n" = 1 ]; then
+    frame '{PHONE_A}'
+    printf '%s\n%s\n' '{PHONE_A}' '{PHONE_B}' > "$w/devices"
+    exec sleep 1000
+  fi
+  frame '{PHONE_A}
+{PHONE_B}'; exec sleep 1000"#
+        ),
+    );
+
+    let tracked = poll_until(|| shows(&sandbox, &wt, "PHONEB02"));
+
+    assert!(
+        tracked,
+        "{}\n{}",
+        status(&sandbox, &wt),
+        daemon_log(&sandbox)
+    );
+    assert!(!runs(&pid_of(&adb, 1)), "the stale stream still runs");
+    assert!(
+        daemon_log(&sandbox).contains("no list with the devices adb lists"),
+        "{}",
+        daemon_log(&sandbox)
     );
 }

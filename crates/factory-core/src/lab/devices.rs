@@ -80,10 +80,7 @@ pub fn parse_track(buf: &[u8]) -> (Vec<Vec<Attached>>, usize) {
     let mut frames = Vec::new();
     let mut at = 0;
     while let Some(head) = buf.get(at..at + 4) {
-        let Some(len) = std::str::from_utf8(head)
-            .ok()
-            .and_then(|h| usize::from_str_radix(h, 16).ok())
-        else {
+        let Some(len) = list_len(head) else {
             break;
         };
         let Some(body) = buf.get(at + 4..at + 4 + len) else {
@@ -95,6 +92,27 @@ pub fn parse_track(buf: &[u8]) -> (Vec<Vec<Attached>>, usize) {
     (frames, at)
 }
 
+/// The length a list's four hex digits give.
+fn list_len(head: &[u8]) -> Option<usize> {
+    std::str::from_utf8(head)
+        .ok()
+        .and_then(|h| usize::from_str_radix(h, 16).ok())
+}
+
+/// Whether a list from `adb track-devices -l` names the same devices, in the same states, as
+/// `adb devices -l` text; their order and properties do not count.
+pub fn same_devices(track_list: &[u8], devices_l: &str) -> bool {
+    let key = |text: &str| {
+        let mut devices: Vec<(String, String)> = parse_devices_l(text)
+            .into_iter()
+            .map(|a| (a.serial, a.state))
+            .collect();
+        devices.sort();
+        devices
+    };
+    key(&String::from_utf8_lossy(track_list)) == key(devices_l)
+}
+
 /// How far an `adb track-devices` stream has come through its lists, by their lengths alone
 /// (no device row is read): it tells a stream that stopped partway through a list from one
 /// that is quiet between lists. A length that is not four hex digits leaves it partway for
@@ -103,8 +121,11 @@ pub fn parse_track(buf: &[u8]) -> (Vec<Vec<Attached>>, usize) {
 pub struct ListFraming {
     /// The digits of the next length read so far.
     head: Vec<u8>,
-    /// The bytes still to come of the list under way.
+    /// The bytes still to come of the list under way, and those that came.
     left: usize,
+    body: Vec<u8>,
+    /// The last whole list.
+    last: Option<Vec<u8>>,
     broken: bool,
 }
 
@@ -116,8 +137,11 @@ impl ListFraming {
             if self.left > 0 {
                 let take = self.left.min(bytes.len());
                 self.left -= take;
+                self.body
+                    .extend_from_slice(bytes.get(..take).unwrap_or_default());
                 bytes = bytes.get(take..).unwrap_or_default();
                 if self.left == 0 {
+                    self.last = Some(std::mem::take(&mut self.body));
                     finished += 1;
                 }
                 continue;
@@ -127,11 +151,11 @@ impl ListFraming {
                 .extend_from_slice(bytes.get(..take).unwrap_or_default());
             bytes = bytes.get(take..).unwrap_or_default();
             if self.head.len() == 4 {
-                match std::str::from_utf8(&self.head)
-                    .ok()
-                    .and_then(|h| usize::from_str_radix(h, 16).ok())
-                {
-                    Some(0) => finished += 1,
+                match list_len(&self.head) {
+                    Some(0) => {
+                        self.last = Some(Vec::new());
+                        finished += 1;
+                    }
                     Some(len) => self.left = len,
                     None => self.broken = true,
                 }
@@ -139,6 +163,11 @@ impl ListFraming {
             }
         }
         finished
+    }
+
+    /// The device lines of the last whole list, once one came.
+    pub fn last_list(&self) -> Option<&[u8]> {
+        self.last.as_deref()
     }
 
     /// Whether the stream stands partway through a list.
