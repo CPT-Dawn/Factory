@@ -48,6 +48,17 @@ pub fn call<P: Serialize, R: DeserializeOwned>(
     Session::open(paths)?.call(method, params)
 }
 
+/// [`Session::call_streaming`] on a connection of its own.
+pub fn call_streaming<P: Serialize, R: DeserializeOwned>(
+    paths: &Paths,
+    method: &str,
+    params: &P,
+    read_timeout: Option<Duration>,
+    on_note: &mut dyn FnMut(&str),
+) -> Result<R, Failure> {
+    Session::open(paths)?.call_streaming(method, params, read_timeout, on_note)
+}
+
 /// Sends a request the daemon answers when an event fires, at most `limit` from now. The daemon
 /// keeps the time; past `limit` and a grace period the CLI gives up with exit 124 on its own.
 pub fn wait<P: Serialize, R: DeserializeOwned>(

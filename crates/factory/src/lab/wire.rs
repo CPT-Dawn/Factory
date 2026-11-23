@@ -37,6 +37,12 @@ pub const GC: &str = "lab.gc";
 pub const STATUS: &str = "lab.status";
 /// Records whether devlab started a slot's stack: [`SlotParams`] in, null out.
 pub const SLOT: &str = "lab.slot";
+/// Sets slots aside for the caller's implementers: [`ReserveParams`] in, one note when it starts
+/// to wait (`{"id", "note"}`), then [`Reserved`] or an error. An owner with no room under its
+/// cap is refused at once with exit 75 and an ETA.
+pub const RESERVE: &str = "lab.reserve";
+/// Gives the caller's reservations of a project back: [`UnreserveParams`] in, how many out.
+pub const UNRESERVE: &str = "lab.unreserve";
 
 /// Who a lease belongs to: a process by pid and start time (pids get reused).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +103,71 @@ pub struct AcquireParams {
     /// The acquire is a `devlab run`'s: the daemon records it in the ledger.
     #[serde(default)]
     pub run: Option<RunAsk>,
+    /// `DEVLAB_RESERVATION`: a reservation of the caller's project to turn into this lease.
+    #[serde(default)]
+    pub reservation: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReserveParams {
+    /// The worktree of the lead that reserves.
+    pub worktree: String,
+    pub owner: Owner,
+    pub project: ProjectAsk,
+    /// How many slots it wants.
+    pub slots: u32,
+    /// How long to queue for the first slot; 0 gives up at once.
+    pub wait_sec: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnreserveParams {
+    pub owner: Owner,
+    pub project: String,
+}
+
+/// A slot set aside for one of an owner's implementers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reservation {
+    pub id: i64,
+    pub project: String,
+    pub slot: u32,
+    /// The lead's worktree.
+    pub worktree: String,
+    pub owner_pid: i64,
+    pub owner_start: String,
+    pub owner_label: String,
+    /// Seconds since the epoch.
+    pub created: i64,
+}
+
+impl Reservation {
+    pub fn owner_key(&self) -> String {
+        format!("{}:{}", self.owner_pid, self.owner_start)
+    }
+
+    /// The reservation as the planner sees it: it holds a slot like a lease.
+    pub fn holding(&self) -> Holding {
+        Holding {
+            // Never a lease id (those start at 1), and no worktree: no waiter is served by it.
+            id: 0,
+            project: Some(self.project.clone()),
+            slot: Some(self.slot),
+            worktree: String::new(),
+            owner: self.owner_key(),
+            owner_label: self.owner_label.clone(),
+        }
+    }
+}
+
+/// What a reserve was given.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reserved {
+    pub project: String,
+    pub requested: u32,
+    /// The owner's cap on the project.
+    pub cap: u32,
+    pub reservations: Vec<Reservation>,
 }
 
 /// The devices a request asks for, and the machine settings their grant and boot follow.
@@ -298,6 +369,9 @@ pub struct Board {
     pub slots: Vec<SlotRow>,
     /// Oldest first.
     pub waiters: Vec<Waiter>,
+    /// By id.
+    #[serde(default)]
+    pub reservations: Vec<Reservation>,
     /// Every device adb lists, a lease holds or devlab runs.
     #[serde(default)]
     pub devices: Vec<DeviceLine>,

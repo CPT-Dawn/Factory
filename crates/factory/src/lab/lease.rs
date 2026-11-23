@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use factory_adapters::adb::{Adb, AdbCli};
 use factory_core::exit::Exit;
-use factory_core::lab::args::Opts;
+use factory_core::lab::args::{Opts, wait_span};
 use factory_core::lab::config::{MachineConfig, ProjectConfig, owner_cap};
 use factory_core::lab::devices::Mode;
 use factory_core::lab::emulator::BOOT_TIMEOUT_SEC;
@@ -23,7 +23,7 @@ use crate::output::Failure;
 use crate::paths::Paths;
 
 /// How much longer than its wait the CLI listens for the daemon's answer.
-const ANSWER_GRACE: Duration = Duration::from_secs(60);
+pub const ANSWER_GRACE: Duration = Duration::from_secs(60);
 /// How much longer an answer may take when the daemon may boot emulators for it: making their
 /// AVDs, starting their units and booting them, then stopping them when that fails.
 const BOOT_GRACE: Duration = Duration::from_secs(BOOT_TIMEOUT_SEC + 300);
@@ -95,10 +95,10 @@ pub fn ask(
         resume: None,
         client: Some(me()),
         run,
+        reservation: super::context::reserved(),
     };
-    let listen = Duration::try_from_secs_f64(wait_sec)
-        .ok()
-        .and_then(|wait| wait.checked_add(ANSWER_GRACE))
+    let listen = wait_span(wait_sec)
+        .checked_add(ANSWER_GRACE)
         .and_then(|wait| {
             if opts.want > 0 && opts.mode != Mode::Phone {
                 wait.checked_add(BOOT_GRACE)
@@ -202,7 +202,7 @@ pub fn wake(lease: &Lease) {
 }
 
 /// The project as a grant needs it: its cap here, its ports and its stack's.
-fn project_ask(ctx: &Ctx, p: &ProjectConfig) -> Result<ProjectAsk, Failure> {
+pub fn project_ask(ctx: &Ctx, p: &ProjectConfig) -> Result<ProjectAsk, Failure> {
     let stack = stack::info(p, &ctx.worktree, 0)?.map(|info| StackAsk {
         project_id: info.project_id,
         ports: info.ports.iter().map(|(_, port)| *port).collect(),

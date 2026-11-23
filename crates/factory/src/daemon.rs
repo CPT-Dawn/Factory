@@ -33,7 +33,7 @@ use factory_adapters::herdr::Herdr;
 use listenfd::ListenFd;
 
 use crate::lab::service::{self, Lab};
-use crate::lab::wire::ACQUIRE;
+use crate::lab::wire::{ACQUIRE, RESERVE};
 use crate::leads::Leads;
 use crate::ledger::Ledger;
 use crate::output::{self, Done, Failure};
@@ -300,6 +300,12 @@ async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut O
             return;
         };
         first = false;
+        if let Ok(request) = serde_json::from_str::<Request>(&line)
+            && request.method == RESERVE
+        {
+            service::reserve(Arc::clone(&daemon.lab), request, &mut writer, &mut lines).await;
+            continue;
+        }
         if let Ok(request) = serde_json::from_str::<Request>(&line)
             && request.method == ACQUIRE
         {

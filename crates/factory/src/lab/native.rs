@@ -17,7 +17,7 @@ use serde_json::{Map, Value, json};
 use super::cli::{self, HELP, Stack};
 use super::context::{Ctx, context};
 use super::wire::{Board, Lease};
-use super::{lease, run, status};
+use super::{lease, reserve, run, status};
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 
@@ -119,6 +119,7 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
             &context()?,
             args.first().map_or("status", String::as_str),
         )?),
+        "reserve" => reserve::done(args)?,
         "gc" => {
             let freed = lease::gc()?;
             match freed.as_slice() {

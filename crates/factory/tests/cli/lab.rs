@@ -16,7 +16,7 @@ use crate::support::world::{World, fixtures, poll_until};
 use crate::support::{Run, Sandbox, finish, kill_group, run, spawn};
 
 /// The sandbox with the golden world installed and the built binary on PATH as `devlab`.
-pub(crate) fn lab() -> (Sandbox, World) {
+pub(super) fn lab() -> (Sandbox, World) {
     let sandbox = Sandbox::new();
     let world = World::install(&sandbox);
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_factory"), sandbox.path("bin/devlab"))
@@ -24,7 +24,7 @@ pub(crate) fn lab() -> (Sandbox, World) {
     (sandbox, world)
 }
 
-fn devlab(sandbox: &Sandbox, dir: &Path, args: &[&str]) -> Command {
+pub(super) fn devlab(sandbox: &Sandbox, dir: &Path, args: &[&str]) -> Command {
     let mut cmd = sandbox.command(sandbox.path("bin/devlab"), args);
     cmd.current_dir(dir);
     cmd
@@ -48,7 +48,7 @@ fn lease_id(out: &Run) -> String {
 }
 
 /// Stops the sandbox's daemon and waits until it is gone.
-fn stop_daemon(sandbox: &Sandbox) {
+pub(super) fn stop_daemon(sandbox: &Sandbox) {
     let pid: u32 = fs::read_to_string(sandbox.path("run/factory/daemon.pid"))
         .expect("a daemon runs")
         .trim()
@@ -70,7 +70,7 @@ fn stop_daemon(sandbox: &Sandbox) {
     assert!(gone, "daemon {pid} outlived its TERM");
 }
 
-fn write_machine_config(sandbox: &Sandbox, extra: &str) {
+pub(super) fn write_machine_config(sandbox: &Sandbox, extra: &str) {
     let base = fs::read_to_string(fixtures().join("machine.json")).expect("read machine.json");
     let merged =
         base.trim_end().trim_end_matches('}').trim_end().to_owned() + ",\n  " + extra + "\n}\n";
@@ -1379,7 +1379,7 @@ fn signal(pid: u32, signal: Signal) {
 }
 
 /// Waits until `devlab status` shows a waiter.
-fn await_waiter(sandbox: &Sandbox, dir: &Path) {
+pub(super) fn await_waiter(sandbox: &Sandbox, dir: &Path) {
     let queued = poll_until(|| {
         run(devlab(sandbox, dir, &["status"]))
             .stdout

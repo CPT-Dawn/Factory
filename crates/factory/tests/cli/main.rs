@@ -17,7 +17,7 @@ mod log;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
 mod monitor;
-mod review;
+mod reserve;
 mod router;
 mod spawn;
 // cfg(test) for the same reason as support: its helpers unwrap.
@@ -26,5 +26,7 @@ mod status;
 // Marked cfg(test) so clippy treats these as test code and lets their helpers unwrap.
 #[cfg(test)]
 mod hook;
+#[cfg(test)]
+mod review;
 #[cfg(test)]
 mod support;
