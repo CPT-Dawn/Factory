@@ -33,7 +33,7 @@ $ a@plain-a devlab status
 1> stack slots
 1>   demo 0   down                         lease 2 demo-c
 1>   demo per owner (cap 1 of 2): claude:<c> 1/1 at cap
-1> memory <mem> GB free; watcher inactive (systemctl --user enable --now devlab-watch)
+1> memory <mem> GB free; watcher active
 ? 0
 $ a@plain-a devlab release
 2> devlab: released lease 1
@@ -44,7 +44,7 @@ $ a@plain-a devlab status
 1> stack slots
 1>   demo 0   down                         lease 2 demo-c
 1>   demo per owner (cap 1 of 2): claude:<c> 1/1 at cap
-1> memory <mem> GB free; watcher inactive (systemctl --user enable --now devlab-watch)
+1> memory <mem> GB free; watcher active
 ? 0
 $ b@plain-b devlab acquire --emulator
 1> export DEVLAB_LEASE=3
@@ -84,7 +84,7 @@ $ b@plain-b devlab status --json
 1>     }
 1>   ],
 1>   "waiting": [],
-1>   "watcher": "inactive",
+1>   "watcher": "active",
 1>   "memAvailableMB": <mem>
 1> }
 ? 0

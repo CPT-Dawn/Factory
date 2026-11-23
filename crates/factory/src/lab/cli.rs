@@ -134,9 +134,12 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
             }
             Ok(0)
         }
-        "watch" => Err(Failure::usage(format!(
-            "devlab {cmd} is not in factory lab yet; run today's devlab for it"
-        ))),
+        "watch" => {
+            println!(
+                "devlab watch: the factory daemon frees leases and stops idle emulators and stacks now; nothing to start"
+            );
+            Ok(0)
+        }
         other => Err(Failure::usage(format!(
             "unknown command {other}; devlab help"
         ))),

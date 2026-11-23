@@ -40,7 +40,7 @@ $ a@plain-a devlab status
 1>   FAKEPHONE01        phone    Pixel 8        ready        lease 1 plain-a (claude:<a>)
 1>   FAKEPHONE02        phone    -              unauthorized free
 1>   FAKEPHONE03        phone    Pixel 7        ready        lease 2 plain-b (claude:<b>)
-1> memory <mem> GB free; watcher inactive (systemctl --user enable --now devlab-watch)
+1> memory <mem> GB free; watcher active
 ? 0
 $ a@plain-a devlab status --json
 1> {
@@ -70,7 +70,7 @@ $ a@plain-a devlab status --json
 1>   "slots": [],
 1>   "owners": [],
 1>   "waiting": [],
-1>   "watcher": "inactive",
+1>   "watcher": "active",
 1>   "memAvailableMB": <mem>
 1> }
 ? 0

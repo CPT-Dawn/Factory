@@ -23,7 +23,6 @@ toml.workspace = true
 jiff.workspace = true
 
 [dev-dependencies]
-rustix = { workspace = true, features = ["event"] }
 tempfile.workspace = true
 
 [lints]

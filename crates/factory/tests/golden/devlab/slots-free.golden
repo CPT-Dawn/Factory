@@ -63,7 +63,7 @@ $ a@demo-a devlab status
 1>   demo 0   down                         lease 1 demo-a
 1>   demo 1   down                         lease 2 demo-b
 1>   demo per owner (cap 1 of 2): claude:<a> 1/1 at cap, claude:<b> 1/1 at cap
-1> memory <mem> GB free; watcher inactive (systemctl --user enable --now devlab-watch)
+1> memory <mem> GB free; watcher active
 ? 0
 $ a@demo-a devlab status --json
 1> {
@@ -101,7 +101,7 @@ $ a@demo-a devlab status --json
 1>     }
 1>   ],
 1>   "waiting": [],
-1>   "watcher": "inactive",
+1>   "watcher": "active",
 1>   "memAvailableMB": <mem>
 1> }
 ? 0

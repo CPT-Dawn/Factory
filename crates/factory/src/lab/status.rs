@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 
-use factory_adapters::systemd::{Systemctl, Units};
 use factory_core::lab::ago;
 use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{DeviceRow, device_line};
@@ -26,7 +25,9 @@ struct Report {
     slots: Vec<SlotLine>,
     owners: Vec<OwnerLine>,
     waiting: Vec<String>,
-    watcher: String,
+    /// Always `active`: the daemon answering is the watcher (#18), where devlab asked systemd
+    /// about its devlab-watch unit.
+    watcher: &'static str,
     #[serde(rename = "memAvailableMB")]
     mem_available_mb: i64,
 }
@@ -143,17 +144,10 @@ pub fn screen(board: &Board) -> Result<String, Failure> {
     }
     #[allow(clippy::cast_precision_loss)]
     let gb = report.mem_available_mb as f64 / 1024.0;
-    let enable = if report.watcher == "active" {
-        ""
-    } else {
-        " (systemctl --user enable --now devlab-watch)"
-    };
-    let watcher = if report.watcher.is_empty() {
-        "unknown"
-    } else {
-        &report.watcher
-    };
-    out.push(format!("memory {gb:.1} GB free; watcher {watcher}{enable}"));
+    out.push(format!(
+        "memory {gb:.1} GB free; watcher {}",
+        report.watcher
+    ));
     Ok(out.join("\n"))
 }
 
@@ -280,7 +274,7 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
         slots,
         owners,
         waiting,
-        watcher: Systemctl.is_active("devlab-watch"),
+        watcher: "active",
         mem_available_mb: mem_available_mb(),
     }
 }

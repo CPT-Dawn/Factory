@@ -4,12 +4,17 @@
 //! runs) first, then decides and writes in one short transaction. It waits on a change to the
 //! board (a grant, a release, a waiter leaving) or the re-check tick, never in a sleep loop of
 //! the CLI's.
+//!
+//! The keeper ([`keeper`]) does what devlab's watcher did: it frees an owner's leases the moment
+//! the owner exits, and stops idle emulators and the idle stacks devlab started.
 
-use std::collections::{BTreeSet, HashSet};
+mod keeper;
+
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, MutexGuard, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use factory_adapters::adb::{Adb, AdbCli, AdbTrack};
@@ -48,8 +53,8 @@ use super::{android, host};
 use crate::ledger::Ledger;
 use crate::protocol::{ErrorBody, Outcome, Request, Response};
 
-/// How often a waiting acquire looks again without a change to the board: an owner that exited
-/// or a port that freed tells no one (the daemon watches owners itself from #18).
+/// How often a waiting acquire looks again without a change to the board: a port that freed
+/// tells no one. An owner that exits does: the keeper watches each one.
 const RECHECK: Duration = Duration::from_secs(3);
 /// How long a call that needs the device list waits for adb's first one.
 const FIRST_LIST: Duration = Duration::from_secs(15);
@@ -76,6 +81,21 @@ pub struct Lab {
     /// The waiters whose callers are connected to this daemon; the rest are kept for callers
     /// that come back after a restart, until they can't.
     callers: Mutex<HashSet<i64>>,
+    /// The owners the keeper watches, by [`Lease::owner_key`].
+    watched: Mutex<HashSet<String>>,
+    /// What the keeper is stopping because it idled; no grant hands it out meanwhile.
+    stopping: Mutex<keeper::Stopping>,
+    /// A line for each lease dropped because its owner exited, until `devlab gc` tells it: the
+    /// keeper usually drops it first. The newest [`UNREPORTED`].
+    unreported: Mutex<VecDeque<String>>,
+}
+
+/// How many dropped leases wait for `devlab gc` to tell them.
+const UNREPORTED: usize = 64;
+
+/// The lock, whether or not a thread panicked while it held it.
+fn lock_ignoring_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 mod overview;
@@ -92,6 +112,9 @@ impl Lab {
             changed: watch::Sender::new(0),
             attached: watch::Sender::new(None),
             tracking: Once::new(),
+            watched: Mutex::new(HashSet::new()),
+            stopping: Mutex::new(keeper::Stopping::default()),
+            unreported: Mutex::new(VecDeque::new()),
             callers: Mutex::new(HashSet::new()),
         })
     }
@@ -160,24 +183,17 @@ impl Lab {
     }
 
     /// One write transaction; dead owners' leases, dead stoppers' holds and waiters that can't
-    /// come back are dropped first, telling waiters.
+    /// come back are dropped first, telling waiters and `devlab gc`. The reverses the dropped
+    /// leases' devices were given are taken back beside it, after the transaction.
     fn write<T>(&self, work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>) -> Answer<T> {
-        self.write_gc(work).map(|(_, out)| out)
-    }
-
-    /// [`Lab::write`], with a line for each lease of an owner that exited.
-    fn write_gc<T>(
-        &self,
-        work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>,
-    ) -> Answer<(Vec<String>, T)> {
         let mut store = self
             .store
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = now();
-        let (freed, unstopped, out) = store
+        let (freed, unreserved, unstopped, out) = store
             .write(|c| {
-                let freed = store::gc(c, now, &host::alive)?;
+                let (freed, unreserved) = store::gc(c, now, &host::alive)?;
                 let unstopped = store::clear_dead_stoppers(c, &host::alive)?;
                 let attached = self.callers().clone();
                 let pruned = store::prune_waiters(
@@ -187,16 +203,36 @@ impl Lab {
                     &|id| attached.contains(&id),
                     &host::alive,
                 )?;
-                Ok((freed, unstopped + pruned, work(c, now)?))
+                Ok((freed, unreserved, unstopped + pruned, work(c, now)?))
             })
             .map_err(|e| ErrorBody {
                 code: Exit::Precondition.code(),
                 message: format!("lab store {}: {e}; retry", self.path.display()),
             })?;
-        if !freed.is_empty() || unstopped > 0 {
+        drop(store);
+        let lines: Vec<String> = freed
+            .iter()
+            .map(|l| format!("lease {} ({}, owner exited)", l.id, l.owner_label))
+            .chain(unreserved)
+            .collect();
+        if !lines.is_empty() {
+            let mut unreported = lock_ignoring_poison(&self.unreported);
+            for line in lines {
+                if unreported.len() == UNREPORTED {
+                    unreported.pop_front();
+                }
+                unreported.push_back(line);
+            }
+            drop(unreported);
             self.notify();
         }
-        Ok((freed, out))
+        if unstopped > 0 {
+            self.notify();
+        }
+        if !freed.is_empty() {
+            keeper::take_back_reverses_on_thread(self.attached.borrow().clone(), freed);
+        }
+        Ok(out)
     }
 
     fn callers(&self) -> std::sync::MutexGuard<'_, HashSet<i64>> {
@@ -237,7 +273,13 @@ pub async fn respond(lab: &Arc<Lab>, method: &str, params: Value) -> Option<Outc
         LEASE => |lab, p, seen| reply(lab_lease(lab, parse(p)?, seen)),
         RELEASE => |lab, p, _| reply(release(lab, parse(p)?)),
         STOPPING => |lab, p, _| reply(stopping(lab, parse(p)?)),
-        GC => |lab, _, _| reply(lab.write_gc(|_, _| Ok(())).map(|(freed, ())| freed)),
+        GC => |lab, _, _| {
+            reply(lab.write(|_, _| Ok(())).map(|()| {
+                lock_ignoring_poison(&lab.unreported)
+                    .drain(..)
+                    .collect::<Vec<_>>()
+            }))
+        },
         STATUS => |lab, _, seen| reply(status(lab, seen)),
         SLOT => |lab, p, _| reply(slot(lab, parse(p)?)),
         UNRESERVE => |lab, p, _| reply(reserve::unreserve(lab, parse(p)?)),
@@ -319,6 +361,12 @@ fn release(lab: &Lab, p: ReleaseParams) -> Answer<Option<Lease>> {
     })?;
     if dropped.is_some() || unstopped > 0 {
         lab.notify();
+    }
+    if let Some(lease) = &dropped {
+        keeper::take_back_reverses(
+            lab.attached.borrow().clone().as_deref(),
+            std::slice::from_ref(lease),
+        );
     }
     Ok(dropped)
 }
@@ -477,6 +525,7 @@ fn plan(
     lease: Option<&Lease>,
     seen: &[Attached],
     mem_available_mb: i64,
+    stopping: &keeper::Stopping,
 ) -> rusqlite::Result<Result<Option<Planned>, String>> {
     let mut have = 0u32;
     for held in lease.map_or(&[][..], |l| l.devices.as_slice()) {
@@ -512,6 +561,7 @@ fn plan(
             .filter(|e| {
                 State::from_word(&e.state) == State::Ready
                     && !is_taken(&e.serial)
+                    && !stopping.emulators.contains(&e.idx)
                     && state_of(seen, &e.serial) == Some("device")
             })
             .map(|e| e.serial.clone())
@@ -645,6 +695,7 @@ fn grant_board(
     project: Option<&ProjectAsk>,
     worktree: &str,
     facts: &Facts,
+    stopping: &keeper::Stopping,
 ) -> rusqlite::Result<grant::Board> {
     let mut leases: Vec<_> = store::leases(c)?.iter().map(Lease::holding).collect();
     leases.extend(reservations::all(c)?.iter().map(|r| r.holding()));
@@ -673,6 +724,7 @@ fn grant_board(
                         stack_running: facts.running.get(slot as usize).copied().unwrap_or(false),
                         own_ports,
                         stack_ports,
+                        stopping: stopping.slots.contains(&(project.name.clone(), slot)),
                     }
                 })
                 .collect()
@@ -721,6 +773,7 @@ fn try_grant(
                 reused: Vec::new(),
             }));
         }
+        let stopping = lock_ignoring_poison(&lab.stopping).clone();
         let planned = match &p.devices {
             Some(ask) => plan(
                 c,
@@ -728,6 +781,7 @@ fn try_grant(
                 lease.as_ref(),
                 &facts.attached,
                 facts.mem_available_mb,
+                &stopping,
             )?,
             None => Ok(None),
         };
@@ -735,7 +789,7 @@ fn try_grant(
             Ok(planned) => (planned, None),
             Err(why) => (None, Some(why)),
         };
-        let board = grant_board(c, p.project.as_ref(), &p.worktree, facts)?;
+        let board = grant_board(c, p.project.as_ref(), &p.worktree, facts, &stopping)?;
         let ask = Ask {
             waiter,
             project: project_ask(p),
@@ -1213,6 +1267,7 @@ pub async fn acquire<W, R, S>(
         let why = match tried {
             Ok(Ok(taken)) => {
                 lab.notify();
+                lab.watch_owner(&taken.granted.lease);
                 let (fresh, previous) = (taken.fresh, taken.granted.previous.clone());
                 let lease = taken.granted.lease.clone();
                 match settle(&lab, &p, taken, writer, id).await {

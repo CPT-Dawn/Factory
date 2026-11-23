@@ -299,6 +299,8 @@ pub struct SlotView {
     /// Its host ports: the project's own, and its stack's.
     pub own_ports: Vec<u32>,
     pub stack_ports: Vec<u32>,
+    /// The daemon is stopping its idle stack (#18): it is handed out once that is done.
+    pub stopping: bool,
 }
 
 /// The slot to hand out, or why none can be: the free slots tried in order (the same worktree as
@@ -324,6 +326,10 @@ pub fn pick_slot(
     free.sort_by_key(|(slot, view)| (score(view), *slot));
     let mut busy = Vec::new();
     for (slot, view) in free {
+        if view.stopping {
+            busy.push(format!("slot {slot}: its idle stack is stopping"));
+            continue;
+        }
         let squat: Vec<String> = view
             .own_ports
             .iter()
@@ -581,6 +587,7 @@ port = 54327
             stack_running,
             own_ports,
             stack_ports,
+            stopping: false,
         }
     }
 
@@ -618,6 +625,23 @@ port = 54327
         assert_eq!(
             pick_slot("p", &[view(true, false, false, 0)], &BTreeSet::new(), true),
             Err("all 1 stack slots of p are held".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_slot_whose_idle_stack_is_being_stopped_is_skipped_and_named() {
+        let stopping = SlotView {
+            stopping: true,
+            ..view(false, true, true, 0)
+        };
+        let slots = [stopping.clone(), view(false, false, false, 1)];
+        assert_eq!(pick_slot("p", &slots, &BTreeSet::new(), true), Ok(1));
+        assert_eq!(
+            pick_slot("p", &[stopping], &BTreeSet::new(), true),
+            Err(
+                "all 1 stack slots of p are held or blocked (slot 0: its idle stack is stopping)"
+                    .to_owned()
+            )
         );
     }
 }
