@@ -70,13 +70,7 @@ pub fn call_streaming<P: Serialize, R: DeserializeOwned>(
     read_timeout: Option<Duration>,
     mut on_note: impl FnMut(&str),
 ) -> Result<R, Failure> {
-    Session::open(paths)?.exchange(
-        method,
-        params,
-        read_timeout,
-        Exit::Precondition,
-        &mut on_note,
-    )
+    Session::open(paths)?.call_streaming(method, params, read_timeout, &mut on_note)
 }
 
 /// One connection to the daemon, kept open across requests: what the daemon grants on it (a
@@ -109,6 +103,23 @@ impl Session {
             Exit::Precondition,
             &mut |_| {},
         )
+    }
+
+    /// [`call_streaming`] on this session's connection.
+    pub fn call_streaming<P: Serialize, R: DeserializeOwned>(
+        &mut self,
+        method: &str,
+        params: &P,
+        read_timeout: Option<Duration>,
+        on_note: &mut dyn FnMut(&str),
+    ) -> Result<R, Failure> {
+        self.exchange(method, params, read_timeout, Exit::Precondition, on_note)
+    }
+
+    /// A second handle on the connection, to send notifications on (requests the daemon doesn't
+    /// answer) from another thread, even while a request waits for its answer.
+    pub fn notifier(&self) -> std::io::Result<UnixStream> {
+        self.reader.get_ref().try_clone()
     }
 
     /// Sends a request the daemon answers when what it waits on happens, however long that is.

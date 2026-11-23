@@ -286,7 +286,15 @@ async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut O
             && request.method == ACQUIRE
         {
             // Not cut short by a stop: a lease granted as it was dropped would go unanswered.
-            service::acquire(Arc::clone(&daemon.lab), request, &mut writer, &mut lines).await;
+            service::acquire(
+                Arc::clone(&daemon.lab),
+                Arc::clone(&daemon.ledger),
+                request,
+                &mut writer,
+                &mut lines,
+                stop.clone().stopping(),
+            )
+            .await;
             continue;
         }
         let response = tokio::select! {
@@ -490,7 +498,7 @@ fn refusal(exit: Exit, message: String) -> ErrorBody {
 
 /// The append-only event ledger. Each event is stamped and written as one line under one lock,
 /// so lines never interleave.
-struct Ledger {
+pub(crate) struct Ledger {
     path: PathBuf,
     file: Mutex<File>,
 }
@@ -513,7 +521,7 @@ impl Ledger {
         })
     }
 
-    fn append(&self, event: &Event) -> io::Result<Fields> {
+    pub(crate) fn append(&self, event: &Event) -> io::Result<Fields> {
         let mut file = self
             .file
             .lock()
