@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/factory-core", "crates/factory-adapters", "crates/factory"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/CPT-Dawn/Factory"
+publish = false
+
+[workspace.dependencies]
+factory-core = { path = "crates/factory-core" }
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "net", "io-util"] }
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
