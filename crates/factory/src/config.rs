@@ -93,6 +93,9 @@ pub struct LeadSetup {
 const DEFAULT_LEAD_MODEL: &str = "opus";
 const DEFAULT_LEAD_EFFORT: &str = "medium";
 const DEFAULT_RETRY_PAUSE_S: u64 = 2;
+/// The most a pause may be: a spawn tries the prompt up to five times, and the CLI waits ten
+/// minutes for all of it.
+const MAX_RETRY_PAUSE_S: u64 = 30;
 /// The plugins the 2026-11-23 retro measured at about 6.3k tokens of skill listings per request.
 const DEFAULT_DISABLED_PLUGINS: [&str; 2] =
     ["expo@claude-plugins-official", "cloudflare@cloudflare"];
@@ -158,6 +161,14 @@ pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
 /// How `factory lead spawn` starts Claude.
 pub fn lead_setup(paths: &Paths) -> Result<LeadSetup, Failure> {
     let lead = read(paths)?.lead;
+    let pause = lead.retry_pause.unwrap_or(DEFAULT_RETRY_PAUSE_S);
+    if pause > MAX_RETRY_PAUSE_S {
+        return Err(Failure::usage(format!(
+            "{}: [lead] retry_pause is {pause}s, at most {MAX_RETRY_PAUSE_S}s keeps a spawn \
+             inside the CLI's wait; lower it",
+            paths.config_file().display()
+        )));
+    }
     Ok(LeadSetup {
         model: lead.model.unwrap_or_else(|| DEFAULT_LEAD_MODEL.to_owned()),
         effort: lead
@@ -169,7 +180,7 @@ pub fn lead_setup(paths: &Paths) -> Result<LeadSetup, Failure> {
                 .map(|plugin| (*plugin).to_owned())
                 .collect()
         }),
-        retry_pause: Duration::from_secs(lead.retry_pause.unwrap_or(DEFAULT_RETRY_PAUSE_S)),
+        retry_pause: Duration::from_secs(pause),
     })
 }
 

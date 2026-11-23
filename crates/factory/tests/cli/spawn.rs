@@ -418,6 +418,81 @@ fn a_stalled_prompt_that_is_gone_from_the_screen_is_typed_again() {
 }
 
 #[test]
+fn a_retry_pause_too_long_for_the_cli_to_wait_is_refused_before_anything_starts() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    configure(&sandbox, "[lead]\nretry_pause = 700\n");
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 2, "{out:?}");
+    assert!(out.stderr.contains("retry_pause is 700s"), "{out:?}");
+    assert_eq!(herdr.count("worktree.create"), 0);
+}
+
+#[test]
+fn a_repo_named_in_digits_still_gets_one_lead_end_after_a_restart() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.path("123");
+    fs::create_dir_all(&repo).expect("create the repo dir");
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    ] {
+        sandbox.git(&repo, &args);
+    }
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    let logged = sandbox.factory(&[
+        "log",
+        "lead-end",
+        "repo=123",
+        "slug=cart",
+        "outcome=finished",
+    ]);
+    assert_eq!(logged.code, 0, "{logged:?}");
+    let pid = fs::read_to_string(sandbox.path("run/factory/daemon.pid")).expect("the daemon's pid");
+    sandbox
+        .command("kill", &["-9", pid.trim()])
+        .output()
+        .expect("run kill");
+    let gone = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
+    assert!(poll_until(|| !gone.exists()), "the daemon never died");
+    fs::write(sandbox.path("state/factory/leads/123/cart.md"), "done\n").expect("write the report");
+    herdr.status("w1:p1", "idle");
+
+    // A second lead, ended the same way, shows the restart has settled both.
+    let listed = sandbox.factory(&["lead", "list"]);
+    assert_eq!(listed.code, 0, "{listed:?}");
+    let spawned = sandbox.factory_in(&repo, &["lead", "spawn", "pay", "#13"]);
+    assert_eq!(spawned.code, 0, "{spawned:?}");
+    herdr.await_watch("w2:p1");
+    fs::write(sandbox.path("state/factory/leads/123/pay.md"), "done\n").expect("write the report");
+    herdr.status("w2:p1", "idle");
+
+    assert!(
+        poll_until(|| events(&sandbox, "lead-end")
+            .iter()
+            .any(|end| end["slug"] == "pay")),
+        "no lead-end for pay in {:?}",
+        sandbox.ledger_lines()
+    );
+    assert_eq!(events(&sandbox, "lead-end").len(), 2);
+}
+
+#[test]
 fn an_existing_branch_beats_an_unknown_base() {
     let sandbox = Sandbox::new();
     let herdr = FakeHerdr::start(&sandbox);

@@ -31,7 +31,12 @@ impl Ledger {
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         {
-            if event["repo"] != repo || event["slug"] != slug {
+            // A repo or slug of digits is stored as a number: compare what each prints.
+            let named = |field: &str, want: &str| match &event[field] {
+                Value::String(text) => text == want,
+                other => other.to_string() == want,
+            };
+            if !(named("repo", repo) && named("slug", slug)) {
                 continue;
             }
             match event["type"].as_str() {
