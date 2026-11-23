@@ -38,6 +38,8 @@ pub trait Repo {
     fn toplevel(&self) -> Result<PathBuf, GitError>;
     /// The git dir of this worktree, where the implementer leaves its evidence.
     fn git_dir(&self) -> Result<PathBuf, GitError>;
+    /// The git dir its worktrees share, which holds their objects and refs.
+    fn common_dir(&self) -> Result<PathBuf, GitError>;
 }
 
 /// The repository at a directory, through the `git` on PATH.
@@ -141,6 +143,11 @@ impl Repo for GitRepo {
         let dir = self.git(&["rev-parse", "--absolute-git-dir"])?;
         Ok(PathBuf::from(dir.trim_end()))
     }
+
+    fn common_dir(&self) -> Result<PathBuf, GitError> {
+        let dir = self.git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+        Ok(PathBuf::from(dir.trim_end()))
+    }
 }
 
 /// A repository held in memory, for tests of code that reads one.
@@ -154,6 +161,7 @@ pub struct FakeRepo {
     pub commits: String,
     pub toplevel: PathBuf,
     pub git_dir: PathBuf,
+    pub common_dir: PathBuf,
 }
 
 impl Repo for FakeRepo {
@@ -187,5 +195,9 @@ impl Repo for FakeRepo {
 
     fn git_dir(&self) -> Result<PathBuf, GitError> {
         Ok(self.git_dir.clone())
+    }
+
+    fn common_dir(&self) -> Result<PathBuf, GitError> {
+        Ok(self.common_dir.clone())
     }
 }
