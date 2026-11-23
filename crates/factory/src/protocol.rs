@@ -10,6 +10,12 @@ use serde_json::Value;
 
 /// Appends one event to the ledger: [`LogParams`] in, [`LogResult`] out.
 pub const LOG: &str = "log";
+/// Takes a slot on the first review backend with quota and room, waiting when the router says
+/// to: [`AcquireParams`] in, [`AcquireResult`] out. The connection holds the slot until it
+/// asks for another or closes.
+pub const REVIEW_ACQUIRE: &str = "review.acquire";
+/// Records what a review learned of a backend's quota: [`QuotaParams`] in, the same out.
+pub const REVIEW_QUOTA: &str = "review.quota";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -53,4 +59,34 @@ pub struct LogResult {
     pub ledger: String,
     /// The line as it landed.
     pub event: Fields,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AcquireParams {
+    /// The configured backends, in the order they are tried.
+    pub backends: Vec<BackendSlots>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BackendSlots {
+    pub name: String,
+    pub concurrency: u32,
+    /// `queue` or `next`.
+    pub when_busy: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AcquireResult {
+    /// The backend whose slot this connection now holds.
+    pub backend: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QuotaParams {
+    pub backend: String,
+    /// `available` or `cooling`.
+    pub quota: String,
+    /// When a cooling backend resets, in milliseconds since the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<i64>,
 }

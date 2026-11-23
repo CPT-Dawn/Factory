@@ -529,7 +529,9 @@ fn an_event_that_cannot_be_logged_fails_the_run_in_one_line_naming_the_report() 
     let sandbox = Sandbox::new();
     let repo = sandbox.repo();
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
-    fs::create_dir_all(sandbox.ledger()).unwrap();
+    // The daemon must start, as it routes the review, but no append to the ledger lands.
+    fs::create_dir_all(sandbox.ledger().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/dev/full", sandbox.ledger()).unwrap();
 
     let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
 

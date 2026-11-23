@@ -1,5 +1,7 @@
 //! `factory review <base> <label> [spec] [prev]`: review.sh's arguments, a prepared review
-//! bundle, one Codex run, and one line back.
+//! bundle, a run on the first configured backend the daemon's router grants, and one line back.
+//! A backend that runs out of quota partway is cooled down until its reset, and the same review
+//! re-runs on the next one.
 //!
 //! Every file of a review is kept in `<state>/reviews/<repo>/`, named by its label: the
 //! bundle (`.bundle.md`), the prompt (`.prompt`), the report (`.md`) and Codex's event
@@ -15,14 +17,22 @@ use std::time::{Duration, Instant};
 
 use factory_adapters::gh::{Gh, Issues};
 use factory_adapters::git::{GitError, GitRepo, Repo};
-use factory_adapters::reviewer::{Codex, Job, Reviewer, ReviewerError};
+use factory_adapters::reviewer::{Claude, Codex, Job, Reviewer, ReviewerError, home_of};
 use factory_core::exit::Exit;
+use factory_core::quota::WhenBusy;
 use factory_core::review::{self, Bundle, Finding, Part, Reading, Record, Verdict};
-use serde_json::json;
+use factory_core::timestamp::Timestamp;
+use serde_json::{Value, json};
 
+use crate::client;
+use crate::clock;
+use crate::config::{self, Backend, Cli};
 use crate::log;
 use crate::output::{Done, Failure};
 use crate::paths::Paths;
+use crate::protocol::{
+    AcquireParams, AcquireResult, BackendSlots, QuotaParams, REVIEW_ACQUIRE, REVIEW_QUOTA,
+};
 
 /// Lines of context around each change in the bundle's diff, so the reviewer rarely opens a
 /// file to see what surrounds a hunk.
@@ -37,17 +47,34 @@ pub struct Args {
     pub label: String,
     pub spec: Option<String>,
     pub previous: Option<PathBuf>,
-    pub timeout: Duration,
+    /// Overrides every backend's configured timeout.
+    pub timeout: Option<Duration>,
 }
 
 pub fn run(args: &Args) -> Result<Done, Failure> {
     review::check_label(&args.label).map_err(|e| Failure::usage(e.to_string()))?;
     let paths = Paths::from_env()?;
     let started = Instant::now();
-    let codex = Codex::configured_in(&codex_home());
+    let backends = config::review_backends(&paths);
+    let reviewers: Vec<Box<dyn Reviewer>> = backends
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(reviewer)
+        .collect();
     let mut run = Run::default();
-    let result = review(args, &paths, &codex, &mut run);
+    let result = match &backends {
+        Ok(backends) => review(args, &paths, backends, &reviewers, &mut run),
+        Err(failure) => Err(Failure::new(failure.exit, failure.message.clone())),
+    };
     let failed = result.as_ref().err().map(|failure| failure.message.clone());
+    let chosen = backends
+        .as_ref()
+        .ok()
+        .and_then(|backends| backends.get(run.backend));
+    let reviewer = reviewers.get(run.backend);
+    let fallback_from: Vec<&str> = run.cooled.iter().map(|(name, _)| name.as_str()).collect();
+    let fallback_from = fallback_from.join(",");
     let record = Record {
         repo: &run.repo,
         label: &args.label,
@@ -55,10 +82,11 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         base: &args.base,
         head: &run.head,
         spec: &run.spec,
-        backend: codex.name(),
-        model: codex.model(),
-        effort: codex.effort(),
+        backend: chosen.map_or("", |backend| backend.name.as_str()),
+        model: reviewer.and_then(|reviewer| reviewer.model()),
+        effort: reviewer.and_then(|reviewer| reviewer.effort()),
         duration_s: started.elapsed().as_secs(),
+        fallback_from: &fallback_from,
         report: &run.report,
         stream: &run.stream,
         findings: &run.findings,
@@ -86,6 +114,19 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
     }
 }
 
+/// The adapter that runs a configured backend.
+fn reviewer(backend: &Backend) -> Box<dyn Reviewer> {
+    let (model, effort) = (backend.model.clone(), backend.effort.clone());
+    match backend.cli {
+        Cli::Codex => Box::new(Codex::new(model, effort, &home_of("CODEX_HOME", ".codex"))),
+        Cli::Claude => Box::new(Claude::new(
+            model,
+            effort,
+            &home_of("CLAUDE_CONFIG_DIR", ".claude"),
+        )),
+    }
+}
+
 /// What a run learned on its way, for its event. The report, stream and findings ledger are
 /// named once the reviewer starts, as before then they hold nothing of this run.
 #[derive(Default)]
@@ -93,13 +134,23 @@ struct Run {
     repo: String,
     head: String,
     spec: String,
+    /// The configured backend that runs (or last ran) the review: the first until one is picked.
+    backend: usize,
+    /// The backends that ran out of quota on the way, with their reset.
+    cooled: Vec<(String, Timestamp)>,
     report: String,
     stream: String,
     findings: String,
     reading: Option<Reading>,
 }
 
-fn review(args: &Args, paths: &Paths, codex: &Codex, run: &mut Run) -> Result<Done, Failure> {
+fn review(
+    args: &Args,
+    paths: &Paths,
+    backends: &[Backend],
+    reviewers: &[Box<dyn Reviewer>],
+    run: &mut Run,
+) -> Result<Done, Failure> {
     let cwd = env::current_dir().map_err(|e| {
         Failure::precondition(format!(
             "cannot read the working directory: {e}; cd into the repo under review"
@@ -117,35 +168,95 @@ fn review(args: &Args, paths: &Paths, codex: &Codex, run: &mut Run) -> Result<Do
     let spec = inputs.spec.as_ref().map_or("none", |(name, _)| name);
     run.spec = spec.to_owned();
     write(&files.bundle, &inputs.bundle(args).render())?;
-    let prompt = review::prompt(
-        &args.base,
-        &files.bundle.display().to_string(),
-        spec,
-        inputs.previous.as_ref().map(|(name, _)| name.as_str()),
-    );
-    write(&files.prompt, &prompt)?;
-    let job = Job {
-        cwd,
-        prompt: files.prompt.clone(),
-        report: files.report.clone(),
-        stream: files.stream.clone(),
-        timeout: args.timeout,
+    // The daemon holds the backend's slot for as long as this session lives.
+    let mut daemon = client::Session::open(paths)?;
+    let slots = AcquireParams {
+        backends: backends
+            .iter()
+            .map(|backend| BackendSlots {
+                name: backend.name.clone(),
+                concurrency: backend.concurrency,
+                when_busy: match backend.when_busy {
+                    WhenBusy::Queue => "queue",
+                    WhenBusy::Next => "next",
+                }
+                .to_owned(),
+            })
+            .collect(),
     };
-    files.clear_outputs()?;
-    run.report = files.report.display().to_string();
-    run.stream = files.stream.display().to_string();
-    codex
-        .review(&job)
-        .map_err(|e| reviewer_failed(codex, &e, &files.stream))?;
-    let text = fs::read_to_string(&files.report).unwrap_or_default();
-    if text.trim().is_empty() {
-        return Err(Failure::precondition(format!(
-            "{} finished without a report ({}); see {}",
-            codex.name(),
-            files.report.display(),
-            files.stream.display()
-        )));
-    }
+    let text = loop {
+        let granted: AcquireResult = daemon.wait(REVIEW_ACQUIRE, &slots)?;
+        let index = backends
+            .iter()
+            .position(|backend| backend.name == granted.backend)
+            .ok_or_else(|| {
+                Failure::precondition(format!(
+                    "the daemon granted an unknown backend {}; restart the daemon",
+                    granted.backend
+                ))
+            })?;
+        let (backend, reviewer) = (&backends[index], &reviewers[index]);
+        if run.cooled.iter().any(|(name, _)| *name == backend.name) {
+            return Err(Failure::precondition(format!(
+                "the daemon granted {} again although it ran out of quota; restart the daemon",
+                backend.name
+            )));
+        }
+        run.backend = index;
+        let prompt = review::prompt(
+            &reviewer.opening(&args.base),
+            &files.bundle.display().to_string(),
+            spec,
+            inputs.previous.as_ref().map(|(name, _)| name.as_str()),
+        );
+        write(&files.prompt, &prompt)?;
+        let stream = files.stream(reviewer.stream_extension());
+        let job = Job {
+            cwd: cwd.clone(),
+            prompt: files.prompt.clone(),
+            report: files.report.clone(),
+            stream: stream.clone(),
+            timeout: args.timeout.unwrap_or(backend.timeout),
+        };
+        files.clear_outputs(&stream)?;
+        run.report = files.report.display().to_string();
+        run.stream = stream.display().to_string();
+        match reviewer.review(&job) {
+            Ok(()) => {}
+            Err(ReviewerError::OutOfQuota(reset)) => {
+                let now = clock::now();
+                let until = reset.until(now, clock::utc_offset(now));
+                let cooling = QuotaParams {
+                    backend: backend.name.clone(),
+                    quota: "cooling".to_owned(),
+                    until: Some(until.unix_millis()),
+                };
+                let _: QuotaParams = daemon.call(REVIEW_QUOTA, &cooling)?;
+                run.cooled.push((backend.name.clone(), until));
+                continue;
+            }
+            Err(e) => return Err(reviewer_failed(reviewer.as_ref(), &e, &stream)),
+        }
+        let text = fs::read_to_string(&files.report).unwrap_or_default();
+        if text.trim().is_empty() {
+            return Err(Failure::precondition(format!(
+                "{} finished without a report ({}); see {}",
+                reviewer.name(),
+                files.report.display(),
+                stream.display()
+            )));
+        }
+        let available = QuotaParams {
+            backend: backend.name.clone(),
+            quota: "available".to_owned(),
+            until: None,
+        };
+        // The review is done whether or not this lands; the next run that cools it down
+        // records its quota again.
+        let _: Result<QuotaParams, _> = daemon.call(REVIEW_QUOTA, &available);
+        break text;
+    };
+    let backend = &backends[run.backend];
     let reading = Reading::of(&text).map_err(|e| {
         Failure::precondition(format!("{e}: {}; read it there", files.report.display()))
     })?;
@@ -154,7 +265,7 @@ fn review(args: &Args, paths: &Paths, codex: &Codex, run: &mut Run) -> Result<Do
         "round": review::round(&args.label, args.previous.is_some()),
         "base": args.base,
         "head": inputs.head,
-        "backend": codex.name(),
+        "backend": backend.name,
         "verdict": reading.verdict.to_string(),
         "blocking": reading.counts.blocking,
         "advisory": reading.counts.advisory,
@@ -166,10 +277,17 @@ fn review(args: &Args, paths: &Paths, codex: &Codex, run: &mut Run) -> Result<Do
     });
     write(&files.findings, &format!("{ledger:#}\n"))?;
     run.findings = files.findings.display().to_string();
+    let cooled: Vec<Value> = run
+        .cooled
+        .iter()
+        .map(|(name, until)| json!({"backend": name, "until": until.to_string()}))
+        .collect();
     let mut done = Done::new(
         reading.summary(&args.label, &run.report),
         json!({
             "label": args.label,
+            "backend": backend.name,
+            "cooled": cooled,
             "verdict": reading.verdict.to_string(),
             "blocking": reading.counts.blocking,
             "advisory": reading.counts.advisory,
@@ -285,9 +403,10 @@ struct Files {
     spec: PathBuf,
     prompt: PathBuf,
     report: PathBuf,
-    stream: PathBuf,
     /// The findings ledger read from the report.
     findings: PathBuf,
+    dir: PathBuf,
+    label: String,
 }
 
 impl Files {
@@ -305,14 +424,22 @@ impl Files {
             spec: file("spec.md"),
             prompt: file("prompt"),
             report: file("md"),
-            stream: file("jsonl"),
             findings: file("findings.json"),
+            dir: dir.clone(),
+            label: label.to_owned(),
         })
     }
 
-    /// Removes what an earlier run under the same label left, so nothing stale is read.
-    fn clear_outputs(&self) -> Result<(), Failure> {
-        for path in [&self.report, &self.stream, &self.findings] {
+    /// A backend's event stream, by the extension it names: Codex's is `.jsonl`, which
+    /// factory-stats reads.
+    fn stream(&self, extension: &str) -> PathBuf {
+        self.dir.join(format!("{}.{extension}", self.label))
+    }
+
+    /// Removes what an earlier run under the same label left in the report, the findings
+    /// ledger and this backend's `stream`, so nothing stale is read.
+    fn clear_outputs(&self, stream: &Path) -> Result<(), Failure> {
+        for path in [&self.report, stream, &self.findings] {
             match fs::remove_file(path) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => {
                     return Err(Failure::precondition(format!(
@@ -325,15 +452,6 @@ impl Files {
         }
         Ok(())
     }
-}
-
-/// Codex's own dir: `$CODEX_HOME`, else `~/.codex`.
-fn codex_home() -> PathBuf {
-    let var = |key: &str| env::var_os(key).filter(|value| !value.is_empty());
-    var("CODEX_HOME").map_or_else(
-        || Path::new(&var("HOME").unwrap_or_default()).join(".codex"),
-        PathBuf::from,
-    )
 }
 
 /// The spec's name for the prompt and its text. An issue ref is fetched with gh and saved to
@@ -372,7 +490,7 @@ fn write(path: &Path, text: &str) -> Result<(), Failure> {
 
 /// The failure a backend's error is: a timeout exits 124, anything else 3. The line starts
 /// `<backend> <what happened>` (`codex exited 1`), which factory-stats' classifier reads.
-fn reviewer_failed(reviewer: &impl Reviewer, e: &ReviewerError, stream: &Path) -> Failure {
+fn reviewer_failed(reviewer: &dyn Reviewer, e: &ReviewerError, stream: &Path) -> Failure {
     let exit = match e {
         ReviewerError::TimedOut(_) => Exit::Timeout,
         _ => Exit::Precondition,

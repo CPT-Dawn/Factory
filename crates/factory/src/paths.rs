@@ -2,7 +2,8 @@
 //!
 //! State resolves as factory-stats resolves it (`$FACTORY_STATE`, else
 //! `${XDG_STATE_HOME:-$HOME/.local/state}/factory`), so both read and write one ledger. The
-//! daemon's socket, locks and pid live in `$XDG_RUNTIME_DIR/factory`.
+//! daemon's socket, locks and pid live in `$XDG_RUNTIME_DIR/factory`, and the config in
+//! `${XDG_CONFIG_HOME:-$HOME/.config}/factory`.
 
 use std::env;
 use std::ffi::OsString;
@@ -16,32 +17,44 @@ use crate::output::Failure;
 pub struct Paths {
     pub state: PathBuf,
     pub runtime: PathBuf,
+    pub config: PathBuf,
 }
 
 impl Paths {
     pub fn from_env() -> Result<Paths, Failure> {
         // An empty variable counts as unset, as in factory-stats.
         let var = |key: &str| env::var_os(key).filter(|value| !value.is_empty());
+        let home = || var("HOME").unwrap_or_else(|| OsString::from("/"));
         let state = match (var("FACTORY_STATE"), var("XDG_STATE_HOME")) {
             (Some(dir), _) => PathBuf::from(dir),
             (None, Some(dir)) => Path::new(&dir).join("factory"),
-            (None, None) => {
-                let home = var("HOME").unwrap_or_else(|| OsString::from("/"));
-                Path::new(&home).join(".local/state/factory")
-            }
+            (None, None) => Path::new(&home()).join(".local/state/factory"),
         };
+        let config = var("XDG_CONFIG_HOME")
+            .map_or_else(|| Path::new(&home()).join(".config"), PathBuf::from)
+            .join("factory");
         let runtime = var("XDG_RUNTIME_DIR").ok_or_else(|| {
             Failure::precondition("XDG_RUNTIME_DIR is not set; run factory inside a user session")
         })?;
         Ok(Paths {
             state,
             runtime: Path::new(&runtime).join("factory"),
+            config,
         })
     }
 
     /// The event ledger factory-stats reads.
     pub fn ledger(&self) -> PathBuf {
         self.state.join("events.jsonl")
+    }
+
+    /// The daemon's database: reviewer quotas, and later leases and waits.
+    pub fn database(&self) -> PathBuf {
+        self.state.join("factory.db")
+    }
+
+    pub fn config_file(&self) -> PathBuf {
+        self.config.join("config.toml")
     }
 
     pub fn socket(&self) -> PathBuf {

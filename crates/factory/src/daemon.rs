@@ -9,18 +9,21 @@ use std::io::{self, Write};
 use std::os::unix::net::UnixListener as StdListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use factory_core::event::{Event, Fields};
 use factory_core::exit::Exit;
-use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::clock;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
-use crate::protocol::{ErrorBody, LOG, LogParams, LogResult, Outcome, Request, Response};
+use crate::protocol::{
+    ErrorBody, LOG, LogParams, LogResult, Outcome, REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response,
+};
+use crate::router::Router;
+use crate::store::Store;
 
 /// What to do when the CLI and the daemon don't speak the same protocol.
 const MISMATCH: &str = "the daemon may be older than this factory: restart it";
@@ -36,6 +39,7 @@ pub fn run(json: bool) -> Result<Done, Failure> {
     })?;
     let ledger = Ledger::open(paths.ledger())?;
     let _lock = take_daemon_lock(&paths)?;
+    let router = Router::open(Store::open(&paths.database())?)?;
     let listener = bind(&paths)?;
     let pid = std::process::id();
     fs::write(paths.daemon_pid(), format!("{pid}\n")).map_err(|e| {
@@ -46,6 +50,7 @@ pub fn run(json: bool) -> Result<Done, Failure> {
     })?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
+        .enable_time()
         .build()
         .map_err(|e| {
             Failure::precondition(format!("cannot start the daemon's runtime: {e}; retry"))
@@ -63,7 +68,7 @@ pub fn run(json: bool) -> Result<Done, Failure> {
             ),
             json,
         );
-        match serve(listener, Arc::new(ledger)).await {}
+        match serve(listener, Arc::new(ledger), Arc::new(router)).await {}
     })
 }
 
@@ -110,11 +115,11 @@ fn bind(paths: &Paths) -> Result<StdListener, Failure> {
     Ok(listener)
 }
 
-async fn serve(listener: UnixListener, ledger: Arc<Ledger>) -> Infallible {
+async fn serve(listener: UnixListener, ledger: Arc<Ledger>, router: Arc<Router>) -> Infallible {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(answer(stream, Arc::clone(&ledger)));
+                tokio::spawn(answer(stream, Arc::clone(&ledger), Arc::clone(&router)));
             }
             Err(e) => {
                 let _ = writeln!(io::stderr(), "factory: accept failed: {e}");
@@ -123,23 +128,31 @@ async fn serve(listener: UnixListener, ledger: Arc<Ledger>) -> Infallible {
     }
 }
 
-/// Answers each request line on one connection until the client hangs up.
-async fn answer(stream: UnixStream, ledger: Arc<Ledger>) {
+/// Answers each request line on one connection until the client hangs up, then frees the
+/// review slot the connection holds.
+async fn answer(stream: UnixStream, ledger: Arc<Ledger>, router: Arc<Router>) {
+    let mut held = None;
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        let response = respond(&line, &ledger).await;
+        let response = respond(&line, &ledger, &router, &mut held).await;
         let Ok(mut out) = serde_json::to_string(&response) else {
-            return;
+            break;
         };
         out.push('\n');
         if writer.write_all(out.as_bytes()).await.is_err() {
-            return;
+            break;
         }
     }
+    router.release(&mut held);
 }
 
-async fn respond(line: &str, ledger: &Arc<Ledger>) -> Response {
+async fn respond(
+    line: &str,
+    ledger: &Arc<Ledger>,
+    router: &Arc<Router>,
+    held: &mut Option<String>,
+) -> Response {
     let request: Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(e) => {
@@ -161,6 +174,18 @@ async fn respond(line: &str, ledger: &Arc<Ledger>) -> Response {
                 Err(e) => Outcome::Error(refusal(
                     Exit::Precondition,
                     format!("log failed in the daemon: {e}; retry"),
+                )),
+            }
+        }
+        REVIEW_ACQUIRE => router.acquire(request.params, held).await,
+        REVIEW_QUOTA => {
+            let router = Arc::clone(router);
+            let params = request.params;
+            match tokio::task::spawn_blocking(move || router.record(params)).await {
+                Ok(outcome) => outcome,
+                Err(e) => Outcome::Error(refusal(
+                    Exit::Precondition,
+                    format!("recording a quota failed in the daemon: {e}; retry"),
                 )),
             }
         }
@@ -244,17 +269,10 @@ impl Ledger {
             .file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let landed = event.stamped(now());
+        let landed = event.stamped(clock::now());
         let mut line = Value::Object(landed.clone()).to_string();
         line.push('\n');
         file.write_all(line.as_bytes())?;
         Ok(landed)
     }
-}
-
-fn now() -> Timestamp {
-    let since_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    Timestamp::from_unix_millis(i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX))
 }
