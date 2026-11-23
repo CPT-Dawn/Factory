@@ -17,7 +17,7 @@ use tokio::time::Instant;
 
 use super::{
     Answer, Facts, Lab, Present, RECHECK, blocking, gather_stack, grant_board, grant_project,
-    parse, send,
+    lock_ignoring_poison, parse, send,
 };
 use crate::lab::lease::base_name;
 use crate::lab::reservations;
@@ -70,7 +70,8 @@ fn enqueue(lab: &Lab, p: &ReserveParams) -> Answer<i64> {
 
 fn try_reserve(lab: &Lab, p: &ReserveParams, waiter: i64, facts: &Facts) -> Answer<Tried> {
     lab.write(|c, now| {
-        let board = grant_board(c, Some(&p.project), &p.worktree, facts)?;
+        let stopping = lock_ignoring_poison(&lab.stopping).clone();
+        let board = grant_board(c, Some(&p.project), &p.worktree, facts, &stopping)?;
         let ask = Reserve {
             waiter,
             project: grant_project(&p.project),

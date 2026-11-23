@@ -155,6 +155,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
         let lab = Arc::new(lab);
         lab.recover();
         notifier.resume();
+        lab.keep();
         let daemon = Daemon {
             ledger,
             leads,

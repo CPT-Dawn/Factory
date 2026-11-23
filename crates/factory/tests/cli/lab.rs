@@ -340,15 +340,13 @@ PY
 }
 
 #[test]
-fn docker_and_systemctl_run_while_the_store_is_unlocked() {
+fn docker_runs_while_the_store_is_unlocked() {
     let (sandbox, world) = lab();
     let probes: PathBuf = sandbox.path("probes");
     let wt = world.worktree("demo-lock");
     // The daemon makes lab.db on its first call; probe once it is there.
     assert_eq!(owned(&sandbox, &wt, &["status"]).code, 0);
-    for tool in ["docker", "systemctl"] {
-        probe_lock(&sandbox, tool, &probes);
-    }
+    probe_lock(&sandbox, "docker", &probes);
     let other = world.worktree("demo-other");
     // A second owner, so its lease takes the other slot instead of queueing behind the cap.
     let mut second = Command::new("sleep")
@@ -376,12 +374,7 @@ fn docker_and_systemctl_run_while_the_store_is_unlocked() {
     let _ = second.wait();
 
     let seen = fs::read_to_string(&probes).unwrap_or_default();
-    for tool in ["docker", "systemctl"] {
-        assert!(
-            seen.contains(&format!("{tool} free")),
-            "{tool} never ran: {seen}"
-        );
-    }
+    assert!(seen.contains("docker free"), "docker never ran: {seen}");
     assert!(!seen.contains("held"), "{seen}");
 }
 
@@ -1565,4 +1558,248 @@ fn a_daemon_stopping_under_a_run_records_it_as_lost_without_waiting_for_it() {
     );
     assert_eq!(event["outcome"], "lost", "{event}");
     assert_eq!(event["phase"], "running", "{event}");
+}
+
+/// A process that stands in for an agent owning leases, until the test kills it.
+fn owner_process() -> std::process::Child {
+    let mut cmd = Command::new("sleep");
+    cmd.arg("120").stdin(std::process::Stdio::null());
+    spawn(cmd)
+}
+
+/// `devlab` run with `owner` as its owner.
+fn owned_by(sandbox: &Sandbox, dir: &Path, owner: u32, args: &[&str]) -> Run {
+    let mut cmd = devlab(sandbox, dir, args);
+    cmd.env("DEVLAB_OWNER_PID", owner.to_string());
+    run(cmd)
+}
+
+/// Kills an [`owner_process`] and reaps it, as its parent would.
+fn kill_owner(owner: std::process::Child) {
+    signal(owner.id(), Signal::KILL);
+    let _ = finish(owner);
+}
+
+#[test]
+fn an_owner_that_exits_frees_its_lease_within_a_second_even_before_it_is_reaped() {
+    let (sandbox, world) = lab();
+    let (a, b) = (owner_process(), owner_process());
+    for (owner, name) in [(&a, "demo-a"), (&b, "demo-b")] {
+        let held = owned_by(
+            &sandbox,
+            &world.worktree(name),
+            owner.id(),
+            &["acquire", "--no-device", "--quiet"],
+        );
+        assert_eq!(held.code, 0, "{held:?}");
+    }
+    let wt = world.worktree("demo-c");
+    // Status waits for adb's first device list, whose news would wake the queue by chance.
+    assert!(status(&sandbox, &wt).starts_with("devices: none attached\n"));
+    let mut queued = devlab(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--quiet", "--wait", "60"],
+    );
+    queued.env("DEVLAB_OWNER_PID", std::process::id().to_string());
+    let queued = spawn(queued);
+    await_waiter(&sandbox, &wt);
+
+    // Killed and not yet reaped: a zombie with its pid and start time, which no longer owns.
+    let killed = std::time::Instant::now();
+    signal(a.id(), Signal::KILL);
+    let out = finish(queued);
+    let took = killed.elapsed();
+    let _ = finish(a);
+    kill_owner(b);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(out.stdout.contains("export DEVLAB_SLOT=0\n"), "{out:?}");
+    assert!(
+        took < std::time::Duration::from_secs(1),
+        "the lease was freed after {took:?}"
+    );
+}
+
+/// adb's call that takes back the reverse of device port `port` on `serial`.
+fn unreverse(serial: &str, port: &str) -> Vec<String> {
+    ["-s", serial, "reverse", "--remove", port]
+        .map(str::to_owned)
+        .to_vec()
+}
+
+#[test]
+fn a_release_takes_back_the_reverses_its_phone_was_given() {
+    let (sandbox, world) = lab();
+    world
+        .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
+        .unwrap();
+    let wt = world.worktree("demo-reverse");
+    let held = owned(&sandbox, &wt, &["acquire", "--phone", "--quiet"]);
+    assert_eq!(held.code, 0, "{held:?}");
+    let given = ["-s", "FAKEPHONE01", "reverse", "tcp:8787", "tcp:27787"].map(str::to_owned);
+    assert!(
+        sandbox.calls("adb").contains(&given.to_vec()),
+        "{:?}",
+        sandbox.calls("adb")
+    );
+
+    let out = owned(&sandbox, &wt, &["release"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let calls = sandbox.calls("adb");
+    assert!(
+        calls.contains(&unreverse("FAKEPHONE01", "tcp:8787")),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn the_lease_of_an_owner_that_exits_takes_back_its_reverses_too() {
+    let (sandbox, world) = lab();
+    world
+        .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
+        .unwrap();
+    let wt = world.worktree("demo-reverse");
+    let owner = owner_process();
+    let held = owned_by(
+        &sandbox,
+        &wt,
+        owner.id(),
+        &["acquire", "--phone", "--quiet"],
+    );
+    assert_eq!(held.code, 0, "{held:?}");
+
+    kill_owner(owner);
+
+    let taken_back = poll_until(|| {
+        sandbox
+            .calls("adb")
+            .contains(&unreverse("FAKEPHONE01", "tcp:8787"))
+    });
+    assert!(taken_back, "{:?}", sandbox.calls("adb"));
+    assert!(
+        status(&sandbox, &wt)
+            .contains("FAKEPHONE01        phone    Pixel 8        ready        free"),
+        "{}",
+        status(&sandbox, &wt)
+    );
+}
+
+#[test]
+fn an_emulator_idle_for_the_configured_minutes_is_stopped_and_forgotten() {
+    let (sandbox, world) = lab();
+    // 0.02 minutes: about a second.
+    write_machine_config(&sandbox, r#""emulatorIdleMin": 0.02"#);
+    let wt = world.worktree("plain-idle");
+    let held = owned(&sandbox, &wt, &["acquire", "--emulator", "--quiet"]);
+    assert_eq!(held.code, 0, "{held:?}");
+    assert!(
+        status(&sandbox, &wt).contains("emulator-5580"),
+        "{}",
+        status(&sandbox, &wt)
+    );
+
+    assert_eq!(owned(&sandbox, &wt, &["release"]).code, 0);
+
+    let stopped = poll_until(|| status(&sandbox, &wt).starts_with("devices: none attached\n"));
+    assert!(stopped, "{}", status(&sandbox, &wt));
+    let kill = ["-s", "emulator-5580", "emu", "kill"]
+        .map(str::to_owned)
+        .to_vec();
+    assert!(
+        sandbox.calls("adb").contains(&kill),
+        "{:?}",
+        sandbox.calls("adb")
+    );
+}
+
+/// The fake supabase's calls that stopped the stack of `project_id`.
+fn stack_stops(sandbox: &Sandbox, project_id: &str) -> usize {
+    sandbox
+        .calls("supabase")
+        .iter()
+        .filter(|c| c.first().is_some_and(|a| a == "stop") && c.iter().any(|a| a == project_id))
+        .count()
+}
+
+#[test]
+fn a_stack_devlab_started_is_stopped_once_idle_and_one_started_outside_devlab_never_is() {
+    let (sandbox, world) = lab();
+    // 0.02 minutes: about a second.
+    write_machine_config(&sandbox, r#""stackIdleMin": 0.02"#);
+    let ours = world.worktree("demo-ours");
+    let held = owned(
+        &sandbox,
+        &ours,
+        &["acquire", "--no-device", "--stack", "--quiet"],
+    );
+    assert_eq!(held.code, 0, "{held:?}");
+    // Slot 1's stack was started outside devlab; a lease that doesn't start it uses it.
+    let containers = sandbox.path("world/containers");
+    let mut listed = fs::read_to_string(&containers).unwrap_or_default();
+    listed.push_str("supabase_db_demo_s1\n");
+    fs::write(&containers, listed).expect("start a stack outside devlab");
+    let other = owner_process();
+    let outside = world.worktree("demo-outside");
+    let held = owned_by(
+        &sandbox,
+        &outside,
+        other.id(),
+        &["acquire", "--no-device", "--quiet"],
+    );
+    assert!(held.stdout.contains("export DEVLAB_SLOT=1\n"), "{held:?}");
+
+    // The outside stack idles first, so a look that stops ours had it due too.
+    assert_eq!(
+        owned_by(&sandbox, &outside, other.id(), &["release"]).code,
+        0
+    );
+    assert_eq!(owned(&sandbox, &ours, &["release"]).code, 0);
+
+    // The fake records the stop before it takes the container down.
+    let stopped = poll_until(|| {
+        stack_stops(&sandbox, "demo") == 1
+            && !fs::read_to_string(&containers)
+                .unwrap_or_default()
+                .lines()
+                .any(|c| c == "supabase_db_demo")
+    });
+    kill_owner(other);
+    assert!(stopped, "{:?}", sandbox.calls("supabase"));
+    let up = fs::read_to_string(&containers).unwrap_or_default();
+    assert!(up.lines().any(|c| c == "supabase_db_demo_s1"), "{up}");
+    assert_eq!(
+        stack_stops(&sandbox, "demo_s1"),
+        0,
+        "{:?}",
+        sandbox.calls("supabase")
+    );
+}
+
+#[test]
+fn status_names_the_daemon_as_the_watcher_and_devlab_watch_starts_no_poller() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-watch");
+    let text = status(&sandbox, &wt);
+    assert!(
+        text.lines()
+            .last()
+            .is_some_and(|l| l.ends_with("; watcher active")),
+        "{text}"
+    );
+    let json = owned(&sandbox, &wt, &["status", "--json"]);
+    let json: serde_json::Value =
+        serde_json::from_str(&json.stdout).unwrap_or_else(|e| panic!("{e}: {json:?}"));
+    assert_eq!(json["watcher"], "active", "{json}");
+
+    let watch = owned(&sandbox, &wt, &["watch"]);
+    assert_eq!(
+        (watch.code, watch.stdout.as_str()),
+        (
+            0,
+            "devlab watch: the factory daemon frees leases and stops idle emulators and stacks now; nothing to start\n"
+        ),
+        "{watch:?}"
+    );
 }

@@ -50,6 +50,8 @@ pub trait Adb: Send + Sync {
     fn shell(&self, serial: &str, cmd: &str) -> Option<String>;
     /// `adb -s <serial> reverse tcp:<device> tcp:<host>`; whether it worked.
     fn reverse(&self, serial: &str, device_port: u32, host_port: u32) -> bool;
+    /// `adb -s <serial> reverse --remove tcp:<device>`; whether it worked.
+    fn unreverse(&self, serial: &str, device_port: u32) -> bool;
     /// `adb -s <serial> emu kill`: an emulator saves its quick-boot snapshot and exits.
     fn emu_kill(&self, serial: &str);
 }
@@ -84,6 +86,15 @@ impl Adb for AdbCli {
                 &format!("tcp:{host_port}"),
             ],
             TIMEOUT,
+        )
+        .is_some()
+    }
+
+    fn unreverse(&self, serial: &str, device_port: u32) -> bool {
+        let port = format!("tcp:{device_port}");
+        adb(
+            &["-s", serial, "reverse", "--remove", &port],
+            Duration::from_secs(5),
         )
         .is_some()
     }
@@ -220,6 +231,11 @@ impl Adb for FakeAdb {
         self.record(format!(
             "-s {serial} reverse tcp:{device_port} tcp:{host_port}"
         ));
+        true
+    }
+
+    fn unreverse(&self, serial: &str, device_port: u32) -> bool {
+        self.record(format!("-s {serial} reverse --remove tcp:{device_port}"));
         true
     }
 
