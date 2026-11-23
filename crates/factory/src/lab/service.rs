@@ -160,8 +160,10 @@ impl Lab {
             let spawned = std::thread::Builder::new()
                 .name("adb-track".to_owned())
                 .spawn(move || {
+                    let tracker = AdbTrack::from_env();
                     android::track_forever(
-                        &AdbTrack,
+                        &tracker,
+                        tracker.pace,
                         &|list| {
                             lab.attached.send_replace(Some(list));
                             lab.notify();
@@ -175,6 +177,7 @@ impl Lab {
                                 unknown
                             });
                         },
+                        &|line| eprintln!("factory: lab: {line}"),
                     )
                 });
             if spawned.is_err() {

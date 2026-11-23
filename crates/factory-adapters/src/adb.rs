@@ -7,7 +7,9 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use factory_core::lab::devices::{ListFraming, same_devices};
 
 use crate::process;
 
@@ -107,52 +109,215 @@ impl Adb for AdbCli {
 /// A source of `adb track-devices -l` streams.
 pub trait TrackDevices: Send + Sync {
     /// A new stream: four hex digits of length, then that many bytes of `adb devices -l`
-    /// lines, once now and once each time the list changes.
+    /// lines, once now and once each time the list changes. A stream that was cut off because
+    /// adb stopped answering ends with an error that says so.
     fn start(&self) -> std::io::Result<Box<dyn Read + Send>>;
 }
 
-/// How long `adb track-devices` may take to show its first list; past it the stream's process
-/// group is killed, and the stream ends.
-const FIRST_FRAME: Duration = Duration::from_secs(15);
-
-/// `adb track-devices -l`, in a process group of its own. Its first list must come within
-/// [`FIRST_FRAME`], or its group is killed; after that it streams for as long as adb runs (adb
-/// writes only when the list changes, so silence is no fault), and its group is killed when the
-/// stream is dropped.
-pub struct AdbTrack;
-
-struct Stream {
-    child: Child,
-    /// Set once the stream has shown bytes or is dropped: the first-frame watchdog stands down.
-    done: Arc<(Mutex<bool>, Condvar)>,
+/// How long the device stream's watch lets things take, and how long it waits to restart one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pace {
+    /// How long a list may take to come whole: the first from the stream's start, each later
+    /// one from its first byte.
+    pub list_within: Duration,
+    /// How often adb is asked for its device list while the stream is quiet (adb writes only
+    /// when the list changes, so silence alone is no fault). One question may take at most this
+    /// long, or [`PROBE_TIMEOUT`] if that is less.
+    pub probe_every: Duration,
+    /// The wait before the first restart of a stream; it doubles with each next one.
+    pub restart_base: Duration,
+    /// The longest wait before a restart.
+    pub restart_cap: Duration,
 }
 
-impl Stream {
-    fn stand_down(&self) {
-        let (done, cvar) = &*self.done;
-        *done.lock().unwrap_or_else(PoisonError::into_inner) = true;
-        cvar.notify_all();
+/// How long one question to adb may take at most.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+impl Default for Pace {
+    fn default() -> Pace {
+        Pace {
+            list_within: Duration::from_secs(15),
+            probe_every: Duration::from_secs(60),
+            restart_base: Duration::from_secs(3),
+            restart_cap: Duration::from_secs(60),
+        }
     }
+}
+
+impl Pace {
+    /// The default pace, with the milliseconds `FACTORY_ADB_LIST_MS`, `FACTORY_ADB_PROBE_MS`
+    /// and `FACTORY_ADB_BACKOFF_MS` give (the last also sets the cap, at twenty times it): the
+    /// harness's way to make the watch quick.
+    pub fn from_env() -> Pace {
+        let ms = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .map(Duration::from_millis)
+        };
+        let mut pace = Pace::default();
+        pace.list_within = ms("FACTORY_ADB_LIST_MS").unwrap_or(pace.list_within);
+        pace.probe_every = ms("FACTORY_ADB_PROBE_MS").unwrap_or(pace.probe_every);
+        if let Some(base) = ms("FACTORY_ADB_BACKOFF_MS") {
+            pace.restart_base = base;
+            pace.restart_cap = base.saturating_mul(20);
+        }
+        pace
+    }
+}
+
+/// `adb track-devices -l`, tethered (see [`Tethered`]) and watched. Each list must come whole
+/// within [`Pace::list_within`]: the first from the start, a later one from its first byte.
+/// While the stream is quiet between lists, adb is asked for its device list every
+/// [`Pace::probe_every`] (`adb devices -l`, which also starts a server that died): it must
+/// answer, and when it lists other devices than the stream last showed, the stream must show
+/// a new list within [`Pace::list_within`] (a list that still differs is caught by the next
+/// question). Any of these fails, and the stream's group is killed, so the stream ends with an
+/// error that says why.
+#[derive(Debug, Default)]
+pub struct AdbTrack {
+    pub pace: Pace,
+}
+
+/// The shell around an adb command: it keeps the pipe it got as stdin on descriptor 3, runs adb
+/// (given as its arguments) with no stdin and no stderr, writes adb's exit status to its own
+/// stderr, and kills its own process group once the pipe reaches its end or adb exits, so that
+/// nothing adb started lives on or holds the command's stdout open.
+const WRAPPER: &str = r#"exec 3<&0 0</dev/null
+"$@" 3<&- 2>/dev/null &
+adb=$!
+(cat <&3; kill -KILL 0) >/dev/null 2>&1 &
+wait "$adb"
+echo "$?" >&2
+kill -KILL 0"#;
+
+/// An adb command under [`WRAPPER`], in a process group of its own, whose stdin is a pipe only
+/// this process holds the writing end of: when this process dies, however it dies, the pipe
+/// ends and the wrapper kills the group. Dropped, it kills the group itself.
+struct Tethered {
+    child: Child,
+    lifeline: Option<std::process::ChildStdin>,
+    /// The wrapper is reaped, so its pid no longer names the group.
+    reaped: bool,
+}
+
+impl Tethered {
+    fn start(args: &[&str], stdout: Stdio, stderr: Stdio) -> std::io::Result<Tethered> {
+        let mut child = Command::new("sh")
+            .args(["-c", WRAPPER, "adb", &tool("adb").to_string_lossy()])
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(stdout)
+            .stderr(stderr)
+            .process_group(0)
+            .spawn()?;
+        let lifeline = child.stdin.take();
+        Ok(Tethered {
+            child,
+            lifeline,
+            reaped: false,
+        })
+    }
+
+    /// Kills the group, while its leader is still unreaped so that its pid still names it.
+    fn kill(&self) {
+        if !self.reaped {
+            kill_group(self.child.id());
+        }
+    }
+
+    /// Whether the wrapper has ended (and is reaped).
+    fn ended(&mut self) -> bool {
+        self.reaped = self.reaped || matches!(self.child.try_wait(), Ok(Some(_)));
+        self.reaped
+    }
+}
+
+impl Drop for Tethered {
+    fn drop(&mut self) {
+        self.kill();
+        // A wrapper already reaped killed its group as it ended; should anything be left, the
+        // pipe's end tells the group's watcher, which is in it, to kill the rest.
+        drop(self.lifeline.take());
+        if !self.reaped {
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[derive(Default)]
+struct Watch {
+    /// Since when, and why, the stream has stood waiting for a list to come whole: from its
+    /// start until its first list, from the first byte of each next one, and from when adb
+    /// listed devices the stream had not shown; `None` while it is quiet and up to date.
+    awaiting: Option<(Instant, &'static str)>,
+    /// The whole lists the stream has shown, and the last of them.
+    lists: u64,
+    last_list: Option<Vec<u8>>,
+    /// What adb said when last asked for its device list (`None` inside: it did not answer),
+    /// until the watch reads it.
+    answer: Option<Option<String>>,
+    /// The stream is dropped: the watch stands down.
+    dropped: bool,
+    /// Why the watch killed the stream.
+    cut_off: Option<String>,
+}
+
+/// Why a list is awaited.
+const NO_WHOLE_LIST: &str = "no whole list";
+const BEHIND_ADB: &str = "no list with the devices adb lists";
+
+type Shared = Arc<(Mutex<Watch>, Condvar)>;
+
+fn watch(shared: &Shared) -> std::sync::MutexGuard<'_, Watch> {
+    shared.0.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+struct Stream {
+    adb: Tethered,
+    framing: ListFraming,
+    shared: Shared,
 }
 
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let read = match self.child.stdout.as_mut() {
+        let read = match self.adb.child.stdout.as_mut() {
             Some(out) => out.read(buf),
             None => Ok(0),
         };
-        if matches!(read, Ok(n) if n > 0) {
-            self.stand_down();
+        match read {
+            Ok(n) if n > 0 => {
+                let finished = self.framing.feed(buf.get(..n).unwrap_or_default());
+                let mid_list = self.framing.mid_list();
+                let mut watch = watch(&self.shared);
+                let was = watch.awaiting;
+                if finished > 0 {
+                    watch.lists += finished as u64;
+                    watch.last_list = self.framing.last_list().map(<[u8]>::to_vec);
+                    watch.awaiting = mid_list.then(|| (Instant::now(), NO_WHOLE_LIST));
+                } else if was.is_none() && mid_list {
+                    watch.awaiting = Some((Instant::now(), NO_WHOLE_LIST));
+                }
+                if watch.awaiting != was {
+                    self.shared.1.notify_all();
+                }
+                Ok(n)
+            }
+            ended => match watch(&self.shared).cut_off.clone() {
+                Some(why) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, why)),
+                None => ended,
+            },
         }
-        read
     }
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        self.stand_down();
-        kill_group(self.child.id());
-        let _ = self.child.wait();
+        // Under the lock, so the watch kills no group once the stream is on its way out; the
+        // tethered adb is killed and reaped next, as the fields drop.
+        watch(&self.shared).dropped = true;
+        self.shared.1.notify_all();
     }
 }
 
@@ -165,41 +330,150 @@ fn kill_group(pid: u32) {
     }
 }
 
-/// Kills the stream's process group unless it shows bytes, or is dropped, within
-/// [`FIRST_FRAME`]. The stream is not reaped before it is dropped, so the group is still its.
-fn watch_first_frame(pid: u32, done: Arc<(Mutex<bool>, Condvar)>) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("adb-track-first".to_owned())
+/// adb's device list: `adb devices -l` (which also starts a server that died), tethered in a
+/// group of its own; `None` when it fails or outlives `limit`, and then its group is killed.
+/// Its stdout is read as it comes, so a long answer does not stall it.
+fn ask_adb(limit: Duration) -> Option<String> {
+    let mut probe = Tethered::start(&["devices", "-l"], Stdio::piped(), Stdio::piped()).ok()?;
+    let mut out = probe.child.stdout.take()?;
+    let reader = std::thread::Builder::new()
+        .name("adb-track-answer".to_owned())
         .spawn(move || {
-            let (flag, cvar) = &*done;
-            let guard = flag.lock().unwrap_or_else(PoisonError::into_inner);
-            let (guard, _) = cvar
-                .wait_timeout_while(guard, FIRST_FRAME, |done| !*done)
-                .unwrap_or_else(PoisonError::into_inner);
-            if !*guard {
-                kill_group(pid);
+            let mut said = String::new();
+            out.read_to_string(&mut said).ok().map(|_| said)
+        })
+        .ok()?;
+    let until = Instant::now() + limit;
+    while !probe.ended() {
+        if Instant::now() >= until {
+            // Killing the group ends every writer of stdout, so the reader ends too.
+            drop(probe);
+            let _ = reader.join();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut status = String::new();
+    probe
+        .child
+        .stderr
+        .take()?
+        .read_to_string(&mut status)
+        .ok()?;
+    let said = reader.join().ok()??;
+    (status.trim() == "0").then_some(said)
+}
+
+/// Kills the stream's process group when a list it awaits does not come whole within
+/// [`Pace::list_within`], or when adb does not answer the question asked every
+/// [`Pace::probe_every`] while the stream is quiet; stands down when the stream is dropped.
+/// adb's answer, its device list, must match the stream's last list: when it does not, and no
+/// list came while adb was asked, the stream awaits one. Any whole list ends that wait; should it
+/// still not match adb's, the next question finds so and the stream awaits one again. The
+/// question runs on a thread of its own, so no deadline waits on it. The stream is not reaped
+/// before it is dropped, so the group is still its.
+fn watch_stream(pid: u32, shared: Shared, pace: Pace) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("adb-track-watch".to_owned())
+        .spawn(move || {
+            let (_, cvar) = &*shared;
+            let asked = pace.probe_every.min(PROBE_TIMEOUT);
+            let mut next_question = Instant::now() + pace.probe_every;
+            // The lists shown when adb was asked, while a question is out.
+            let mut asking: Option<u64> = None;
+            let mut guard = watch(&shared);
+            loop {
+                if guard.dropped {
+                    return;
+                }
+                if let Some(answer) = guard.answer.take() {
+                    let lists_then = asking.take();
+                    let Some(said) = answer else {
+                        guard.cut_off =
+                            Some(format!("adb did not answer in {}ms", asked.as_millis()));
+                        kill_group(pid);
+                        return;
+                    };
+                    let behind = !guard
+                        .last_list
+                        .as_deref()
+                        .is_some_and(|list| same_devices(list, &said));
+                    if behind && guard.awaiting.is_none() && lists_then == Some(guard.lists) {
+                        guard.awaiting = Some((Instant::now(), BEHIND_ADB));
+                    }
+                }
+                let now = Instant::now();
+                if let Some((since, why)) = guard.awaiting {
+                    let deadline = since + pace.list_within;
+                    if now >= deadline {
+                        guard.cut_off =
+                            Some(format!("{why} in {}ms", pace.list_within.as_millis()));
+                        kill_group(pid);
+                        return;
+                    }
+                    guard = cvar
+                        .wait_timeout(guard, deadline - now)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                    continue;
+                }
+                if asking.is_none() && now >= next_question {
+                    next_question = now + pace.probe_every;
+                    let lists = guard.lists;
+                    let answer_to = Arc::clone(&shared);
+                    let sent = std::thread::Builder::new()
+                        .name("adb-track-ask".to_owned())
+                        .spawn(move || {
+                            let said = ask_adb(asked);
+                            watch(&answer_to).answer = Some(said);
+                            answer_to.1.notify_all();
+                        });
+                    if sent.is_ok() {
+                        asking = Some(lists);
+                    }
+                }
+                // A question out is waited for by its answer's notice; the next one is due at
+                // `next_question`.
+                let wait = if asking.is_some() {
+                    pace.probe_every
+                } else {
+                    next_question.saturating_duration_since(now)
+                };
+                guard = cvar
+                    .wait_timeout(guard, wait)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
             }
         })
         .map(drop)
 }
 
+impl AdbTrack {
+    pub fn from_env() -> AdbTrack {
+        AdbTrack {
+            pace: Pace::from_env(),
+        }
+    }
+}
+
 impl TrackDevices for AdbTrack {
     fn start(&self) -> std::io::Result<Box<dyn Read + Send>> {
-        let child = Command::new(tool("adb"))
-            .args(["track-devices", "-l"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()?;
-        let done = Arc::new((Mutex::new(false), Condvar::new()));
-        let pid = child.id();
-        // A stream with no watchdog is not handed out: dropping it kills its group.
+        let adb = Tethered::start(&["track-devices", "-l"], Stdio::piped(), Stdio::null())?;
+        let pid = adb.child.id();
+        let shared: Shared = Arc::new((
+            Mutex::new(Watch {
+                awaiting: Some((Instant::now(), NO_WHOLE_LIST)),
+                ..Watch::default()
+            }),
+            Condvar::new(),
+        ));
+        // A stream with no watch is not handed out: dropping it kills its group.
         let stream = Stream {
-            child,
-            done: Arc::clone(&done),
+            adb,
+            framing: ListFraming::default(),
+            shared: Arc::clone(&shared),
         };
-        watch_first_frame(pid, done)?;
+        watch_stream(pid, shared, self.pace)?;
         Ok(Box::new(stream))
     }
 }
