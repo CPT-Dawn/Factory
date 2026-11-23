@@ -23,8 +23,8 @@ const SANDBOX_STARTED: &str =
 
 /// A sandbox with fake agy, codex and claude that play the lines of `plan` in turn, one per
 /// review run: `ok` writes the report, `quota` is agy's exit 3 quota error, `limit` Codex's
-/// usage limit, `hold` (agy) waits for the file `release` (a minute at most, so a failed test leaves
-/// no agy behind) before writing the report. Each
+/// usage limit, `hold` (agy) waits for the file `release` before writing the report, and fails
+/// (exit 9) a minute on without it, so a failed test leaves no agy behind. Each
 /// run appends a line to `runs`: `agy <model>`, or `codex`/`claude` and its arguments.
 struct Lab {
     sandbox: Sandbox,
@@ -111,7 +111,7 @@ impl Lab {
                  [ -n \"$log\" ] && echo '{SANDBOX_STARTED}' >> \"$log\"\n\
                  {pop}\n\
                  case $step in\n\
-                 hold) n=0; while [ ! -e '{release}' ] && [ $n -lt 1200 ]; do sleep 0.05; n=$((n+1)); done; cat <<'R'\n{agy_result}\nR\n;;\n\
+                 hold) timeout 60 sh -c 'until [ -e \"$1\" ]; do sleep 0.05; done' hold '{release}' || exit 9; cat <<'R'\n{agy_result}\nR\n;;\n\
                  ok) cat <<'R'\n{agy_result}\nR\n;;\n\
                  quota) cat <<'R'\n{agy_quota}\nR\n\
                  echo 'AGY_ERROR: Individual quota reached. Resets in 2h0m0s' >&2; exit 3;;\n\
