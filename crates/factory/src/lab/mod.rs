@@ -11,7 +11,7 @@
 mod android;
 mod cli;
 mod context;
-mod host;
+pub(crate) mod host;
 mod lease;
 mod native;
 mod owner;

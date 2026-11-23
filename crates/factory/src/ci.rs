@@ -9,24 +9,18 @@ use serde_json::Value;
 
 use crate::client;
 use crate::config;
+use crate::notify;
 use crate::output::{Done, Failure, LINE_LIMIT};
 use crate::paths::Paths;
-use crate::protocol::{WAIT_CI, WaitCiParams, WaitCiResult};
+use crate::protocol::{NotifyOn, WAIT_CI, WaitCiParams, WaitCiResult};
 
 pub fn wait(pr: &str, timeout: Duration) -> Result<Done, Failure> {
     let paths = Paths::from_env()?;
     let poll = config::ci_poll(&paths)?;
-    let cwd = env::current_dir().map_err(|e| {
-        Failure::precondition(format!(
-            "cannot read the working directory: {e}; run it from the repo's checkout"
-        ))
-    })?;
     let params = WaitCiParams {
         pr: pr.to_owned(),
-        cwd: cwd.to_string_lossy().into_owned(),
-        waiter: env::var("HERDR_PANE_ID")
-            .ok()
-            .filter(|pane| !pane.is_empty()),
+        cwd: cwd()?,
+        waiter: client::waiter(),
         timeout_secs: timeout.as_secs(),
         poll_secs: poll.as_secs(),
     };
@@ -39,10 +33,31 @@ pub fn wait(pr: &str, timeout: Duration) -> Result<Done, Failure> {
     Ok(done)
 }
 
+/// `factory wait ci --notify`: registers the wait, and the daemon posts its line when it ends.
+pub fn notify(pr: &str, timeout: Duration) -> Result<Done, Failure> {
+    let poll = config::ci_poll(&Paths::from_env()?)?;
+    let on = NotifyOn::Ci {
+        pr: pr.to_owned(),
+        cwd: cwd()?,
+        poll_secs: poll.as_secs(),
+    };
+    notify::register(on, timeout)
+}
+
+/// The working directory, where `gh` finds the repo a pull request's number belongs to.
+fn cwd() -> Result<String, Failure> {
+    let cwd = env::current_dir().map_err(|e| {
+        Failure::precondition(format!(
+            "cannot read the working directory: {e}; run it from the repo's checkout"
+        ))
+    })?;
+    Ok(cwd.to_string_lossy().into_owned())
+}
+
 /// `<pr>: <n> passed, <n> failed[, <n> skipped][; logs in <file>; failed: <names>]`, with as
 /// many names as fit the line and a count of the rest, which the file and `--json` list. Only a
 /// state dir so deep that its path alone fills the line gets cut.
-fn line(answer: &WaitCiResult) -> String {
+pub fn line(answer: &WaitCiResult) -> String {
     let mut line = format!(
         "{}: {} passed, {} failed",
         answer.pr,

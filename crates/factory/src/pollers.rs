@@ -13,8 +13,8 @@
 //!
 //! A wait on CI lives in memory, bound to its CLI's connection, like a wait on a lead: a
 //! restarted daemon has no connection to answer it on, and the CLI it belonged to has already
-//! failed with exit 3 and can wait again. Only a wait that outlives its CLI (`--notify`,
-//! #21) needs a row in the database.
+//! failed with exit 3 and can wait again. Only a wait that outlives its CLI (`--notify`) has a
+//! row in the database, kept by [`crate::notifier`].
 
 use std::collections::HashMap;
 use std::future::pending;

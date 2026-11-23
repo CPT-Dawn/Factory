@@ -30,20 +30,23 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use factory_adapters::herdr::Herdr;
+use factory_adapters::inbox::Inbox;
 use listenfd::ListenFd;
 
 use crate::lab::service::{self, Lab};
 use crate::lab::wire::{ACQUIRE, RESERVE};
 use crate::leads::Leads;
 use crate::ledger::Ledger;
+use crate::notifier::Notifier;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::pollers::Pollers;
 use crate::protocol::{
     ErrorBody, LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH,
-    MONITOR_START, MONITOR_STATUS, MONITOR_STOP, Outcome, REVIEW_ACQUIRE, REVIEW_QUOTA, Request,
-    Response, ReviewRef, STATUS, SpawnParams, StatusParams, WAIT_CI, WAIT_LEAD, WAIT_REVIEW,
-    WaitCiParams, WaitCiResult, WaitLeadParams, WaitReviewParams,
+    MONITOR_START, MONITOR_STATUS, MONITOR_STOP, NotifyParams, Outcome, REVIEW_ACQUIRE,
+    REVIEW_QUOTA, Request, Response, ReviewRef, STATUS, SpawnParams, StatusParams, WAIT_CI,
+    WAIT_LEAD, WAIT_NOTIFY, WAIT_REVIEW, WaitCiParams, WaitCiResult, WaitLeadParams,
+    WaitReviewParams,
 };
 use crate::reviews::Reviews;
 use crate::router::Router;
@@ -52,15 +55,16 @@ use crate::steward::Steward;
 use crate::store::Store;
 
 /// What every connection answers from: the ledger, the picture of the leads, the reviewer
-/// router, the lab's lease store and the CI pollers.
+/// router, the lab's lease store, the CI pollers and the waits that outlive their CLI.
 struct Daemon {
     ledger: Arc<Ledger>,
     leads: Arc<Leads>,
     router: Arc<Router>,
     reviews: Arc<Reviews>,
     lab: Arc<Lab>,
-    pollers: Pollers,
+    pollers: Arc<Pollers>,
     steward: Arc<Steward>,
+    notifier: Arc<Notifier>,
 }
 
 /// How long a stopping daemon gives the connections it holds to finish their requests.
@@ -90,12 +94,19 @@ pub fn run(json: bool) -> Result<(), Failure> {
         Arc::clone(&ledger),
         Store::open(&paths.database())?,
     )?;
-    let pollers = Pollers::new(paths.clone(), Gh);
+    let pollers = Arc::new(Pollers::new(paths.clone(), Gh));
     let router = Arc::new(Router::open(Store::open(&paths.database())?)?);
     let steward = Steward::new(
         paths.clone(),
         Arc::clone(&leads),
         Store::open(&paths.database())?,
+    );
+    let notifier = Notifier::new(
+        paths.clone(),
+        Store::open(&paths.database())?,
+        Inbox,
+        Arc::clone(&leads),
+        Arc::clone(&pollers),
     );
     // Opened under the lock: it forgets the waiters a dead daemon left.
     let lab = Lab::open(&paths.lab_db()).map_err(|e| {
@@ -143,6 +154,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
         tokio::spawn(Arc::clone(&steward).resume());
         let lab = Arc::new(lab);
         lab.recover();
+        notifier.resume();
         let daemon = Daemon {
             ledger,
             leads,
@@ -151,6 +163,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
             lab,
             pollers,
             steward,
+            notifier,
         };
         serve(listener, Arc::new(daemon), stop).await;
         Ok(())
@@ -410,6 +423,15 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
                     waited = daemon.reviews.wait(&daemon.ledger, &params) => answered(waited),
                 }
             }
+            Err(refused) => refused,
+        },
+        WAIT_NOTIFY => match params::<NotifyParams>(WAIT_NOTIFY, request.params) {
+            // Biased, as a blocking wait: a stopping daemon registers no wait.
+            Ok(params) => tokio::select! {
+                biased;
+                () = stop.clone().stopping() => stopped("wait"),
+                registered = daemon.notifier.register(params) => answered(registered),
+            },
             Err(refused) => refused,
         },
         MONITOR_START => answered(daemon.steward.start().await),

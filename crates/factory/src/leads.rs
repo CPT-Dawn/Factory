@@ -451,13 +451,28 @@ impl<H: HerdrApi> Leads<H> {
         waiter: Option<String>,
         limit: Duration,
     ) -> Result<WaitLeadResult, Failure> {
-        self.check().await?;
-        self.known(name).await?;
-        let deadline = Instant::now() + limit;
+        self.find(name).await?;
         let _wait = self.register(Wait {
             waiter,
             on: WaitOn::Lead(name.to_owned()),
         });
+        self.settled(name, Instant::now() + limit, limit).await
+    }
+
+    /// Fails unless herdr is reachable and has a lead named `name`.
+    pub async fn find(self: &Arc<Self>, name: &str) -> Result<(), Failure> {
+        self.check().await?;
+        self.known(name).await
+    }
+
+    /// Answers once the lead settles, or fails at `deadline`, `limit` after the wait began.
+    /// The caller registers the wait.
+    pub async fn settled(
+        self: &Arc<Self>,
+        name: &str,
+        deadline: Instant,
+        limit: Duration,
+    ) -> Result<WaitLeadResult, Failure> {
         let mut changes = self.changed.subscribe();
         loop {
             changes.borrow_and_update();

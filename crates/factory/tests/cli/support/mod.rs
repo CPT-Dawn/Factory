@@ -26,6 +26,7 @@ use tempfile::TempDir;
 pub mod github;
 pub mod golden;
 pub mod herdr;
+pub mod inbox;
 pub mod socket_unit;
 pub mod world;
 

@@ -13,11 +13,12 @@ use serde_json::{Value, json};
 
 use crate::client;
 use crate::config;
+use crate::notify;
 use crate::output::{Done, Failure, LINE_LIMIT};
 use crate::paths::Paths;
 use crate::protocol::{
-    LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LeadList, LeadParams, LeadReport, SpawnParams, SpawnResult,
-    WAIT_LEAD, WaitLeadParams, WaitLeadResult,
+    LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LeadList, LeadParams, LeadReport, NotifyOn, SpawnParams,
+    SpawnResult, WAIT_LEAD, WaitLeadParams, WaitLeadResult,
 };
 
 /// What the daemon asks of herdr around a spawn, beyond the spawn's own steps: its ping, and
@@ -123,9 +124,7 @@ pub fn status(lead: &str) -> Result<Done, Failure> {
 pub fn wait(lead: &str, timeout: Duration) -> Result<Done, Failure> {
     let params = WaitLeadParams {
         lead: lead_name(lead).map_err(|e| Failure::usage(e.to_string()))?,
-        waiter: env::var("HERDR_PANE_ID")
-            .ok()
-            .filter(|pane| !pane.is_empty()),
+        waiter: client::waiter(),
         timeout_secs: timeout.as_secs(),
     };
     let paths = Paths::from_env()?;
@@ -134,6 +133,12 @@ pub fn wait(lead: &str, timeout: Duration) -> Result<Done, Failure> {
     let mut done = shown(&answer.lead, exit);
     done.json = serde_json::to_value(&answer).unwrap_or(Value::Null);
     Ok(done)
+}
+
+/// `factory wait lead --notify`: registers the wait, and the daemon posts its line when it ends.
+pub fn notify(lead: &str, timeout: Duration) -> Result<Done, Failure> {
+    let lead = lead_name(lead).map_err(|e| Failure::usage(e.to_string()))?;
+    notify::register(NotifyOn::Lead { lead }, timeout)
 }
 
 /// A lead's line, then its pane's last lines when it is blocked or asking.
@@ -147,7 +152,7 @@ fn shown(report: &LeadReport, exit: Exit) -> Done {
     done
 }
 
-fn line(report: &LeadReport) -> String {
+pub fn line(report: &LeadReport) -> String {
     match &report.report {
         Some(path) if report.state == "finished" => format!("{} finished: {path}", report.lead),
         _ => format!("{} {}", report.lead, report.status),

@@ -7,6 +7,8 @@
 //!
 //! Its `[ci]` table sets how often a wait on CI polls GitHub when it can't listen for events,
 //! and its `[monitor]` table the context steward's thresholds.
+//! Its `[notify]` table is the switch for event delivery: whether `factory wait --notify` may
+//! post into the sessions that ask. It is off unless the owner switches it on.
 //!
 //! ```toml
 //! [ci]
@@ -16,6 +18,9 @@
 //! ask = 300000             # context at which an idle lead is asked to stop, then compacted
 //! grace = "2m"             # how long an asked lead stays idle before it is compacted
 //! subagent = 200000        # context at which a subagent is told about to its lead
+//!
+//! [notify]
+//! enabled = false          # true lets the daemon post into Claude Code sessions
 //!
 //! [[review.backend]]
 //! cli = "codex"            # which adapter runs it: agy, codex or claude
@@ -118,6 +123,15 @@ struct ConfigFile {
     ci: CiSection,
     #[serde(default)]
     monitor: MonitorSection,
+    #[serde(default)]
+    notify: NotifySection,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct NotifySection {
+    #[serde(default)]
+    enabled: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -292,6 +306,21 @@ pub fn ci_poll(paths: &Paths) -> Result<Duration, Failure> {
             path.display()
         ))),
     }
+}
+
+/// Whether event delivery is switched on, and the file that says so: off without the file.
+pub fn notify_enabled(paths: &Paths) -> Result<(bool, PathBuf), Failure> {
+    let (path, file) = load_config(paths)?;
+    Ok((file.notify.enabled, path))
+}
+
+/// The refusal of a `--notify` wait while event delivery is off. Only the owner switches it on.
+pub fn notify_off(config: &Path) -> Failure {
+    Failure::precondition(format!(
+        "--notify is off: event delivery into sessions stays off until the owner sets \
+         [notify] enabled = true in {}; wait without --notify",
+        config.display()
+    ))
 }
 
 /// The context steward's thresholds.
