@@ -15,18 +15,39 @@ fn line(kind: &str, pairs: &[&str], session: Option<&str>) -> String {
 }
 
 #[test]
-fn values_that_look_numeric_become_numbers_and_the_rest_stay_strings() {
+fn a_count_or_a_measure_that_looks_numeric_becomes_a_number() {
     let cases = [
         ("round=1", r#""round":1"#),
-        ("n=007", r#""n":7"#),
-        ("neg=-3", r#""neg":-3"#),
-        ("dur=1.50", r#""dur":1.5"#),
-        ("two=2.0", r#""two":2"#),
+        ("round=007", r#""round":7"#),
+        ("fixed=-3", r#""fixed":-3"#),
+        ("duration_s=1.50", r#""duration_s":1.5"#),
+        ("tokens=2.0", r#""tokens":2"#),
+        ("standards_hard=2", r#""standards_hard":2"#),
+        ("spec_findings=0", r#""spec_findings":0"#),
+        ("question=1", r#""question":1"#),
+        ("bundle_bytes=1334262", r#""bundle_bytes":1334262"#),
+        ("round=+5", r#""round":"+5""#),
+        ("round=1e3", r#""round":"1e3""#),
+        ("round=.5", r#""round":".5""#),
+        ("round=5.", r#""round":"5.""#),
+    ];
+    for (pair, field) in cases {
+        let expected = format!(r#"{{"ts":"2026-11-20T02:47:18.365Z","type":"review",{field}}}"#);
+        assert_eq!(line("review", &[pair], None), expected, "{pair}");
+    }
+}
+
+#[test]
+fn any_other_value_stays_the_string_it_was_given() {
+    let cases = [
+        ("head=4750048", r#""head":"4750048""#),
+        ("head=0475004", r#""head":"0475004""#),
+        ("from=57334235", r#""from":"57334235""#),
+        ("label=3", r#""label":"3""#),
+        ("slug=42", r#""slug":"42""#),
+        ("n=007", r#""n":"007""#),
+        ("dur=1.50", r#""dur":"1.50""#),
         ("head=612ee246", r#""head":"612ee246""#),
-        ("plus=+5", r#""plus":"+5""#),
-        ("exp=1e3", r#""exp":"1e3""#),
-        ("half=.5", r#""half":".5""#),
-        ("trail=5.", r#""trail":"5.""#),
         ("tags=a,b", r#""tags":"a,b""#),
         ("eq=a=b", r#""eq":"a=b""#),
     ];
@@ -40,7 +61,7 @@ fn values_that_look_numeric_become_numbers_and_the_rest_stay_strings() {
 fn an_empty_value_is_dropped_and_a_later_duplicate_wins_in_place() {
     assert_eq!(
         line("lead-end", &["a=1", "b=", "c=x", "a=2", "c="], None),
-        r#"{"ts":"2026-11-20T02:47:18.365Z","type":"lead-end","a":2,"c":"x"}"#
+        r#"{"ts":"2026-11-20T02:47:18.365Z","type":"lead-end","a":"2","c":"x"}"#
     );
 }
 

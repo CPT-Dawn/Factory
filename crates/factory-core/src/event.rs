@@ -1,7 +1,8 @@
 //! Ledger events: what `factory log <type> key=value…` appends.
 //!
 //! The format is the one factory-stats has always written and reads: one compact JSON object
-//! per line, `ts` first, then `type`, then the fields in the order given.
+//! per line, `ts` first, then `type`, then the fields in the order given. Only the fields in
+//! [`NUMERIC_FIELDS`] hold numbers; every other value is a string.
 
 use std::fmt;
 
@@ -56,6 +57,20 @@ impl Event {
         })
     }
 
+    /// The event a writer that types its own values sends the daemon (factory-stats sends every
+    /// value of digits as a number), with each field as the ledger keeps it: a number outside
+    /// [`NUMERIC_FIELDS`] goes back to its text, and a string of digits in one becomes the number.
+    pub fn from_fields(kind: &str, fields: Fields) -> Result<Event, EventError> {
+        let fields = fields
+            .into_iter()
+            .map(|(key, value)| {
+                let value = typed(&key, value);
+                (key, value)
+            })
+            .collect();
+        Event::new(kind, fields)
+    }
+
     /// The event `factory log <kind> <pairs>…` describes, with `session` recorded last
     /// unless a pair sets it.
     pub fn from_args<S: AsRef<str>>(
@@ -107,16 +122,54 @@ fn parse_pairs<S: AsRef<str>>(pairs: &[S]) -> Result<Fields, EventError> {
             return Err(EventError::Pair(pair.to_owned()));
         };
         if !value.is_empty() {
-            fields.insert(key.to_owned(), field_value(value));
+            fields.insert(key.to_owned(), field_value(key, value));
         }
     }
     Ok(fields)
 }
 
-/// A value matching `^-?\d+(\.\d+)?$` becomes a number, as JavaScript's `Number` reads it
-/// (`007` is 7, `2.0` is 2); anything else stays a string.
-fn field_value(value: &str) -> Value {
-    let number = is_decimal(value)
+/// The fields the ledger keeps as numbers: the counts and measures factory-stats adds up
+/// (`round`, `duration_s`, `tokens` and the finding counts) and the other counts its lines
+/// have always held as numbers. Every other field keeps the text it was given, so a sha of
+/// digits like `0475004` stays a sha.
+pub const NUMERIC_FIELDS: [&str; 16] = [
+    "round",
+    "duration_s",
+    "tokens",
+    "standards_hard",
+    "standards_judgement",
+    "spec_findings",
+    "spec_advisory",
+    "questions",
+    "fixed",
+    "still_present",
+    "bundle_bytes",
+    "stalls",
+    "blocking",
+    "advisory",
+    "question",
+    "dropped",
+];
+
+/// `value` as the ledger keeps field `key`.
+fn typed(key: &str, value: Value) -> Value {
+    match value {
+        Value::Number(n) if !is_numeric_field(key) => Value::String(n.to_string()),
+        Value::String(text) => field_value(key, &text),
+        other => other,
+    }
+}
+
+/// Whether the ledger keeps the field `key` as a number.
+pub fn is_numeric_field(key: &str) -> bool {
+    NUMERIC_FIELDS.contains(&key)
+}
+
+/// The value of field `key`: in a numeric field, a value matching `^-?\d+(\.\d+)?$` becomes a
+/// number, as JavaScript's `Number` reads it (`007` is 7, `2.0` is 2); anything else stays a
+/// string.
+fn field_value(key: &str, value: &str) -> Value {
+    let number = (is_numeric_field(key) && is_decimal(value))
         .then(|| value.parse::<f64>().ok())
         .flatten()
         .and_then(js_number);

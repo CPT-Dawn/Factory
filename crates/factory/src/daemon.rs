@@ -600,7 +600,7 @@ fn log(params: Value, ledger: &Ledger) -> Outcome {
         Ok(params) => params,
         Err(refused) => return refused,
     };
-    let event = match Event::new(&params.kind, params.fields) {
+    let event = match Event::from_fields(&params.kind, params.fields) {
         Ok(event) => event,
         Err(e) => return Outcome::Error(refusal(Exit::Usage, e.to_string())),
     };
