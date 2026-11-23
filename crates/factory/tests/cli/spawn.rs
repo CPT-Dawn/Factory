@@ -416,3 +416,95 @@ fn a_stalled_prompt_that_is_gone_from_the_screen_is_typed_again() {
     let starts = events(&sandbox, "lead-start");
     assert_eq!(starts[0]["stalls"], 1, "{starts:?}");
 }
+
+#[test]
+fn an_existing_branch_beats_an_unknown_base() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    sandbox.git(&repo, &["branch", "factory/cart"]);
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12", "nope"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(herdr.count("worktree.create"), 0);
+}
+
+#[test]
+fn a_long_state_path_keeps_the_report_in_the_one_line_and_json_keeps_the_worktree() {
+    let state = "s".repeat(80);
+    let sandbox = Sandbox::new().env("FACTORY_STATE", Sandbox::new().path(&state));
+    let _herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let lines = out.stdout_lines();
+    assert_eq!(lines.len(), 1, "{out:?}");
+    assert!(lines[0].chars().count() <= 200, "{}", lines[0]);
+    assert!(
+        lines[0].contains(&format!("/{state}/")) && lines[0].contains(".md"),
+        "the report path is missing: {}",
+        lines[0]
+    );
+    let json = sandbox.factory_in(&repo, &["lead", "spawn", "pay", "#13", "--json"]);
+    let said: Value = serde_json::from_str(json.stdout.trim()).expect("one JSON line");
+    assert_eq!(said["worktree"], "/worktrees/repo/pay");
+}
+
+#[test]
+fn a_restarted_daemon_still_writes_the_end_of_a_lead_it_spawned_and_only_once() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    for (slug, spec) in [("cart", "#12"), ("pay", "#13")] {
+        let out = sandbox.factory_in(&repo, &["lead", "spawn", slug, spec]);
+        assert_eq!(out.code, 0, "{out:?}");
+    }
+    // The old daemon wrote cart's end and stopped before it kept that.
+    let logged = sandbox.factory(&[
+        "log",
+        "lead-end",
+        "repo=repo",
+        "slug=cart",
+        "outcome=finished",
+    ]);
+    assert_eq!(logged.code, 0, "{logged:?}");
+    let pid = fs::read_to_string(sandbox.path("run/factory/daemon.pid")).expect("the daemon's pid");
+    let killed = sandbox
+        .command("kill", &["-9", pid.trim()])
+        .output()
+        .expect("run kill");
+    assert!(killed.status.success(), "{killed:?}");
+    // A command sent while it is dying would be reset, not start a new one.
+    let gone = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
+    assert!(poll_until(|| !gone.exists()), "the daemon never died");
+    for (slug, pane) in [("cart", "w1:p1"), ("pay", "w2:p1")] {
+        fs::write(
+            sandbox.path(format!("state/factory/leads/repo/{slug}.md")),
+            "done\n",
+        )
+        .expect("write the report");
+        herdr.status(pane, "idle");
+    }
+
+    // The next command starts a new daemon, which settles what the old one left.
+    let listed = sandbox.factory(&["lead", "list"]);
+    assert_eq!(listed.code, 0, "{listed:?}");
+
+    assert!(
+        poll_until(|| {
+            events(&sandbox, "lead-end")
+                .iter()
+                .any(|end| end["slug"] == "pay")
+        }),
+        "no lead-end for pay in {:?}",
+        sandbox.ledger_lines()
+    );
+    let ends: Vec<String> = events(&sandbox, "lead-end")
+        .iter()
+        .map(|end| end["slug"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(ends, ["cart", "pay"]);
+}

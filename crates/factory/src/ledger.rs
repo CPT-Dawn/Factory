@@ -20,6 +20,29 @@ pub struct Ledger {
 }
 
 impl Ledger {
+    /// Whether the ledger holds a `lead-end` for the lead `slug` of `repo` after its latest
+    /// `lead-start`.
+    pub fn has_ended(&self, repo: &str, slug: &str) -> bool {
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return false;
+        };
+        let mut ended = false;
+        for event in text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        {
+            if event["repo"] != repo || event["slug"] != slug {
+                continue;
+            }
+            match event["type"].as_str() {
+                Some("lead-start") => ended = false,
+                Some("lead-end") => ended = true,
+                _ => {}
+            }
+        }
+        ended
+    }
+
     pub fn open(path: PathBuf) -> Result<Ledger, Failure> {
         let file = File::options()
             .create(true)

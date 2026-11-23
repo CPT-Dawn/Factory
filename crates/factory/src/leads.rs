@@ -70,6 +70,9 @@ struct Inner {
 struct Unfinished {
     repo: String,
     report: PathBuf,
+    /// Read back from the database after a restart: its end may already be in the ledger, if the
+    /// daemon stopped between writing it and keeping that.
+    recovered: bool,
 }
 
 struct Lead {
@@ -100,6 +103,7 @@ impl<H: HerdrApi> Leads<H> {
                     Unfinished {
                         repo,
                         report: PathBuf::from(report),
+                        recovered: true,
                     },
                 )
             })
@@ -177,6 +181,10 @@ impl<H: HerdrApi> Leads<H> {
             ("effort", params.effort.as_str()),
         ]
         .map(|(key, value)| format!("{key}={value}"));
+        // Kept before the event is written: a daemon that stops in between still owes the end.
+        if started.is_ok() {
+            self.expect_end(&name, &params.repo_name, &report, false);
+        }
         let event = event::Event::from_args("lead-start", &pairs, params.session.as_deref())
             .map_err(|e| Failure::usage(e.to_string()))?;
         self.ledger.append(&event).map_err(|e| {
@@ -186,7 +194,6 @@ impl<H: HerdrApi> Leads<H> {
             ))
         })?;
         let started = started.map_err(|failed| Failure::precondition(failed.message))?;
-        self.expect_end(&name, &params.repo_name, &report);
         {
             // The workspace is new: list herdr again so its pane is watched.
             let _turn = self.turn.lock().await;
@@ -194,6 +201,7 @@ impl<H: HerdrApi> Leads<H> {
                 eprintln!("factory: {}", failure.message);
             }
         }
+        self.resync().await;
         Ok(SpawnResult {
             lead: name,
             workspace: started.workspace,
@@ -203,8 +211,28 @@ impl<H: HerdrApi> Leads<H> {
         })
     }
 
+    /// Lists the agents again, now that the subscription is live. The listing a rebuild took is
+    /// older than its subscription, so a lead that finished in between would show as working
+    /// for good, and its end would never be written.
+    async fn resync(&self) {
+        if let Ok(agents) = self.herdr.agents().await {
+            let mut inner = self.lock();
+            for agent in agents {
+                let Some(lead) = agent.name.and_then(|name| inner.leads.get_mut(&name)) else {
+                    continue;
+                };
+                lead.agent = agent
+                    .agent
+                    .as_ref()
+                    .map(|_| AgentStatus::parse(&agent.agent_status));
+            }
+            drop(inner);
+            self.bump();
+        }
+    }
+
     /// Remembers that `name` is running and owes the ledger a `lead-end`.
-    fn expect_end(&self, name: &str, repo: &str, report: &Path) {
+    fn expect_end(&self, name: &str, repo: &str, report: &Path, recovered: bool) {
         let kept = self
             .store
             .lock()
@@ -220,6 +248,7 @@ impl<H: HerdrApi> Leads<H> {
             Unfinished {
                 repo: repo.to_owned(),
                 report: report.to_owned(),
+                recovered,
             },
         );
     }
@@ -259,9 +288,18 @@ impl<H: HerdrApi> Leads<H> {
                 format!("slug={}", lead::slug(&name)),
                 "outcome=finished".to_owned(),
             ];
-            let landed = event::Event::from_args("lead-end", &pairs, None)
-                .map_err(|e| e.to_string())
-                .and_then(|event| self.ledger.append(&event).map_err(|e| e.to_string()));
+            let landed = if lead.recovered && self.ledger.has_ended(&lead.repo, lead::slug(&name)) {
+                Ok(())
+            } else {
+                event::Event::from_args("lead-end", &pairs, None)
+                    .map_err(|e| e.to_string())
+                    .and_then(|event| {
+                        self.ledger
+                            .append(&event)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    })
+            };
             match landed {
                 Ok(_) => {
                     let kept = self

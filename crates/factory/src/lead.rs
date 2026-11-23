@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::client;
 use crate::config;
-use crate::output::{Done, Failure};
+use crate::output::{Done, Failure, LINE_LIMIT};
 use crate::paths::Paths;
 use crate::protocol::{
     LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LeadList, LeadParams, LeadReport, SpawnParams, SpawnResult,
@@ -57,18 +57,23 @@ pub fn spawn(args: &SpawnArgs) -> Result<Done, Failure> {
     }
     let top = git.toplevel().map_err(|e| no_repo(&e))?;
     let repo_name = git.name().map_err(|e| no_repo(&e))?;
-    let git_failed = |e: factory_adapters::git::GitError| Failure::precondition(e.to_string());
+    let git_failed = |e: factory_adapters::git::GitError| {
+        Failure::precondition(format!(
+            "{e}; check the repository at {} and retry",
+            top.display()
+        ))
+    };
+    let branch = lead::branch(lead::slug(&name));
+    if git.branch_exists(&branch).map_err(git_failed)? {
+        return Err(Failure::precondition(format!(
+            "{branch} already exists in {repo_name}; pick another slug, or delete the branch"
+        )));
+    }
     if git.commit(&args.base).map_err(git_failed)?.is_none() {
         return Err(Failure::usage(format!(
             "unknown base: {}; name a branch, tag or commit of {}",
             args.base,
             top.display()
-        )));
-    }
-    let branch = lead::branch(lead::slug(&name));
-    if git.branch_exists(&branch).map_err(git_failed)? {
-        return Err(Failure::precondition(format!(
-            "{branch} already exists in {repo_name}; pick another slug, or delete the branch"
         )));
     }
     let params = SpawnParams {
@@ -88,10 +93,7 @@ pub fn spawn(args: &SpawnArgs) -> Result<Done, Failure> {
     };
     let started: SpawnResult = client::wait(&paths, LEAD_SPAWN, &params, SPAWN_PATIENCE)?;
     Ok(Done::new(
-        format!(
-            "{}: workspace {}, branch {}, worktree {}, report {}",
-            started.lead, started.workspace, started.branch, started.worktree, started.report
-        ),
+        spawned_line(&started),
         serde_json::to_value(&started).unwrap_or(Value::Null),
     ))
 }
@@ -150,4 +152,20 @@ fn line(report: &LeadReport) -> String {
         Some(path) if report.state == "finished" => format!("{} finished: {path}", report.lead),
         _ => format!("{} {}", report.lead, report.status),
     }
+}
+
+/// The line that says where a lead is. When the worktree's path would push it past the output
+/// limit it is left to `--json`, so the report path, the one file the night page needs, stays.
+fn spawned_line(lead: &SpawnResult) -> String {
+    let full = format!(
+        "{}: workspace {}, branch {}, worktree {}, report {}",
+        lead.lead, lead.workspace, lead.branch, lead.worktree, lead.report
+    );
+    if full.chars().count() <= LINE_LIMIT {
+        return full;
+    }
+    format!(
+        "{}: workspace {}, branch {}, report {}",
+        lead.lead, lead.workspace, lead.branch, lead.report
+    )
 }
