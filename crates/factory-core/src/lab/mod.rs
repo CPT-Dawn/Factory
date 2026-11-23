@@ -5,6 +5,7 @@
 //! - [`queue`] is the FIFO queue in which an owner at its cap steps aside.
 //! - [`slots`] lays out a slot's ports, its Supabase config and its environment.
 //! - [`grant`] decides, from one picture of the board, whether a request is served now.
+//! - [`run`] says how a `devlab run` ended.
 //!
 //! Devices (#16) and reservations (#17) get modules of their own beside these.
 
@@ -12,6 +13,7 @@ pub mod args;
 pub mod config;
 pub mod grant;
 pub mod queue;
+pub mod run;
 pub mod slots;
 
 /// `Math.round` as devlab's TypeScript did it: halves round up.

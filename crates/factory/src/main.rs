@@ -1,16 +1,19 @@
 //! `factory`: the CLI and the daemon of the agent software factory (spec #1).
 
+mod ci;
 mod cli;
 mod client;
 mod clock;
 mod config;
 mod daemon;
+mod install;
 mod lab;
 mod lead;
 mod leads;
 mod log;
 mod output;
 mod paths;
+mod pollers;
 mod protocol;
 mod review;
 mod router;
@@ -43,13 +46,20 @@ fn main() -> ExitCode {
             &args.into_iter().map(OsString::from).collect::<Vec<_>>(),
             json,
         ),
-        Ok(cli) => output::finish(run(cli.command, cli.json), cli.json),
+        Ok(cli) => run(cli.command, cli.json),
         Err(refusal) => cli::refuse(refusal, json),
     }
 }
 
-fn run(command: Command, json: bool) -> Result<Done, Failure> {
-    match command {
+fn run(command: Command, json: bool) -> ExitCode {
+    let outcome: Result<Done, Failure> = match command {
+        // The daemon prints its ready line itself, and nothing when it stops.
+        Command::Daemon => {
+            return daemon::run(json).map_or_else(
+                |failure| output::finish(Err(failure), json),
+                |()| ExitCode::SUCCESS,
+            );
+        }
         Command::Log { kind, pairs } => log::run(&kind, &pairs),
         Command::Lead {
             command: LeadCommand::List,
@@ -60,6 +70,9 @@ fn run(command: Command, json: bool) -> Result<Done, Failure> {
         Command::Wait {
             command: WaitCommand::Lead { lead, timeout },
         } => lead::wait(&lead, timeout),
+        Command::Wait {
+            command: WaitCommand::Ci { pr, timeout },
+        } => ci::wait(&pr, timeout),
         Command::Review {
             base,
             label,
@@ -73,8 +86,10 @@ fn run(command: Command, json: bool) -> Result<Done, Failure> {
             previous,
             timeout: timeout.map(std::time::Duration::from_secs),
         }),
-        Command::Daemon => daemon::run(json),
+        Command::Install { units } => install::install(units.as_deref()),
+        Command::Uninstall => install::uninstall(),
         // main hands every `factory lab` to the lab; this arm is never reached.
         Command::Lab { .. } => Err(Failure::usage("run factory lab help")),
-    }
+    };
+    output::finish(outcome, json)
 }

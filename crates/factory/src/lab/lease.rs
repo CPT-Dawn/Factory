@@ -13,7 +13,7 @@ use super::host::proc;
 use super::stack;
 use super::wire::{
     ACQUIRE, AcquireParams, GC, Granted, LEASE, Lease, Process, ProjectAsk, RECEIVED, RELEASE,
-    ReleaseParams, SLOT, STOPPING, SlotParams, StackAsk, StopParams,
+    ReleaseParams, RunAsk, SLOT, STOPPING, SlotParams, StackAsk, StopParams,
 };
 use crate::client;
 use crate::output::Failure;
@@ -22,7 +22,7 @@ use crate::paths::Paths;
 /// How much longer than its wait the CLI listens for the daemon's answer.
 const ANSWER_GRACE: Duration = Duration::from_secs(60);
 
-fn paths() -> Result<Paths, Failure> {
+pub fn paths() -> Result<Paths, Failure> {
     Paths::from_env()
 }
 
@@ -42,6 +42,30 @@ pub fn acquire(
     waiting: &mut dyn FnMut(&str),
     warn: &mut dyn FnMut(&str),
 ) -> Result<Lease, Failure> {
+    let (params, listen) = ask(ctx, opts, None)?;
+    let ask_at = |resume| AcquireParams {
+        resume,
+        ..params.clone()
+    };
+    // A daemon that comes back says why it waits again: say it once.
+    let mut said = String::new();
+    let granted: Granted =
+        client::call_queued(&paths()?, ACQUIRE, RECEIVED, ask_at, listen, |why| {
+            if why != said {
+                waiting(why);
+                said = why.to_owned();
+            }
+        })?;
+    take(ctx, opts, granted, warn)
+}
+
+/// The acquire to send for `opts` (for `run`, if any) and how long to listen for its answer;
+/// none listens as long as it takes.
+pub fn ask(
+    ctx: &Ctx,
+    opts: &Opts,
+    run: Option<RunAsk>,
+) -> Result<(AcquireParams, Option<Duration>), Failure> {
     if opts.want == 0 && ctx.project.is_none() {
         return Err(Failure::usage(format!(
             "no devlab.json in {}: nothing to lease without a device",
@@ -58,27 +82,30 @@ pub fn acquire(
         None => None,
     };
     let wait_sec = opts.wait_sec.unwrap_or(ctx.cfg.wait_sec);
-    let params = |resume| AcquireParams {
+    let params = AcquireParams {
         worktree: ctx.worktree.clone(),
         owner: ctx.owner.clone(),
         lease: super::context::forced_lease(),
         project: project.clone(),
         wait_sec,
-        resume,
+        resume: None,
         client: Some(me()),
+        run,
     };
     let listen = Duration::try_from_secs_f64(wait_sec)
         .ok()
         .and_then(|wait| wait.checked_add(ANSWER_GRACE));
-    // A daemon that comes back says why it waits again: say it once.
-    let mut said = String::new();
-    let granted: Granted =
-        client::call_queued(&paths()?, ACQUIRE, RECEIVED, params, listen, |why| {
-            if why != said {
-                waiting(why);
-                said = why.to_owned();
-            }
-        })?;
+    Ok((params, listen))
+}
+
+/// Takes a granted lease: prepares the slot's workdir and, with `--stack`, starts its stack. A
+/// warning about the slot goes to `warn`.
+pub fn take(
+    ctx: &Ctx,
+    opts: &Opts,
+    granted: Granted,
+    warn: &mut dyn FnMut(&str),
+) -> Result<Lease, Failure> {
     let lease = granted.lease;
     if let (Some(p), Some(slot)) = (&ctx.project, lease.slot) {
         stack::prepare_workdir(p, &ctx.worktree, slot)?;

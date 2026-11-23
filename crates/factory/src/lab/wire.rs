@@ -8,11 +8,21 @@ use serde::{Deserialize, Serialize};
 /// queue (`{"id", "queued"}`), notes while it waits (`{"id", "note"}`), then [`Granted`] or an
 /// error. The queue outlives the daemon: a caller that lost it asks again with `resume`. A
 /// caller sends [`RECEIVED`] on the same connection once it has its grant.
+///
+/// For `devlab run` ([`AcquireParams::run`]) the connection then follows the run: the client
+/// sends [`RUN_START`] when its command starts and [`RUN_END`] when the run ends, and the
+/// daemon writes one `lab-run` ledger event. A run that closes the connection without a
+/// [`RUN_END`] is `lost`.
 pub const ACQUIRE: &str = "lab.acquire";
 /// The caller of [`ACQUIRE`] has its grant: no params, `true` out once the daemon let its place
 /// go. Until then a daemon that restarts hands the caller that grant again, and gives it back
 /// once the caller exits.
 pub const RECEIVED: &str = "lab.received";
+/// A notification on a run's connection, unanswered: its command started. No params.
+pub const RUN_START: &str = "lab.run.start";
+/// A notification on a run's connection, unanswered: how the run ended, [`RunEnd`]. Sent while
+/// queued, it also takes the run out of the queue, and the acquire is answered with an error.
+pub const RUN_END: &str = "lab.run.end";
 /// The caller's lease, touched: [`FindParams`] in, `Option<Lease>` out.
 pub const LEASE: &str = "lab.lease";
 /// Drops the caller's lease: [`ReleaseParams`] in, the lease it dropped (`Option<Lease>`) out.
@@ -80,6 +90,26 @@ pub struct AcquireParams {
     /// The devlab call that asks: its place goes once it exits.
     #[serde(default)]
     pub client: Option<Process>,
+    /// The acquire is a `devlab run`'s: the daemon records it in the ledger.
+    #[serde(default)]
+    pub run: Option<RunAsk>,
+}
+
+/// The run an acquire is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunAsk {
+    /// The command line, its words joined by spaces.
+    pub command: String,
+    /// The Claude Code session it runs in, `CLAUDE_CODE_SESSION_ID`.
+    pub session: Option<String>,
+}
+
+/// How a run ended, in the ledger's words: [`factory_core::lab::run::End::outcome`] and
+/// [`factory_core::lab::run::Phase::word`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunEnd {
+    pub outcome: String,
+    pub phase: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

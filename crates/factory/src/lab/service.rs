@@ -8,13 +8,16 @@
 use std::collections::{BTreeSet, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use factory_adapters::docker::{Containers, Docker};
+use factory_core::event::{Event, Fields};
 use factory_core::exit::Exit;
 use factory_core::lab::grant::{self, Ask, Decision};
 use factory_core::lab::js_number;
+use factory_core::lab::run::{End, Phase};
 use factory_core::lab::slots::{SlotView, slot_host_ports, slot_project_id};
 use rusqlite::Connection;
 use serde::Serialize;
@@ -28,9 +31,11 @@ use super::host;
 use super::lease::base_name;
 use super::store::{self, Store};
 use super::wire::{
-    AcquireParams, Board, FindParams, GC, Granted, LEASE, Lease, RECEIVED, RELEASE, ReleaseParams,
-    SLOT, STATUS, STOPPING, SlotParams, StopParams, Waiter,
+    AcquireParams, Board, FindParams, GC, Granted, LEASE, Lease, RECEIVED, RELEASE, RUN_END,
+    RUN_START, ReleaseParams, RunAsk, RunEnd, SLOT, STATUS, STOPPING, SlotParams, StopParams,
+    Waiter,
 };
+use crate::daemon::Ledger;
 use crate::protocol::{ErrorBody, Outcome, Request, Response};
 
 /// How often a waiting acquire looks again without a change to the board: an owner that exited
@@ -443,11 +448,19 @@ fn try_grant(
 }
 
 /// Serves one `lab.acquire`: queues it, writes a note each time the reason it waits changes,
-/// then the grant or the error. A client that hangs up leaves the queue.
-pub async fn acquire<W, R>(lab: Arc<Lab>, request: Request, writer: &mut W, lines: &mut Lines<R>)
-where
+/// then the grant or the error. A client that hangs up leaves the queue. A run's acquire is then
+/// followed to its end, which lands in the ledger.
+pub async fn acquire<W, R, S>(
+    lab: Arc<Lab>,
+    ledger: Arc<Ledger>,
+    request: Request,
+    writer: &mut W,
+    lines: &mut Lines<R>,
+    stopping: S,
+) where
     W: AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
+    S: Future<Output = ()>,
 {
     let id = Some(request.id);
     let p: AcquireParams = match parse(request.params) {
@@ -473,6 +486,16 @@ where
         );
     }
     let p = Arc::new(p);
+    tokio::pin!(stopping);
+    let mut run = p.run.clone().map(|ask| Run {
+        ask,
+        worktree: p.worktree.clone(),
+        ledger,
+        queued: Instant::now(),
+        granted: None,
+        started: None,
+        lease: None,
+    });
     let queued = {
         let (lab, p) = (Arc::clone(&lab), Arc::clone(&p));
         blocking(move || enqueue(&lab, &p)).await
@@ -488,10 +511,15 @@ where
             granted,
         }) => {
             let _attached = Attached(Arc::clone(&lab), waiter);
-            answer(&lab, writer, lines, id, waiter, granted, true).await;
+            let place = (waiter, granted, true);
+            deliver(&lab, writer, lines, id, place, run, stopping.as_mut()).await;
             return;
         }
         Err(body) => {
+            if let Some(run) = &run {
+                run.record(End::Exit(body.code).outcome(), Phase::Queued.word())
+                    .await;
+            }
             send(
                 writer,
                 Response {
@@ -511,6 +539,9 @@ where
     };
     if !send(writer, place).await {
         lab.remove_waiter(waiter);
+        if let Some(run) = &run {
+            run.record(End::Lost.outcome(), Phase::Queued.word()).await;
+        }
         return;
     }
     // A wait that ran out while the daemon was away takes nothing that came free meanwhile.
@@ -523,6 +554,10 @@ where
                 js_number(p.wait_sec)
             ),
         };
+        if let Some(run) = &run {
+            run.record(End::Exit(body.code).outcome(), Phase::Queued.word())
+                .await;
+        }
         send(
             writer,
             Response {
@@ -533,10 +568,14 @@ where
         .await;
         return;
     }
-    let deadline = Instant::now()
-        + deadline_ms.map_or(FOREVER, |ms| {
-            Duration::from_millis(u64::try_from(ms.saturating_sub(now_ms())).unwrap_or(0))
-        });
+    let now = Instant::now();
+    let left = deadline_ms.map_or(FOREVER, |ms| {
+        Duration::from_millis(u64::try_from(ms.saturating_sub(now_ms())).unwrap_or(0))
+    });
+    let deadline = now
+        .checked_add(left)
+        .or_else(|| now.checked_add(FOREVER))
+        .unwrap_or(now);
     let mut said = String::new();
     loop {
         let mut changed = lab.changed.subscribe();
@@ -551,12 +590,25 @@ where
         let why = match tried {
             Ok(Ok((granted, fresh))) => {
                 lab.notify();
-                answer(&lab, writer, lines, id, waiter, granted, fresh).await;
+                deliver(
+                    &lab,
+                    writer,
+                    lines,
+                    id,
+                    (waiter, granted, fresh),
+                    run,
+                    stopping.as_mut(),
+                )
+                .await;
                 return;
             }
             Ok(Err(why)) => why,
             Err(body) => {
                 lab.remove_waiter(waiter);
+                if let Some(run) = &run {
+                    run.record(End::Exit(body.code).outcome(), Phase::Queued.word())
+                        .await;
+                }
                 send(
                     writer,
                     Response {
@@ -574,6 +626,10 @@ where
                 code: Exit::Busy.code(),
                 message: format!("gave up after {} s: {why}", js_number(p.wait_sec)),
             };
+            if let Some(run) = &run {
+                run.record(End::Exit(body.code).outcome(), Phase::Queued.word())
+                    .await;
+            }
             send(
                 writer,
                 Response {
@@ -591,6 +647,9 @@ where
             };
             if !send(writer, note).await {
                 lab.remove_waiter(waiter);
+                if let Some(run) = &run {
+                    run.record(End::Lost.outcome(), Phase::Queued.word()).await;
+                }
                 return;
             }
             said = why;
@@ -599,9 +658,40 @@ where
             _ = changed.changed() => {}
             () = tokio::time::sleep(RECHECK) => {}
             () = tokio::time::sleep_until(deadline) => {}
-            line = lines.next_line() => {
-                if !matches!(line, Ok(Some(_))) {
+            // The daemon is stopping: the place stays for its caller to ask the next daemon for,
+            // but for a run's, which asks no other daemon.
+            () = stopping.as_mut() => {
+                if let Some(run) = &run {
                     lab.remove_waiter(waiter);
+                    run.record(End::Lost.outcome(), Phase::Queued.word()).await;
+                }
+                return;
+            }
+            line = lines.next_line() => {
+                let Ok(Some(line)) = line else {
+                    lab.remove_waiter(waiter);
+                    if let Some(run) = &run {
+                        run.record(End::Lost.outcome(), Phase::Queued.word()).await;
+                    }
+                    return;
+                };
+                if let Some(run) = &mut run
+                    && let Some(end) = run_end(&line)
+                {
+                    lab.remove_waiter(waiter);
+                    run.record(end.outcome, &end.phase).await;
+                    let body = ErrorBody {
+                        code: Exit::Precondition.code(),
+                        message: "the run was stopped while queued".to_owned(),
+                    };
+                    send(
+                        writer,
+                        Response {
+                            id,
+                            outcome: Outcome::Error(body),
+                        },
+                    )
+                    .await;
                     return;
                 }
             }
@@ -609,22 +699,76 @@ where
     }
 }
 
-/// Sends the grant, then lets the waiter go once the caller says it has it ([`RECEIVED`]), and
-/// confirms. A caller gone before that never learns of a `fresh` lease: it is given back. Until
-/// the waiter goes, a daemon that restarts hands its caller the same grant.
-async fn answer<W, R>(
+/// How a grant's caller took it.
+enum Receipt {
+    /// The caller has it; `then`, the line of a run that said so by starting or ending.
+    Received { then: Option<String> },
+    /// The caller never had it, and a fresh lease went back; `end`, a run's, if it said one.
+    Gone { end: Option<RunEnd> },
+    /// The daemon stopped first: the grant stays for the caller to ask for again.
+    Stopping,
+}
+
+/// Answers a grant and, for a run, follows the run to its end.
+async fn deliver<W, R, S>(
     lab: &Lab,
     writer: &mut W,
     lines: &mut Lines<R>,
     id: Option<u64>,
-    waiter: i64,
-    granted: Granted,
-    fresh: bool,
+    (waiter, granted, fresh): (i64, Granted, bool),
+    run: Option<Run>,
+    mut stopping: Pin<&mut S>,
 ) where
     W: AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
+    S: Future<Output = ()>,
 {
     let lease = granted.lease.clone();
+    let receipt = answer(
+        lab,
+        writer,
+        lines,
+        id,
+        (waiter, granted, fresh),
+        &mut stopping,
+    )
+    .await;
+    let Some(mut run) = run else { return };
+    run.granted = Some(Instant::now());
+    match receipt {
+        Receipt::Received { then } => {
+            run.lease = Some(lease);
+            run.follow(lines, then, stopping).await;
+        }
+        Receipt::Gone { end: Some(end) } => run.record(end.outcome, &end.phase).await,
+        Receipt::Gone { end: None } | Receipt::Stopping => {
+            run.record(End::Lost.outcome(), Phase::Queued.word()).await;
+        }
+    }
+}
+
+/// Sends the grant, then lets the waiter go once the caller says it has it ([`RECEIVED`]), and
+/// confirms. A run says so by starting or ending too, unless it ended while still queued. A
+/// caller gone before it says so never learns of a `fresh` lease: it is given back. Until the
+/// waiter goes, a daemon that restarts hands its caller the same grant.
+async fn answer<W, R, S>(
+    lab: &Lab,
+    writer: &mut W,
+    lines: &mut Lines<R>,
+    id: Option<u64>,
+    (waiter, granted, fresh): (i64, Granted, bool),
+    stopping: &mut Pin<&mut S>,
+) -> Receipt
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+    S: Future<Output = ()>,
+{
+    let lease = granted.lease.clone();
+    let give_back = |end| {
+        let _ = lab.settle(waiter, fresh.then_some(&lease));
+        Receipt::Gone { end }
+    };
     let value = serde_json::to_value(granted).unwrap_or(Value::Null);
     let sent = send(
         writer,
@@ -634,33 +778,141 @@ async fn answer<W, R>(
         },
     )
     .await;
-    let received = if sent {
-        tokio::time::timeout(RECEIVED_TIMEOUT, lines.next_line())
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .flatten()
-            .and_then(|line| serde_json::from_str::<Request>(&line).ok())
-            .filter(|said| said.method == RECEIVED)
-    } else {
-        None
+    if !sent {
+        return give_back(None);
+    }
+    let next = tokio::select! {
+        next = tokio::time::timeout(RECEIVED_TIMEOUT, lines.next_line()) => next,
+        () = stopping.as_mut() => return Receipt::Stopping,
     };
-    let Some(said) = received else {
-        let _ = lab.settle(waiter, fresh.then_some(&lease));
-        return;
+    let Ok(Ok(Some(line))) = next else {
+        return give_back(None);
     };
-    let outcome = match lab.settle(waiter, None) {
-        Ok(()) => Outcome::Result(Value::Bool(true)),
-        Err(body) => Outcome::Error(body),
-    };
-    send(
-        writer,
-        Response {
-            id: Some(said.id),
-            outcome,
+    match serde_json::from_str::<Request>(&line) {
+        Ok(said) if said.method == RECEIVED => {
+            let outcome = match lab.settle(waiter, None) {
+                Ok(()) => Outcome::Result(Value::Bool(true)),
+                Err(body) => Outcome::Error(body),
+            };
+            send(
+                writer,
+                Response {
+                    id: Some(said.id),
+                    outcome,
+                },
+            )
+            .await;
+            Receipt::Received { then: None }
+        }
+        _ => match run_end(&line) {
+            Some(end) if end.phase == Phase::Queued.word() => give_back(Some(end)),
+            _ => {
+                let _ = lab.settle(waiter, None);
+                Receipt::Received { then: Some(line) }
+            }
         },
-    )
-    .await;
+    }
+}
+
+/// A run's end, if `line` is one.
+fn run_end(line: &str) -> Option<RunEnd> {
+    let request: Request = serde_json::from_str(line).ok()?;
+    (request.method == RUN_END)
+        .then(|| serde_json::from_value(request.params).ok())
+        .flatten()
+}
+
+/// A `devlab run` the daemon follows, from its acquire to its end.
+struct Run {
+    ask: RunAsk,
+    worktree: String,
+    ledger: Arc<Ledger>,
+    queued: Instant,
+    granted: Option<Instant>,
+    started: Option<Instant>,
+    lease: Option<Lease>,
+}
+
+impl Run {
+    /// Reads the run's connection after the grant, from its line `first` if it was read
+    /// already: its start, then its end, or the connection closing without one, which is a lost
+    /// run. A daemon stopping under a run loses it too: the run may outlast any drain, and its
+    /// end would reach no one.
+    async fn follow<R, S>(&mut self, lines: &mut Lines<R>, first: Option<String>, stopping: S)
+    where
+        R: AsyncBufRead + Unpin,
+        S: Future<Output = ()>,
+    {
+        tokio::pin!(stopping);
+        let mut first = first;
+        loop {
+            let line = match first.take() {
+                Some(line) => Ok(Some(line)),
+                None => tokio::select! {
+                    line = lines.next_line() => line,
+                    () = &mut stopping => Ok(None),
+                },
+            };
+            let Ok(Some(line)) = line else {
+                let phase = if self.started.is_some() {
+                    Phase::Running
+                } else {
+                    Phase::Queued
+                };
+                self.record(End::Lost.outcome(), phase.word()).await;
+                return;
+            };
+            if let Some(end) = run_end(&line) {
+                self.record(end.outcome, &end.phase).await;
+                return;
+            }
+            if serde_json::from_str::<Request>(&line).is_ok_and(|r| r.method == RUN_START) {
+                self.started.get_or_insert_with(Instant::now);
+            }
+        }
+    }
+
+    /// Writes the run's `lab-run` event.
+    async fn record(&self, outcome: String, phase: &str) {
+        let now = Instant::now();
+        let queued_until = self.granted.unwrap_or(now);
+        let mut fields = Fields::new();
+        fields.insert("worktree".to_owned(), self.worktree.clone().into());
+        if let Some(lease) = &self.lease {
+            fields.insert("lease".to_owned(), lease.id.into());
+            if let Some(slot) = lease.slot {
+                fields.insert("slot".to_owned(), slot.into());
+            }
+        }
+        fields.insert("command".to_owned(), self.ask.command.clone().into());
+        fields.insert(
+            "queue_s".to_owned(),
+            queued_until.duration_since(self.queued).as_secs().into(),
+        );
+        fields.insert(
+            "run_s".to_owned(),
+            self.started
+                .map_or(0, |started| now.duration_since(started).as_secs())
+                .into(),
+        );
+        fields.insert("outcome".to_owned(), outcome.into());
+        fields.insert("phase".to_owned(), phase.into());
+        if let Some(session) = &self.ask.session {
+            fields.insert("session".to_owned(), session.clone().into());
+        }
+        let Ok(event) = Event::new("lab-run", fields) else {
+            return;
+        };
+        let ledger = Arc::clone(&self.ledger);
+        let landed = tokio::task::spawn_blocking(move || ledger.append(&event)).await;
+        if !matches!(landed, Ok(Ok(_))) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "factory: lab: cannot record a run of {} in the ledger",
+                self.worktree
+            );
+        }
+    }
 }
 
 async fn blocking<T: Send + 'static>(
