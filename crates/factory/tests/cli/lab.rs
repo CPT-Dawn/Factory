@@ -1868,3 +1868,104 @@ fn status_names_the_daemon_as_the_watcher_and_devlab_watch_starts_no_poller() {
         "{watch:?}"
     );
 }
+
+/// Whether the daemon holds a wait on lease `id`, as `factory status --json` lists its waits.
+fn lease_waited_on(sandbox: &Sandbox, id: &str) -> bool {
+    let out = sandbox.factory(&["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_str(&out.stdout).unwrap_or_default();
+    status["waits"]
+        .as_array()
+        .is_some_and(|waits| waits.iter().any(|w| w["kind"] == "lease" && w["on"] == id))
+}
+
+#[test]
+fn factory_wait_lease_returns_once_the_lease_is_released() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-wait-lease");
+    let me = std::process::id();
+    let acquired = native(&sandbox, &wt, me, &["lab", "acquire", "--no-device"]);
+    assert!(one_line(&acquired).starts_with("lease 1,"), "{acquired:?}");
+    let waiter = spawn(sandbox.factory_command(&["wait", "lease", "1"]));
+
+    assert!(
+        poll_until(|| lease_waited_on(&sandbox, "1")),
+        "the daemon never held the wait"
+    );
+    let released = native(&sandbox, &wt, me, &["lab", "release"]);
+    assert_eq!(released.code, 0, "{released:?}");
+    let out = finish(waiter);
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "lease 1 ended\n", ""),
+        "{out:?}"
+    );
+    // An ended lease is answered at once, in JSON too.
+    let again = one_json(&sandbox.factory(&["wait", "lease", "1", "--json"]));
+    assert_eq!(again, serde_json::json!({"lease": 1, "held": false}));
+    assert!(!lease_waited_on(&sandbox, "1"));
+}
+
+#[test]
+fn factory_wait_lease_returns_once_the_owner_exits() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-wait-owner");
+    let mut owner = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn the owner");
+    let acquired = native(
+        &sandbox,
+        &wt,
+        owner.id(),
+        &["lab", "acquire", "--no-device"],
+    );
+    assert!(one_line(&acquired).starts_with("lease 1,"), "{acquired:?}");
+    let waiter = spawn(sandbox.factory_command(&["wait", "lease", "1"]));
+    assert!(
+        poll_until(|| lease_waited_on(&sandbox, "1")),
+        "the daemon never held the wait"
+    );
+
+    owner.kill().expect("kill the owner");
+    owner.wait().expect("reap the owner");
+    let out = finish(waiter);
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "lease 1 ended\n", ""),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn factory_wait_lease_refuses_an_id_never_granted_and_times_out_on_a_held_one() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-wait-refused");
+    let me = std::process::id();
+    let acquired = native(&sandbox, &wt, me, &["lab", "acquire", "--no-device"]);
+    assert_eq!(acquired.code, 0, "{acquired:?}");
+
+    let never = sandbox.factory(&["wait", "lease", "7"]);
+    assert_eq!(
+        (never.code, never.stdout.as_str(), never.stderr.as_str()),
+        (
+            4,
+            "",
+            "factory: no lease 7 was ever granted; see factory lab status\n"
+        ),
+        "{never:?}"
+    );
+    let held = sandbox.factory(&["wait", "lease", "1", "--timeout", "1s"]);
+    assert_eq!(
+        (held.code, held.stdout.as_str(), held.stderr.as_str()),
+        (
+            124,
+            "",
+            "factory: lease 1 still held after 1s; wait again\n"
+        ),
+        "{held:?}"
+    );
+    let bad = sandbox.factory(&["wait", "lease", "one"]);
+    assert_eq!(bad.code, 2, "{bad:?}");
+}

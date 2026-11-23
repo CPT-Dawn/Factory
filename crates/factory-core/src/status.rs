@@ -312,7 +312,7 @@ fn waits(status: &Status, rows: &mut Vec<String>) {
                 (None, None) => "outside herdr".to_owned(),
             };
             let on = match wait.kind.as_str() {
-                kind @ ("ci" | "review") => format!("{kind} {}", wait.on),
+                kind @ ("ci" | "review" | "lease") => format!("{kind} {}", wait.on),
                 _ => wait.on.clone(),
             };
             format!("  {waiter} -> {on}")

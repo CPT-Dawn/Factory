@@ -23,7 +23,9 @@ pub mod service;
 mod stack;
 mod status;
 mod store;
+mod wait;
 pub mod wire;
 
 pub use cli::main;
 pub use native::main as native;
+pub use wait::wait as wait_lease;

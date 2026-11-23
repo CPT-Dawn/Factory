@@ -140,6 +140,9 @@ fn run(command: Command, json: bool) -> ExitCode {
         Command::Wait {
             command: WaitCommand::Review { label, timeout },
         } => reviews::wait(&label, timeout),
+        Command::Wait {
+            command: WaitCommand::Lease { lease, timeout },
+        } => lab::wait_lease(lease, timeout),
         Command::Review {
             base,
             label,

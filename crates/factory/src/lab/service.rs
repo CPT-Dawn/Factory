@@ -50,7 +50,8 @@ use super::wire::{
 };
 use super::{android, host};
 use crate::ledger::Ledger;
-use crate::protocol::{ErrorBody, Outcome, Request, Response};
+use crate::output::Failure;
+use crate::protocol::{ErrorBody, Outcome, Request, Response, WaitLeaseParams, WaitLeaseResult};
 use factory_core::lab::base_name;
 
 /// How often a waiting acquire looks again without a change to the board: a port that freed
@@ -263,6 +264,62 @@ impl Lab {
     fn remove_waiter(&self, id: i64) {
         if let Ok(true) = self.write(|c, _| store::delete_waiter(c, id)) {
             self.notify();
+        }
+    }
+}
+
+/// Answers once lease `p.lease` is held no more: released, its owner exited (each look frees
+/// a dead owner's leases first), or expired. Fails with exit 4 for an id never granted, and
+/// with exit 124 when it is still held at the params' timeout.
+pub async fn wait_lease(lab: &Arc<Lab>, p: &WaitLeaseParams) -> Result<WaitLeaseResult, Failure> {
+    let limit = Duration::from_secs(p.timeout_secs);
+    let deadline = Instant::now() + limit;
+    let id = p.lease;
+    loop {
+        // Subscribed before the look, so a release during it is not missed.
+        let mut changed = lab.changed.subscribe();
+        let looked = {
+            let lab = Arc::clone(lab);
+            blocking(move || {
+                lab.write(|c, _| Ok((store::lease(c, id)?.is_some(), store::last_lease_id(c)?)))
+            })
+            .await
+        };
+        match looked.map_err(|body| {
+            Failure::new(
+                Exit::from_code(body.code).unwrap_or(Exit::Precondition),
+                body.message,
+            )
+        })? {
+            (false, last) if id > last => {
+                return Err(Failure::new(
+                    Exit::NoLease,
+                    format!("no lease {id} was ever granted; see factory lab status"),
+                ));
+            }
+            (false, _) => {
+                return Ok(WaitLeaseResult {
+                    lease: id,
+                    held: false,
+                });
+            }
+            (true, _) => {}
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(Failure::new(
+                Exit::Timeout,
+                format!(
+                    "lease {id} still held after {}; wait again",
+                    factory_core::duration::show(limit)
+                ),
+            ));
+        }
+        // A change, or a look again in a while: an owner can exit unnoticed between changes.
+        let next = (now + RECHECK).min(deadline);
+        tokio::select! {
+            _ = changed.changed() => {}
+            () = tokio::time::sleep_until(next) => {}
         }
     }
 }
