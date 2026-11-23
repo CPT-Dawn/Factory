@@ -57,10 +57,10 @@ pub fn run(json: bool) -> Result<Done, Failure> {
         })?;
         // Ready only once requests can be answered, so this is the one line the daemon prints.
         output::print(
-            &Done {
-                line: format!("factory daemon ready on {}", socket.display()),
-                json: json!({"socket": socket.to_string_lossy(), "pid": pid}),
-            },
+            &Done::new(
+                format!("factory daemon ready on {}", socket.display()),
+                json!({"socket": socket.to_string_lossy(), "pid": pid}),
+            ),
             json,
         );
         match serve(listener, Arc::new(ledger)).await {}

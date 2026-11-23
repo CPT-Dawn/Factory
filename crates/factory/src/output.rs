@@ -19,6 +19,21 @@ pub const LINE_LIMIT: usize = 200;
 pub struct Done {
     pub line: String,
     pub json: Value,
+    /// Lines after the first, only where the spec names them (a review's blocking findings).
+    pub more: Vec<String>,
+    /// [`Exit::Ok`], or [`Exit::NeedsAttention`] for a result that asks for work.
+    pub exit: Exit,
+}
+
+impl Done {
+    pub fn new(line: impl Into<String>, json: Value) -> Done {
+        Done {
+            line: line.into(),
+            json,
+            more: Vec::new(),
+            exit: Exit::Ok,
+        }
+    }
 }
 
 /// Why a command failed: its exit code and one line the agent can act on.
@@ -47,12 +62,14 @@ impl Failure {
 
 /// Prints what a command that succeeded shows. Output nobody reads is not an error.
 pub fn print(done: &Done, json: bool) {
-    let line = if json {
-        done.json.to_string()
-    } else {
-        bounded(&one_line(&done.line))
-    };
-    let _ = writeln!(io::stdout(), "{line}");
+    let mut out = io::stdout().lock();
+    if json {
+        let _ = writeln!(out, "{}", done.json);
+        return;
+    }
+    for line in std::iter::once(&done.line).chain(&done.more) {
+        let _ = writeln!(out, "{}", bounded(&one_line(line)));
+    }
 }
 
 /// Shows a command's outcome and turns it into its exit code.
@@ -60,7 +77,7 @@ pub fn finish(outcome: Result<Done, Failure>, json: bool) -> ExitCode {
     match outcome {
         Ok(done) => {
             print(&done, json);
-            ExitCode::from(Exit::Ok.code())
+            ExitCode::from(done.exit.code())
         }
         Err(failure) => {
             if json {

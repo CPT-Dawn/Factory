@@ -155,6 +155,51 @@ impl Sandbox {
     pub fn factory(&self, args: &[&str]) -> Run {
         run(self.factory_command(args))
     }
+
+    /// Runs the built `factory` binary to completion with `dir` as its working directory.
+    pub fn factory_in(&self, dir: &Path, args: &[&str]) -> Run {
+        let mut cmd = self.factory_command(args);
+        cmd.current_dir(dir);
+        run(cmd)
+    }
+
+    /// A git repository named `repo` in the sandbox: `main` holds one commit, and the
+    /// checked-out branch `work` adds `a.txt` on top of it in one more.
+    pub fn repo(&self) -> PathBuf {
+        let repo = self.path("repo");
+        fs::create_dir(&repo).expect("create the repo dir");
+        self.git(&repo, &["init", "-q", "-b", "main"]);
+        fs::write(repo.join("README.md"), "# repo\n").expect("write README.md");
+        self.git(&repo, &["add", "."]);
+        self.git(&repo, &["commit", "-q", "-m", "chore: start"]);
+        self.git(&repo, &["checkout", "-q", "-b", "work"]);
+        fs::write(repo.join("a.txt"), "a\n").expect("write a.txt");
+        self.git(&repo, &["add", "."]);
+        self.git(&repo, &["commit", "-q", "-m", "feat: add a"]);
+        repo
+    }
+
+    /// Runs git in `dir` as the sandbox's committer, failing the test when it fails.
+    pub fn git(&self, dir: &Path, args: &[&str]) -> String {
+        let mut cmd = self.command(
+            "git",
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+            ],
+        );
+        cmd.args(args).current_dir(dir);
+        let out = run(cmd);
+        assert_eq!(out.code, 0, "git {args:?}: {out:?}");
+        out.stdout
+    }
+
+    /// Where `factory review` keeps its files for the sandbox's [`Sandbox::repo`].
+    pub fn reviews(&self) -> PathBuf {
+        self.path("state/factory/reviews/repo")
+    }
 }
 
 impl Drop for Sandbox {

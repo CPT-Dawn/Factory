@@ -27,8 +27,8 @@ pub fn run(kind: &str, pairs: &[String]) -> Result<Done, Failure> {
         .get("ts")
         .and_then(Value::as_str)
         .unwrap_or("?");
-    Ok(Done {
-        line: format!("logged {kind} at {ts}"),
-        json: serde_json::to_value(&landed).unwrap_or(Value::Null),
-    })
+    Ok(Done::new(
+        format!("logged {kind} at {ts}"),
+        serde_json::to_value(&landed).unwrap_or(Value::Null),
+    ))
 }
