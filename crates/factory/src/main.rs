@@ -22,6 +22,7 @@ mod review;
 mod router;
 mod sessions;
 mod spawn;
+mod status;
 mod steward;
 mod store;
 
@@ -95,6 +96,7 @@ fn run(command: Command, json: bool) -> ExitCode {
         Command::Lead {
             command: LeadCommand::Status { lead },
         } => lead::status(&lead),
+        Command::Status => status::run(),
         Command::Monitor { command } => match command {
             MonitorCommand::Start => monitor::start(),
             MonitorCommand::Stop => monitor::stop(),

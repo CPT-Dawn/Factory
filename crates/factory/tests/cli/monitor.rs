@@ -57,7 +57,7 @@ fn without_herdr_the_monitor_does_not_start() {
 
 /// Where Claude Code keeps the log of session `id` run in `cwd`: every character of the cwd that
 /// isn't a letter or digit becomes `-`.
-fn session_log(sandbox: &Sandbox, cwd: &str, id: &str) -> PathBuf {
+pub(crate) fn session_log(sandbox: &Sandbox, cwd: &str, id: &str) -> PathBuf {
     let project: String = cwd
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -69,7 +69,7 @@ fn session_log(sandbox: &Sandbox, cwd: &str, id: &str) -> PathBuf {
 }
 
 /// The log of subagent `agent-<id>` of the session whose log is `lead_log`.
-fn subagent_log(lead_log: &Path, id: &str) -> PathBuf {
+pub(crate) fn subagent_log(lead_log: &Path, id: &str) -> PathBuf {
     lead_log
         .with_extension("")
         .join("subagents")
@@ -77,7 +77,7 @@ fn subagent_log(lead_log: &Path, id: &str) -> PathBuf {
 }
 
 /// An assistant line whose usage puts the context at `tokens`, as Claude Code logs it.
-fn usage(tokens: u64, sidechain: bool) -> String {
+pub(crate) fn usage(tokens: u64, sidechain: bool) -> String {
     json!({
         "type": "assistant",
         "isSidechain": sidechain,
@@ -92,7 +92,7 @@ fn usage(tokens: u64, sidechain: bool) -> String {
 }
 
 /// Appends `lines` to the log at `path`, making its directories.
-fn append(path: &Path, lines: &[String]) {
+pub(crate) fn append(path: &Path, lines: &[String]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut file = OpenOptions::new()
         .create(true)
@@ -117,7 +117,7 @@ fn status(sandbox: &Sandbox) -> Value {
 }
 
 /// Asks `monitor status --json` until `done` accepts it, failing the test after [`DEADLINE`].
-fn await_status(sandbox: &Sandbox, what: &str, done: impl Fn(&Value) -> bool) -> Value {
+pub(crate) fn await_status(sandbox: &Sandbox, what: &str, done: impl Fn(&Value) -> bool) -> Value {
     let mut last = Value::Null;
     let seen = poll_until(|| {
         last = status(sandbox);
@@ -127,14 +127,20 @@ fn await_status(sandbox: &Sandbox, what: &str, done: impl Fn(&Value) -> bool) ->
     last
 }
 
-fn start(sandbox: &Sandbox) {
+pub(crate) fn start(sandbox: &Sandbox) {
     let out = sandbox.factory(&["monitor", "start"]);
     assert_eq!(out.code, 0, "{out:?}");
 }
 
 /// A herdr with the lead `lead-<slug>` in pane `w<n>:p1` of the repo `app`, its session `s<n>`
 /// run in `/work/app.<slug>`; returns the session's log.
-fn lead(sandbox: &Sandbox, herdr: &FakeHerdr, n: u32, slug: &str, status: &str) -> PathBuf {
+pub(crate) fn lead(
+    sandbox: &Sandbox,
+    herdr: &FakeHerdr,
+    n: u32,
+    slug: &str,
+    status: &str,
+) -> PathBuf {
     let pane = format!("w{n}:p1");
     let cwd = format!("/work/app.{slug}");
     let session = format!("s{n}");

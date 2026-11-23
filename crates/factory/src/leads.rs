@@ -27,6 +27,7 @@ use factory_core::duration;
 use factory_core::event;
 use factory_core::exit::Exit;
 use factory_core::lead::{self, AgentStatus, LeadFacts, LeadState};
+use factory_core::status;
 use factory_core::wait::{Wait, WaitId, WaitOn, Waits};
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
@@ -208,6 +209,47 @@ impl<H: HerdrApi> Leads<H> {
             })
             .collect();
         Some(seen)
+    }
+
+    /// What `factory status` shows of the leads, from the picture alone: the reason the link to
+    /// herdr is down, if it is, and every lead seen. Unlike [`Leads::list`] it asks herdr for
+    /// nothing, not even to bring a link that is down back up.
+    pub fn picture(&self) -> (Option<String>, Vec<LeadReport>) {
+        let inner = self.lock();
+        let leads = inner
+            .leads
+            .iter()
+            .map(|(name, lead)| report(name, lead, &state_of(&inner, lead)))
+            .collect();
+        (inner.down.clone(), leads)
+    }
+
+    /// Every registered wait, oldest first, with the lead in the pane that registered it.
+    pub fn registered(&self) -> Vec<status::Wait> {
+        let inner = self.lock();
+        inner
+            .waits
+            .all()
+            .map(|wait| {
+                let lead = wait.waiter.as_deref().and_then(|pane| {
+                    inner
+                        .leads
+                        .iter()
+                        .find(|(_, lead)| lead.pane == pane)
+                        .map(|(name, _)| name.clone())
+                });
+                let (kind, on) = match &wait.on {
+                    WaitOn::Lead(name) => ("lead", name.clone()),
+                    WaitOn::Ci(pr) => ("ci", pr.clone()),
+                };
+                status::Wait {
+                    pane: wait.waiter.clone(),
+                    lead,
+                    kind: kind.to_owned(),
+                    on,
+                }
+            })
+            .collect()
     }
 
     /// Ticks on every change to the picture.

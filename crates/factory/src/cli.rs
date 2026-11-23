@@ -44,6 +44,8 @@ pub enum Command {
         #[command(subcommand)]
         command: MonitorCommand,
     },
+    /// One screen: leases and queue, reviewer quotas, waits, leads and their contexts
+    Status,
     /// Block, silent, until something happens
     Wait {
         #[command(subcommand)]

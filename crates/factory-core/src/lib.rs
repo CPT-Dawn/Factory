@@ -13,6 +13,7 @@ pub mod lab;
 pub mod lead;
 pub mod quota;
 pub mod review;
+pub mod status;
 pub mod steward;
 pub mod timestamp;
 pub mod wait;
