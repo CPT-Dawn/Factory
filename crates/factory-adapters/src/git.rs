@@ -1,6 +1,7 @@
 //! The repository under review, through `git`.
 
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -43,6 +44,7 @@ pub trait Repo {
 }
 
 /// The repository at a directory, through the `git` on PATH.
+#[derive(Debug)]
 pub struct GitRepo {
     dir: PathBuf,
 }
@@ -72,6 +74,65 @@ impl GitRepo {
             return Err(failed(args, &output));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+impl GitRepo {
+    /// A detached checkout of `rev` at `dir`, outside this repository, in a worktree of its
+    /// own: what is done in it leaves this repository's working tree alone. Whatever an earlier
+    /// checkout left at `dir` is removed first. The checkout is removed when it is dropped.
+    pub fn checkout(&self, rev: &str, dir: &Path) -> Result<Checkout, GitError> {
+        let path = dir
+            .to_str()
+            .ok_or_else(|| GitError(format!("{} is not UTF-8", dir.display())))?;
+        let checkout = Checkout {
+            repo: GitRepo::at(&self.dir),
+            dir: dir.to_owned(),
+        };
+        checkout.remove();
+        if let Some(parent) = dir.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| GitError(format!("cannot create {}: {e}", parent.display())))?;
+        }
+        self.git(&["worktree", "add", "--detach", "--quiet", path, rev])?;
+        Ok(checkout)
+    }
+
+    /// Forgets the worktrees whose directory is gone.
+    pub fn prune_worktrees(&self) -> Result<(), GitError> {
+        self.git(&["worktree", "prune"]).map(drop)
+    }
+}
+
+/// A throwaway checkout, from [`GitRepo::checkout`]: removed, worktree and directory, when
+/// dropped, however the work in it ended.
+#[derive(Debug)]
+pub struct Checkout {
+    repo: GitRepo,
+    dir: PathBuf,
+}
+
+impl Checkout {
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Removes the worktree and whatever is left of its directory, and has the repository
+    /// forget it. Nothing to remove is not a failure.
+    fn remove(&self) {
+        if let Some(path) = self.dir.to_str() {
+            let _ = self
+                .repo
+                .output(&["worktree", "remove", "--force", "--force", path]);
+        }
+        let _ = fs::remove_dir_all(&self.dir);
+        let _ = self.repo.prune_worktrees();
+    }
+}
+
+impl Drop for Checkout {
+    fn drop(&mut self) {
+        self.remove();
     }
 }
 

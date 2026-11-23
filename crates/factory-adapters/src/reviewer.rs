@@ -12,20 +12,23 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
+use factory_core::agy::{self, Sandbox};
 use factory_core::quota::{self, Reset};
 use factory_core::review;
 use factory_core::timestamp::Timestamp;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::git::{GitRepo, Repo};
+use crate::git::{Checkout, GitRepo, Repo};
 use crate::process::{self, RunError};
 
 /// One review for a backend to run.
 #[derive(Clone, Debug)]
 pub struct Job {
-    /// The repository under review; the backend runs read-only in it.
+    /// The repository under review; the backend runs read-only in it, or in a checkout of it.
     pub cwd: PathBuf,
+    /// The commit under review, the head the bundle was made from.
+    pub head: String,
     /// The prompt, handed to the backend on stdin.
     pub prompt: PathBuf,
     /// Where the backend's final message, the report, goes.
@@ -50,8 +53,11 @@ pub enum ReviewerError {
     /// The backend can't take a review now, for this reason (its usage query failed, say);
     /// the review goes on to the next one.
     Unready(String),
-    /// The backend's sandbox would not be active, for this reason, so it must not review.
+    /// The backend's sandbox would not be active, or was not, for this reason, so it must
+    /// not review, or its review is not kept.
     NoSandbox(String),
+    /// The head under review could not be checked out for the backend, for this reason.
+    Checkout(String),
 }
 
 /// A review backend.
@@ -178,7 +184,14 @@ pub enum AgyAuth {
 }
 
 /// Antigravity, headless: `agy -p` in plan mode inside its sandbox, with writes, URLs and MCP
-/// denied, JSON output, a print timeout, and no paid credits.
+/// denied, JSON output, a print timeout, and no paid credits. It reviews a throwaway detached
+/// checkout of the head, so a terminal command that writes changes nothing of the caller's;
+/// its review is kept only when its own log says its sandbox started.
+///
+/// With no model configured it runs the model chosen in agy, and its quota is that model's
+/// group: the label agy's `/model` saved under `model` in
+/// `~/.gemini/antigravity-cli/settings.json`, else agy's default, Gemini 4 Neon, whose group is
+/// "Gemini Models".
 #[derive(Clone, Debug)]
 pub struct Agy {
     model: Option<String>,
@@ -186,6 +199,8 @@ pub struct Agy {
     auth: AgyAuth,
     /// Where the last answer of its usage query is kept for reviews close together.
     usage_cache: PathBuf,
+    /// Where its throwaway checkouts go, one per review process: `<repo>-<pid>`.
+    checkouts: PathBuf,
 }
 
 impl Agy {
@@ -194,13 +209,48 @@ impl Agy {
         effort: Option<String>,
         auth: AgyAuth,
         usage_cache: PathBuf,
+        checkouts: PathBuf,
     ) -> Agy {
         Agy {
             model,
             effort,
             auth,
             usage_cache,
+            checkouts,
         }
+    }
+
+    /// The model whose quota a review draws on: the configured one, else the one chosen in
+    /// agy's settings, else agy's default.
+    fn quota_model(&self) -> String {
+        self.model.clone().unwrap_or_else(|| {
+            let home = env::var_os("HOME").unwrap_or_default();
+            let settings = Path::new(&home).join(".gemini/antigravity-cli/settings.json");
+            quota::agy_chosen_model(fs::read_to_string(settings).ok().as_deref())
+        })
+    }
+
+    /// A detached checkout of the head under review, outside the repo, and the directory in it
+    /// that mirrors the caller's. What a review that died before removing its own left here is
+    /// removed first.
+    fn checkout(&self, job: &Job) -> Result<(Checkout, PathBuf), ReviewerError> {
+        let failed = |e: crate::git::GitError| ReviewerError::Checkout(e.to_string());
+        let repo = GitRepo::at(&job.cwd);
+        let name = repo.name().map_err(failed)?;
+        let top = repo.toplevel().map_err(failed)?;
+        sweep_checkouts(&self.checkouts, &repo);
+        let here = self
+            .checkouts
+            .join(format!("{name}-{}", std::process::id()));
+        let checkout = repo.checkout(&job.head, &here).map_err(failed)?;
+        let within = job
+            .cwd
+            .strip_prefix(&top)
+            .map(|sub| checkout.dir().join(sub))
+            .ok()
+            .filter(|dir| dir.is_dir())
+            .unwrap_or_else(|| checkout.dir().to_owned());
+        Ok((checkout, within))
     }
 
     /// Its `--settings`: no paid credits, commands run in the sandbox without asking, and the
@@ -268,7 +318,8 @@ impl Agy {
 
     /// Whether the quota of its model's group has some left, by its usage query.
     fn quota_left(&self) -> Result<(), ReviewerError> {
-        let group = quota::agy_group(self.model.as_deref().unwrap_or_default());
+        let model = self.quota_model();
+        let group = quota::agy_group(&model);
         let (usage, cached) = self.usage(false)?;
         let mut said = quota::agy_usage(&usage, group);
         // A cached answer may name an empty bucket whose reset has come since: ask again.
@@ -341,11 +392,19 @@ impl Reviewer for Agy {
         let stream = File::create(&job.stream).map_err(ReviewerError::Files)?;
         let log_path = job.stream.with_extension("log");
         let log = File::create(&log_path).map_err(ReviewerError::Files)?;
+        // agy's own log, which says whether its sandbox started. It is emptied first, as agy
+        // may add to it.
+        let own_log = job.stream.with_extension("run.log");
+        File::create(&own_log).map_err(ReviewerError::Files)?;
+        // Dropped, so removed, however the review ends.
+        let (_checkout, within) = self.checkout(job)?;
         let mut cmd = self.command();
         cmd.arg("-p")
             .arg(prompt)
             .args(["--mode", "plan", "--sandbox", "--add-dir"])
-            .arg(shared);
+            .arg(shared)
+            .arg("--log-file")
+            .arg(&own_log);
         if let Some(model) = &self.model {
             cmd.args(["--model", model]);
         }
@@ -356,7 +415,7 @@ impl Reviewer for Agy {
             .arg(format!("{}s", job.timeout.as_secs()))
             .arg("--settings")
             .arg(self.settings())
-            .current_dir(&job.cwd)
+            .current_dir(&within)
             .stdout(Stdio::from(stream))
             .stderr(Stdio::from(log));
         // agy stops itself at its print timeout; the grace is for an agy that doesn't. Either
@@ -366,6 +425,7 @@ impl Reviewer for Agy {
         let result = fs::read_to_string(&job.stream).unwrap_or_default();
         let parsed = serde_json::from_str::<Value>(&result).ok();
         let Some(code) = failed else {
+            sandbox_started(&own_log)?;
             let report = parsed
                 .as_ref()
                 .and_then(|result| result.get("response")?.as_str())
@@ -383,6 +443,44 @@ impl Reviewer for Agy {
             Some(reset) if code == Some(3) => Err(ReviewerError::OutOfQuota(reset)),
             _ => Err(ReviewerError::Exited(code)),
         }
+    }
+}
+
+/// Whether agy's own log, at `path`, says its sandbox started: a review it ran without one is
+/// not kept.
+fn sandbox_started(path: &Path) -> Result<(), ReviewerError> {
+    let log = fs::read_to_string(path).unwrap_or_default();
+    let why = match agy::sandbox(&log) {
+        Sandbox::Started => return Ok(()),
+        Sandbox::Unavailable(why) => why,
+        Sandbox::Unknown => "its log never says it started".to_owned(),
+    };
+    Err(ReviewerError::NoSandbox(format!(
+        "its sandbox did not start ({why}); see {}",
+        path.display()
+    )))
+}
+
+/// Removes the checkouts in `dir` whose review process has died, which never removed its own,
+/// and has `repo` forget them. A checkout is named `<repo>-<pid>`.
+fn sweep_checkouts(dir: &Path, repo: &GitRepo) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut swept = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|name| name.rsplit_once('-'))
+            .and_then(|(_, pid)| pid.parse::<u32>().ok());
+        let Some(pid) = pid else { continue };
+        if pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists() {
+            swept |= fs::remove_dir_all(entry.path()).is_ok();
+        }
+    }
+    if swept {
+        let _ = repo.prune_worktrees();
     }
 }
 
@@ -601,6 +699,7 @@ impl fmt::Display for ReviewerError {
             ReviewerError::Unready(why) | ReviewerError::NoSandbox(why) => {
                 write!(f, "skipped: {why}")
             }
+            ReviewerError::Checkout(why) => write!(f, "has no checkout to review in: {why}"),
         }
     }
 }
