@@ -1,5 +1,5 @@
 //! The daemon's SQLite database, `<state>/factory.db`, in WAL mode: what a daemon restart must
-//! not lose: each review backend's quota, the leads spawned whose end is not yet in the
+//! not lose: each review backend's quota, the Claude plan's quota, the leads spawned whose end is not yet in the
 //! ledger, whether the context steward runs and what it has done to each session, and each wait
 //! that outlives its CLI (`--notify`).
 
@@ -7,6 +7,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use factory_core::claude::{ClaudeQuota, Limit, Seen, Window};
 use factory_core::quota::Quota;
 use factory_core::timestamp::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -15,7 +16,7 @@ use crate::output::Failure;
 use crate::protocol::{NotifyOn, SessionParam};
 
 /// The schema version this daemon writes, kept in `PRAGMA user_version`.
-const VERSION: i64 = 3;
+const VERSION: i64 = 4;
 
 pub struct Store {
     db: Connection,
@@ -87,7 +88,15 @@ impl Store {
                  deadline_ms INTEGER NOT NULL,
                  limit_secs INTEGER NOT NULL
              );
-             PRAGMA user_version = 3;",
+             CREATE TABLE IF NOT EXISTS claude_quota (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 used_percent REAL,
+                 resets_ms INTEGER,
+                 seen_ms INTEGER,
+                 limit_until_ms INTEGER,
+                 limit_at_ms INTEGER
+             );
+             PRAGMA user_version = 4;",
         )
         .map_err(cannot)?;
         Ok(Store { db })
@@ -148,6 +157,68 @@ impl Store {
             "INSERT INTO quota (backend, state, until_ms) VALUES (?1, ?2, ?3)
              ON CONFLICT (backend) DO UPDATE SET state = ?2, until_ms = ?3",
             params![backend, state, until],
+        )?;
+        Ok(())
+    }
+}
+
+impl Store {
+    /// The Claude plan's quota as last recorded; nothing recorded is nothing known.
+    pub fn claude_quota(&self) -> rusqlite::Result<ClaudeQuota> {
+        let row = self
+            .db
+            .query_row(
+                "SELECT used_percent, resets_ms, seen_ms, limit_until_ms, limit_at_ms
+                 FROM claude_quota WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<f64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((used, resets, seen, until, at)) = row else {
+            return Ok(ClaudeQuota::default());
+        };
+        let stamp = Timestamp::from_unix_millis;
+        Ok(ClaudeQuota {
+            window: match (used, resets, seen) {
+                (Some(used_percent), Some(resets), Some(seen)) => Some(Seen {
+                    window: Window {
+                        used_percent,
+                        resets: stamp(resets),
+                    },
+                    at: stamp(seen),
+                }),
+                _ => None,
+            },
+            limit: until.zip(at).map(|(until, at)| Limit {
+                until: stamp(until),
+                at: stamp(at),
+            }),
+        })
+    }
+
+    /// Records the Claude plan's quota.
+    pub fn set_claude_quota(&self, quota: &ClaudeQuota) -> rusqlite::Result<()> {
+        let window = quota.window;
+        self.db.execute(
+            "INSERT INTO claude_quota (id, used_percent, resets_ms, seen_ms, limit_until_ms, limit_at_ms)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (id) DO UPDATE SET used_percent = ?1, resets_ms = ?2, seen_ms = ?3,
+                 limit_until_ms = ?4, limit_at_ms = ?5",
+            params![
+                window.map(|seen| seen.window.used_percent),
+                window.map(|seen| seen.window.resets.unix_millis()),
+                window.map(|seen| seen.at.unix_millis()),
+                quota.limit.map(|limit| limit.until.unix_millis()),
+                quota.limit.map(|limit| limit.at.unix_millis()),
+            ],
         )?;
         Ok(())
     }

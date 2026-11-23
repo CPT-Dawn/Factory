@@ -1,8 +1,9 @@
-//! `factory hook pre-tool|post-tool|subagent-stop`: Claude Code's hook JSON on stdin,
+//! `factory hook pre-tool|post-tool|subagent-stop|stop-failure`: Claude Code's hook JSON on stdin,
 //! answered in its hook protocol on stdout.
 //!
 //! A hook runs on every tool call, so it never talks to the daemon and reads no more than it
-//! must. It prints nothing and exits 0 to let a call through, and one JSON line to refuse it.
+//! must; only stop-failure, which runs when a turn ends on an API error, tells the daemon. It
+//! prints nothing and exits 0 to let a call through, and one JSON line to refuse it.
 //! A hook that cannot read its input exits 3: Claude Code shows that line and carries on, where
 //! exit 2 would block the call.
 
@@ -51,6 +52,10 @@ fn answer(command: &HookCommand) -> Result<Option<Value>, Failure> {
         },
         HookCommand::PostTool => {
             hook::post_tool(&input).map(|line| json!({"decision": "block", "reason": line}))
+        }
+        HookCommand::StopFailure => {
+            crate::claude::stop_failure(&input)?;
+            None
         }
         HookCommand::SubagentStop => {
             let settings = config::hook_settings(&paths::config_dir())?;

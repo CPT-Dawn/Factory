@@ -1,12 +1,13 @@
 //! `factory status`: one screen of what the daemon holds.
 //!
 //! The CLI sends the configured review backends (the config is the CLI's to read) and the daemon
-//! answers from its own state: the lease store, the router's quotas, the picture of the leads, the
+//! answers from its own state: the lease store, the router's quotas, the Claude plan's quota, the picture of the leads, the
 //! wait registry and the context steward's table. No call to adb, docker or herdr is made.
 
 use factory_core::status::{self, Status};
 use serde_json::json;
 
+use crate::claude::Claude;
 use crate::client;
 use crate::config;
 use crate::lab::service::Lab;
@@ -28,7 +29,15 @@ pub fn run() -> Result<Done, Failure> {
             when_busy: backend.when_busy.unwrap_or(WhenBusy::Queue).into(),
         })
         .collect();
-    let status: Status = client::call(&paths, STATUS, &StatusParams { backends })?;
+    let claude_hold_at = config::claude_hold_at(&paths)?;
+    let status: Status = client::call(
+        &paths,
+        STATUS,
+        &StatusParams {
+            backends,
+            claude_hold_at,
+        },
+    )?;
     let mut rows = status::screen(&status).into_iter();
     let mut done = Done::new(
         rows.next().unwrap_or_default(),
@@ -45,6 +54,7 @@ pub async fn gather(
     lab: &std::sync::Arc<Lab>,
     leads: &Leads,
     steward: &Steward,
+    claude: &Claude,
 ) -> Result<Status, Failure> {
     let now = crate::clock::now();
     let lab = lab
@@ -64,6 +74,7 @@ pub async fn gather(
         now: now.unix_millis(),
         lab,
         review: router.snapshot(&params.backends, now),
+        claude: claude.record(params.claude_hold_at),
         waits: leads.registered(),
         leads: status::Leads {
             error,

@@ -17,6 +17,8 @@ pub enum WaitOn {
     Review(String),
     /// A lab lease, by its id.
     Lease(i64),
+    /// The Claude plan's window, until a lead may dispatch again.
+    Claude,
 }
 
 impl fmt::Display for WaitOn {
@@ -26,6 +28,7 @@ impl fmt::Display for WaitOn {
             WaitOn::Ci(pr) => write!(f, "ci {pr}"),
             WaitOn::Review(label) => write!(f, "review {label}"),
             WaitOn::Lease(id) => write!(f, "lease {id}"),
+            WaitOn::Claude => f.write_str("claude quota"),
         }
     }
 }

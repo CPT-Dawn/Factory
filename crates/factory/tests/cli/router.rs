@@ -405,7 +405,7 @@ fn a_review_finding_its_backend_full_queues_for_it_when_configured_to() {
 }
 
 /// Kills the daemon the way a crash would, and waits until its socket stops answering.
-fn kill_daemon(sandbox: &Sandbox) {
+pub(crate) fn kill_daemon(sandbox: &Sandbox) {
     let pid = fs::read_to_string(sandbox.path("run/factory/daemon.pid")).unwrap_or_default();
     let pid: u32 = pid.trim().parse().unwrap_or(0);
     assert!(pid > 0, "no daemon pid");

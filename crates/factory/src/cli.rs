@@ -78,6 +78,13 @@ pub enum Command {
         #[command(subcommand)]
         command: HookCommand,
     },
+    /// Whether a lead may dispatch on the Claude plan now: exit 0, or 75 naming the reset
+    Quota {
+        #[command(subcommand)]
+        command: QuotaCommand,
+    },
+    /// Claude Code's statusline: its JSON on stdin; records the plan's window, prints one line
+    Statusline,
     /// Run the daemon; other commands start it when it isn't running
     Daemon,
     /// Install or upgrade factory in ~/.local/bin and its systemd units, and start the socket
@@ -113,6 +120,14 @@ pub enum HookCommand {
     PostTool,
     /// When a subagent stops: send back a report longer than its template
     SubagentStop,
+    /// When a turn ends on an API error: a rate limit holds Claude dispatches until its reset
+    StopFailure,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum QuotaCommand {
+    /// The Claude plan's 5-hour window: dispatch (exit 0) or hold until its reset (exit 75)
+    Claude,
 }
 
 #[derive(Subcommand, Debug)]
@@ -184,6 +199,12 @@ pub enum WaitCommand {
     Review {
         /// The review's label, as factory review was given it
         label: String,
+        /// Give up after this long with exit 124, such as 90s, 9m or 2h
+        #[arg(long, default_value = "9m", value_parser = duration)]
+        timeout: Duration,
+    },
+    /// Until a lead may dispatch on the Claude plan again: its window has room (exit 0)
+    Claude {
         /// Give up after this long with exit 124, such as 90s, 9m or 2h
         #[arg(long, default_value = "9m", value_parser = duration)]
         timeout: Duration,

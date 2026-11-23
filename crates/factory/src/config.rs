@@ -181,6 +181,14 @@ struct ConfigFile {
     monitor: MonitorSection,
     #[serde(default)]
     notify: NotifySection,
+    #[serde(default)]
+    claude: ClaudeSection,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ClaudeSection {
+    hold_at_percent: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -416,6 +424,20 @@ fn load_config(paths: &Paths) -> Result<(PathBuf, ConfigFile), Failure> {
     let path = paths.config_file();
     let file = load(&path)?;
     Ok((path, file))
+}
+
+/// The share of the Claude plan's 5-hour window, in percent, past which a lead holds new
+/// dispatches: `[claude] hold_at_percent`, more than 0 and at most 100.
+pub fn claude_hold_at(paths: &Paths) -> Result<f64, Failure> {
+    let (path, file) = load_config(paths)?;
+    match file.claude.hold_at_percent {
+        None => Ok(factory_core::claude::HOLD_AT_PERCENT),
+        Some(at) if at > 0.0 && at <= 100.0 => Ok(at),
+        Some(at) => Err(Failure::precondition(format!(
+            "{}: [claude] hold_at_percent is {at}; give it more than 0 and at most 100",
+            path.display()
+        ))),
+    }
 }
 
 /// The review backends, each tier's chain over them, and the reviewer skill.
