@@ -266,6 +266,9 @@ fn a_failed_claude_that_hit_a_limit_names_its_reset_when_it_can() {
 fn a_rate_limit_or_a_429_is_a_limit_with_no_reset() {
     for text in [
         "API Error: 429 Too Many Requests",
+        "HTTP 429",
+        "{\"type\":\"error\",\"status\":429}",
+        "request failed with status code 429",
         "{\"error\":{\"type\":\"rate_limit_error\"}}",
         "This request would exceed your account's rate limit.",
     ] {
@@ -279,6 +282,8 @@ fn another_failure_is_no_limit() {
         "",
         "API Error: 500 internal server error",
         "request 4290 failed",
+        "API Error: 500 internal server error; request 429 failed",
+        "read 429 files before it failed",
         "Invalid API key",
     ] {
         assert_eq!(failure_limit(text), None, "{text}");
@@ -302,5 +307,31 @@ fn a_weekly_reset_is_the_next_such_weekday_in_the_users_zone() {
         }
         .until(at(NOW), IST),
         at(NOW + 24 * HOUR - 10 * HOUR - HOUR / 2)
+    );
+}
+
+#[test]
+fn a_reset_named_with_a_429_or_alone_is_the_cooldowns_end() {
+    assert_eq!(
+        failure_limit("API Error: 429 \u{b7} resets 3:45pm"),
+        Some(Reset::At {
+            hour: 15,
+            minute: 45
+        })
+    );
+    assert_eq!(
+        failure_limit("Try again, it resets 3:45pm"),
+        Some(Reset::At {
+            hour: 15,
+            minute: 45
+        })
+    );
+    assert_eq!(
+        failure_limit("HTTP 429, the quota resets Mon 12:00am"),
+        Some(Reset::Weekly {
+            weekday: 1,
+            hour: 0,
+            minute: 0
+        })
     );
 }

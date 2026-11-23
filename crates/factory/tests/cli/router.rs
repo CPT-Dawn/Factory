@@ -714,7 +714,7 @@ fn a_claude_failure_that_is_no_quota_still_exits_3_with_no_cooldown() {
     let repo = claude_fails_then_codex_reviews(
         &sandbox,
         &claude_fails(
-            "API Error: 500 internal server error; request 4290 failed",
+            "API Error: 500 internal server error; request 429 failed",
             false,
         ),
     );

@@ -206,30 +206,41 @@ pub fn limit_reset(text: &str, now: Timestamp, utc_offset: i32) -> Option<LimitH
 }
 
 /// Whether the text of a failed `claude -p` says it ran out of quota: a plan limit
-/// ([`limit_reset`]'s), or a rate limit (`rate_limit_error`, HTTP 429), and when it resets.
-/// [`Reset::Unknown`] when the message names no reset that can be read. None when the failure
-/// is no quota's.
+/// ([`limit_reset`]'s), a rate limit (`rate_limit_error`, HTTP 429), or a reset it names. The
+/// reset is the one it names, else [`Reset::Unknown`]. None when the failure is no quota's.
 pub fn failure_limit(text: &str) -> Option<Reset> {
-    plan_limit(text).or_else(|| {
-        let lower = text.to_lowercase();
-        let rate = lower.contains("rate limit")
-            || lower.contains("rate_limit")
-            || lower.contains("too many requests")
-            || has_word(&lower, "429");
-        rate.then_some(Reset::Unknown)
+    if let Some(reset) = plan_limit(text) {
+        return Some(reset);
+    }
+    let lower = text.to_lowercase();
+    let named = named_reset(&lower);
+    let rate = lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many requests")
+        || is_status(&lower, "429");
+    (rate || named.is_some()).then(|| named.unwrap_or(Reset::Unknown))
+}
+
+/// Whether `text` has the HTTP status `code`: the number alone, after `http`, `status`,
+/// `code` or `error` (`API Error: 429`, `"status":429`, `status code 429`).
+fn is_status(text: &str, code: &str) -> bool {
+    text.match_indices(code).any(|(at, _)| {
+        let alone = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric());
+        if !alone(text[..at].chars().next_back()) || !alone(text[at + code.len()..].chars().next())
+        {
+            return false;
+        }
+        let before = text[..at].trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+        ["http", "status", "code", "error"]
+            .iter()
+            .any(|word| before.ends_with(word))
     })
 }
 
-/// Whether `word` is in `text` apart from other digits and letters.
-fn has_word(text: &str, word: &str) -> bool {
-    text.match_indices(word).any(|(at, _)| {
-        let before = text[..at].chars().next_back();
-        let after = text[at + word.len()..].chars().next();
-        [before, after]
-            .into_iter()
-            .flatten()
-            .all(|c| !c.is_ascii_alphanumeric())
-    })
+/// The reset `lower` names after its last `resets `: a time of day or a weekday and time.
+fn named_reset(lower: &str) -> Option<Reset> {
+    let at = lower.rfind("resets ")?;
+    reset_clock(&lower[at + "resets ".len()..])
 }
 
 /// The plan limit `text` says was hit, and the reset it names: [`Reset::Unknown`] when none
@@ -248,13 +259,7 @@ fn plan_limit(text: &str) -> Option<Reset> {
         && (lower.contains("resets")
             || lower.contains("hit your")
             || lower.contains("usage limit"));
-    if !plan {
-        return None;
-    }
-    let reset = lower
-        .rfind("resets ")
-        .and_then(|at| reset_clock(&lower[at + "resets ".len()..]));
-    Some(reset.unwrap_or(Reset::Unknown))
+    plan.then(|| named_reset(&lower).unwrap_or(Reset::Unknown))
 }
 
 /// A `StopFailure` hook's input: the limit a turn ended on, with the reset its message names.
