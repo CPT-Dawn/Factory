@@ -2,6 +2,7 @@
 //! the report contract every backend's report is read by (spec #1, "Rubric and report
 //! contract").
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde_json::Value;
@@ -61,6 +62,140 @@ pub fn issue_ref(spec: &str) -> Option<&str> {
     }
 }
 
+/// The lines a fix touched, read from its diff: the new-side lines it added or changed, and
+/// the line after each deletion.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Fix {
+    touched: BTreeMap<String, BTreeSet<u32>>,
+}
+
+impl Fix {
+    /// Reads a unified diff of any amount of context.
+    pub fn of_diff(diff: &str) -> Fix {
+        let mut touched: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+        let mut path: Option<&str> = None;
+        // The old and new lines left in the hunk being read, and the new line number.
+        let (mut old_left, mut new_left, mut line) = (0u32, 0u32, 0u32);
+        for text in diff.lines() {
+            if old_left > 0 || new_left > 0 {
+                let mark = |touched: &mut BTreeMap<String, BTreeSet<u32>>, line: u32| {
+                    if let Some(path) = path {
+                        touched.entry(path.to_owned()).or_default().insert(line);
+                    }
+                };
+                match text.as_bytes().first() {
+                    Some(b'+') => {
+                        mark(&mut touched, line);
+                        (new_left, line) = (new_left.saturating_sub(1), line + 1);
+                    }
+                    Some(b'-') => {
+                        mark(&mut touched, line);
+                        old_left = old_left.saturating_sub(1);
+                    }
+                    Some(b'\\') => {}
+                    _ => {
+                        old_left = old_left.saturating_sub(1);
+                        (new_left, line) = (new_left.saturating_sub(1), line + 1);
+                    }
+                }
+            } else if let Some(file) = text.strip_prefix("+++ ") {
+                path = file.strip_prefix("b/");
+            } else if let Some(hunk) = text.strip_prefix("@@ -")
+                && let Some((old, new)) = hunk.split_once(" +")
+            {
+                let (_, old_len) = span(old);
+                let (start, new_len) = span(new.split(' ').next().unwrap_or_default());
+                (old_left, new_left, line) = (old_len, new_len, start);
+            }
+        }
+        Fix { touched }
+    }
+
+    /// Whether a finding's `path:line`, `path:from-to` or bare `path` lies on lines the fix
+    /// touched. A location naming no file the fix changed does not.
+    pub fn touches(&self, location: &str) -> bool {
+        let location = location.trim().trim_matches('`');
+        let location = location.strip_prefix("./").unwrap_or(location);
+        let (path, lines) = match location
+            .match_indices(':')
+            .find(|(i, _)| location[i + 1..].starts_with(|c: char| c.is_ascii_digit()))
+        {
+            Some((i, _)) => (&location[..i], Some(&location[i + 1..])),
+            None => (location, None),
+        };
+        let Some(touched) = self.touched.get(path) else {
+            return false;
+        };
+        let Some(lines) = lines else {
+            return true;
+        };
+        let Some((from, rest)) = number(lines) else {
+            return true;
+        };
+        let to = rest
+            .strip_prefix('-')
+            .and_then(number)
+            .map_or(from, |(to, _)| to);
+        touched.range(from..=to.max(from)).next().is_some()
+    }
+}
+
+/// The number a text starts with, and what follows it.
+fn number(text: &str) -> Option<(u32, &str)> {
+    let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    text[..digits]
+        .parse::<u32>()
+        .ok()
+        .map(|n| (n, &text[digits..]))
+}
+
+/// The start and length of a hunk header's `start,len` (length 1 when it names none).
+fn span(range: &str) -> (u32, u32) {
+    let range = range.trim_start_matches(['-', '+']);
+    let (start, len) = range.split_once(',').unwrap_or((range, "1"));
+    (start.parse().unwrap_or(0), len.parse().unwrap_or(1))
+}
+
+/// What a fix round takes from the previous round's findings ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Previous {
+    /// The head that round reviewed: where this round's diff starts.
+    pub head: String,
+    /// That round's findings that are still open, numbered `f1`, `f2`... for the reviewer to
+    /// mark; none when its report held no readable findings ledger.
+    pub open: Option<Vec<Finding>>,
+}
+
+impl Previous {
+    /// Reads a review's findings ledger (`<label>.findings.json`); none without a head.
+    pub fn of_ledger(ledger: &str) -> Option<Previous> {
+        let value: Value = serde_json::from_str(ledger).ok()?;
+        let head = value
+            .get("head")?
+            .as_str()
+            .filter(|head| !head.is_empty())?;
+        let open = value.get("findings")?.as_array().and_then(|entries| {
+            let findings: Option<Vec<Finding>> = entries.iter().map(finding).collect();
+            Some(
+                findings?
+                    .into_iter()
+                    .filter(|finding| finding.status != Status::Fixed)
+                    .enumerate()
+                    .map(|(i, finding)| Finding {
+                        id: format!("f{}", i + 1),
+                        status: Status::New,
+                        ..finding
+                    })
+                    .collect(),
+            )
+        });
+        Some(Previous {
+            head: head.to_owned(),
+            open,
+        })
+    }
+}
+
 /// One named text the bundle carries: a spec, a report, a standards file, an evidence file.
 #[derive(Clone, Copy, Debug)]
 pub struct Part<'a> {
@@ -76,6 +211,12 @@ pub struct Bundle<'a> {
     pub base: &'a str,
     pub base_commit: &'a str,
     pub head: &'a str,
+    /// On a fix round, the head the previous round reviewed: the diff starts there, not at
+    /// the base.
+    pub fix_from: Option<&'a str>,
+    /// On a fix round, the previous round's open findings, which the reviewer marks fixed or
+    /// still present.
+    pub open: Option<&'a [Finding]>,
     pub commits: &'a str,
     pub diff_stat: &'a str,
     pub diff: &'a str,
@@ -91,10 +232,20 @@ impl Bundle<'_> {
     /// The bundle as one Markdown file, each part fenced so nothing inside it reads as
     /// structure. The diff comes last, being the largest.
     pub fn render(&self) -> String {
-        let mut out = format!(
-            "# Review bundle: {}\n\nRound {}: the commits from {} ({}) to {}.\n",
-            self.label, self.round, self.base, self.base_commit, self.head
-        );
+        let mut out = match self.fix_from {
+            Some(from) => format!(
+                "# Review bundle: {}\n\nRound {}, the fix only: the commits from {} (the head round {} reviewed) to {}.\n",
+                self.label,
+                self.round,
+                from,
+                self.round - 1,
+                self.head
+            ),
+            None => format!(
+                "# Review bundle: {}\n\nRound {}: the commits from {} ({}) to {}.\n",
+                self.label, self.round, self.base, self.base_commit, self.head
+            ),
+        };
         fenced(&mut out, "Commits", self.commits, "");
         fenced(&mut out, "Diff stat", self.diff_stat, "");
         named(
@@ -103,12 +254,15 @@ impl Bundle<'_> {
             self.spec,
             "None given: skip the spec axis.",
         );
-        named(
-            &mut out,
-            "Previous review",
-            self.previous,
-            "None: this is a first round.",
-        );
+        match (self.open, self.previous) {
+            (Some(open), previous) => previous_findings(&mut out, open, previous.map(|p| p.name)),
+            (None, previous) => named(
+                &mut out,
+                "Previous review",
+                previous,
+                "None: this is a first round.",
+            ),
+        }
         if self.standards.is_empty() {
             absent(
                 &mut out,
@@ -128,6 +282,22 @@ impl Bundle<'_> {
         fenced(&mut out, "Diff", self.diff, "diff");
         out
     }
+}
+
+/// Appends the previous round's open findings as JSON, with what a fix round does with them.
+fn previous_findings(out: &mut String, open: &[Finding], report: Option<&str>) {
+    let ledger =
+        serde_json::json!({"findings": open.iter().map(Finding::to_value).collect::<Vec<_>>()});
+    let mut text = String::from(
+        "The previous round's open findings. Mark each in your ledger by its id as fixed or still_present; report a new finding only on a line this diff touches (a security problem or a hard standards violation anywhere).\n",
+    );
+    if let Some(report) = report {
+        text.push_str(&format!(
+            "Its report, to open only to check a claim: {report}\n"
+        ));
+    }
+    out.push_str(&format!("\n## Previous findings\n\n{text}"));
+    fenced(out, "", &format!("{ledger:#}"), "json");
 }
 
 /// Appends `## heading: name` and the part, or `## heading` and `note` when there is none.
@@ -168,6 +338,9 @@ pub const REPORT_CONTRACT: &str = r#"End the report with its findings ledger, th
 
 One entry per open finding (an empty list when none is open): severity is blocking, advisory or question; axis is standards or spec; tag is one from the rubric's list."#;
 
+/// What a fix round's reviewer is told on top of the report contract.
+pub const FIX_ROUND: &str = r#"This is a fix round: the bundle's diff is only the fix, and its "Previous findings" are the open findings of the round before. Put each of them in your findings ledger again, whole and with its "id", and add `"status": "fixed"` or `"status": "still_present"`. Report a new finding (no id, `"status": "new"`) only on a line the fix touched, except a hard Standards violation or a security problem, which you report wherever it is. The factory drops any other new finding."#;
+
 /// What a headless Claude reviewer is told beside its prompt: it stands in for the others, so
 /// it reads the reviewer skill they run as a file and follows it.
 pub const STANDIN_REVIEWER: &str = "You are the factory's code reviewer, standing in while the \
@@ -179,7 +352,13 @@ pub const STANDIN_REVIEWER: &str = "You are the factory's code reviewer, standin
 
 /// The prompt a backend gets: the bundle is its whole input. `opening` is the backend's own
 /// first line, which sets it reviewing the changes since the base.
-pub fn prompt(opening: &str, bundle: &str, spec: &str, previous: Option<&str>) -> String {
+pub fn prompt(
+    opening: &str,
+    bundle: &str,
+    spec: &str,
+    previous: Option<&str>,
+    fix_round: bool,
+) -> String {
     let mut out = format!(
         "{opening}\n\
          The review bundle is your whole input: {bundle}. It holds the commits, the diff stat, \
@@ -194,6 +373,11 @@ pub fn prompt(opening: &str, bundle: &str, spec: &str, previous: Option<&str>) -
     out.push_str("Non-interactive run: nobody can answer questions.\n\n");
     out.push_str(REPORT_CONTRACT);
     out.push('\n');
+    if fix_round {
+        out.push('\n');
+        out.push_str(FIX_ROUND);
+        out.push('\n');
+    }
     out
 }
 
@@ -234,9 +418,49 @@ pub struct Finding {
     /// Where it is, as `path:line`.
     pub location: String,
     pub summary: String,
+    /// How a fix round numbered it for the reviewer to answer; empty on a first round.
+    pub id: String,
+    pub status: Status,
+}
+
+/// What a fix round's reviewer says of a finding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Status {
+    /// Raised this round.
+    #[default]
+    New,
+    /// An earlier finding the fix settled.
+    Fixed,
+    /// An earlier finding the fix left open.
+    StillPresent,
+}
+
+impl Status {
+    fn as_str(self) -> &'static str {
+        match self {
+            Status::New => "new",
+            Status::Fixed => "fixed",
+            Status::StillPresent => "still_present",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Status> {
+        match word {
+            "new" => Some(Status::New),
+            "fixed" => Some(Status::Fixed),
+            "still_present" => Some(Status::StillPresent),
+            _ => None,
+        }
+    }
 }
 
 impl Finding {
+    /// A finding a fix round keeps wherever it lies: a hard Standards violation or a security
+    /// problem.
+    pub fn is_exempt(&self) -> bool {
+        self.tag == "security" || (self.axis == "standards" && self.severity == Severity::Blocking)
+    }
+
     /// The finding as the one line a caller reads.
     pub fn line(&self) -> String {
         format!(
@@ -247,13 +471,20 @@ impl Finding {
 
     /// The finding as its findings-ledger entry.
     pub fn to_value(&self) -> Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "severity": self.severity.as_str(),
             "axis": self.axis,
             "tag": self.tag,
             "location": self.location,
             "summary": self.summary,
-        })
+        });
+        if !self.id.is_empty() {
+            value["id"] = self.id.clone().into();
+        }
+        if self.status != Status::New {
+            value["status"] = self.status.as_str().into();
+        }
+        value
     }
 }
 
@@ -288,6 +519,11 @@ pub struct Reading {
     pub counts: Counts,
     /// The report's findings ledger; none when it holds no readable one.
     pub findings: Option<Vec<Finding>>,
+    /// On a fix round, the earlier findings the fix settled and the ones it left open.
+    pub fixed: u64,
+    pub still_present: u64,
+    /// On a fix round, the new findings dropped for lying outside the fix's lines.
+    pub dropped: Vec<Finding>,
     /// The `key=value` words of its FINDINGS line, which the review event carries on.
     pub tallies: Vec<String>,
 }
@@ -316,25 +552,7 @@ impl Reading {
     pub fn of(report: &str) -> Result<Reading, ReportError> {
         let tallies = findings_line(report);
         if let Some(findings) = ledger(report) {
-            let mut counts = Counts::default();
-            for finding in &findings {
-                match finding.severity {
-                    Severity::Blocking => counts.blocking += 1,
-                    Severity::Advisory => counts.advisory += 1,
-                    Severity::Question => counts.question += 1,
-                }
-            }
-            let verdict = if counts.blocking == 0 {
-                Verdict::Clean
-            } else {
-                Verdict::Findings
-            };
-            return Ok(Reading {
-                verdict,
-                counts,
-                findings: Some(findings),
-                tallies,
-            });
+            return Ok(Reading::counted(findings, Vec::new(), tallies));
         }
         let verdict = verdict_line(report).ok_or(ReportError::NoVerdict)?;
         let tally = |keys: &[&str]| {
@@ -356,8 +574,73 @@ impl Reading {
             verdict,
             counts,
             findings: None,
+            fixed: tally(&["fixed"]),
+            still_present: tally(&["still_present"]),
+            dropped: Vec::new(),
             tallies,
         })
+    }
+
+    /// A reading of `findings`: the open ones (not fixed) decide the counts and the verdict.
+    fn counted(findings: Vec<Finding>, dropped: Vec<Finding>, tallies: Vec<String>) -> Reading {
+        let mut counts = Counts::default();
+        let (mut fixed, mut still_present) = (0, 0);
+        for finding in &findings {
+            match finding.status {
+                Status::Fixed => {
+                    fixed += 1;
+                    continue;
+                }
+                Status::StillPresent => still_present += 1,
+                Status::New => {}
+            }
+            match finding.severity {
+                Severity::Blocking => counts.blocking += 1,
+                Severity::Advisory => counts.advisory += 1,
+                Severity::Question => counts.question += 1,
+            }
+        }
+        Reading {
+            verdict: if counts.blocking == 0 {
+                Verdict::Clean
+            } else {
+                Verdict::Findings
+            },
+            counts,
+            findings: Some(findings),
+            fixed,
+            still_present,
+            dropped,
+            tallies,
+        }
+    }
+
+    /// Holds a fix round's reading to the round's rules. Each of the `previous` round's open
+    /// findings the reviewer did not mark by its id stays open, as still present: nothing
+    /// shows it fixed. A new finding off the lines `fix` touched is dropped, unless it is hard
+    /// or a security problem. A reading with no findings ledger is returned as it is.
+    pub fn within(self, previous: &[Finding], fix: &Fix) -> Reading {
+        let Some(mut findings) = self.findings else {
+            return self;
+        };
+        let marked = |id: &str| {
+            findings
+                .iter()
+                .any(|f| f.status != Status::New && f.id == id)
+        };
+        let unmarked: Vec<Finding> = previous
+            .iter()
+            .filter(|p| !marked(&p.id))
+            .map(|p| Finding {
+                status: Status::StillPresent,
+                ..p.clone()
+            })
+            .collect();
+        let (kept, dropped): (Vec<Finding>, Vec<Finding>) = findings
+            .drain(..)
+            .partition(|f| f.status != Status::New || f.is_exempt() || fix.touches(&f.location));
+        let kept = kept.into_iter().chain(unmarked).collect();
+        Reading::counted(kept, dropped, self.tallies)
     }
 
     /// The blocking findings, one line each.
@@ -365,7 +648,9 @@ impl Reading {
         self.findings
             .iter()
             .flatten()
-            .filter(|finding| finding.severity == Severity::Blocking)
+            .filter(|finding| {
+                finding.severity == Severity::Blocking && finding.status != Status::Fixed
+            })
             .map(Finding::line)
             .collect()
     }
@@ -377,8 +662,23 @@ impl Reading {
             advisory,
             question,
         } = self.counts;
+        // A fix round adds what it settled, what it left and what it dropped, when any.
+        let mut fix = Vec::new();
+        for (n, what) in [
+            (self.fixed, "fixed"),
+            (self.still_present, "still present"),
+            (self.dropped.len() as u64, "dropped"),
+        ] {
+            if n > 0 {
+                fix.push(format!("{n} {what}"));
+            }
+        }
+        let fix = match fix.is_empty() {
+            true => String::new(),
+            false => format!("; {}", fix.join(", ")),
+        };
         format!(
-            "review {label}: {} ({blocking} blocking, {advisory} advisory, {question} question) → {report}",
+            "review {label}: {} ({blocking} blocking, {advisory} advisory, {question} question{fix}) → {report}",
             self.verdict
         )
     }
@@ -433,6 +733,8 @@ pub struct Record<'a> {
     pub stream: &'a str,
     /// The run's findings ledger file.
     pub findings: &'a str,
+    /// On a fix round, the head the previous round reviewed, where its diff started.
+    pub from: &'a str,
     /// What the report says, or why the run failed.
     pub result: Result<&'a Reading, &'a str>,
 }
@@ -464,6 +766,7 @@ impl Record<'_> {
             format!("effort={}", self.effort.unwrap_or_default()),
             format!("report={}", self.report),
             format!("stream={}", self.stream),
+            format!("from={}", self.from),
         ];
         if let Ok(reading) = self.result {
             let Counts {
@@ -475,6 +778,11 @@ impl Record<'_> {
             pairs.push(format!("blocking={blocking}"));
             pairs.push(format!("advisory={advisory}"));
             pairs.push(format!("question={question}"));
+            if self.round > 1 {
+                pairs.push(format!("fixed={}", reading.fixed));
+                pairs.push(format!("still_present={}", reading.still_present));
+                pairs.push(format!("dropped={}", reading.dropped.len()));
+            }
             // A FINDINGS word joins only when it is `key=value` with a lowercase key the event
             // doesn't already set, so a stray word can neither overwrite a field nor be refused.
             let taken: Vec<String> = pairs
@@ -522,6 +830,11 @@ fn finding(value: &Value) -> Option<Finding> {
         tag: text("tag"),
         location: text("location"),
         summary: text("summary"),
+        id: text("id"),
+        status: match value.get("status").and_then(Value::as_str) {
+            Some(word) => Status::parse(word)?,
+            None => Status::New,
+        },
     })
 }
 
@@ -547,6 +860,33 @@ mod tests {
                 round,
                 "{label} {has_previous}"
             );
+        }
+    }
+
+    #[test]
+    fn a_ledger_names_the_head_it_reviewed_and_the_findings_still_open() {
+        let ledger = r#"{"head": "abc123", "findings": [
+            {"severity": "blocking", "axis": "spec", "tag": "t", "location": "a:1", "summary": "one", "id": "f1", "status": "fixed"},
+            {"severity": "advisory", "axis": "standards", "tag": "u", "location": "b:2", "summary": "two", "id": "f2", "status": "still_present"},
+            {"severity": "blocking", "axis": "spec", "tag": "t", "location": "c:3", "summary": "three"}
+        ]}"#;
+        let previous = Previous::of_ledger(ledger).unwrap();
+        assert_eq!(previous.head, "abc123");
+        let open: Vec<(&str, &str, Status)> = previous
+            .open
+            .iter()
+            .flatten()
+            .map(|f| (f.id.as_str(), f.summary.as_str(), f.status))
+            .collect();
+        // A fixed finding is not open; the rest are renumbered for this round.
+        assert_eq!(
+            open,
+            [("f1", "two", Status::New), ("f2", "three", Status::New)]
+        );
+        let bare = Previous::of_ledger(r#"{"head": "abc123", "findings": null}"#).unwrap();
+        assert_eq!(bare.open, None);
+        for ledger in ["", "not json", "{}", r#"{"head": ""}"#, r#"{"head": 4}"#] {
+            assert_eq!(Previous::of_ledger(ledger), None, "{ledger}");
         }
     }
 
@@ -661,6 +1001,217 @@ mod tests {
         }
     }
 
+    fn entry(severity: &str, axis: &str, tag: &str, location: &str, extra: &str) -> String {
+        format!(
+            r#"{{"severity": "{severity}", "axis": "{axis}", "tag": "{tag}", "location": "{location}", "summary": "s"{extra}}}"#
+        )
+    }
+
+    fn report_of(entries: &[String]) -> String {
+        format!(
+            "```json\n{{\"findings\": [{}]}}\n```\nVERDICT: findings\n",
+            entries.join(",")
+        )
+    }
+
+    #[test]
+    fn a_fixed_finding_is_not_open_and_a_fix_rounds_ledger_counts_what_it_settled() {
+        let report = report_of(&[
+            entry(
+                "blocking",
+                "spec",
+                "t",
+                "a:1",
+                r#", "id": "f1", "status": "fixed""#,
+            ),
+            entry(
+                "blocking",
+                "spec",
+                "t",
+                "b:2",
+                r#", "id": "f2", "status": "still_present""#,
+            ),
+            entry("advisory", "standards", "u", "c:3", r#", "status": "new""#),
+            entry("advisory", "standards", "u", "c:4", ""),
+        ]);
+        let reading = Reading::of(&report).unwrap();
+        assert_eq!(reading.verdict, Verdict::Findings);
+        assert_eq!(
+            reading.counts,
+            Counts {
+                blocking: 1,
+                advisory: 2,
+                question: 0
+            }
+        );
+        assert_eq!((reading.fixed, reading.still_present), (1, 1));
+        assert_eq!(reading.blocking_lines(), ["- [spec/t] b:2: s"]);
+        let only_fixed = Reading::of(&report_of(&[entry(
+            "blocking",
+            "spec",
+            "t",
+            "a:1",
+            r#", "id": "f1", "status": "fixed""#,
+        )]))
+        .unwrap();
+        assert_eq!(only_fixed.verdict, Verdict::Clean);
+        assert_eq!(only_fixed.blocking_lines(), Vec::<String>::new());
+    }
+
+    const FIX: &str = "diff --git a/src/lib.rs b/src/lib.rs
+index 1..2 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,4 +10,5 @@ fn x() {
+ context
+-gone
++new one
++new two
+ context
+ context
+diff --git a/old.rs b/old.rs
+deleted file mode 100644
+--- a/old.rs
++++ /dev/null
+@@ -1,2 +0,0 @@
+-a
+-b
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-x
++y
+";
+
+    #[test]
+    fn a_location_is_touched_when_the_fix_changed_or_deleted_a_line_there() {
+        let fix = Fix::of_diff(FIX);
+        for (location, touched) in [
+            ("src/lib.rs:11", true),
+            ("src/lib.rs:12", true),
+            ("src/lib.rs:13", false),
+            ("src/lib.rs:10", false),
+            ("src/lib.rs:9-11", true),
+            ("src/lib.rs:12-30", true),
+            ("src/lib.rs:13-30", false),
+            ("src/lib.rs:12:5", true),
+            ("./src/lib.rs:12", true),
+            ("`src/lib.rs:12`", true),
+            ("src/lib.rs", true),
+            ("README.md:1", true),
+            ("README.md:2", false),
+            ("old.rs:1", false),
+            ("other.rs:1", false),
+            ("", false),
+            ("spec", false),
+        ] {
+            assert_eq!(fix.touches(location), touched, "{location}");
+        }
+    }
+
+    #[test]
+    fn a_new_finding_off_the_fix_is_dropped_unless_hard_or_security() {
+        let previous = Previous::of_ledger(&format!(
+            r#"{{"head": "h", "findings": [{}, {}, {}]}}"#,
+            entry("blocking", "spec", "t", "a:1", ""),
+            entry("blocking", "spec", "t", "b:2", ""),
+            entry("advisory", "standards", "u", "c:3", "")
+        ))
+        .unwrap();
+        let open = previous.open.unwrap();
+        let report = report_of(&[
+            entry(
+                "blocking",
+                "spec",
+                "t",
+                "a:1",
+                r#", "id": "f1", "status": "fixed""#,
+            ),
+            // f2 is not answered: it stays open. f3 is answered.
+            entry(
+                "advisory",
+                "standards",
+                "u",
+                "c:3",
+                r#", "id": "f3", "status": "still_present""#,
+            ),
+            entry(
+                "blocking",
+                "spec",
+                "partial-requirement",
+                "src/lib.rs:11",
+                "",
+            ),
+            entry(
+                "blocking",
+                "spec",
+                "partial-requirement",
+                "src/lib.rs:90",
+                "",
+            ),
+            entry(
+                "advisory",
+                "standards",
+                "mysterious-name",
+                "elsewhere.rs:1",
+                "",
+            ),
+            entry(
+                "blocking",
+                "standards",
+                "missing-test",
+                "elsewhere.rs:2",
+                "",
+            ),
+            entry("blocking", "spec", "security", "elsewhere.rs:3", ""),
+            entry("question", "spec", "spec-conflict", "", ""),
+        ]);
+
+        let reading = Reading::of(&report)
+            .unwrap()
+            .within(&open, &Fix::of_diff(FIX));
+
+        let kept: Vec<&str> = reading
+            .findings
+            .iter()
+            .flatten()
+            .map(|f| f.location.as_str())
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                "a:1",
+                "c:3",
+                "src/lib.rs:11",
+                "elsewhere.rs:2",
+                "elsewhere.rs:3",
+                "b:2"
+            ]
+        );
+        let dropped: Vec<&str> = reading
+            .dropped
+            .iter()
+            .map(|f| f.location.as_str())
+            .collect();
+        assert_eq!(dropped, ["src/lib.rs:90", "elsewhere.rs:1", ""]);
+        assert_eq!((reading.fixed, reading.still_present), (1, 2));
+        assert_eq!(
+            reading.counts,
+            Counts {
+                blocking: 4,
+                advisory: 1,
+                question: 0
+            }
+        );
+        assert_eq!(reading.verdict, Verdict::Findings);
+        let carried = reading.findings.unwrap().pop().unwrap();
+        assert_eq!(
+            (carried.id.as_str(), carried.status),
+            ("f2", Status::StillPresent)
+        );
+    }
+
     fn record<'a>(result: Result<&'a Reading, &'a str>) -> Record<'a> {
         Record {
             repo: "repo",
@@ -678,6 +1229,7 @@ mod tests {
             report: "r.md",
             stream: "r.jsonl",
             findings: "r.findings.json",
+            from: "",
             result,
         }
     }

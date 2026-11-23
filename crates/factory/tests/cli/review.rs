@@ -553,3 +553,336 @@ fn an_event_that_cannot_be_logged_fails_the_run_in_one_line_naming_the_report() 
         "{out:?}"
     );
 }
+
+/// Reviews `work` as round 1 with a ledger of `report`, then commits `fix` (a file and its
+/// text) and returns the round-2 run's output. The fake codex answers round 2 with `second`.
+fn fix_round(
+    sandbox: &Sandbox,
+    repo: &std::path::Path,
+    report: &str,
+    second: &str,
+) -> crate::support::Run {
+    sandbox.fake("codex", &codex_writes(report));
+    let first = sandbox.factory_in(repo, &["review", "main", "t1-r1"]);
+    assert!(first.code == 0 || first.code == 10, "{first:?}");
+    fs::write(repo.join("b.txt"), "b\n").unwrap();
+    sandbox.git(repo, &["add", "."]);
+    sandbox.git(repo, &["commit", "-q", "-m", "fix: add b"]);
+    sandbox.fake("codex", &codex_writes(second));
+    let previous = sandbox.reviews().join("t1-r1.md");
+    sandbox.factory_in(
+        repo,
+        &[
+            "review",
+            "main",
+            "t1-r2",
+            "none",
+            previous.to_str().unwrap(),
+        ],
+    )
+}
+
+#[test]
+fn a_fix_round_bundles_only_the_diff_since_the_previous_reviews_head() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+
+    let out = fix_round(&sandbox, &repo, FINDINGS_REPORT, FIXED_REPORT);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let round_one = fs::read_to_string(sandbox.reviews().join("t1-r1.bundle.md")).unwrap();
+    let round_two = fs::read_to_string(sandbox.reviews().join("t1-r2.bundle.md")).unwrap();
+    assert!(round_one.contains("+++ b/a.txt"), "{round_one}");
+    assert!(round_two.contains("+++ b/b.txt"), "{round_two}");
+    assert!(!round_two.contains("+++ b/a.txt"), "{round_two}");
+    assert!(round_two.contains("fix: add b"), "{round_two}");
+    assert!(!round_two.contains("feat: add a"), "{round_two}");
+}
+
+#[test]
+fn a_fix_round_without_a_reviewed_head_reviews_the_whole_diff_and_says_so() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    let previous = sandbox.path("t1-r1.md");
+    fs::write(&previous, "a lacks a test\nVERDICT: findings\n").unwrap();
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+
+    let out = sandbox.factory_in(
+        &repo,
+        &[
+            "review",
+            "main",
+            "t1-r2",
+            "none",
+            previous.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(
+        out.stderr,
+        format!(
+            "factory: no reviewed head for {} on this branch; round 2 reviews the whole diff\n",
+            previous.display()
+        )
+    );
+    let bundle = fs::read_to_string(sandbox.reviews().join("t1-r2.bundle.md")).unwrap();
+    assert!(bundle.contains("+++ b/a.txt"), "{bundle}");
+    assert!(bundle.contains("a lacks a test"), "{bundle}");
+}
+
+#[test]
+fn a_fix_round_with_nothing_committed_since_the_previous_head_fails_with_exit_2() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake("codex", &codex_writes(FINDINGS_REPORT));
+    sandbox.factory_in(&repo, &["review", "main", "t1-r1"]);
+    let previous = sandbox.reviews().join("t1-r1.md");
+    let calls = sandbox.calls("codex").len();
+
+    let out = sandbox.factory_in(
+        &repo,
+        &[
+            "review",
+            "main",
+            "t1-r2",
+            "none",
+            previous.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr
+            .starts_with("factory: no committed changes since the previous review's head "),
+        "{out:?}"
+    );
+    assert_eq!(sandbox.calls("codex").len(), calls);
+}
+
+#[test]
+fn a_fix_rounds_bundle_carries_the_previous_open_findings_as_structured_input() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+
+    let out = fix_round(&sandbox, &repo, FINDINGS_REPORT, FIXED_REPORT);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let bundle = fs::read_to_string(sandbox.reviews().join("t1-r2.bundle.md")).unwrap();
+    let (_, tail) = bundle
+        .split_once("## Previous findings")
+        .unwrap_or_else(|| panic!("no Previous findings in:\n{bundle}"));
+    let json = tail
+        .split("```json\n")
+        .nth(1)
+        .unwrap()
+        .split("```")
+        .next()
+        .unwrap();
+    let carried: Value = serde_json::from_str(json).unwrap();
+    let ids: Vec<&str> = carried["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["f1", "f2", "f3", "f4"]);
+    assert_eq!(carried["findings"][3]["summary"], "nothing tests a");
+    assert_eq!(carried["findings"][3]["severity"], "blocking");
+    // The report's prose is not repeated: the findings are the input.
+    assert!(!bundle.contains("Two things."), "{bundle}");
+}
+
+/// Round 2 of `FINDINGS_REPORT` after a fix that settled all four of its findings.
+const FIXED_REPORT: &str = r#"## Findings ledger
+
+```json
+{"findings":[
+  {"id":"f1","status":"fixed","severity":"blocking","axis":"spec","tag":"partial-requirement","location":"a.txt:1","summary":"a holds no b"},
+  {"id":"f2","status":"fixed","severity":"advisory","axis":"standards","tag":"mysterious-name","location":"a.txt:1","summary":"a is a vague name"},
+  {"id":"f3","status":"fixed","severity":"question","axis":"spec","tag":"spec-conflict","location":"README.md:1","summary":"which title?"},
+  {"id":"f4","status":"fixed","severity":"blocking","axis":"standards","tag":"missing-test","location":"a.txt:1","summary":"nothing tests a"}
+]}
+```
+
+FINDINGS: standards_hard=0 standards_judgement=0 spec_findings=0 spec_advisory=0 questions=0 fixed=4 still_present=0 tags=
+VERDICT: clean
+"#;
+
+/// Round 2 of `FINDINGS_REPORT` after a fix that added b.txt: f1 and f3 fixed, f2 and f4 still
+/// there, and three new findings, two of them on lines the fix never touched.
+const SECOND_REPORT: &str = r#"## Spec
+
+Checked.
+
+## Findings ledger
+
+```json
+{"findings":[
+  {"id":"f1","status":"fixed","severity":"blocking","axis":"spec","tag":"partial-requirement","location":"a.txt:1","summary":"a holds no b"},
+  {"id":"f2","status":"still_present","severity":"advisory","axis":"standards","tag":"mysterious-name","location":"a.txt:1","summary":"a is a vague name"},
+  {"id":"f3","status":"fixed","severity":"question","axis":"spec","tag":"spec-conflict","location":"README.md:1","summary":"which title?"},
+  {"id":"f4","status":"still_present","severity":"blocking","axis":"standards","tag":"missing-test","location":"a.txt:1","summary":"nothing tests a"},
+  {"status":"new","severity":"blocking","axis":"spec","tag":"incorrect-behavior","location":"b.txt:1","summary":"b is wrong"},
+  {"status":"new","severity":"blocking","axis":"spec","tag":"incorrect-behavior","location":"a.txt:1","summary":"a is wrong too"},
+  {"severity":"advisory","axis":"standards","tag":"mysterious-name","location":"a.txt:5","summary":"a stays vague"}
+]}
+```
+
+FINDINGS: standards_hard=1 standards_judgement=2 spec_findings=2 spec_advisory=0 questions=0 fixed=2 still_present=2 tags=x
+VERDICT: findings
+"#;
+
+#[test]
+fn a_fix_rounds_ledger_marks_each_old_finding_and_drops_new_ones_off_the_fix() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+
+    let out = fix_round(&sandbox, &repo, FINDINGS_REPORT, SECOND_REPORT);
+
+    assert_eq!(out.code, 10, "{out:?}");
+    let report = sandbox.reviews().join("t1-r2.md");
+    assert_eq!(
+        out.stdout_lines(),
+        vec![
+            format!(
+                "review t1-r2: findings (2 blocking, 1 advisory, 0 question; 2 fixed, 2 still present, 2 dropped) → {}",
+                report.display()
+            )
+            .as_str(),
+            "- [standards/missing-test] a.txt:1: nothing tests a",
+            "- [spec/incorrect-behavior] b.txt:1: b is wrong",
+        ]
+    );
+    let ledger: Value = serde_json::from_str(
+        &fs::read_to_string(sandbox.reviews().join("t1-r2.findings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ledger["fixed"], 2);
+    assert_eq!(ledger["still_present"], 2);
+    assert_eq!(ledger["dropped"], 2);
+    let status: Vec<(&str, &str)> = ledger["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["location"].as_str().unwrap(),
+                f["status"].as_str().unwrap_or("new"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        status,
+        [
+            ("a.txt:1", "fixed"),
+            ("a.txt:1", "still_present"),
+            ("README.md:1", "fixed"),
+            ("a.txt:1", "still_present"),
+            ("b.txt:1", "new"),
+        ]
+    );
+    let dropped: Vec<&str> = ledger["dropped_findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["summary"].as_str().unwrap())
+        .collect();
+    assert_eq!(dropped, ["a is wrong too", "a stays vague"]);
+    // The ledger's head is the one round 3 would start from.
+    let head = sandbox.git(&repo, &["rev-parse", "HEAD"]);
+    assert_eq!(ledger["head"], head.trim());
+    let first: Value = serde_json::from_str(
+        &fs::read_to_string(sandbox.reviews().join("t1-r1.findings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ledger["from"], first["head"]);
+}
+
+#[test]
+fn a_fix_rounds_event_carries_what_was_fixed_kept_and_dropped() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+
+    fix_round(&sandbox, &repo, FINDINGS_REPORT, SECOND_REPORT);
+
+    let lines = sandbox.ledger_lines();
+    let event: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(event["label"], "t1-r2");
+    assert_eq!(event["round"], 2);
+    for (key, expected) in [
+        ("fixed", 2),
+        ("still_present", 2),
+        ("dropped", 2),
+        ("blocking", 2),
+    ] {
+        assert_eq!(event[key], expected, "{key} in {event}");
+    }
+    let first: Value = serde_json::from_str(&lines[0]).unwrap();
+    assert_eq!(event["from"], first["head"], "{event}");
+}
+
+#[test]
+fn a_fix_round_keeps_an_old_finding_the_reviewer_left_unmarked_as_still_present() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+
+    let out = fix_round(&sandbox, &repo, FINDINGS_REPORT, CLEAN_REPORT);
+
+    // The reviewer marked none of the four old findings: nothing shows them fixed, so they
+    // stay open as still present. Its one new finding is off the fix.
+    assert_eq!(out.code, 10, "{out:?}");
+    assert!(
+        out.stdout.starts_with("review t1-r2: findings (2 blocking, 1 advisory, 1 question; 4 still present, 1 dropped) → "),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_fix_rounds_bundle_is_smaller_than_the_first_rounds() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    fs::write(repo.join("big.txt"), "line\n".repeat(400)).unwrap();
+    sandbox.git(&repo, &["add", "."]);
+    sandbox.git(&repo, &["commit", "-q", "-m", "feat: add a lot"]);
+
+    fix_round(&sandbox, &repo, FINDINGS_REPORT, CLEAN_REPORT);
+
+    let size = |label: &str| {
+        fs::metadata(sandbox.reviews().join(format!("{label}.bundle.md")))
+            .unwrap()
+            .len()
+    };
+    assert!(
+        size("t1-r2") < size("t1-r1"),
+        "{} vs {}",
+        size("t1-r2"),
+        size("t1-r1")
+    );
+}
+
+#[test]
+fn a_fix_rounds_prompt_asks_for_each_old_finding_marked_and_new_ones_only_on_the_fix() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    let first = sandbox.git(&repo, &["rev-parse", "--short=8", "HEAD"]);
+
+    fix_round(&sandbox, &repo, FINDINGS_REPORT, FIXED_REPORT);
+
+    let prompt = fs::read_to_string(sandbox.reviews().join("t1-r2.prompt")).unwrap();
+    assert!(
+        prompt.starts_with(&format!("$code-review since {}.\n", first.trim())),
+        "{prompt}"
+    );
+    for part in [
+        "still_present",
+        "id",
+        "only on a line the fix touched",
+        "hard",
+    ] {
+        assert!(prompt.contains(part), "{part:?} missing from:\n{prompt}");
+    }
+    let first_round = fs::read_to_string(sandbox.reviews().join("t1-r1.prompt")).unwrap();
+    assert!(!first_round.contains("still_present"), "{first_round}");
+}
