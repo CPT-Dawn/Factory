@@ -19,6 +19,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::lab::service::{self, Lab};
+use crate::lab::wire::ACQUIRE;
 use crate::leads::Leads;
 use crate::ledger::Ledger;
 use crate::output::{self, Done, Failure};
@@ -31,12 +33,13 @@ use crate::protocol::{
 use crate::router::Router;
 use crate::store::Store;
 
-/// What every connection answers from: the ledger, the picture of the leads, and the reviewer
-/// router.
+/// What every connection answers from: the ledger, the picture of the leads, the reviewer
+/// router and the lab's lease store.
 struct Daemon {
     ledger: Arc<Ledger>,
     leads: Arc<Leads>,
     router: Arc<Router>,
+    lab: Arc<Lab>,
 }
 
 pub fn run(json: bool) -> Result<Done, Failure> {
@@ -57,6 +60,10 @@ pub fn run(json: bool) -> Result<Done, Failure> {
         Store::open(&paths.database())?,
     )?;
     let router = Router::open(Store::open(&paths.database())?)?;
+    // Opened under the lock: it forgets the waiters a dead daemon left.
+    let lab = Lab::open(&paths.lab_db()).map_err(|e| {
+        Failure::precondition(format!("{e}; check FACTORY_STATE and XDG_STATE_HOME"))
+    })?;
     let listener = bind(&paths)?;
     let pid = std::process::id();
     fs::write(paths.daemon_pid(), format!("{pid}\n")).map_err(|e| {
@@ -92,6 +99,7 @@ pub fn run(json: bool) -> Result<Done, Failure> {
                 ledger,
                 leads,
                 router,
+                lab: Arc::new(lab),
             }),
         )
         .await {}
@@ -157,12 +165,18 @@ async fn serve(listener: UnixListener, daemon: Arc<Daemon>) -> Infallible {
 /// Answers each request line on one connection until the client hangs up, then frees the
 /// review slot the connection holds. A client sends one request at a time; one that hangs up,
 /// or sends more, before its answer abandons the request, so a wait whose CLI is gone stops
-/// waiting.
+/// waiting. A `lab.acquire` holds the connection while it waits, writing notes before its answer.
 async fn answer(stream: UnixStream, daemon: Arc<Daemon>) {
     let mut held = None;
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        if let Ok(request) = serde_json::from_str::<Request>(&line)
+            && request.method == ACQUIRE
+        {
+            service::acquire(Arc::clone(&daemon.lab), request, &mut writer, &mut lines).await;
+            continue;
+        }
         let response = tokio::select! {
             response = respond(&line, &daemon, &mut held) => response,
             _ = lines.next_line() => break,
@@ -248,10 +262,13 @@ async fn respond(line: &str, daemon: &Daemon, held: &mut Option<String>) -> Resp
                 )),
             }
         }
-        other => Outcome::Error(refusal(
-            Exit::Usage,
-            format!("unknown method {other:?}; {MISMATCH}"),
-        )),
+        other => match service::respond(&daemon.lab, other, request.params).await {
+            Some(outcome) => outcome,
+            None => Outcome::Error(refusal(
+                Exit::Usage,
+                format!("unknown method {other:?}; {MISMATCH}"),
+            )),
+        },
     };
     Response {
         id: Some(request.id),

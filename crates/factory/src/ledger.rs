@@ -34,7 +34,7 @@ impl Ledger {
             // A repo or slug of digits is stored as a number: compare what each prints.
             let named = |field: &str, want: &str| match &event[field] {
                 Value::String(text) => text == want,
-                other => other.to_string() == want,
+                other => format!("{other}") == want,
             };
             if !(named("repo", repo) && named("slug", slug)) {
                 continue;

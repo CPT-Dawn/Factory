@@ -6,6 +6,7 @@
 pub mod duration;
 pub mod event;
 pub mod exit;
+pub mod lab;
 pub mod lead;
 pub mod quota;
 pub mod review;

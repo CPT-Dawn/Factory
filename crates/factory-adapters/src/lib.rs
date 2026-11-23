@@ -7,8 +7,11 @@
 //! herdr is a server, not a command: it is reached on its socket, and the binary-seam tests run
 //! a fake herdr server (`crates/factory/tests/cli/support/herdr.rs`).
 
+pub mod docker;
 pub mod gh;
 pub mod git;
 pub mod herdr;
 pub mod process;
 pub mod reviewer;
+pub mod supabase;
+pub mod systemd;
