@@ -246,7 +246,7 @@ pub fn stopping(ctx: &Ctx) -> Result<Option<Lease>, Failure> {
 }
 
 /// This devlab call, as a stopper or a waiter.
-fn me() -> Process {
+pub(super) fn me() -> Process {
     let pid = i64::from(std::process::id());
     Process {
         pid,

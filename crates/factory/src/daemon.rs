@@ -37,7 +37,7 @@ use listenfd::ListenFd;
 use crate::claude::Claude;
 use crate::clock;
 use crate::lab::service::{self, Lab};
-use crate::lab::wire::{ACQUIRE, RESERVE};
+use crate::lab::wire::{ACQUIRE, RESERVE, RUN_RESUME};
 use crate::leads::{Leads, Registered};
 use crate::ledger::Ledger;
 use crate::notifier::Notifier;
@@ -115,7 +115,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
         Arc::clone(&pollers),
     );
     // Opened under the lock: it forgets the waiters a dead daemon left.
-    let lab = Lab::open(&paths.lab_db()).map_err(|e| {
+    let lab = Lab::open(&paths.lab_db(), Arc::clone(&ledger)).map_err(|e| {
         Failure::precondition(format!("{e}; check FACTORY_STATE and XDG_STATE_HOME"))
     })?;
     let listener = match activated {
@@ -342,7 +342,17 @@ async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut O
                 // Not cut short by a stop: a lease granted as it was dropped would go unanswered.
                 service::acquire(
                     Arc::clone(&daemon.lab),
-                    Arc::clone(&daemon.ledger),
+                    request,
+                    &mut writer,
+                    &mut lines,
+                    stop.clone().stopping(),
+                )
+                .await;
+                continue;
+            }
+            Ok(request) if request.method == RUN_RESUME => {
+                service::resume_run(
+                    Arc::clone(&daemon.lab),
                     request,
                     &mut writer,
                     &mut lines,

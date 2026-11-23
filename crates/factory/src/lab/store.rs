@@ -61,6 +61,19 @@ CREATE TABLE IF NOT EXISTS lease_devices (
   abi TEXT,
   model TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS runs (
+  id INTEGER PRIMARY KEY,
+  worktree TEXT NOT NULL,
+  command TEXT NOT NULL,
+  session TEXT,
+  client_pid INTEGER NOT NULL,
+  client_start TEXT NOT NULL,
+  queued_ms INTEGER NOT NULL,
+  granted_ms INTEGER,
+  started_ms INTEGER,
+  lease INTEGER,
+  slot INTEGER
+);
 CREATE TABLE IF NOT EXISTS emulators (
   idx INTEGER PRIMARY KEY,
   serial TEXT NOT NULL,
@@ -80,8 +93,9 @@ pub struct EmulatorRow {
     pub idle_since: Option<i64>,
 }
 /// The schema's version, in `PRAGMA user_version`. Version 0 kept waiters only while the
-/// daemon that queued them ran, so their table is rebuilt; `stoppers` is new.
-const VERSION: i64 = 1;
+/// daemon that queued them ran, so their table is rebuilt; `stoppers` is new. Version 2 adds
+/// `runs`.
+const VERSION: i64 = 2;
 
 pub struct Store {
     conn: Connection,
@@ -622,4 +636,142 @@ pub fn set_stack_ours(
         params![project, slot, ours],
     )?;
     Ok(())
+}
+
+/// A `devlab run` the daemon follows, kept across its restarts: what its `lab-run` event
+/// needs, and the devlab process that runs it. Its id is the waiter it first queued as; times are
+/// milliseconds since the epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRow {
+    pub id: i64,
+    pub worktree: String,
+    pub command: String,
+    pub session: Option<String>,
+    pub client: Process,
+    pub queued_ms: i64,
+    pub granted_ms: Option<i64>,
+    pub started_ms: Option<i64>,
+    pub lease: Option<i64>,
+    pub slot: Option<u32>,
+}
+
+fn run_row(row: &Row<'_>) -> rusqlite::Result<RunRow> {
+    Ok(RunRow {
+        id: row.get("id")?,
+        worktree: row.get("worktree")?,
+        command: row.get("command")?,
+        session: row.get("session")?,
+        client: Process {
+            pid: row.get("client_pid")?,
+            start: row.get("client_start")?,
+        },
+        queued_ms: row.get("queued_ms")?,
+        granted_ms: row.get("granted_ms")?,
+        started_ms: row.get("started_ms")?,
+        lease: row.get("lease")?,
+        slot: row.get("slot")?,
+    })
+}
+
+/// The run `fresh` describes, as it was kept: a devlab process runs one run, so one it queued
+/// for before (under another waiter, if its place was lost) is the same run, now under
+/// `fresh.id`. Else `fresh`, kept from now on.
+pub fn begin_run(c: &Connection, fresh: &RunRow) -> rusqlite::Result<RunRow> {
+    let kept = c
+        .query_row(
+            "SELECT * FROM runs WHERE id = ?1 OR (client_pid = ?2 AND client_start = ?3)
+             ORDER BY id = ?1 DESC, id DESC LIMIT 1",
+            params![fresh.id, fresh.client.pid, fresh.client.start],
+            run_row,
+        )
+        .optional()?;
+    if let Some(mut kept) = kept {
+        if kept.id != fresh.id {
+            c.execute(
+                "UPDATE runs SET id = ?1 WHERE id = ?2",
+                params![fresh.id, kept.id],
+            )?;
+            kept.id = fresh.id;
+        }
+        return Ok(kept);
+    }
+    c.execute(
+        "INSERT INTO runs (id, worktree, command, session, client_pid, client_start, queued_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            fresh.id,
+            fresh.worktree,
+            fresh.command,
+            fresh.session,
+            fresh.client.pid,
+            fresh.client.start,
+            fresh.queued_ms
+        ],
+    )?;
+    Ok(fresh.clone())
+}
+
+/// The run devlab process `client` runs, if the daemon keeps one.
+pub fn run_of(c: &Connection, client: &Process) -> rusqlite::Result<Option<RunRow>> {
+    c.query_row(
+        "SELECT * FROM runs WHERE client_pid = ?1 AND client_start = ?2",
+        params![client.pid, client.start],
+        run_row,
+    )
+    .optional()
+}
+
+/// Marks the run granted `lease` at `ms`, unless it was granted before.
+pub fn run_granted(
+    c: &Connection,
+    id: i64,
+    ms: i64,
+    lease: i64,
+    slot: Option<u32>,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE runs SET granted_ms = COALESCE(granted_ms, ?2), lease = ?3, slot = ?4 WHERE id = ?1",
+        params![id, ms, lease, slot],
+    )?;
+    Ok(())
+}
+
+/// Marks the run's command started at `ms`, unless it started before.
+pub fn run_started(c: &Connection, id: i64, ms: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE runs SET started_ms = COALESCE(started_ms, ?2) WHERE id = ?1",
+        params![id, ms],
+    )?;
+    Ok(())
+}
+
+/// Takes the run out of the store, to record its end: none when it was taken already.
+pub fn take_run(c: &Connection, id: i64) -> rusqlite::Result<Option<RunRow>> {
+    let run = c
+        .query_row("SELECT * FROM runs WHERE id = ?1", [id], run_row)
+        .optional()?;
+    if run.is_some() {
+        c.execute("DELETE FROM runs WHERE id = ?1", [id])?;
+    }
+    Ok(run)
+}
+
+/// Takes out the runs no daemon can follow any more: no connection follows them (`attached`)
+/// and their devlab process is gone, so it never comes back to say how they ended.
+pub fn take_orphan_runs(
+    c: &Connection,
+    attached: &dyn Fn(i64) -> bool,
+    alive: &dyn Fn(i64, &str) -> bool,
+) -> rusqlite::Result<Vec<RunRow>> {
+    let mut q = c.prepare("SELECT * FROM runs ORDER BY id")?;
+    let rows: Vec<RunRow> = q.query_map([], run_row)?.collect::<rusqlite::Result<_>>()?;
+    let mut orphans = Vec::new();
+    for run in rows {
+        if attached(run.id) || alive(run.client.pid, &run.client.start) {
+            continue;
+        }
+        c.execute("DELETE FROM runs WHERE id = ?1", [run.id])?;
+        orphans.push(run);
+    }
+    Ok(orphans)
 }
