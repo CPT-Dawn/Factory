@@ -241,16 +241,34 @@ impl Lab {
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
-    /// Ends a granted request once its caller said it has the answer, or can't: `unanswered` is
-    /// the lease to give back, which its caller never learned of.
-    fn settle(&self, waiter: i64, unanswered: Option<&Lease>) -> Answer<()> {
+    /// Gives lease `lease` back whole, its devices as they are now, and ends request `waiter`:
+    /// a request that failed for good. The reverses its devices were given are taken back.
+    fn give_back(&self, waiter: i64, lease: i64) -> Answer<()> {
+        let dropped = self.write(|c, now| {
+            let held = store::lease(c, lease)?;
+            if let Some(held) = &held {
+                store::drop_lease(c, held, now)?;
+            }
+            store::delete_waiter(c, waiter)?;
+            Ok(held)
+        })?;
+        if let Some(held) = dropped {
+            self.notify();
+            keeper::take_back_reverses_on_thread(self.attached.borrow().clone(), vec![held]);
+        }
+        Ok(())
+    }
+
+    /// Ends a granted request once its caller said it has the answer, or can't. `to_drop` is a
+    /// lease to give back with it: a fresh one its caller never learned of.
+    fn settle(&self, waiter: i64, to_drop: Option<&Lease>) -> Answer<()> {
         self.write(|c, now| {
-            if let Some(lease) = unanswered {
+            if let Some(lease) = to_drop {
                 store::drop_lease(c, lease, now)?;
             }
             store::delete_waiter(c, waiter)
         })?;
-        if unanswered.is_some() {
+        if to_drop.is_some() {
             self.notify();
         }
         Ok(())
@@ -927,8 +945,8 @@ fn emulator_device(serial: &str) -> LeaseDevice {
 
 /// The device work after a grant, none of it in a transaction: the new phones' ABIs, the
 /// emulators to boot, then each device readied. Notes go to the caller as it goes. An emulator
-/// that won't boot is exit 77, and the request gets none of its devices: the lease keeps only
-/// what it held before (the caller of a fresh lease gives it back). A device the lease holds that is gone by the end is exit 76. Else the
+/// that won't boot is exit 77, and the request gets none of its devices: the caller of this
+/// function gives the whole lease back (`Lab::give_back`). A device the lease holds that is gone by the end is exit 76. Else the
 /// lease as it is then, with its devices' states.
 async fn settle<W: AsyncWrite + Unpin>(
     lab: &Arc<Lab>,
@@ -1324,16 +1342,28 @@ pub async fn acquire<W, R, S>(
                         let place = (waiter, Granted { lease, previous }, fresh);
                         deliver(&lab, writer, lines, id, place, run, stopping.as_mut()).await;
                     }
-                    Err(body) => {
-                        // The request failed. A fresh lease is given back when its caller never
-                        // hears so, and when an emulator would not boot (exit 77): it holds
-                        // nothing. A lease the caller already had is kept.
-                        let unbootable = body.code == Exit::Emulator.code();
+                    Err(mut body) => {
+                        // An emulator that would not boot (exit 77) gives the lease back, before
+                        // its caller hears so: it can ask `devlab env` at once and find none.
+                        // Any other failure keeps the lease, and only a caller that never hears
+                        // of a fresh one loses it.
+                        let mut given_back = false;
+                        if body.code == Exit::Emulator.code() {
+                            match lab.give_back(waiter, lease.id) {
+                                Ok(()) => given_back = true,
+                                Err(why) => {
+                                    body.message = format!(
+                                        "{}; lease {} could not be given back ({}): run devlab release",
+                                        body.message, lease.id, why.message
+                                    );
+                                }
+                            }
+                        }
                         let outcome = Outcome::Error(body);
                         let answered = send(writer, Response { id, outcome }).await;
                         let _ = lab.settle(
                             waiter,
-                            ((!answered || unbootable) && fresh).then_some(&lease),
+                            (!given_back && !answered && fresh).then_some(&lease),
                         );
                         if let Some(mut run) = run {
                             run.granted = Some(Instant::now());

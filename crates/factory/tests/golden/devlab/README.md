@@ -11,10 +11,10 @@ signal, or whose command a signal ended, says so on stderr (#24): `slots-run-sto
 command kills itself.
 
 Some record behaviour the owner chose to change from today's devlab (#38), so replaying them against
-today's devlab shows the difference: `cli-usage` (`--wait -1` is the configured default, other
-negatives are refused, and help names the daemon as the watcher, not a systemd unit),
-`devices-emulator-failure` (an emulator that fails to boot, exit 77, gives its fresh lease back:
-`devlab env` then exits 4) and `slots-release` (`devlab gc` reports only the leases it freed
+today's devlab shows the difference: `cli-usage` (other negative waits are refused, and help names the
+daemon as the watcher, not a systemd unit), `slots-wait-default` (`--wait -1` is the configured
+default wait: the call queues), `devices-emulator-failure` (an emulator that fails to boot, exit 77,
+gives its lease back: `devlab env` then exits 4) and `slots-release` (`devlab gc` reports only the leases it freed
 itself, not those the daemon freed first).
 
 ## Replaying

@@ -534,7 +534,7 @@ fn a_failed_emulator_boot_frees_the_slot_for_the_next_owner() {
 }
 
 #[test]
-fn a_top_up_whose_emulator_fails_to_boot_keeps_the_lease_it_already_had() {
+fn a_top_up_whose_emulator_fails_to_boot_gives_the_whole_lease_back() {
     let (sandbox, world) = lab();
     let wt = world.worktree("plain-a");
     world
@@ -551,9 +551,14 @@ fn a_top_up_whose_emulator_fails_to_boot_keeps_the_lease_it_already_had() {
     );
 
     assert_eq!(more.code, 77, "{more:?}");
+    // The phone it already held is free again too.
     let env = owned(&sandbox, &wt, &["env"]);
-    assert_eq!(env.code, 0, "{env:?}");
-    assert!(env.stdout.contains("ANDROID_SERIAL=FAKEPHONE01"), "{env:?}");
+    assert_eq!(env.code, 4, "{env:?}");
+    assert!(
+        status(&sandbox, &wt).contains("Pixel 8        ready        free"),
+        "{}",
+        status(&sandbox, &wt)
+    );
 }
 
 #[test]
@@ -1371,7 +1376,7 @@ fn a_request_its_caller_sends_again_keeps_the_place_it_never_heard_of() {
 }
 
 #[test]
-fn factory_lab_gc_names_a_file_with_the_leases_it_released() {
+fn gc_has_nothing_to_say_of_leases_the_daemon_already_freed() {
     let (sandbox, world) = lab();
     let (mut a, mut b) = (Agent::start(), Agent::start());
     let [wa, wb] = ["demo-a", "demo-b"].map(|n| world.worktree(n));
@@ -1403,31 +1408,25 @@ fn factory_lab_gc_names_a_file_with_the_leases_it_released() {
     assert_eq!((plain.code, plain.stdout.as_str()), (0, ""), "{plain:?}");
 }
 
-/// Puts a lease of an owner that has already exited into the lab's store, as one the daemon's
-/// keeper never watched: only a write that finds it frees it.
-fn insert_orphaned_lease(sandbox: &Sandbox, worktree: &Path, label: &str) -> i64 {
-    let mut owner = Command::new("true").spawn().expect("start an owner");
-    let pid = owner.id();
-    let _ = owner.wait();
-    let db = rusqlite::Connection::open(sandbox.path("state/factory/lab.db")).expect("open lab.db");
-    db.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
-    db.execute(
-        "INSERT INTO leases (project, worktree, owner_pid, owner_start, owner_label, slot, created, touched)
-         VALUES (NULL, ?1, ?2, '0', ?3, NULL, 0, 0)",
-        rusqlite::params![worktree.display().to_string(), pid, label],
-    )
-    .expect("insert a lease");
-    db.last_insert_rowid()
+/// A lead that reserved a slot and exited: the keeper watches leases' owners, not reservations',
+/// so only a write that finds the reservation frees it, and a `gc` that is the next call does.
+fn orphaned_reservations(sandbox: &Sandbox, world: &World) -> (PathBuf, Vec<u32>) {
+    let (mut a, mut b) = (Agent::start(), Agent::start());
+    let [wa, wb] = ["demo-a", "demo-b"].map(|n| world.worktree(n));
+    for (agent, wt) in [(&a, &wa), (&b, &wb)] {
+        let reserved = run(for_owner(sandbox, wt, agent.pid(), &["reserve"]));
+        assert_eq!(reserved.code, 0, "{reserved:?}");
+    }
+    let pids = vec![a.pid(), b.pid()];
+    a.exit();
+    b.exit();
+    (wa, pids)
 }
 
 #[test]
-fn gc_names_a_file_with_the_leases_it_freed_itself() {
+fn gc_names_a_file_with_the_reservations_it_freed_itself() {
     let (sandbox, world) = lab();
-    let wa = world.worktree("demo-a");
-    // The daemon is up, and its store made, once it has answered.
-    assert_eq!(owned(&sandbox, &wa, &["status"]).code, 0);
-    let first = insert_orphaned_lease(&sandbox, &wa, "claude:11");
-    let second = insert_orphaned_lease(&sandbox, &wa, "claude:12");
+    let (wa, pids) = orphaned_reservations(&sandbox, &world);
 
     let gc = native(&sandbox, &wa, std::process::id(), &["lab", "gc"]);
 
@@ -1436,35 +1435,35 @@ fn gc_names_a_file_with_the_leases_it_freed_itself() {
         line.starts_with("released 2 leases of exited owners; list in "),
         "{line}"
     );
-    assert_eq!(
-        named_file(line),
-        format!(
-            "released lease {first} (claude:11, owner exited)\nreleased lease {second} (claude:12, owner exited)\n"
-        )
-    );
+    let freed = named_file(line);
+    for pid in pids {
+        assert!(
+            freed.contains(&format!("(sleep:{pid}, owner exited)")),
+            "{freed}"
+        );
+    }
     // Said once: the next gc finds nothing.
     let again = run(devlab(&sandbox, &wa, &["gc"]));
     assert_eq!((again.code, again.stdout.as_str()), (0, ""), "{again:?}");
 }
 
 #[test]
-fn gc_in_devlab_words_says_a_freed_lease_once() {
+fn devlab_gc_says_a_freed_reservation_once() {
     let (sandbox, world) = lab();
-    let wa = world.worktree("demo-a");
-    assert_eq!(owned(&sandbox, &wa, &["status"]).code, 0);
-    let id = insert_orphaned_lease(&sandbox, &wa, "claude:11");
+    let (wa, pids) = orphaned_reservations(&sandbox, &world);
 
     let gc = run(devlab(&sandbox, &wa, &["gc"]));
     let again = run(devlab(&sandbox, &wa, &["gc"]));
 
-    assert_eq!(
-        (gc.code, gc.stdout.as_str()),
-        (
-            0,
-            format!("released lease {id} (claude:11, owner exited)\n").as_str()
-        ),
-        "{gc:?}"
-    );
+    assert_eq!(gc.code, 0, "{gc:?}");
+    assert_eq!(gc.stdout.lines().count(), 2, "{gc:?}");
+    for (line, pid) in gc.stdout.lines().zip(&pids) {
+        assert!(
+            line.starts_with("released reservation ")
+                && line.ends_with(&format!("(sleep:{pid}, owner exited)")),
+            "{line}"
+        );
+    }
     assert_eq!((again.code, again.stdout.as_str()), (0, ""), "{again:?}");
 }
 
