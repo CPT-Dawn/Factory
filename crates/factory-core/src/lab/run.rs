@@ -31,16 +31,21 @@ pub enum End {
     Stopped(i32),
     /// The client's connection closed without saying how it ended: a SIGKILL'd devlab.
     Lost,
+    /// A daemon stop cut the daemon off from the run, and the run never came back to say how
+    /// it ended: its devlab exited while no daemon followed it.
+    DaemonStopped,
 }
 
 impl End {
-    /// The ledger's `outcome`: `exit 3`, `signal SIGKILL`, `stopped SIGTERM` or `lost`.
+    /// The ledger's `outcome`: `exit 3`, `signal SIGKILL`, `stopped SIGTERM`, `lost` or
+    /// `daemon-stopped`.
     pub fn outcome(self) -> String {
         match self {
             End::Exit(code) => format!("exit {code}"),
             End::Signal(signal) => format!("signal {}", signal_name(signal)),
             End::Stopped(signal) => format!("stopped {}", signal_name(signal)),
             End::Lost => "lost".to_owned(),
+            End::DaemonStopped => "daemon-stopped".to_owned(),
         }
     }
 }

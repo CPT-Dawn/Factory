@@ -59,7 +59,7 @@ pub fn run(ctx: &Ctx, opts: &Opts, quiet: bool, argv: &[String]) -> Result<u8, F
     };
     let (params, listen) = lease::ask(ctx, opts, Some(ask))?;
     let mut session = Session::open(&lease::paths()?)?;
-    let watch = Watch::install(program, session.notifier().ok())?;
+    let watch = Watch::install(program, session.notifier().ok(), true, Say(None))?;
     let asked = session.call_streaming::<_, Granted>(ACQUIRE, &params, listen, &mut |said| {
         note(said);
         if let Some(why) = said.strip_prefix("waiting: ") {
@@ -141,9 +141,11 @@ pub fn run(ctx: &Ctx, opts: &Opts, quiet: bool, argv: &[String]) -> Result<u8, F
 }
 
 /// Runs `argv` in the lease, its devices woken and the project's ports reversed onto them, and
-/// returns its exit code (128 + the signal that ended it); [`CANNOT_RUN`] when it can't be
-/// run. Its stdout and stderr, and why it couldn't run, go to `output` when given, else they
-/// are the caller's. `devlab exec` and `factory lab`'s run and exec, which are not followed.
+/// returns its exit code (128 + the signal that ended it, or that stopped this process);
+/// [`CANNOT_RUN`] when it can't be run. Its stdout and stderr, and what it says, go to `output`
+/// when given, else they are the caller's. `devlab exec` and `factory lab`'s run and exec,
+/// which are not followed. Like `devlab run`, it names a signal that stops it or kills its
+/// command (#37).
 pub fn exec_in(
     ctx: &Ctx,
     lease: &Lease,
@@ -154,7 +156,7 @@ pub fn exec_in(
     let Some(program) = argv.first() else {
         return Err(Failure::usage("devlab exec -- <cmd...>"));
     };
-    let mut log = match output {
+    let log = match output {
         Some(path) => Some(File::create(path).map_err(|e| {
             Failure::precondition(format!(
                 "cannot write {}: {e}; check XDG_RUNTIME_DIR",
@@ -163,30 +165,69 @@ pub fn exec_in(
         })?),
         None => None,
     };
+    let say = Say(log
+        .as_ref()
+        .and_then(|file| file.try_clone().ok())
+        .map(Arc::new));
     wake(lease);
-    apply_reverses(lease, ctx.project.as_ref(), &mut |why| match log.as_mut() {
-        Some(file) => {
-            let _ = writeln!(file, "{why}");
+    apply_reverses(lease, ctx.project.as_ref(), &mut |why| say.line(why))?;
+    let watch = Watch::install(program, None, false, say.clone())?;
+    let child = {
+        let mut state = watch.lock();
+        if let Some(signal) = state.stopped {
+            say.line(&stopped_running(program, signal, 0));
+            return Ok(signal_code(signal));
         }
-        None => note(why),
-    })?;
-    let ended = match spawn(argv, &env, log.as_ref()) {
-        Ok(child) => wait_for(child)
-            .map(|status| exit_code(&status))
-            .map_err(|e| format!("cannot wait for {program}: {e}")),
-        Err(e) => Err(format!("cannot run {program}: {e}")),
-    };
-    let why = match ended {
-        Ok(code) => return Ok(code),
-        Err(why) => why,
-    };
-    match log.as_mut() {
-        Some(file) => {
-            let _ = writeln!(file, "{why}");
+        match spawn(argv, &env, log.as_ref()) {
+            Ok(child) => {
+                state.child = Some(Running {
+                    pidfd: child_pidfd(&child),
+                    since: Instant::now(),
+                });
+                child
+            }
+            Err(e) => {
+                say.line(&format!("cannot run {program}: {e}"));
+                return Ok(CANNOT_RUN);
+            }
         }
-        None => note(&why),
+    };
+    let waited = wait_for(child);
+    let mut state = watch.lock();
+    if let Some(signal) = state.stopped {
+        return Ok(signal_code(signal));
     }
-    Ok(CANNOT_RUN)
+    let since = state.child.take().map_or_else(Instant::now, |c| c.since);
+    drop(state);
+    match waited {
+        Ok(status) => {
+            if let Some(signal) = status.signal() {
+                say.line(&killed(program, signal, since.elapsed().as_secs()));
+            }
+            Ok(exit_code(&status))
+        }
+        Err(e) => {
+            say.line(&format!("cannot wait for {program}: {e}"));
+            Ok(CANNOT_RUN)
+        }
+    }
+}
+
+/// Where a run or exec says what happened: devlab's stderr, or the file `factory lab` gave
+/// its command's output.
+#[derive(Clone)]
+struct Say(Option<Arc<File>>);
+
+impl Say {
+    fn line(&self, why: &str) {
+        match &self.0 {
+            Some(file) => {
+                let mut file: &File = file;
+                let _ = writeln!(file, "{why}");
+            }
+            None => note(why),
+        }
+    }
 }
 
 /// Starts `argv` with `env` on top of this process's, its stdout and stderr in `log` if given.
@@ -220,6 +261,9 @@ struct Running {
 
 /// What the signal thread needs to know of the run.
 struct State {
+    /// A `devlab run`, which a signal before its command starts takes out of the queue; an
+    /// exec's command starts at once, so its caller sees the stop then.
+    queued: bool,
     /// Why the run waits, as the daemon last said it.
     reason: String,
     /// The daemon connection, to send the run's end on.
@@ -237,8 +281,14 @@ struct Watch {
 impl Watch {
     /// Takes SIGTERM, SIGINT and SIGHUP from their default (dying) and answers them on a
     /// thread of their own.
-    fn install(program: &str, link: Option<UnixStream>) -> Result<Watch, Failure> {
+    fn install(
+        program: &str,
+        link: Option<UnixStream>,
+        queued: bool,
+        say: Say,
+    ) -> Result<Watch, Failure> {
         let state = Arc::new(Mutex::new(State {
+            queued,
             reason: "no answer from the daemon yet".to_owned(),
             link,
             child: None,
@@ -251,7 +301,7 @@ impl Watch {
         let started = Instant::now();
         thread::spawn(move || {
             for signal in signals.forever() {
-                stopped(&watched, &program, started, signal);
+                stopped(&watched, &program, started, signal, &say);
             }
         });
         Ok(Watch { state })
@@ -276,7 +326,7 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 /// devlab got `signal`: it says so before anything else. While the command runs, the command
 /// gets the signal too, and the main thread exits once it is gone; while queued, the run leaves
 /// the queue, and exits when the daemon has taken it out, or after [`LEAVE_GRACE`].
-fn stopped(state: &Mutex<State>, program: &str, started: Instant, signal: i32) {
+fn stopped(state: &Mutex<State>, program: &str, started: Instant, signal: i32, say: &Say) {
     let mut s = lock(state);
     let first = s.stopped.is_none();
     if first {
@@ -284,7 +334,7 @@ fn stopped(state: &Mutex<State>, program: &str, started: Instant, signal: i32) {
     }
     if let Some(child) = &s.child {
         if first {
-            note(&stopped_running(
+            say.line(&stopped_running(
                 program,
                 signal,
                 child.since.elapsed().as_secs(),
@@ -298,10 +348,10 @@ fn stopped(state: &Mutex<State>, program: &str, started: Instant, signal: i32) {
         }
         return;
     }
-    if !first {
+    if !first || !s.queued {
         return;
     }
-    note(&stopped_queued(
+    say.line(&stopped_queued(
         signal,
         started.elapsed().as_secs(),
         &s.reason,

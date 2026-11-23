@@ -18,13 +18,14 @@ fn signals_go_by_their_linux_names_and_others_by_number() {
 }
 
 #[test]
-fn an_outcome_is_an_exit_code_a_signal_a_stop_or_lost() {
+fn an_outcome_is_an_exit_code_a_signal_a_stop_lost_or_a_daemon_stop() {
     let table = [
         (End::Exit(0), "exit 0"),
         (End::Exit(3), "exit 3"),
         (End::Signal(9), "signal SIGKILL"),
         (End::Stopped(15), "stopped SIGTERM"),
         (End::Lost, "lost"),
+        (End::DaemonStopped, "daemon-stopped"),
     ];
     for (end, outcome) in table {
         assert_eq!(end.outcome(), outcome, "{end:?}");

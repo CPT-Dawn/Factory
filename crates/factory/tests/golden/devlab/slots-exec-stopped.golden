@@ -1,0 +1,25 @@
+# exec says what stopped it as run does (#37; today's devlab said nothing). Stopped while its
+# command runs, it says so before it waits on anything, hands the command the signal, and ends as
+# 128 plus the signal's number once the command is gone. A command a signal kills while devlab is
+# not signalled is named, with the signal, and its code passes through as 128 plus its number.
+$ a@demo-a devlab acquire --no-device --quiet > /dev/null
+? 0
+& e a@demo-a exec devlab exec -- sh -c 'trap "kill \$!; echo got TERM; exit 0" TERM; echo started; sleep 30 & wait'
+until e started
+signal e TERM
+wait e
+1> started
+1> got TERM
+2> devlab: sh stopped by SIGTERM after <n> s
+? 143
+& k a@demo-a exec devlab exec -- sh -c 'echo $$ > child.pid; echo started; sleep 30'
+until k started
+$ a@demo-a kill -KILL "$(cat child.pid)"
+? 0
+wait k
+1> started
+2> devlab: sh killed by SIGKILL after <n> s
+? 137
+$ a@demo-a devlab release
+2> devlab: released lease 1
+? 0

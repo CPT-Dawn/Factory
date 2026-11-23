@@ -450,6 +450,7 @@ pub(crate) mod transcript {
         devices_emulator_grant => "devices-emulator-grant.golden",
         devices_lost => "devices-lost.golden",
         devices_phone_grant => "devices-phone-grant.golden",
+        slots_exec_stopped => "slots-exec-stopped.golden",
         slots_free => "slots-free.golden",
         slots_owner_cap => "slots-owner-cap.golden",
         slots_queue => "slots-queue.golden",

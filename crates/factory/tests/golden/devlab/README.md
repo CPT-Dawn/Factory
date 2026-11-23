@@ -8,7 +8,8 @@ behaviour, and its commit says so.
 Some record behaviour today's devlab never had, so it does not replay them: a run stopped by a
 signal, or whose command a signal ended, says so on stderr (#24): `slots-run-stopped-queued`,
 `slots-run-stopped-running`, `slots-run-killed`, and the two run steps of `slots-run-exit` whose
-command kills itself.
+command kills itself. An exec says the same (#37): `slots-exec-stopped` and the exec step of
+`slots-run-exit` whose command kills itself.
 
 ## Replaying
 
@@ -25,7 +26,8 @@ Without `GOLDEN_DEVLAB`, every transcript replays against the built `factory` (`
 differs, and shows both outputs. `GOLDEN_RECORD=1` rewrites the transcripts with what the binary showed instead.
 
 Groups: `slots-*` (stack slots, #14; `slots-run-exit` is run and exec passing codes and signals,
-#15; `slots-run-stopped-*` and `slots-run-killed` are runs a signal ends, #24), `devices-*`
+#15; `slots-run-stopped-*` and `slots-run-killed` are runs a signal ends, #24;
+`slots-exec-stopped` is an exec a signal ends, #37), `devices-*`
 (phones and emulators, #16), `cli-*` (usage and help). Every transcript has a test in `tests/cli/devlab_golden.rs`.
 
 ## The sandbox
