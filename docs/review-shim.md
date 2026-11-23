@@ -71,8 +71,8 @@ CLI (`agy`, `codex`, `claude`), `pool` the backend. factory adds `backend`, `fal
   follows it. The path is read from the first line, after its last ` → `; a first line without one is a failure
   (exit 3), never a `report:` line naming nothing.
 - Exit 10 becomes 0: the review ran, and the verdict is in the report. Every other code passes through.
-- factory's stderr passes through, so a skipped backend's note and a failure's `code-review: ` line reach the
-  caller.
+- factory's stderr reaches the caller under review.sh's prefix: a line's leading `factory: ` (or
+  `factory: code-review: `) becomes `code-review: `, so a skipped backend's note and a failure read as they did.
 - When `factory` is not on PATH: `code-review: factory is not installed; run factory install`, exit 3.
 
 ## `factory wait review <label> [--timeout <duration>]`

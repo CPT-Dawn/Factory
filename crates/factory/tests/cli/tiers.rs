@@ -21,19 +21,20 @@ const SKILL: &str = "---\nname: code-review\ndescription: the reviewer\n---\n# C
 const SANDBOX_STARTED: &str =
     "I1123 09:37:00.811680 1 session.go:87] Print mode: enabling terminal sandbox for this session";
 
-/// A sandbox with fake agy, codex and claude that play the lines of \`plan\` in turn, one per
-/// review run: \`ok\` writes the report, \`quota\` is agy's exit 3 quota error, \`limit\` Codex's
-/// usage limit, \`hold\` (agy) waits for the file \`release\` before writing the report. Each
-/// run appends a line to \`runs\`: \`agy <model>\`, or \`codex\`/\`claude\` and its arguments.
+/// A sandbox with fake agy, codex and claude that play the lines of `plan` in turn, one per
+/// review run: `ok` writes the report, `quota` is agy's exit 3 quota error, `limit` Codex's
+/// usage limit, `hold` (agy) waits for the file `release` (a minute at most, so a failed test leaves
+/// no agy behind) before writing the report. Each
+/// run appends a line to `runs`: `agy <model>`, or `codex`/`claude` and its arguments.
 struct Lab {
     sandbox: Sandbox,
     repo: PathBuf,
 }
 
 impl Lab {
-    /// A lab whose repo's branch \`work\` holds \`change\` over the branch \`base\`, whose agy
+    /// A lab whose repo's branch `work` holds `change` over the branch `base`, whose agy
     /// usage shows the Gemini 5-hour bucket, the Argon weekly bucket and the Claude 5-hour
-    /// bucket with these fractions left, and whose reviewers play \`plan\`.
+    /// bucket with these fractions left, and whose reviewers play `plan`.
     fn new(change: &str, gemini: f64, argon: f64, claude: f64, plan: &[&str]) -> Lab {
         let sandbox = Sandbox::new().env("TZ", "UTC");
         let repo = sandbox.path("repo");
@@ -74,7 +75,7 @@ impl Lab {
         self.sandbox.path(name)
     }
 
-    /// agy's usage, as in [\`Lab::new\`]. Every bucket resets far off, so an empty one holds.
+    /// agy's usage, as in [`Lab::new`]. Every bucket resets far off, so an empty one holds.
     fn usage(&self, gemini: f64, argon: f64, claude: f64) {
         let bucket = |window: &str, left: f64| json!({"window": window, "remaining_fraction": left, "reset_time": "2099-01-01T00:00:00Z"});
         let usage = json!({"command": {"data": {"groups": [
@@ -110,7 +111,7 @@ impl Lab {
                  [ -n \"$log\" ] && echo '{SANDBOX_STARTED}' >> \"$log\"\n\
                  {pop}\n\
                  case $step in\n\
-                 hold) while [ ! -e '{release}' ]; do sleep 0.05; done; cat <<'R'\n{agy_result}\nR\n;;\n\
+                 hold) n=0; while [ ! -e '{release}' ] && [ $n -lt 1200 ]; do sleep 0.05; n=$((n+1)); done; cat <<'R'\n{agy_result}\nR\n;;\n\
                  ok) cat <<'R'\n{agy_result}\nR\n;;\n\
                  quota) cat <<'R'\n{agy_quota}\nR\n\
                  echo 'AGY_ERROR: Individual quota reached. Resets in 2h0m0s' >&2; exit 3;;\n\
@@ -160,7 +161,7 @@ impl Lab {
             .collect()
     }
 
-    /// The model of each agy run, \`codex\` or \`claude\` for the others.
+    /// The model of each agy run, `codex` or `claude` for the others.
     fn who(&self) -> Vec<String> {
         self.runs()
             .iter()
