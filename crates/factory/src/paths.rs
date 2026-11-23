@@ -16,19 +16,25 @@ use crate::output::Failure;
 pub struct Paths {
     pub state: PathBuf,
     pub runtime: PathBuf,
+    /// herdr's socket: `$HERDR_SOCKET_PATH`, as herdr sets it in its panes, else herdr's
+    /// default `${XDG_CONFIG_HOME:-$HOME/.config}/herdr/herdr.sock`.
+    pub herdr: PathBuf,
 }
 
 impl Paths {
     pub fn from_env() -> Result<Paths, Failure> {
         // An empty variable counts as unset, as in factory-stats.
         let var = |key: &str| env::var_os(key).filter(|value| !value.is_empty());
+        let home = || var("HOME").unwrap_or_else(|| OsString::from("/"));
         let state = match (var("FACTORY_STATE"), var("XDG_STATE_HOME")) {
             (Some(dir), _) => PathBuf::from(dir),
             (None, Some(dir)) => Path::new(&dir).join("factory"),
-            (None, None) => {
-                let home = var("HOME").unwrap_or_else(|| OsString::from("/"));
-                Path::new(&home).join(".local/state/factory")
-            }
+            (None, None) => Path::new(&home()).join(".local/state/factory"),
+        };
+        let herdr = match (var("HERDR_SOCKET_PATH"), var("XDG_CONFIG_HOME")) {
+            (Some(socket), _) => PathBuf::from(socket),
+            (None, Some(dir)) => Path::new(&dir).join("herdr/herdr.sock"),
+            (None, None) => Path::new(&home()).join(".config/herdr/herdr.sock"),
         };
         let runtime = var("XDG_RUNTIME_DIR").ok_or_else(|| {
             Failure::precondition("XDG_RUNTIME_DIR is not set; run factory inside a user session")
@@ -36,12 +42,21 @@ impl Paths {
         Ok(Paths {
             state,
             runtime: Path::new(&runtime).join("factory"),
+            herdr,
         })
     }
 
     /// The event ledger factory-stats reads.
     pub fn ledger(&self) -> PathBuf {
         self.state.join("events.jsonl")
+    }
+
+    /// The final report of the lead `slug` working in `repo`, as lead.sh names it.
+    pub fn lead_report(&self, repo: &str, slug: &str) -> PathBuf {
+        self.state
+            .join("leads")
+            .join(repo)
+            .join(format!("{slug}.md"))
     }
 
     pub fn socket(&self) -> PathBuf {

@@ -14,11 +14,26 @@ use serde_json::{Value, json};
 /// The most characters a default line shows; a longer one is cut and ends in `…`.
 pub const LINE_LIMIT: usize = 200;
 
-/// What a command that succeeded shows.
+/// What a command that answered shows: one line, or the JSON object with `--json`.
 #[derive(Debug)]
 pub struct Done {
     pub line: String,
+    /// Lines shown after the line, where the spec names them (a lead's last pane lines).
+    pub detail: Vec<String>,
     pub json: Value,
+    /// Ok, or another code for an answer that is not a failure (a lead that needs attention).
+    pub exit: Exit,
+}
+
+impl Done {
+    pub fn new(line: impl Into<String>, json: Value) -> Done {
+        Done {
+            line: line.into(),
+            detail: Vec::new(),
+            json,
+            exit: Exit::Ok,
+        }
+    }
 }
 
 /// Why a command failed: its exit code and one line the agent can act on.
@@ -47,12 +62,15 @@ impl Failure {
 
 /// Prints what a command that succeeded shows. Output nobody reads is not an error.
 pub fn print(done: &Done, json: bool) {
-    let line = if json {
-        done.json.to_string()
-    } else {
-        bounded(&one_line(&done.line))
-    };
-    let _ = writeln!(io::stdout(), "{line}");
+    let mut out = io::stdout().lock();
+    if json {
+        let _ = writeln!(out, "{}", done.json);
+        return;
+    }
+    let _ = writeln!(out, "{}", bounded(&one_line(&done.line)));
+    for line in &done.detail {
+        let _ = writeln!(out, "{}", bounded(&one_line(line)));
+    }
 }
 
 /// Shows a command's outcome and turns it into its exit code.
@@ -60,7 +78,7 @@ pub fn finish(outcome: Result<Done, Failure>, json: bool) -> ExitCode {
     match outcome {
         Ok(done) => {
             print(&done, json);
-            ExitCode::from(Exit::Ok.code())
+            ExitCode::from(done.exit.code())
         }
         Err(failure) => {
             if json {

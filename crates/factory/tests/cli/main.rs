@@ -5,6 +5,7 @@
 
 mod harness;
 mod help;
+mod lead;
 mod log;
 // Marked cfg(test) so clippy treats the harness as test code and lets it unwrap.
 #[cfg(test)]
