@@ -148,6 +148,7 @@ fn reviewer(backend: &Backend, paths: &Paths) -> Box<dyn Reviewer> {
             effort,
             backend.auth,
             paths.state.join("agy-usage.json"),
+            paths.state.join("checkouts"),
         )),
         Cli::Codex => Box::new(Codex::new(model, effort, &home_of("CODEX_HOME", ".codex"))),
         Cli::Claude => Box::new(Claude::new(
@@ -288,6 +289,7 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
         let stream = files.stream(reviewer.stream_extension());
         let job = Job {
             cwd: cwd.clone(),
+            head: inputs.head.clone(),
             prompt: files.prompt.clone(),
             report: files.report.clone(),
             stream: stream.clone(),
@@ -300,6 +302,12 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
             Ok(()) => {}
             Err(ReviewerError::OutOfQuota(reset)) => {
                 cool(&mut daemon, run, &backend.name, reset)?;
+                continue;
+            }
+            // Its review ran without the sandbox, so it is not kept: the next backend reviews.
+            Err(ReviewerError::NoSandbox(why)) => {
+                run.notes.push(format!("{} skipped: {why}", backend.name));
+                run.skipped.push((backend.name.clone(), why));
                 continue;
             }
             Err(e) => return Err(reviewer_failed(reviewer.as_ref(), &e, &stream)),
@@ -400,7 +408,6 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
     Ok(done)
 }
 
-/// Cools `backend` down until its `reset`, in the daemon and in the run's record.
 /// The routes a run may still be granted: none it skipped, and none it cooled down while
 /// another is left. The daemon decides whether a cooled one's reset has come.
 fn candidates<'a>(routes: &'a [Route], run: &Run) -> Vec<&'a Route> {
@@ -440,6 +447,7 @@ fn bounded(timeout: Option<Duration>, routes: &[Route]) -> Result<(), Failure> {
     }
 }
 
+/// Cools `backend` down until its `reset`, in the daemon and in the run's record.
 fn cool(
     daemon: &mut client::Session,
     run: &mut Run,
@@ -702,6 +710,7 @@ fn reviewer_failed(reviewer: &dyn Reviewer, e: &ReviewerError, stream: &Path) ->
         ReviewerError::Start(_) => {
             format!("check that {} is installed and on PATH", reviewer.name())
         }
+        ReviewerError::Checkout(_) => "check the repository and its worktrees".to_owned(),
         ReviewerError::TimedOut(_) => format!(
             "its process group was killed; see {}, then retry or raise --timeout",
             stream.display()

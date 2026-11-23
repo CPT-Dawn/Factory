@@ -28,7 +28,10 @@
 //!
 //! [[review.backend]]
 //! cli = "agy"
-//! model = "gemini-4-neon"
+//! model = "gemini-4-neon"  # default: the model chosen with agy's /model (the label kept
+//!                          # under "model" in ~/.gemini/antigravity-cli/settings.json),
+//!                          # else agy's default, Gemini 4 Neon; either way its quota is
+//!                          # that model's group in agy's /usage
 //! auth = "subscription"    # agy only: its "subscription" login, or an "api-key" in
 //!                          # GEMINI_API_KEY (default: subscription)
 //! ```

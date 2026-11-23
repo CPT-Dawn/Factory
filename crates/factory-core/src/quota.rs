@@ -222,10 +222,16 @@ pub fn agy_usage(usage: &str, group: &str) -> AgyUsage {
     until.map_or(AgyUsage::Left, |until| AgyUsage::Empty { until })
 }
 
+/// The model agy runs when none is chosen, in the factory's config or in agy: its log names it
+/// `Gemini 4 Neon (High)` (agy 1.5).
+pub const AGY_DEFAULT_MODEL: &str = "gemini-4-neon";
+
 /// The group of agy's models whose quota `model` draws on, as its usage names them: its
 /// Claude and GPT models share one, Gemini 4 Argon has its own, and the other Gemini models
-/// share the rest.
+/// share the rest. `model` is an ID such as `claude-opus-5-5` or a label as agy's `/model`
+/// saves it, such as `Claude Opus 5.5 (Thinking)`.
 pub fn agy_group(model: &str) -> &'static str {
+    let model = model.trim().to_lowercase().replace(' ', "-");
     if model.starts_with("claude-") || model.starts_with("gpt-") {
         "Claude and GPT models"
     } else if model.starts_with("gemini-4-argon") {
@@ -233,6 +239,17 @@ pub fn agy_group(model: &str) -> &'static str {
     } else {
         "Gemini Models"
     }
+}
+
+/// The model a review draws on when the factory's config names none: the one chosen with
+/// agy's `/model`, which its `settings` (`~/.gemini/antigravity-cli/settings.json`) keep by
+/// its label under `model`, else agy's default. Settings that can't be read choose none.
+pub fn agy_chosen_model(settings: Option<&str>) -> String {
+    settings
+        .and_then(|settings| serde_json::from_str::<Value>(settings).ok())
+        .and_then(|settings| Some(settings.get("model")?.as_str()?.trim().to_owned()))
+        .filter(|model| !model.is_empty())
+        .unwrap_or_else(|| AGY_DEFAULT_MODEL.to_owned())
 }
 
 /// agy's out-of-quota signature: an error of its own that says "Individual quota reached" and
