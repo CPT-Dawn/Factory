@@ -33,6 +33,7 @@ use factory_adapters::herdr::Herdr;
 use factory_adapters::inbox::Inbox;
 use listenfd::ListenFd;
 
+use crate::claude::Claude;
 use crate::lab::service::{self, Lab};
 use crate::lab::wire::{ACQUIRE, RESERVE};
 use crate::leads::Leads;
@@ -42,11 +43,12 @@ use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::pollers::Pollers;
 use crate::protocol::{
-    ErrorBody, LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH,
-    MONITOR_START, MONITOR_STATUS, MONITOR_STOP, NotifyParams, Outcome, REVIEW_ACQUIRE,
-    REVIEW_QUOTA, Request, Response, ReviewRef, STATUS, SpawnParams, StatusParams, WAIT_CI,
-    WAIT_LEAD, WAIT_LEASE, WAIT_NOTIFY, WAIT_REVIEW, WaitCiParams, WaitCiResult, WaitLeadParams,
-    WaitLeaseParams, WaitReviewParams,
+    CLAUDE_LIMIT, CLAUDE_QUOTA, CLAUDE_WINDOW, ClaudeLimitParams, ClaudeQuotaParams,
+    ClaudeWindowParams, ErrorBody, LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LOG, LeadParams, LogParams,
+    LogResult, MISMATCH, MONITOR_START, MONITOR_STATUS, MONITOR_STOP, NotifyParams, Outcome,
+    REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, ReviewRef, STATUS, SpawnParams, StatusParams,
+    WAIT_CI, WAIT_CLAUDE, WAIT_LEAD, WAIT_LEASE, WAIT_NOTIFY, WAIT_REVIEW, WaitCiParams,
+    WaitCiResult, WaitClaudeParams, WaitLeadParams, WaitLeaseParams, WaitReviewParams,
 };
 use crate::reviews::Reviews;
 use crate::router::Router;
@@ -65,6 +67,7 @@ struct Daemon {
     pollers: Arc<Pollers>,
     steward: Arc<Steward>,
     notifier: Arc<Notifier>,
+    claude: Arc<Claude>,
 }
 
 /// How long a stopping daemon gives the connections it holds to finish their requests.
@@ -96,6 +99,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
     )?;
     let pollers = Arc::new(Pollers::new(paths.clone(), Gh));
     let router = Arc::new(Router::open(Store::open(&paths.database())?)?);
+    let claude = Arc::new(Claude::open(Store::open(&paths.database())?)?);
     let steward = Steward::new(
         paths.clone(),
         Arc::clone(&leads),
@@ -165,6 +169,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
             pollers,
             steward,
             notifier,
+            claude,
         };
         serve(listener, Arc::new(daemon), stop).await;
         Ok(())
@@ -441,6 +446,33 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
             }
             Err(refused) => refused,
         },
+        CLAUDE_WINDOW => match params::<ClaudeWindowParams>(CLAUDE_WINDOW, request.params) {
+            Ok(params) => answered(daemon.claude.see(&params)),
+            Err(refused) => refused,
+        },
+        CLAUDE_LIMIT => match params::<ClaudeLimitParams>(CLAUDE_LIMIT, request.params) {
+            Ok(params) => answered(daemon.claude.limit(&params)),
+            Err(refused) => refused,
+        },
+        CLAUDE_QUOTA => match params::<ClaudeQuotaParams>(CLAUDE_QUOTA, request.params) {
+            Ok(params) => answered(Ok::<_, Failure>(daemon.claude.verdict(params.hold_at))),
+            Err(refused) => refused,
+        },
+        WAIT_CLAUDE => match params::<WaitClaudeParams>(WAIT_CLAUDE, request.params) {
+            // Biased, as a lead wait: a stopping daemon answers no wait.
+            Ok(params) => {
+                let _wait = daemon.leads.register(Wait {
+                    waiter: params.waiter.clone(),
+                    on: WaitOn::Claude,
+                });
+                tokio::select! {
+                    biased;
+                    () = stop.clone().stopping() => stopped("wait"),
+                    waited = daemon.claude.wait(&params) => answered(waited),
+                }
+            }
+            Err(refused) => refused,
+        },
         WAIT_NOTIFY => match params::<NotifyParams>(WAIT_NOTIFY, request.params) {
             // Biased, as a blocking wait: a stopping daemon registers no wait.
             Ok(params) => tokio::select! {
@@ -461,6 +493,7 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
                     &daemon.lab,
                     &daemon.leads,
                     &daemon.steward,
+                    &daemon.claude,
                 )
                 .await,
             ),

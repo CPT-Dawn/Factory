@@ -5,6 +5,7 @@
 
 pub mod agy;
 pub mod ci;
+pub mod claude;
 pub mod cutover;
 pub mod duration;
 pub mod event;
