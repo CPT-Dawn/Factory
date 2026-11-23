@@ -54,6 +54,9 @@ pub struct Args {
     pub previous: Option<PathBuf>,
     /// Overrides every backend's configured timeout.
     pub timeout: Option<Duration>,
+    /// The ticket's tier, as the caller named it; only recorded, backends are tried in the
+    /// configured order whatever it is.
+    pub tier: Option<String>,
 }
 
 pub fn run(args: &Args) -> Result<Done, Failure> {
@@ -115,7 +118,9 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
                 .unwrap_or("the run ended without a reading")),
         },
     };
-    let logged = log::land(&paths, "review", &record.pairs());
+    let mut pairs = record.pairs();
+    pairs.extend(args.tier.iter().map(|tier| format!("tier={tier}")));
+    let logged = log::land(&paths, "review", &pairs);
     match (result, logged) {
         (result, Ok(_)) => result,
         (Ok(done), Err(e)) => Err(Failure::precondition(format!(
@@ -355,6 +360,8 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
             "blocking_findings": reading.blocking_lines(),
         }),
     );
+    // Whole: the line names the report, and a shim reads that path.
+    done.whole = true;
     done.more = reading.blocking_lines();
     done.notes = std::mem::take(&mut run.notes);
     if reading.verdict == Verdict::Findings {

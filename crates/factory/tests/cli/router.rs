@@ -224,7 +224,8 @@ fn the_config_file_sets_codexs_model_effort_and_timeout() {
 
     assert_eq!(out.code, 124, "{out:?}");
     assert!(
-        out.stderr.starts_with("factory: code-review: codex timed out after 1s"),
+        out.stderr
+            .starts_with("factory: code-review: codex timed out after 1s"),
         "{out:?}"
     );
     let argv = &sandbox.calls("codex")[0];

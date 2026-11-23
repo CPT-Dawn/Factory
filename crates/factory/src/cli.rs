@@ -57,6 +57,9 @@ pub enum Command {
         /// Seconds a reviewer may take before its process group is killed (default: the config's)
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
+        /// The ticket's tier, recorded in the review's event: hard, standard or trivial
+        #[arg(long, value_name = "TIER", value_parser = ["hard", "standard", "trivial"])]
+        tier: Option<String>,
     },
     /// Answer a Claude Code hook: its JSON on stdin, its hook protocol on stdout
     Hook {

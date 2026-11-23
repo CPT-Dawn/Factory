@@ -100,12 +100,14 @@ fn run(command: Command, json: bool) -> ExitCode {
             spec,
             previous,
             timeout,
+            tier,
         } => review::run(&review::Args {
             base,
             label,
             spec,
             previous,
             timeout: timeout.map(std::time::Duration::from_secs),
+            tier,
         })
         // review.sh's failures said so, and factory-stats' classifier still matches the text.
         .map_err(|failure| Failure::new(failure.exit, format!("code-review: {}", failure.message))),
