@@ -17,6 +17,7 @@ mod log;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
 mod monitor;
+mod reserve;
 mod review;
 mod router;
 mod spawn;

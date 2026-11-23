@@ -15,6 +15,8 @@ mod host;
 mod lease;
 mod native;
 mod owner;
+mod reservations;
+mod reserve;
 mod run;
 pub mod service;
 mod stack;

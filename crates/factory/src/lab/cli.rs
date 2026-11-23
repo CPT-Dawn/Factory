@@ -12,7 +12,7 @@ use factory_core::lab::config::ProjectConfig;
 
 use super::lease;
 use super::wire::Lease;
-use super::{android, run, stack, status};
+use super::{android, reserve, run, stack, status};
 use crate::output::Failure;
 use factory_adapters::adb::AdbCli;
 
@@ -72,6 +72,7 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
             );
             Ok(0)
         }
+        "reserve" => reserve::main(args),
         "exec" => {
             let ctx = context()?;
             let rest = match args.split_first() {

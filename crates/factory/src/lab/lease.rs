@@ -23,7 +23,7 @@ use crate::output::Failure;
 use crate::paths::Paths;
 
 /// How much longer than its wait the CLI listens for the daemon's answer.
-const ANSWER_GRACE: Duration = Duration::from_secs(60);
+pub const ANSWER_GRACE: Duration = Duration::from_secs(60);
 /// How much longer an answer may take when the daemon may boot emulators for it: making their
 /// AVDs, starting their units and booting them, then stopping them when that fails.
 const BOOT_GRACE: Duration = Duration::from_secs(BOOT_TIMEOUT_SEC + 300);
@@ -95,6 +95,7 @@ pub fn ask(
         resume: None,
         client: Some(me()),
         run,
+        reservation: super::context::reserved(),
     };
     let listen = Duration::try_from_secs_f64(wait_sec)
         .ok()
@@ -202,7 +203,7 @@ pub fn wake(lease: &Lease) {
 }
 
 /// The project as a grant needs it: its cap here, its ports and its stack's.
-fn project_ask(ctx: &Ctx, p: &ProjectConfig) -> Result<ProjectAsk, Failure> {
+pub fn project_ask(ctx: &Ctx, p: &ProjectConfig) -> Result<ProjectAsk, Failure> {
     let stack = stack::info(p, &ctx.worktree, 0)?.map(|info| StackAsk {
         project_id: info.project_id,
         ports: info.ports.iter().map(|(_, port)| *port).collect(),
