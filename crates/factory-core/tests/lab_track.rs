@@ -1,9 +1,10 @@
-//! How long the daemon waits before it restarts the adb device stream (#42): the wait doubles
-//! with each restart that follows a stream that never got going, up to a cap.
+//! The adb device stream's watch (#42): how far a stream has come through its lists, and how
+//! long the daemon waits before it restarts one (the wait doubles with each restart that
+//! follows a stream that never got going, up to a cap).
 
 use std::time::Duration;
 
-use factory_core::lab::devices::restart_delay;
+use factory_core::lab::devices::{ListFraming, restart_delay};
 
 const BASE: Duration = Duration::from_secs(3);
 const CAP: Duration = Duration::from_secs(60);
@@ -25,4 +26,46 @@ fn the_wait_stops_growing_at_the_cap() {
 #[test]
 fn a_very_long_run_of_failures_does_not_overflow() {
     assert_eq!(restart_delay(u32::MAX, BASE, CAP), CAP);
+}
+
+#[test]
+fn a_stream_with_nothing_yet_stands_between_lists() {
+    let framing = ListFraming::default();
+    assert!(!framing.mid_list());
+}
+
+#[test]
+fn whole_lists_are_counted_and_leave_the_stream_between_lists() {
+    let mut framing = ListFraming::default();
+    // Two lists in one read: a phone, then none.
+    let finished = framing.feed(b"0013FAKEPHONE01\tdevice\n0000");
+    assert_eq!(finished, 2);
+    assert!(!framing.mid_list());
+}
+
+#[test]
+fn a_list_cut_anywhere_stands_mid_list_until_its_last_byte() {
+    let stream = b"0013FAKEPHONE01\tdevice\n";
+    for cut in 1..stream.len() {
+        let mut framing = ListFraming::default();
+        let (head, tail) = stream.split_at(cut);
+        assert_eq!(framing.feed(head), 0, "cut at {cut}");
+        assert!(framing.mid_list(), "cut at {cut}");
+        assert_eq!(framing.feed(tail), 1, "cut at {cut}");
+        assert!(!framing.mid_list(), "cut at {cut}");
+    }
+}
+
+#[test]
+fn a_list_that_ends_where_the_next_begins_stands_mid_list() {
+    let mut framing = ListFraming::default();
+    assert_eq!(framing.feed(b"000000"), 1);
+    assert!(framing.mid_list());
+}
+
+#[test]
+fn a_length_that_is_not_hex_never_comes_whole() {
+    let mut framing = ListFraming::default();
+    assert_eq!(framing.feed(b"zzzz0000"), 0);
+    assert!(framing.mid_list());
 }

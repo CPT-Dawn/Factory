@@ -95,6 +95,58 @@ pub fn parse_track(buf: &[u8]) -> (Vec<Vec<Attached>>, usize) {
     (frames, at)
 }
 
+/// How far an `adb track-devices` stream has come through its lists, by their lengths alone
+/// (no device row is read): it tells a stream that stopped partway through a list from one
+/// that is quiet between lists. A length that is not four hex digits leaves it partway for
+/// good, as [`parse_track`] never gets past it either.
+#[derive(Debug, Clone, Default)]
+pub struct ListFraming {
+    /// The digits of the next length read so far.
+    head: Vec<u8>,
+    /// The bytes still to come of the list under way.
+    left: usize,
+    broken: bool,
+}
+
+impl ListFraming {
+    /// Takes the stream's next bytes; returns how many lists they finished.
+    pub fn feed(&mut self, mut bytes: &[u8]) -> usize {
+        let mut finished = 0;
+        while !bytes.is_empty() && !self.broken {
+            if self.left > 0 {
+                let take = self.left.min(bytes.len());
+                self.left -= take;
+                bytes = bytes.get(take..).unwrap_or_default();
+                if self.left == 0 {
+                    finished += 1;
+                }
+                continue;
+            }
+            let take = (4 - self.head.len()).min(bytes.len());
+            self.head
+                .extend_from_slice(bytes.get(..take).unwrap_or_default());
+            bytes = bytes.get(take..).unwrap_or_default();
+            if self.head.len() == 4 {
+                match std::str::from_utf8(&self.head)
+                    .ok()
+                    .and_then(|h| usize::from_str_radix(h, 16).ok())
+                {
+                    Some(0) => finished += 1,
+                    Some(len) => self.left = len,
+                    None => self.broken = true,
+                }
+                self.head.clear();
+            }
+        }
+        finished
+    }
+
+    /// Whether the stream stands partway through a list.
+    pub fn mid_list(&self) -> bool {
+        self.broken || self.left > 0 || !self.head.is_empty()
+    }
+}
+
 /// How long to wait before restart number `restarts` (0 for the first) of the adb device
 /// stream: `base` doubled for each restart before it, at most `cap`.
 pub fn restart_delay(

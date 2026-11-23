@@ -14,8 +14,8 @@ use crate::support::{Sandbox, kill_group, run};
 /// The sandbox's adb: each `track-devices` run is numbered, writes its pid to `adb/pid.<run>`, and
 /// then plays the part `script` gives it for that run (shell, with `$n` the run and `frame
 /// <lines>` writing one device list). `adb start-server`, which the daemon probes with, hangs
-/// while `adb/probe-hangs` exists (its pid is then in `adb/probe.pid`), and notes each call's pid in
-/// `adb/probes`.
+/// while `adb/probe-hangs` exists (its pid is then in `adb/probe.pid`, and that of a child it
+/// left running in `adb/probe-child.pid`), and notes each call's pid in `adb/probes`.
 fn adb_playing(sandbox: &Sandbox, script: &str) -> PathBuf {
     let dir = sandbox.path("adb");
     fs::create_dir_all(&dir).expect("create the adb dir");
@@ -25,7 +25,12 @@ frame() {{ printf '%04x' "$(printf '%s\n' "$1" | wc -c)"; printf '%s\n' "$1"; }}
 case "$1" in
 start-server)
   echo "$$" >> "$w/probes"
-  if [ -e "$w/probe-hangs" ]; then echo "$$" > "$w/probe.pid"; exec sleep 1000; fi
+  if [ -e "$w/probe-hangs" ]; then
+    sleep 1000 &
+    echo "$!" > "$w/probe-child.pid"
+    echo "$$" > "$w/probe.pid"
+    exec sleep 1000
+  fi
   exit 0 ;;
 track-devices)
   n=$(( $(cat "$w/runs" 2>/dev/null || echo 0) + 1 ))
@@ -128,7 +133,7 @@ fn a_stream_that_ends_is_restarted_and_the_devices_seen_after_it_are_tracked() {
 fn a_stream_that_never_shows_a_list_is_cut_off_and_restarted_within_a_bound() {
     let sandbox = Sandbox::new()
         .env("FACTORY_ADB_BACKOFF_MS", "50")
-        .env("FACTORY_ADB_FIRST_FRAME_MS", "300");
+        .env("FACTORY_ADB_LIST_MS", "300");
     let (sandbox, wt) = setup(sandbox);
     let adb = adb_playing(
         &sandbox,
@@ -180,6 +185,12 @@ fn a_stream_whose_adb_stops_answering_after_its_list_is_cut_off_and_restarted() 
         daemon_log(&sandbox)
     );
     assert!(!runs(&pid_of(&adb, 1)), "the hung stream still runs");
+    let question = fs::read_to_string(adb.join("probe.pid")).unwrap_or_default();
+    let its_child = fs::read_to_string(adb.join("probe-child.pid")).unwrap_or_default();
+    assert!(
+        poll_until(|| !runs(&question) && !runs(&its_child)),
+        "the question {question:?} that went unanswered, or its child {its_child:?}, still runs"
+    );
 }
 
 #[test]
@@ -284,6 +295,7 @@ fn after_the_daemon_is_killed_mid_question_the_question_to_adb_does_not_linger()
         poll_until(|| runs(&fs::read_to_string(adb.join("probe.pid")).unwrap_or_default()));
     assert!(asking, "adb was never asked whether it answers");
     let question = fs::read_to_string(adb.join("probe.pid")).unwrap_or_default();
+    let its_child = fs::read_to_string(adb.join("probe-child.pid")).unwrap_or_default();
 
     let daemon: u32 = fs::read_to_string(sandbox.path("run/factory/daemon.pid"))
         .expect("a daemon runs")
@@ -292,10 +304,10 @@ fn after_the_daemon_is_killed_mid_question_the_question_to_adb_does_not_linger()
         .expect("a pid");
     kill_group(daemon, Signal::KILL);
 
-    let gone = poll_until(|| !runs(&question) && !runs(&pid_of(&adb, 1)));
+    let gone = poll_until(|| !runs(&question) && !runs(&its_child) && !runs(&pid_of(&adb, 1)));
     assert!(
         gone,
-        "the question {question:?} ({}) or the stream {:?} ({}) outlived the daemon",
+        "the question {question:?} ({}), its child {its_child:?} or the stream {:?} ({}) outlived the daemon",
         runs(&question),
         pid_of(&adb, 1),
         runs(&pid_of(&adb, 1))
@@ -306,7 +318,7 @@ fn after_the_daemon_is_killed_mid_question_the_question_to_adb_does_not_linger()
 fn a_first_list_that_stops_halfway_is_as_hung_as_none() {
     let sandbox = Sandbox::new()
         .env("FACTORY_ADB_BACKOFF_MS", "50")
-        .env("FACTORY_ADB_FIRST_FRAME_MS", "300");
+        .env("FACTORY_ADB_LIST_MS", "300");
     let (sandbox, wt) = setup(sandbox);
     let adb = adb_playing(
         &sandbox,
@@ -316,6 +328,36 @@ fn a_first_list_that_stops_halfway_is_as_hung_as_none() {
     );
 
     let tracked = poll_until(|| shows(&sandbox, &wt, "PHONEA01"));
+
+    assert!(
+        tracked,
+        "{}\n{}",
+        status(&sandbox, &wt),
+        daemon_log(&sandbox)
+    );
+    assert!(
+        !runs(&pid_of(&adb, 1)),
+        "the stream that stopped halfway still runs"
+    );
+}
+
+#[test]
+fn a_later_list_that_stops_halfway_is_cut_off_though_adb_still_answers() {
+    let sandbox = Sandbox::new()
+        .env("FACTORY_ADB_BACKOFF_MS", "50")
+        .env("FACTORY_ADB_LIST_MS", "300")
+        .env("FACTORY_ADB_PROBE_MS", "100");
+    let (sandbox, wt) = setup(sandbox);
+    let adb = adb_playing(
+        &sandbox,
+        &format!(
+            r#"if [ "$n" = 1 ]; then frame '{PHONE_A}'; printf '00'; exec sleep 1000; fi
+  frame '{PHONE_A}
+{PHONE_B}'; exec sleep 1000"#
+        ),
+    );
+
+    let tracked = poll_until(|| shows(&sandbox, &wt, "PHONEB02"));
 
     assert!(
         tracked,
