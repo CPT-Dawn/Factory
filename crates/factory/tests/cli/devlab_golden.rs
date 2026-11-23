@@ -393,7 +393,7 @@ fn a_relative_devlab_path_is_read_from_the_workspace_root() {
 
 /// One test per transcript, replayed against [`golden::devlab_under_test`]: the built `factory`
 /// unless `GOLDEN_DEVLAB` names another; skipped when there is none. Run one group with `cargo test transcript::slots_` (or `devices_`, `cli_`).
-mod transcript {
+pub(crate) mod transcript {
     use crate::support::golden;
 
     macro_rules! transcripts {

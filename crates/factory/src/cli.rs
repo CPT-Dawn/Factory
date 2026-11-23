@@ -83,6 +83,15 @@ pub enum Command {
     },
     /// Stop the daemon and remove the binary and units install put in place; state stays
     Uninstall,
+    /// Hand the devlab name on PATH to factory lab and retire today's devlab, while it holds no lease
+    Cutover {
+        /// Give the name back to today's devlab and start its watcher again
+        #[arg(long)]
+        rollback: bool,
+        /// With --rollback: skip the check that factory lab holds nothing, for a lab that no longer answers
+        #[arg(long, requires = "rollback")]
+        force: bool,
+    },
     /// Lease this PC's local stack slots, in devlab's words: factory lab help (or run it as devlab)
     #[command(disable_help_flag = true)]
     Lab {
