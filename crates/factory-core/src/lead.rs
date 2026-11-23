@@ -140,6 +140,43 @@ pub fn lead_name(arg: &str) -> Result<String, BadLeadName> {
     }
 }
 
+/// The integration branch a lead's worktree is cut on.
+pub fn branch(slug: &str) -> String {
+    format!("factory/{slug}")
+}
+
+/// What a freshly started lead is told: run `skill` on `spec`, unattended, and leave the final
+/// report at `report`.
+pub fn prompt(skill: &str, spec: &str, branch: &str, report: &str) -> String {
+    format!(
+        "/{skill} {spec}. Integration branch: {branch}, already checked out here. \
+         You run unattended: wherever a skill says to ask or confirm with the user, decide from \
+         the spec and tickets yourself and list each such decision in your report. When everything \
+         is finished, run devlab release (a finished lead must not hold a stack slot or a phone), \
+         then write your final report to {report}."
+    )
+}
+
+/// The arguments Claude starts with: its model and effort, and a settings override that turns
+/// each of `disabled_plugins` (`name@marketplace`) off, so their skills stay out of every request.
+pub fn claude_args(model: &str, effort: &str, disabled_plugins: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "--model".to_owned(),
+        model.to_owned(),
+        "--effort".to_owned(),
+        effort.to_owned(),
+    ];
+    if !disabled_plugins.is_empty() {
+        let enabled: serde_json::Map<String, serde_json::Value> = disabled_plugins
+            .iter()
+            .map(|plugin| (plugin.clone(), serde_json::Value::Bool(false)))
+            .collect();
+        args.push("--settings".to_owned());
+        args.push(serde_json::json!({ "enabledPlugins": enabled }).to_string());
+    }
+    args
+}
+
 /// The slug of a lead's agent name.
 pub fn slug(name: &str) -> &str {
     name.strip_prefix(PREFIX).unwrap_or(name)

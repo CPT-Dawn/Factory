@@ -11,13 +11,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use factory_adapters::herdr::{Event, Events, Herdr, HerdrApi, HerdrError, PROTOCOL, Watch};
 use factory_core::duration;
+use factory_core::event;
 use factory_core::exit::Exit;
 use factory_core::lead::{self, AgentStatus, LeadFacts, LeadState};
 use factory_core::wait::{Wait, WaitId, WaitOn, Waits};
@@ -25,9 +26,12 @@ use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
+use crate::ledger::Ledger;
 use crate::output::Failure;
 use crate::paths::Paths;
-use crate::protocol::{LeadList, LeadReport, WaitLeadResult};
+use crate::protocol::{LeadList, LeadReport, SpawnParams, SpawnResult, WaitLeadResult};
+use crate::spawn;
+use crate::store::Store;
 
 /// How many of a pane's last lines a blocked or asking lead shows.
 const SCREEN_LINES: usize = 10;
@@ -37,6 +41,9 @@ const READ_LINES: u32 = 60;
 pub struct Leads<H: HerdrApi = Herdr> {
     herdr: H,
     paths: Paths,
+    ledger: Arc<Ledger>,
+    /// What a restart must not lose: the leads spawned whose end is not in the ledger yet.
+    store: Mutex<Store>,
     inner: Mutex<Inner>,
     /// Held while the picture is rebuilt from herdr, so one rebuild runs at a time.
     turn: tokio::sync::Mutex<()>,
@@ -55,6 +62,14 @@ struct Inner {
     /// The task reading the live subscription, and its generation.
     follower: Option<(u64, AbortHandle)>,
     generation: u64,
+    /// The leads this daemon spawned that have not finished, by agent name: each gets one
+    /// `lead-end` event when it does.
+    unfinished: BTreeMap<String, Unfinished>,
+}
+
+struct Unfinished {
+    repo: String,
+    report: PathBuf,
 }
 
 struct Lead {
@@ -65,10 +80,35 @@ struct Lead {
 }
 
 impl<H: HerdrApi> Leads<H> {
-    pub fn new(paths: Paths, herdr: H) -> Arc<Leads<H>> {
-        Arc::new(Leads {
+    pub fn new(
+        paths: Paths,
+        herdr: H,
+        ledger: Arc<Ledger>,
+        store: Store,
+    ) -> Result<Arc<Leads<H>>, Failure> {
+        let unfinished = store
+            .leads_running()
+            .map_err(|e| {
+                Failure::precondition(format!(
+                    "cannot read the running leads from the database: {e}; check FACTORY_STATE"
+                ))
+            })?
+            .into_iter()
+            .map(|(name, repo, report)| {
+                (
+                    name,
+                    Unfinished {
+                        repo,
+                        report: PathBuf::from(report),
+                    },
+                )
+            })
+            .collect();
+        Ok(Arc::new(Leads {
             herdr,
             paths,
+            ledger,
+            store: Mutex::new(store),
             inner: Mutex::new(Inner {
                 down: Some("herdr not checked yet".to_owned()),
                 leads: BTreeMap::new(),
@@ -76,17 +116,168 @@ impl<H: HerdrApi> Leads<H> {
                 watched: BTreeSet::new(),
                 follower: None,
                 generation: 0,
+                unfinished,
             }),
             turn: tokio::sync::Mutex::new(()),
             changed: watch::channel(0).0,
-        })
+        }))
     }
 
     /// Checks herdr at the daemon's start; a failure goes to the daemon's log, and each lead
     /// command checks again.
     pub async fn start(self: Arc<Self>) {
+        tokio::spawn(Arc::clone(&self).settle_loop());
         if let Err(failure) = self.up().await {
             eprintln!("factory: {}", failure.message);
+        }
+    }
+
+    /// Starts a lead in a new herdr workspace, writes its `lead-start` event and keeps watch
+    /// for its end. Nothing is asked of herdr until it is known to be there.
+    pub async fn spawn(self: &Arc<Self>, params: SpawnParams) -> Result<SpawnResult, Failure> {
+        let name = lead::lead_name(&params.lead).map_err(|e| Failure::usage(e.to_string()))?;
+        self.up().await?;
+        let slug = lead::slug(&name);
+        let branch = lead::branch(slug);
+        let report = self.paths.lead_report(&params.repo_name, slug);
+        // A report left by an earlier lead of this name would read as this one finished.
+        prepare(&report)?;
+        let prompt = lead::prompt(
+            &params.skill,
+            &params.spec,
+            &branch,
+            &report.to_string_lossy(),
+        );
+        let plan = spawn::Plan {
+            name: &name,
+            repo: Path::new(&params.repo_path),
+            branch: &branch,
+            base: &params.base,
+            label: slug,
+            claude_args: &params.claude_args,
+            prompt: &prompt,
+            pause: Duration::from_millis(params.retry_pause_ms),
+        };
+        let started = spawn::start(&self.herdr, &plan).await;
+        let (outcome, reason, stalls) = match &started {
+            Ok(started) => ("ok", "", started.stalls),
+            Err(failed) => ("error", failed.message.as_str(), failed.stalls),
+        };
+        let pairs = [
+            ("repo", params.repo_name.as_str()),
+            ("slug", slug),
+            ("spec", params.spec.as_str()),
+            ("skill", params.skill.as_str()),
+            ("base", params.base.as_str()),
+            ("branch", branch.as_str()),
+            ("outcome", outcome),
+            ("reason", reason),
+            ("stalls", &stalls.to_string()),
+            ("model", params.model.as_str()),
+            ("effort", params.effort.as_str()),
+        ]
+        .map(|(key, value)| format!("{key}={value}"));
+        let event = event::Event::from_args("lead-start", &pairs, params.session.as_deref())
+            .map_err(|e| Failure::usage(e.to_string()))?;
+        self.ledger.append(&event).map_err(|e| {
+            Failure::precondition(format!(
+                "cannot append to {}: {e}; check the disk and FACTORY_STATE",
+                self.ledger.path.display()
+            ))
+        })?;
+        let started = started.map_err(|failed| Failure::precondition(failed.message))?;
+        self.expect_end(&name, &params.repo_name, &report);
+        {
+            // The workspace is new: list herdr again so its pane is watched.
+            let _turn = self.turn.lock().await;
+            if let Err(failure) = self.rebuild().await {
+                eprintln!("factory: {}", failure.message);
+            }
+        }
+        Ok(SpawnResult {
+            lead: name,
+            workspace: started.workspace,
+            branch,
+            worktree: started.worktree,
+            report: report.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// Remembers that `name` is running and owes the ledger a `lead-end`.
+    fn expect_end(&self, name: &str, repo: &str, report: &Path) {
+        let kept = self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lead_started(name, repo, &report.to_string_lossy());
+        if let Err(e) = kept {
+            eprintln!(
+                "factory: cannot keep {name} in the database: {e}; its end is lost on a restart"
+            );
+        }
+        self.lock().unfinished.insert(
+            name.to_owned(),
+            Unfinished {
+                repo: repo.to_owned(),
+                report: report.to_owned(),
+            },
+        );
+    }
+
+    /// Writes the `lead-end` of every spawned lead that has finished, once each, whenever the
+    /// picture changes.
+    async fn settle_loop(self: Arc<Self>) {
+        let mut changes = self.changed.subscribe();
+        loop {
+            self.settle();
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn settle(&self) {
+        let done: Vec<(String, Unfinished)> = {
+            let mut inner = self.lock();
+            if inner.down.is_some() {
+                return;
+            }
+            let names: Vec<String> = inner
+                .unfinished
+                .iter()
+                .filter(|(name, lead)| ended(&inner, name, lead))
+                .map(|(name, _)| name.clone())
+                .collect();
+            names
+                .into_iter()
+                .filter_map(|name| inner.unfinished.remove(&name).map(|lead| (name, lead)))
+                .collect()
+        };
+        for (name, lead) in done {
+            let pairs = [
+                format!("repo={}", lead.repo),
+                format!("slug={}", lead::slug(&name)),
+                "outcome=finished".to_owned(),
+            ];
+            let landed = event::Event::from_args("lead-end", &pairs, None)
+                .map_err(|e| e.to_string())
+                .and_then(|event| self.ledger.append(&event).map_err(|e| e.to_string()));
+            match landed {
+                Ok(_) => {
+                    let kept = self
+                        .store
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .lead_ended(&name);
+                    if let Err(e) = kept {
+                        eprintln!("factory: cannot mark {name} ended in the database: {e}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("factory: cannot write the lead-end of {name}: {e}");
+                    self.lock().unfinished.insert(name, lead);
+                }
+            }
         }
     }
 
@@ -439,4 +630,35 @@ fn report(name: &str, lead: &Lead, state: &LeadState) -> LeadReport {
             .map(|path| path.to_string_lossy().into_owned()),
         lines: Vec::new(),
     }
+}
+
+/// Clears what an earlier lead of the same name left, and makes the directory its report goes in.
+fn prepare(report: &Path) -> Result<(), Failure> {
+    let cannot = |e: std::io::Error| {
+        Failure::precondition(format!(
+            "cannot prepare the report {}: {e}; check FACTORY_STATE",
+            report.display()
+        ))
+    };
+    match std::fs::remove_file(report) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(cannot(e)),
+    }
+    if let Some(dir) = report.parent() {
+        std::fs::create_dir_all(dir).map_err(cannot)?;
+    }
+    Ok(())
+}
+
+/// Whether a spawned lead is over: its report is written and its agent isn't working, or its
+/// agent is gone with the report. A lead that died without one never ends here.
+fn ended(inner: &Inner, name: &str, lead: &Unfinished) -> bool {
+    let agent = inner.leads.get(name).and_then(|seen| seen.agent);
+    let state = LeadState::of(LeadFacts {
+        agent,
+        reported: lead.report.is_file(),
+        waiting_on: None,
+    });
+    state == LeadState::Finished
 }

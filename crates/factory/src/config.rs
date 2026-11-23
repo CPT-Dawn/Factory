@@ -14,6 +14,16 @@
 //! concurrency = 2          # reviews it runs at once
 //! when_busy = "queue"      # at its limit: "queue" for it, or take the "next" backend
 //! ```
+//!
+//! Its `[lead]` table sets how `factory lead spawn` starts Claude:
+//!
+//! ```toml
+//! [lead]
+//! model = "opus"                                # default: opus
+//! effort = "medium"                             # default: medium
+//! disable_plugins = ["expo@claude-plugins-official", "cloudflare@cloudflare"]  # the default
+//! retry_pause = 2                               # seconds between tries to submit the prompt
+//! ```
 
 use std::collections::HashSet;
 use std::fs;
@@ -55,7 +65,37 @@ pub struct Backend {
 struct ConfigFile {
     #[serde(default)]
     review: Review,
+    #[serde(default)]
+    lead: LeadSection,
 }
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct LeadSection {
+    model: Option<String>,
+    effort: Option<String>,
+    disable_plugins: Option<Vec<String>>,
+    retry_pause: Option<u64>,
+}
+
+/// How a lead's Claude is started, as configured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeadSetup {
+    pub model: String,
+    pub effort: String,
+    /// Plugins (`name@marketplace`) the lead starts with turned off: the ones the factory never
+    /// uses, whose skills would otherwise ride along on every request.
+    pub disable_plugins: Vec<String>,
+    /// How long to wait between tries to get the lead's prompt submitted.
+    pub retry_pause: Duration,
+}
+
+const DEFAULT_LEAD_MODEL: &str = "opus";
+const DEFAULT_LEAD_EFFORT: &str = "medium";
+const DEFAULT_RETRY_PAUSE_S: u64 = 2;
+/// The plugins the 2026-11-23 retro measured at about 6.3k tokens of skill listings per request.
+const DEFAULT_DISABLED_PLUGINS: [&str; 2] =
+    ["expo@claude-plugins-official", "cloudflare@cloudflare"];
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -86,17 +126,7 @@ enum Busy {
 /// The review backends in the order they are tried.
 pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
     let path = paths.config_file();
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(Failure::precondition(format!(
-                "cannot read {}: {e}; check its permissions",
-                path.display()
-            )));
-        }
-    };
-    let file: ConfigFile = toml::from_str(&text).map_err(|e| bad(&path, &text, &e))?;
+    let file = read(paths)?;
     if file.review.backend.is_empty() {
         return Ok(defaults());
     }
@@ -123,6 +153,40 @@ pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
             Ok(backend)
         })
         .collect()
+}
+
+/// How `factory lead spawn` starts Claude.
+pub fn lead_setup(paths: &Paths) -> Result<LeadSetup, Failure> {
+    let lead = read(paths)?.lead;
+    Ok(LeadSetup {
+        model: lead.model.unwrap_or_else(|| DEFAULT_LEAD_MODEL.to_owned()),
+        effort: lead
+            .effort
+            .unwrap_or_else(|| DEFAULT_LEAD_EFFORT.to_owned()),
+        disable_plugins: lead.disable_plugins.unwrap_or_else(|| {
+            DEFAULT_DISABLED_PLUGINS
+                .iter()
+                .map(|plugin| (*plugin).to_owned())
+                .collect()
+        }),
+        retry_pause: Duration::from_secs(lead.retry_pause.unwrap_or(DEFAULT_RETRY_PAUSE_S)),
+    })
+}
+
+/// The config file as written; an absent file is an empty one.
+fn read(paths: &Paths) -> Result<ConfigFile, Failure> {
+    let path = paths.config_file();
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(Failure::precondition(format!(
+                "cannot read {}: {e}; check its permissions",
+                path.display()
+            )));
+        }
+    };
+    toml::from_str(&text).map_err(|e| bad(&path, &text, &e))
 }
 
 fn backend(entry: Entry) -> Backend {

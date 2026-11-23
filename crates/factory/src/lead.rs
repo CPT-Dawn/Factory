@@ -2,19 +2,99 @@
 //! the daemon, which follows herdr's events.
 
 use std::env;
+use std::path::PathBuf;
 use std::time::Duration;
 
+use factory_adapters::git::{GitRepo, Repo};
 use factory_core::exit::Exit;
-use factory_core::lead::lead_name;
+use factory_core::lead::{self, lead_name};
 use serde_json::{Value, json};
 
 use crate::client;
+use crate::config;
 use crate::output::{Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{
-    LEAD_LIST, LEAD_STATUS, LeadList, LeadParams, LeadReport, WAIT_LEAD, WaitLeadParams,
-    WaitLeadResult,
+    LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LeadList, LeadParams, LeadReport, SpawnParams, SpawnResult,
+    WAIT_LEAD, WaitLeadParams, WaitLeadResult,
 };
+
+/// The longest a spawn may take: herdr waits up to two minutes for Claude to come up and then
+/// a minute per try at the prompt.
+const SPAWN_PATIENCE: Duration = Duration::from_secs(600);
+
+pub struct SpawnArgs {
+    pub slug: String,
+    pub spec: String,
+    pub base: String,
+    pub skill: String,
+    pub repo: Option<PathBuf>,
+}
+
+/// Starts the lead `args.slug` and says where it is. Everything that can be refused is refused
+/// here, against the repo, before herdr is asked for anything.
+pub fn spawn(args: &SpawnArgs) -> Result<Done, Failure> {
+    let name = lead_name(&args.slug).map_err(|e| Failure::usage(e.to_string()))?;
+    let paths = Paths::from_env()?;
+    let setup = config::lead_setup(&paths)?;
+    let dir = match &args.repo {
+        Some(dir) => dir.clone(),
+        None => env::current_dir().map_err(|e| {
+            Failure::precondition(format!(
+                "cannot tell the current directory: {e}; pass --repo"
+            ))
+        })?,
+    };
+    let git = GitRepo::at(&dir);
+    let no_repo = |why: &dyn std::fmt::Display| {
+        Failure::precondition(format!(
+            "{} is not a git repository ({why}); run from the repo or pass --repo",
+            dir.display()
+        ))
+    };
+    if !dir.is_dir() {
+        return Err(no_repo(&"no such directory"));
+    }
+    let top = git.toplevel().map_err(|e| no_repo(&e))?;
+    let repo_name = git.name().map_err(|e| no_repo(&e))?;
+    let git_failed = |e: factory_adapters::git::GitError| Failure::precondition(e.to_string());
+    if git.commit(&args.base).map_err(git_failed)?.is_none() {
+        return Err(Failure::usage(format!(
+            "unknown base: {}; name a branch, tag or commit of {}",
+            args.base,
+            top.display()
+        )));
+    }
+    let branch = lead::branch(lead::slug(&name));
+    if git.branch_exists(&branch).map_err(git_failed)? {
+        return Err(Failure::precondition(format!(
+            "{branch} already exists in {repo_name}; pick another slug, or delete the branch"
+        )));
+    }
+    let params = SpawnParams {
+        lead: name,
+        repo_path: top.to_string_lossy().into_owned(),
+        repo_name,
+        base: args.base.clone(),
+        skill: args.skill.clone(),
+        spec: args.spec.clone(),
+        claude_args: lead::claude_args(&setup.model, &setup.effort, &setup.disable_plugins),
+        model: setup.model,
+        effort: setup.effort,
+        retry_pause_ms: u64::try_from(setup.retry_pause.as_millis()).unwrap_or(u64::MAX),
+        session: env::var("CLAUDE_CODE_SESSION_ID")
+            .ok()
+            .filter(|id| !id.is_empty()),
+    };
+    let started: SpawnResult = client::wait(&paths, LEAD_SPAWN, &params, SPAWN_PATIENCE)?;
+    Ok(Done::new(
+        format!(
+            "{}: workspace {}, branch {}, worktree {}, report {}",
+            started.lead, started.workspace, started.branch, started.worktree, started.report
+        ),
+        serde_json::to_value(&started).unwrap_or(Value::Null),
+    ))
+}
 
 pub fn list() -> Result<Done, Failure> {
     let paths = Paths::from_env()?;

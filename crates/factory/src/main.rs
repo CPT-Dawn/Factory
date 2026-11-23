@@ -7,12 +7,14 @@ mod config;
 mod daemon;
 mod lead;
 mod leads;
+mod ledger;
 mod log;
 mod output;
 mod paths;
 mod protocol;
 mod review;
 mod router;
+mod spawn;
 mod store;
 
 use std::ffi::OsString;
@@ -33,6 +35,22 @@ fn main() -> ExitCode {
 fn run(command: Command, json: bool) -> Result<Done, Failure> {
     match command {
         Command::Log { kind, pairs } => log::run(&kind, &pairs),
+        Command::Lead {
+            command:
+                LeadCommand::Spawn {
+                    slug,
+                    spec,
+                    base,
+                    skill,
+                    repo,
+                },
+        } => lead::spawn(&lead::SpawnArgs {
+            slug,
+            spec,
+            base,
+            skill,
+            repo,
+        }),
         Command::Lead {
             command: LeadCommand::List,
         } => lead::list(),

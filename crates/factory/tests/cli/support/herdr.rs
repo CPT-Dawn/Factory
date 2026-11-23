@@ -5,12 +5,12 @@
 //! shape it meets in production. Tests script the agents, workspaces and screens it reports,
 //! change an agent's status (which it tells its subscribers), and read back every request it got.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::Instant;
@@ -40,6 +40,8 @@ struct State {
     workspaces: Vec<Value>,
     screens: HashMap<String, String>,
     requests: Vec<Value>,
+    /// Refusals scripted by method, each given to the next request of that method.
+    refusals: HashMap<String, VecDeque<(String, String)>>,
     subscribers: Vec<Subscriber>,
     next_subscriber: u64,
 }
@@ -162,6 +164,27 @@ impl FakeHerdr {
         }
     }
 
+    /// Makes the next request for `method` fail with herdr's error `code` and `message`.
+    pub fn refuse(&self, method: &str, code: &str, message: &str) {
+        self.shared
+            .lock()
+            .refusals
+            .entry(method.to_owned())
+            .or_default()
+            .push_back((code.to_owned(), message.to_owned()));
+    }
+
+    /// The params of every request for `method` the fake got, oldest first.
+    pub fn requests(&self, method: &str) -> Vec<Value> {
+        let state = self.shared.lock();
+        state
+            .requests
+            .iter()
+            .filter(|request| request["method"] == method)
+            .map(|request| request["params"].clone())
+            .collect()
+    }
+
     /// The method of every request the fake got, oldest first.
     pub fn methods(&self) -> Vec<String> {
         let state = self.shared.lock();
@@ -237,11 +260,22 @@ fn serve(shared: &Shared, stream: UnixStream) {
     state.requests.push(request.clone());
     let id = request["id"].clone();
     let method = request["method"].as_str().unwrap_or_default();
+    let refused = state.refusals.get_mut(method).and_then(VecDeque::pop_front);
+    if let Some((code, message)) = refused {
+        let error = json!({"id": id, "error": {"code": code, "message": message}});
+        let _ = writeln!(&stream, "{error}");
+        return;
+    }
     let result = match method {
         "ping" => json!({"type": "pong", "version": "0.9.5", "protocol": state.protocol}),
         "agent.list" => json!({"type": "agent_list", "agents": state.agents}),
         "workspace.list" => json!({"type": "workspace_list", "workspaces": state.workspaces}),
         "pane.read" => read(&state, &request["params"]),
+        "worktree.create" => worktree_created(&mut state, &request["params"]),
+        "agent.start" => agent_started(&mut state, &request["params"]),
+        "agent.read" => agent_read(&state, &request["params"]),
+        "agent.prompt" => agent_prompted(&mut state, &request["params"]),
+        "agent.wait" | "agent.send_keys" => agent_answered(&state, &request["params"]),
         "events.subscribe" => json!({"type": "subscription_started"}),
         other => {
             let error = json!({"id": id, "error": {
@@ -301,4 +335,89 @@ fn read(state: &State, params: &Value) -> Value {
         "revision": 0,
         "truncated": false,
     }})
+}
+
+/// `worktree.create`: a workspace numbered after the ones there are, on a worktree
+/// `/worktrees/<repo>/<label>` of the repo at `cwd`, whose one pane is `<workspace>:p1`.
+fn worktree_created(state: &mut State, params: &Value) -> Value {
+    let label = params["label"].as_str().unwrap_or("worktree");
+    let repo = Path::new(params["cwd"].as_str().unwrap_or_default())
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let workspace = format!("w{}", state.workspaces.len() + 1);
+    let pane = format!("{workspace}:p1");
+    let path = format!("/worktrees/{repo}/{label}");
+    state.workspaces.push(json!({
+        "workspace_id": workspace,
+        "label": label,
+        "worktree": {
+            "repo_name": repo,
+            "repo_key": format!("/repos/{repo}/.git"),
+            "repo_root": format!("/repos/{repo}"),
+            "checkout_path": path,
+            "is_linked_worktree": true,
+        },
+    }));
+    json!({"type": "worktree_created",
+        "workspace": {"workspace_id": workspace, "label": label},
+        "tab": {"tab_id": format!("{workspace}:t1")},
+        "root_pane": {"pane_id": pane, "workspace_id": workspace},
+        "worktree": {"path": path, "label": label, "branch": params["branch"]},
+    })
+}
+
+/// `agent.start`: an idle agent named as asked in the pane asked for.
+fn agent_started(state: &mut State, params: &Value) -> Value {
+    let pane = params["pane_id"].as_str().unwrap_or_default();
+    let workspace = pane.split(':').next().unwrap_or(pane);
+    let agent = json!({
+        "name": params["name"],
+        "agent": params["kind"],
+        "agent_status": "idle",
+        "pane_id": pane,
+        "workspace_id": workspace,
+        "tab_id": format!("{workspace}:t1"),
+        "terminal_id": format!("term-{pane}"),
+        "focused": false,
+        "revision": 0,
+    });
+    state.agents.push(agent.clone());
+    let mut argv = vec![params["kind"].clone()];
+    argv.extend(params["args"].as_array().cloned().unwrap_or_default());
+    json!({"type": "agent_started", "agent": agent, "argv": argv})
+}
+
+/// `agent.read`: the screen of the pane the named agent is in.
+fn agent_read(state: &State, params: &Value) -> Value {
+    let pane = state
+        .agents
+        .iter()
+        .find(|agent| agent["name"] == params["target"])
+        .and_then(|agent| agent["pane_id"].as_str())
+        .unwrap_or_default();
+    read(state, &json!({"pane_id": pane, "source": params["source"]}))
+}
+
+/// `agent.prompt`: the named agent starts working.
+fn agent_prompted(state: &mut State, params: &Value) -> Value {
+    let agent = state
+        .agents
+        .iter_mut()
+        .find(|agent| agent["name"] == params["target"]);
+    let Some(agent) = agent else {
+        return json!({"type": "agent_prompted", "agent": Value::Null});
+    };
+    agent["agent_status"] = json!("working");
+    json!({"type": "agent_prompted", "agent": agent.clone()})
+}
+
+/// `agent.wait` and `agent.send_keys`: the named agent, as it is.
+fn agent_answered(state: &State, params: &Value) -> Value {
+    let agent = state
+        .agents
+        .iter()
+        .find(|agent| agent["name"] == params["target"])
+        .cloned()
+        .unwrap_or(Value::Null);
+    json!({"type": "agent_info", "agent": agent})
 }

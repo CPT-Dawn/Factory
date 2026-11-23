@@ -383,8 +383,19 @@ fn a_wait_whose_caller_is_gone_stops_waiting() {
 #[test]
 fn a_wait_that_loses_herdr_fails_and_the_next_command_reconnects() {
     let sandbox = Sandbox::new();
-    let herdr = shop(&sandbox, &[("lead-cart", "w1:p1", "working")]);
-    let child = waiting(&sandbox, &herdr, &["cart"], "w1:p1");
+    let herdr = shop(
+        &sandbox,
+        &[
+            ("lead-cart", "w1:p1", "working"),
+            ("lead-pay", "w2:p1", "working"),
+        ],
+    );
+    // The waiter names its own pane, so `lead status` shows once the daemon has the wait:
+    // a hang-up before that would only make the wait reconnect.
+    let mut cmd = sandbox.factory_command(&["wait", "lead", "cart"]);
+    cmd.env("HERDR_PANE_ID", "w2:p1");
+    let child = spawn(cmd);
+    await_status(&sandbox, "pay", "lead-pay waiting: lead-cart");
 
     herdr.hang_up();
     let out = finish(child);
