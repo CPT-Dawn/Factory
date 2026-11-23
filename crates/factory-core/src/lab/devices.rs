@@ -99,13 +99,13 @@ fn list_len(head: &[u8]) -> Option<usize> {
         .and_then(|h| usize::from_str_radix(h, 16).ok())
 }
 
-/// Whether a list from `adb track-devices -l` names the same devices, in the same states, as
-/// `adb devices -l` text; their order and properties do not count.
+/// Whether a list from `adb track-devices -l` names the same devices, in the same states and
+/// of the same models, as `adb devices -l` text; their order and other properties do not count.
 pub fn same_devices(track_list: &[u8], devices_l: &str) -> bool {
     let key = |text: &str| {
-        let mut devices: Vec<(String, String)> = parse_devices_l(text)
+        let mut devices: Vec<(String, String, String)> = parse_devices_l(text)
             .into_iter()
-            .map(|a| (a.serial, a.state))
+            .map(|a| (a.serial, a.state, a.model))
             .collect();
         devices.sort();
         devices

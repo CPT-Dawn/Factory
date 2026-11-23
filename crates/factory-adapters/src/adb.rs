@@ -171,9 +171,10 @@ impl Pace {
 /// within [`Pace::list_within`]: the first from the start, a later one from its first byte.
 /// While the stream is quiet between lists, adb is asked for its device list every
 /// [`Pace::probe_every`] (`adb devices -l`, which also starts a server that died): it must
-/// answer, and a list it gives that the stream has not shown must come on the stream, whole,
-/// within [`Pace::list_within`]. Any of these fails, and the stream's group is killed, so the
-/// stream ends with an error that says why.
+/// answer, and when it lists other devices than the stream last showed, the stream must show
+/// a new list within [`Pace::list_within`] (a list that still differs is caught by the next
+/// question). Any of these fails, and the stream's group is killed, so the stream ends with an
+/// error that says why.
 #[derive(Debug, Default)]
 pub struct AdbTrack {
     pub pace: Pace,
@@ -331,11 +332,23 @@ fn kill_group(pid: u32) {
 
 /// adb's device list: `adb devices -l` (which also starts a server that died), tethered in a
 /// group of its own; `None` when it fails or outlives `limit`, and then its group is killed.
+/// Its stdout is read as it comes, so a long answer does not stall it.
 fn ask_adb(limit: Duration) -> Option<String> {
     let mut probe = Tethered::start(&["devices", "-l"], Stdio::piped(), Stdio::piped()).ok()?;
+    let mut out = probe.child.stdout.take()?;
+    let reader = std::thread::Builder::new()
+        .name("adb-track-answer".to_owned())
+        .spawn(move || {
+            let mut said = String::new();
+            out.read_to_string(&mut said).ok().map(|_| said)
+        })
+        .ok()?;
     let until = Instant::now() + limit;
     while !probe.ended() {
         if Instant::now() >= until {
+            // Killing the group ends every writer of stdout, so the reader ends too.
+            drop(probe);
+            let _ = reader.join();
             return None;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -347,8 +360,7 @@ fn ask_adb(limit: Duration) -> Option<String> {
         .take()?
         .read_to_string(&mut status)
         .ok()?;
-    let mut said = String::new();
-    probe.child.stdout.take()?.read_to_string(&mut said).ok()?;
+    let said = reader.join().ok()??;
     (status.trim() == "0").then_some(said)
 }
 
@@ -356,9 +368,10 @@ fn ask_adb(limit: Duration) -> Option<String> {
 /// [`Pace::list_within`], or when adb does not answer the question asked every
 /// [`Pace::probe_every`] while the stream is quiet; stands down when the stream is dropped.
 /// adb's answer, its device list, must match the stream's last list: when it does not, and no
-/// list came while adb was asked, the stream awaits one. The question runs on a thread of its
-/// own, so no deadline waits on it. The stream is not reaped before it is dropped, so the group
-/// is still its.
+/// list came while adb was asked, the stream awaits one. Any whole list ends that wait; should it
+/// still not match adb's, the next question finds so and the stream awaits one again. The
+/// question runs on a thread of its own, so no deadline waits on it. The stream is not reaped
+/// before it is dropped, so the group is still its.
 fn watch_stream(pid: u32, shared: Shared, pace: Pace) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("adb-track-watch".to_owned())

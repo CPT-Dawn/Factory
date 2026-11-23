@@ -100,3 +100,11 @@ fn a_device_adb_lists_that_the_list_lacks_or_shows_in_another_state_differs() {
     ));
     assert!(same_devices(b"", "List of devices attached\n\n"));
 }
+
+#[test]
+fn a_device_whose_model_differs_differs() {
+    assert!(!same_devices(
+        b"FAKEPHONE01\tdevice model:Pixel_8\n",
+        "List of devices attached\nFAKEPHONE01 device model:Pixel_9\n"
+    ));
+}

@@ -16,7 +16,8 @@ use crate::support::{Sandbox, kill_group, run};
 /// <lines>` writing one device list, which `adb/devices` then holds too). `adb devices -l`, which
 /// the daemon probes with, lists what `adb/devices` holds; it hangs while `adb/probe-hangs`
 /// exists (its pid is then in `adb/probe.pid`, and that of a child it left running in
-/// `adb/probe-child.pid`), and notes each call's pid in `adb/probes`.
+/// `adb/probe-child.pid`), and notes each call's pid in `adb/probes`. While `adb/chatty` exists,
+/// it says far more than a pipe holds before its list.
 fn adb_playing(sandbox: &Sandbox, script: &str) -> PathBuf {
     let dir = sandbox.path("adb");
     fs::create_dir_all(&dir).expect("create the adb dir");
@@ -32,6 +33,7 @@ devices)
     echo "$$" > "$w/probe.pid"
     exec sleep 1000
   fi
+  [ -e "$w/chatty" ] && yes '* adb says a lot' | head -c 200000
   echo 'List of devices attached'
   cat "$w/devices" 2>/dev/null
   exit 0 ;;
@@ -409,4 +411,27 @@ fn a_stream_that_misses_a_change_adb_knows_of_is_cut_off_and_restarted() {
         "{}",
         daemon_log(&sandbox)
     );
+}
+
+#[test]
+fn a_quiet_stream_whose_adb_answers_at_length_is_left_alone() {
+    let sandbox = Sandbox::new()
+        .env("FACTORY_ADB_BACKOFF_MS", "50")
+        .env("FACTORY_ADB_PROBE_MS", "500");
+    let (sandbox, wt) = setup(sandbox);
+    let adb = adb_playing(
+        &sandbox,
+        &format!(r#"touch "$w/chatty"; frame '{PHONE_A}'; exec sleep 1000"#),
+    );
+
+    assert!(
+        poll_until(|| shows(&sandbox, &wt, "PHONEA01")),
+        "no first list"
+    );
+    let asked =
+        poll_until(|| fs::read_to_string(adb.join("probes")).is_ok_and(|p| p.lines().count() >= 3));
+    assert!(asked, "adb was never asked for its devices");
+
+    assert!(runs(&pid_of(&adb, 1)), "{}", daemon_log(&sandbox));
+    assert!(!adb.join("pid.2").exists(), "{}", daemon_log(&sandbox));
 }
