@@ -460,6 +460,7 @@ pub(crate) mod transcript {
         slots_run_stopped_queued => "slots-run-stopped-queued.golden",
         slots_run_stopped_running => "slots-run-stopped-running.golden",
         slots_stack_failure => "slots-stack-failure.golden",
+        slots_wait_default => "slots-wait-default.golden",
     }
 
     fn replay(file: &str) {
