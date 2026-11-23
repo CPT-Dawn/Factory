@@ -173,7 +173,7 @@ pub struct WaitClaudeParams {
 /// Whether a lead may dispatch: `unknown`, `go` or `hold`, with the window and the hold.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClaudeVerdict {
-    pub verdict: String,
+    pub verdict: factory_core::status::ClaudeState,
     pub used_percent: Option<f64>,
     /// When the window resets, in milliseconds since the epoch.
     pub resets: Option<i64>,

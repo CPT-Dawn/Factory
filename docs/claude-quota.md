@@ -17,8 +17,8 @@ The statusline is the only documented signal that gives both the share spent and
 
 ## How it works
 
-- `factory statusline` is Claude Code's `statusLine` command. It reads the statusline JSON, sends the 5-hour window to the daemon, and prints `<model> · 5h <n>% · resets HH:MM`. A daemon that doesn't answer costs the line nothing.
-- `factory hook stop-failure` is the `StopFailure` hook. A turn that ended on a rate limit records a limit until the reset its message names. Without a named reset, the limit lasts until the window's known reset, else one hour. A limit that is already holding keeps its reset unless a later one is named. Other errors change nothing.
+- `factory statusline` is Claude Code's `statusLine` command. It reads the statusline JSON, sends the 5-hour window to the daemon, and prints `<model> · 5h <n>% · resets HH:MM` (with `--json`, one object holding the line, the model and the window). A daemon that doesn't answer costs the line nothing.
+- `factory hook stop-failure` is the `StopFailure` hook. A turn that ended on a rate limit records a limit until the reset its message names. Without a named reset, the limit lasts until the window's known reset, else one hour. A limit that is already holding keeps its reset unless a later one is named. Another error counts only when its message names a plan limit; otherwise it changes nothing.
 - A statusline window with room (under 100%), seen after a limit was recorded, lifts the limit, because that 429 was a capacity limit and not the plan's.
 - `factory quota claude` exits 0 to dispatch, or 75 with `hold new dispatches until <time>`. It holds once `[claude] hold_at_percent` (default 90) of the window is spent, or while a limit holds.
 - `factory wait claude [--timeout 9m]` blocks, silent, until a lead may dispatch (exit 0), or exits 124 to wait again.

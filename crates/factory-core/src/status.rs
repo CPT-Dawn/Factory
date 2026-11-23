@@ -120,14 +120,24 @@ pub enum QuotaState {
 /// The Claude plan's quota as `factory quota claude` judges it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claude {
-    /// `unknown` (no window seen, or it has reset), `go` or `hold`.
-    pub verdict: String,
+    pub verdict: ClaudeState,
     /// The window's spent share, rounded; none when no current window was seen.
     pub used_percent: Option<u32>,
     /// When the window resets, in milliseconds since the epoch.
     pub resets: Option<i64>,
     /// When a hold ends, in milliseconds since the epoch.
     pub until: Option<i64>,
+}
+
+/// Whether a lead may dispatch on the Claude plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaudeState {
+    /// No window seen, or the last one has reset.
+    #[default]
+    Unknown,
+    Go,
+    Hold,
 }
 
 /// A registered wait.
@@ -317,13 +327,13 @@ fn claude(status: &Status, rows: &mut Vec<String>) {
     let used = claude
         .used_percent
         .map(|used| format!("{used}% of 5h used"));
-    let row = match (claude.verdict.as_str(), claude.until, claude.resets, used) {
-        ("hold", Some(until), _, used) => format!(
+    let row = match (claude.verdict, claude.until, claude.resets, used) {
+        (ClaudeState::Hold, Some(until), _, used) => format!(
             "claude: holding dispatches until {}, {}",
             moment(until, status.now),
             used.unwrap_or_else(|| "its limit hit".to_owned())
         ),
-        ("go", _, Some(resets), Some(used)) => {
+        (ClaudeState::Go, _, Some(resets), Some(used)) => {
             format!("claude: {used}, resets {}", moment(resets, status.now))
         }
         _ => "claude: no plan window seen".to_owned(),

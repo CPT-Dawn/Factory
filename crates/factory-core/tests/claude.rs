@@ -1,7 +1,9 @@
 //! The Claude plan's quota: what the statusline and a 429 say of the 5-hour window, and whether a
 //! lead may dispatch.
 
-use factory_core::claude::{ClaudeQuota, Verdict, limit_reset, statusline_window, stop_failure};
+use factory_core::claude::{
+    ClaudeQuota, LimitHit, Verdict, limit_reset, statusline_window, stop_failure,
+};
 use factory_core::timestamp::Timestamp;
 use serde_json::json;
 
@@ -197,7 +199,7 @@ fn the_documented_limit_messages_give_their_reset_in_local_time() {
     for (text, until) in cases {
         assert_eq!(
             limit_reset(text, at(NOW), IST),
-            Some(until.map(at)),
+            until.map(|until| LimitHit::Resets(at(until))),
             "{text}"
         );
     }
@@ -214,7 +216,7 @@ fn other_errors_are_no_plan_limit() {
     }
     assert_eq!(
         limit_reset("You've hit your session limit", at(NOW), IST),
-        Some(None)
+        Some(LimitHit::Unnamed)
     );
 }
 
@@ -225,11 +227,11 @@ fn a_stop_failure_for_a_rate_limit_is_a_limit_with_the_reset_its_message_names()
         "last_assistant_message": "You've hit your session limit · resets 3:45pm"});
     assert_eq!(
         stop_failure(&input, at(NOW), IST),
-        Some(Some(at(NOW + 5 * HOUR + 15 * 60_000)))
+        Some(LimitHit::Resets(at(NOW + 5 * HOUR + 15 * 60_000)))
     );
     let bare = json!({"hook_event_name": "StopFailure", "error": "rate_limit",
         "last_assistant_message": "API Error: Rate limit reached"});
-    assert_eq!(stop_failure(&bare, at(NOW), IST), Some(None));
+    assert_eq!(stop_failure(&bare, at(NOW), IST), Some(LimitHit::Unnamed));
     let other = json!({"hook_event_name": "StopFailure", "error": "server_error",
         "last_assistant_message": "API Error: 500"});
     assert_eq!(stop_failure(&other, at(NOW), IST), None);

@@ -2,8 +2,8 @@
 //! ticket names (three slots, three backends, five leads) fits one terminal screen.
 
 use factory_core::status::{
-    Backend, COLUMNS, Claude, Lab, Lead, Leads, Lease, Queued, QuotaState, ROWS, Reservation, Slot,
-    Status, Subagent, Wait, screen,
+    Backend, COLUMNS, Claude, ClaudeState, Lab, Lead, Leads, Lease, Queued, QuotaState, ROWS,
+    Reservation, Slot, Status, Subagent, Wait, screen,
 };
 use factory_core::timestamp::Timestamp;
 
@@ -474,7 +474,7 @@ fn the_claude_row_shows_the_window_or_the_hold() {
     let mut status = idle();
     let at = |t: &str| Timestamp::parse(t).map(Timestamp::unix_millis);
     status.claude = Claude {
-        verdict: "go".to_owned(),
+        verdict: ClaudeState::Go,
         used_percent: Some(41),
         resets: at("2026-11-23T07:00:00Z"),
         until: None,
@@ -482,7 +482,7 @@ fn the_claude_row_shows_the_window_or_the_hold() {
     assert_eq!(rows(&status)[3], "claude: 41% of 5h used, resets 07:00Z");
 
     status.claude = Claude {
-        verdict: "hold".to_owned(),
+        verdict: ClaudeState::Hold,
         used_percent: None,
         resets: None,
         until: at("2026-11-24T01:30:00Z"),

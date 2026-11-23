@@ -61,8 +61,8 @@ fn main() -> ExitCode {
         }) => hook::run(&command, json),
         Ok(Cli {
             command: Command::Statusline,
-            ..
-        }) => claude::statusline(),
+            json,
+        }) => claude::statusline(json),
         Ok(cli::Cli {
             command: Command::Lab { args },
             json,
@@ -114,7 +114,7 @@ fn run(command: Command, json: bool) -> ExitCode {
             command: QuotaCommand::Claude,
         } => claude::quota(),
         // Handled in main, before the output contract: its line is Claude Code's.
-        Command::Statusline => return claude::statusline(),
+        Command::Statusline => return claude::statusline(json),
         Command::Wait {
             command: WaitCommand::Claude { timeout },
         } => claude::wait(timeout),

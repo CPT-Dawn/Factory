@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use factory_core::claude::{self, ClaudeQuota, Verdict, Window};
 use factory_core::exit::Exit;
+use factory_core::status::ClaudeState;
 use factory_core::timestamp::Timestamp;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
@@ -50,7 +51,7 @@ impl Claude {
     }
 
     /// A statusline saw the window.
-    pub fn see(&self, params: &ClaudeWindowParams) -> Result<ClaudeVerdict, Failure> {
+    pub fn see(&self, params: &ClaudeWindowParams) -> Result<(), Failure> {
         let window = Window {
             used_percent: params.used_percent,
             resets: Timestamp::from_unix_millis(params.resets),
@@ -59,15 +60,12 @@ impl Claude {
     }
 
     /// A turn ended on the plan's limit.
-    pub fn limit(&self, params: &ClaudeLimitParams) -> Result<ClaudeVerdict, Failure> {
+    pub fn limit(&self, params: &ClaudeLimitParams) -> Result<(), Failure> {
         let reset = params.reset.map(Timestamp::from_unix_millis);
         self.change(|quota, now| quota.hit_limit(reset, now))
     }
 
-    fn change(
-        &self,
-        apply: impl FnOnce(&mut ClaudeQuota, Timestamp),
-    ) -> Result<ClaudeVerdict, Failure> {
+    fn change(&self, apply: impl FnOnce(&mut ClaudeQuota, Timestamp)) -> Result<(), Failure> {
         let now = clock::now();
         let mut quota = lock(&self.quota);
         let mut next = *quota;
@@ -80,7 +78,7 @@ impl Claude {
         *quota = next;
         drop(quota);
         self.changed.notify_waiters();
-        Ok(self.verdict(claude::HOLD_AT_PERCENT))
+        Ok(())
     }
 
     /// Whether a lead may dispatch now, holding at `hold_at` percent.
@@ -133,7 +131,7 @@ fn answer(verdict: Verdict, hold_at: f64) -> ClaudeVerdict {
         } => (used_percent, None, Some(until.unix_millis())),
     };
     ClaudeVerdict {
-        verdict: verdict.word().to_owned(),
+        verdict: verdict.state(),
         used_percent,
         resets,
         until,
@@ -170,13 +168,8 @@ pub fn wait(timeout: Duration) -> Result<Done, Failure> {
 
 fn judged(verdict: ClaudeVerdict) -> Result<Done, Failure> {
     let used = verdict.used_percent.map(percent);
-    let line = match (
-        verdict.verdict.as_str(),
-        verdict.until,
-        verdict.resets,
-        used,
-    ) {
-        ("hold", Some(until), _, used) => {
+    let line = match (verdict.verdict, verdict.until, verdict.resets, used) {
+        (ClaudeState::Hold, Some(until), _, used) => {
             let until = Timestamp::from_unix_millis(until);
             let what = used.map_or_else(
                 || "hit its limit".to_owned(),
@@ -185,11 +178,11 @@ fn judged(verdict: ClaudeVerdict) -> Result<Done, Failure> {
             return Err(Failure::new(
                 Exit::Busy,
                 format!(
-                    "claude: {what}; hold new dispatches until {until}, then factory wait claude"
+                    "claude: {what}; hold new dispatches until {until}; factory wait claude blocks until then"
                 ),
             ));
         }
-        ("go", _, Some(resets), Some(used)) => format!(
+        (ClaudeState::Go, _, Some(resets), Some(used)) => format!(
             "claude: {used}% of the 5-hour window used, resets {}; dispatch",
             Timestamp::from_unix_millis(resets)
         ),
@@ -205,9 +198,9 @@ fn percent(used: f64) -> i64 {
 }
 
 /// `factory statusline`: Claude Code's statusline JSON on stdin; tells the daemon the 5-hour
-/// window and prints the model and the window in one line. A daemon that doesn't answer costs
-/// the line nothing.
-pub fn statusline() -> ExitCode {
+/// window and prints the model and the window in one line, or with `json` one JSON object. A
+/// daemon that doesn't answer costs the line nothing.
+pub fn statusline(json: bool) -> ExitCode {
     let mut text = String::new();
     let input: Value = match io::stdin().read_to_string(&mut text) {
         Ok(_) => serde_json::from_str(&text).unwrap_or(Value::Null),
@@ -218,19 +211,26 @@ pub fn statusline() -> ExitCode {
         .and_then(Value::as_str)
         .unwrap_or("claude");
     let mut line = model.to_owned();
-    if let Some(window) = claude::statusline_window(&input) {
+    let window = claude::statusline_window(&input);
+    if let Some(window) = window {
         let params = ClaudeWindowParams {
             used_percent: window.used_percent,
             resets: window.resets.unix_millis(),
         };
         if let Ok(paths) = Paths::from_env() {
-            let _: Result<ClaudeVerdict, Failure> = client::call(&paths, CLAUDE_WINDOW, &params);
+            let _: Result<Value, Failure> = client::call(&paths, CLAUDE_WINDOW, &params);
         }
         line.push_str(&format!(
             " · 5h {}% · resets {}",
             percent(window.used_percent),
             local_clock(window.resets)
         ));
+    }
+    if json {
+        let window = window.map(|window| {
+            json!({"used_percent": window.used_percent, "resets": window.resets.unix_millis()})
+        });
+        line = json!({"line": line, "model": model, "five_hour": window}).to_string();
     }
     let _ = writeln!(io::stdout().lock(), "{line}");
     ExitCode::SUCCESS
@@ -243,17 +243,17 @@ fn local_clock(at: Timestamp) -> String {
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
-/// The `StopFailure` hook: a turn that ended on a rate limit tells the daemon, with the reset its
-/// message names. Another error changes nothing.
+/// The `StopFailure` hook: a turn that ended on a rate limit, or whose message names a plan
+/// limit, tells the daemon, with the reset its message names. Another error changes nothing.
 pub fn stop_failure(input: &Value) -> Result<(), Failure> {
     let now = clock::now();
     let Some(reset) = claude::stop_failure(input, now, clock::utc_offset(now)) else {
         return Ok(());
     };
     let params = ClaudeLimitParams {
-        reset: reset.map(Timestamp::unix_millis),
+        reset: reset.reset().map(Timestamp::unix_millis),
     };
-    let _: ClaudeVerdict = client::call(&Paths::from_env()?, CLAUDE_LIMIT, &params)?;
+    let _: Value = client::call(&Paths::from_env()?, CLAUDE_LIMIT, &params)?;
     Ok(())
 }
 

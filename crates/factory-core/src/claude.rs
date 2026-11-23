@@ -132,12 +132,11 @@ impl ClaudeQuota {
 }
 
 impl Verdict {
-    /// `unknown`, `go` or `hold`.
-    pub fn word(self) -> &'static str {
+    pub fn state(self) -> status::ClaudeState {
         match self {
-            Verdict::Unknown => "unknown",
-            Verdict::Go { .. } => "go",
-            Verdict::Hold { .. } => "hold",
+            Verdict::Unknown => status::ClaudeState::Unknown,
+            Verdict::Go { .. } => status::ClaudeState::Go,
+            Verdict::Hold { .. } => status::ClaudeState::Hold,
         }
     }
 
@@ -157,7 +156,7 @@ impl Verdict {
             } => (used_percent.map(round), None, Some(until.unix_millis())),
         };
         status::Claude {
-            verdict: self.word().to_owned(),
+            verdict: self.state(),
             used_percent,
             resets,
             until,
@@ -179,16 +178,36 @@ pub fn statusline_window(input: &Value) -> Option<Window> {
     })
 }
 
+/// A plan limit a message says was hit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitHit {
+    /// It resets at this moment.
+    Resets(Timestamp),
+    /// It names no reset that can be read.
+    Unnamed,
+}
+
+impl LimitHit {
+    pub fn reset(self) -> Option<Timestamp> {
+        match self {
+            LimitHit::Resets(at) => Some(at),
+            LimitHit::Unnamed => None,
+        }
+    }
+}
+
 /// Whether `text` says a plan limit was hit (`You've hit your session limit · resets 3:45pm`,
 /// `Usage limit reached · limit resets 3:45pm`, `Claude AI usage limit reached|<epoch>`), and
 /// the reset it names, read in a zone `utc_offset` seconds east of UTC: a time of day that has
 /// passed is the next day's, a weekday the next one's. None when it is no plan limit.
-pub fn limit_reset(text: &str, now: Timestamp, utc_offset: i32) -> Option<Option<Timestamp>> {
+pub fn limit_reset(text: &str, now: Timestamp, utc_offset: i32) -> Option<LimitHit> {
     let lower = text.to_lowercase();
     if let Some((_, after)) = lower.split_once("limit reached|") {
         let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
         if let Ok(secs) = digits.parse::<i64>() {
-            return Some(Some(Timestamp::from_unix_millis(secs.saturating_mul(1000))));
+            return Some(LimitHit::Resets(Timestamp::from_unix_millis(
+                secs.saturating_mul(1000),
+            )));
         }
     }
     let plan = lower.contains("limit")
@@ -201,13 +220,13 @@ pub fn limit_reset(text: &str, now: Timestamp, utc_offset: i32) -> Option<Option
     let reset = lower
         .rfind("resets ")
         .and_then(|at| reset_time(&lower[at + "resets ".len()..], now, utc_offset));
-    Some(reset)
+    Some(reset.map_or(LimitHit::Unnamed, LimitHit::Resets))
 }
 
 /// A `StopFailure` hook's input: the limit a turn ended on, with the reset its message names.
 /// A rate-limit error counts even when its message names no plan limit; another error counts
 /// only when its message does. None when the turn ended on no limit.
-pub fn stop_failure(input: &Value, now: Timestamp, utc_offset: i32) -> Option<Option<Timestamp>> {
+pub fn stop_failure(input: &Value, now: Timestamp, utc_offset: i32) -> Option<LimitHit> {
     let rate_limit = input.get("error").and_then(Value::as_str) == Some("rate_limit");
     let mut plan = false;
     for key in ["last_assistant_message", "error_details"] {
@@ -215,12 +234,12 @@ pub fn stop_failure(input: &Value, now: Timestamp, utc_offset: i32) -> Option<Op
             continue;
         };
         match limit_reset(text, now, utc_offset) {
-            Some(Some(reset)) => return Some(Some(reset)),
-            Some(None) => plan = true,
+            Some(LimitHit::Resets(reset)) => return Some(LimitHit::Resets(reset)),
+            Some(LimitHit::Unnamed) => plan = true,
             None => {}
         }
     }
-    (rate_limit || plan).then_some(None)
+    (rate_limit || plan).then_some(LimitHit::Unnamed)
 }
 
 const WEEKDAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];

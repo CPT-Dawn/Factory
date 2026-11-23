@@ -312,3 +312,21 @@ fn a_wait_ends_when_a_new_window_has_room() {
     let out = finish(waiting);
     assert_eq!(out.code, 0, "{out:?}");
 }
+
+#[test]
+fn the_statusline_gives_one_json_object_with_json() {
+    let sandbox = utc();
+    let resets = now_secs() + 2 * HOUR;
+
+    let out = sandbox.factory_stdin(&["statusline", "--json"], &statusline_input(40.0, resets));
+
+    assert_eq!((out.code, out.stdout_lines().len()), (0, 1), "{out:?}");
+    let shown: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(shown["model"], "Opus 5.5", "{shown}");
+    assert_eq!(shown["five_hour"]["used_percent"], 40.0, "{shown}");
+    assert_eq!(shown["five_hour"]["resets"], resets * 1000, "{shown}");
+    assert_eq!(
+        shown["line"],
+        format!("Opus 5.5 · 5h 40% · resets {}", clock(resets))
+    );
+}
