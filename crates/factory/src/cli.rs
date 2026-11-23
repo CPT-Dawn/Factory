@@ -98,6 +98,22 @@ pub enum HookCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum LeadCommand {
+    /// Start a lead on a spec in a new herdr workspace, and say where it is
+    Spawn {
+        /// The lead's slug: lowercase letters, digits and -, at most 27
+        slug: String,
+        /// The spec the lead works: an issue ref such as #12
+        spec: String,
+        /// The branch the lead's worktree is cut from
+        #[arg(default_value = "main")]
+        base: String,
+        /// The skill the lead runs
+        #[arg(default_value = "implement-spec")]
+        skill: String,
+        /// The repository to work in (default: the current directory's)
+        #[arg(long, value_name = "PATH")]
+        repo: Option<PathBuf>,
+    },
     /// One line per lead: working, waiting (on what), blocked, asking, finished or dead
     List,
     /// One lead's line, and its pane's last lines when it is blocked or asking

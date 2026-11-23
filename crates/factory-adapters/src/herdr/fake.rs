@@ -10,9 +10,11 @@ use std::sync::{Mutex, MutexGuard};
 
 use tokio::sync::mpsc;
 
+use std::time::Duration;
+
 use super::{
-    Agent, AgentSession, Event, Events, HerdrApi, HerdrError, PROTOCOL, Pong, PromptWait,
-    SessionKind, Source, Watch, Workspace, Worktree,
+    Agent, AgentSession, Event, Events, HerdrApi, HerdrError, NewWorktree, PROTOCOL, Pong,
+    PromptWait, SessionKind, Source, Watch, Workspace, Worktree,
 };
 
 /// A herdr that answers from a script. Every request is recorded by its method name.
@@ -31,6 +33,9 @@ struct State {
     workspaces: Vec<Workspace>,
     screens: HashMap<String, String>,
     calls: Vec<String>,
+    /// Refusals scripted by method, each given to the next request of that method.
+    refusals: HashMap<String, Vec<(String, String)>>,
+    /// The prompts typed into agents, as (agent, text).
     prompts: Vec<(String, String)>,
     subscribers: Vec<(Vec<Watch>, mpsc::UnboundedSender<Event>)>,
 }
@@ -98,11 +103,6 @@ impl FakeHerdr {
         }
     }
 
-    /// Every prompt's target and text, oldest first.
-    pub fn prompts(&self) -> Vec<(String, String)> {
-        self.lock().prompts.clone()
-    }
-
     pub fn screen(&self, pane: &str, text: &str) {
         self.lock().screens.insert(pane.to_owned(), text.to_owned());
     }
@@ -137,6 +137,20 @@ impl FakeHerdr {
         tell(&mut state, &event, |watch| *watch == Watch::PaneGone);
     }
 
+    /// Makes the next request for `method` fail with herdr's error `code` and `message`.
+    pub fn refuse(&self, method: &str, code: &str, message: &str) {
+        self.lock()
+            .refusals
+            .entry(method.to_owned())
+            .or_default()
+            .push((code.to_owned(), message.to_owned()));
+    }
+
+    /// Every prompt typed into an agent, as (agent, text), oldest first.
+    pub fn prompts(&self) -> Vec<(String, String)> {
+        self.lock().prompts.clone()
+    }
+
     /// The method of every request, oldest first.
     pub fn calls(&self) -> Vec<String> {
         self.lock().calls.clone()
@@ -156,6 +170,12 @@ impl FakeHerdr {
             return Err(HerdrError::Unreachable(std::io::Error::from(
                 std::io::ErrorKind::ConnectionRefused,
             )));
+        }
+        if let Some(refusals) = state.refusals.get_mut(method)
+            && !refusals.is_empty()
+        {
+            let (code, message) = refusals.remove(0);
+            return Err(HerdrError::Refused { code, message });
         }
         Ok(state)
     }
@@ -220,5 +240,93 @@ impl HerdrApi for FakeHerdr {
         Ok(Events {
             source: Source::Script(receiver),
         })
+    }
+
+    async fn create_worktree(
+        &self,
+        repo: &Path,
+        _branch: &str,
+        _base: &str,
+        label: &str,
+    ) -> Result<NewWorktree, HerdrError> {
+        let mut state = self.call("worktree.create")?;
+        let name = repo
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        let workspace_id = format!("w{}", state.workspaces.len() + 1);
+        state.workspaces.push(Workspace {
+            workspace_id: workspace_id.clone(),
+            worktree: Some(Worktree {
+                repo_name: name.clone(),
+            }),
+        });
+        Ok(NewWorktree {
+            pane_id: format!("{workspace_id}:p1"),
+            path: format!("/worktrees/{name}/{label}"),
+            workspace_id,
+        })
+    }
+
+    async fn start_agent(
+        &self,
+        name: &str,
+        pane_id: &str,
+        _args: &[String],
+        _timeout: Duration,
+    ) -> Result<(), HerdrError> {
+        let mut state = self.call("agent.start")?;
+        state.agents.push(Agent {
+            name: Some(name.to_owned()),
+            agent: Some("claude".to_owned()),
+            agent_status: "idle".to_owned(),
+            pane_id: pane_id.to_owned(),
+            workspace_id: pane_id.split(':').next().unwrap_or(pane_id).to_owned(),
+            cwd: None,
+            agent_session: None,
+        });
+        Ok(())
+    }
+
+    async fn read_agent(&self, name: &str) -> Result<String, HerdrError> {
+        let state = self.call("agent.read")?;
+        let pane = state
+            .agents
+            .iter()
+            .find(|agent| agent.name.as_deref() == Some(name))
+            .map(|agent| agent.pane_id.clone())
+            .unwrap_or_default();
+        Ok(state.screens.get(&pane).cloned().unwrap_or_default())
+    }
+
+    async fn send_keys(&self, _name: &str, _keys: &[&str]) -> Result<(), HerdrError> {
+        self.call("agent.send_keys").map(drop)
+    }
+
+    async fn wait_agent(
+        &self,
+        _name: &str,
+        _until: &[&str],
+        _timeout: Duration,
+    ) -> Result<(), HerdrError> {
+        self.call("agent.wait").map(drop)
+    }
+
+    async fn prompt_agent(
+        &self,
+        name: &str,
+        text: &str,
+        _until: &[&str],
+        _timeout: Duration,
+    ) -> Result<(), HerdrError> {
+        let mut state = self.call("agent.prompt")?;
+        state.prompts.push((name.to_owned(), text.to_owned()));
+        for agent in state
+            .agents
+            .iter_mut()
+            .filter(|agent| agent.name.as_deref() == Some(name))
+        {
+            "working".clone_into(&mut agent.agent_status);
+        }
+        Ok(())
     }
 }

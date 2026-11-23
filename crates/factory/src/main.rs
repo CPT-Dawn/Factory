@@ -11,6 +11,7 @@ mod install;
 mod lab;
 mod lead;
 mod leads;
+mod ledger;
 mod log;
 mod monitor;
 mod output;
@@ -20,6 +21,7 @@ mod protocol;
 mod review;
 mod router;
 mod sessions;
+mod spawn;
 mod steward;
 mod store;
 
@@ -65,6 +67,24 @@ fn run(command: Command, json: bool) -> ExitCode {
             );
         }
         Command::Log { kind, pairs } => log::run(&kind, &pairs),
+        Command::Lead {
+            command:
+                LeadCommand::Spawn {
+                    slug,
+                    spec,
+                    base,
+                    skill,
+                    repo,
+                },
+        } => lead::spawn(&lead::SpawnArgs {
+            slug,
+            spec,
+            base,
+            skill,
+            repo,
+        })
+        // lead.sh's failures said so, and factory-stats' classifier still matches the text.
+        .map_err(|failure| Failure::new(failure.exit, format!("lead.sh: {}", failure.message))),
         Command::Lead {
             command: LeadCommand::List,
         } => lead::list(),

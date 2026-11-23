@@ -19,6 +19,7 @@ mod log;
 mod monitor;
 mod review;
 mod router;
+mod spawn;
 // Marked cfg(test) so clippy treats these as test code and lets their helpers unwrap.
 #[cfg(test)]
 mod hook;
