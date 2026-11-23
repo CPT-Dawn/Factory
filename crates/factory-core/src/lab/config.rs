@@ -163,6 +163,15 @@ pub fn project_config(file: &str, text: &str) -> Result<ProjectConfig, ConfigErr
             )));
         }
     };
+    let last = max_slots - 1;
+    for (key, port) in &ports {
+        let highest = u64::from(*port) + u64::from(slot_stride) * u64::from(last);
+        if *port == 0 || highest > 65535 {
+            return Err(ConfigError(format!(
+                "{file}: \"ports.{key}\" must stay within 1-65535 in every slot (slot {last} would use {highest})"
+            )));
+        }
+    }
     Ok(ProjectConfig {
         name: name.to_owned(),
         max_slots,
@@ -295,6 +304,28 @@ mod tests {
                 cli: "supabase".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn a_port_that_leaves_the_port_range_in_some_slot_is_refused() {
+        let at = |port: u32, stride: u32| {
+            project_config(
+                "f",
+                &format!(
+                    r#"{{"name":"demo","maxSlots":2,"slotStride":{stride},"ports":{{"API_PORT":{port}}}}}"#
+                ),
+            )
+        };
+        assert_eq!(
+            at(65535, 100),
+            Err(ConfigError(
+                "f: \"ports.API_PORT\" must stay within 1-65535 in every slot (slot 1 would use 65635)"
+                    .to_owned()
+            ))
+        );
+        assert!(at(0, 100).is_err());
+        assert!(at(65435, 100).is_ok());
+        assert!(at(80, 4_294_967_295).is_err());
     }
 
     #[test]

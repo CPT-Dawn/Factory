@@ -91,6 +91,15 @@ impl Lab {
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
+    fn drop_unanswered(&self, lease: &Lease) {
+        if self
+            .write(|c, now| store::drop_lease(c, lease, now))
+            .is_ok()
+        {
+            self.notify();
+        }
+    }
+
     fn remove_waiter(&self, id: i64) {
         if let Ok(true) = self.write(|c, _| store::delete_waiter(c, id)) {
             self.notify();
@@ -241,7 +250,7 @@ fn try_grant(
     p: &AcquireParams,
     waiter: i64,
     facts: &Facts,
-) -> Answer<Result<Granted, String>> {
+) -> Answer<Result<(Granted, bool), String>> {
     lab.write(|c, now| {
         let lease = store::find_lease(c, &p.worktree, &p.owner, p.lease)?;
         let leases = store::leases(c)?;
@@ -287,6 +296,7 @@ fn try_grant(
             Decision::Wait(why) => return Ok(Err(why)),
             Decision::Grant { slot, new } => (slot, new),
         };
+        let fresh = new || lease.is_none();
         let lease = match lease {
             Some(lease) if !new => lease,
             _ => store::insert_lease(
@@ -304,7 +314,7 @@ fn try_grant(
         };
         store::touch(c, lease.id, now)?;
         store::delete_waiter(c, waiter)?;
-        Ok(Ok(Granted { lease, previous }))
+        Ok(Ok((Granted { lease, previous }, fresh)))
     })
 }
 
@@ -372,10 +382,11 @@ where
             .await
         };
         let why = match tried {
-            Ok(Ok(granted)) => {
+            Ok(Ok((granted, fresh))) => {
                 lab.notify();
+                let lease = granted.lease.clone();
                 let value = serde_json::to_value(granted).unwrap_or(Value::Null);
-                send(
+                let answered = send(
                     writer,
                     Response {
                         id,
@@ -383,6 +394,10 @@ where
                     },
                 )
                 .await;
+                // A caller gone before its answer never learns of the lease: give it back.
+                if !answered && fresh {
+                    lab.drop_unanswered(&lease);
+                }
                 return;
             }
             Ok(Err(why)) => why,

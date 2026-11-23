@@ -94,7 +94,7 @@ pub fn patch_supabase_config(toml: &str, slot: u32, stride: u32, project_ports: 
     if slot == 0 {
         return toml.to_owned();
     }
-    let off = slot * stride;
+    let off = slot.saturating_mul(stride);
     let mut section = String::new();
     let lines: Vec<String> = toml
         .split('\n')
@@ -113,7 +113,14 @@ pub fn patch_supabase_config(toml: &str, slot: u32, stride: u32, project_ports: 
                 && is_port(&section, &m[2])
                 && let Ok(port) = m[4].parse::<u32>()
             {
-                return format!("{}{}{}{}{}", &m[1], &m[2], &m[3], port + off, &m[5]);
+                return format!(
+                    "{}{}{}{}{}",
+                    &m[1],
+                    &m[2],
+                    &m[3],
+                    port.saturating_add(off),
+                    &m[5]
+                );
             }
             shift_url_ports(line, off, project_ports)
         })
@@ -140,7 +147,7 @@ fn shift_url_ports(line: &str, off: u32, project_ports: &[u32]) -> String {
             out.push_str(&line[last..all.start()]);
             out.push_str(host.as_str());
             out.push(':');
-            out.push_str(&(number + off).to_string());
+            out.push_str(&number.saturating_add(off).to_string());
             last = all.end();
         }
     }
@@ -174,20 +181,20 @@ fn get<'a>(env: &'a Env, key: &str) -> Option<&'a str> {
 /// Every exported value for a slot: project ports, the stack's ports and URLs, then the
 /// project's own templates.
 pub fn slot_env(p: &ProjectConfig, slot: u32, supa: Option<&StackInfo>) -> Env {
-    let off = slot * p.slot_stride;
+    let off = slot.saturating_mul(p.slot_stride);
     let mut env: Env = vec![
         ("DEVLAB_PROJECT".to_owned(), p.name.clone()),
         ("DEVLAB_SLOT".to_owned(), slot.to_string()),
     ];
     for (name, port) in &p.ports {
-        set(&mut env, name.clone(), (port + off).to_string());
+        set(&mut env, name.clone(), port.saturating_add(off).to_string());
     }
     if let Some(supa) = supa {
         let port = |key: &str| {
             supa.ports
                 .iter()
                 .find(|(k, _)| k == key)
-                .map(|(_, v)| v + off)
+                .map(|(_, v)| v.saturating_add(off))
                 .filter(|v| *v != 0)
         };
         if let Some(api) = port("api.port") {
@@ -266,13 +273,16 @@ pub fn slot_host_ports(
     slot: u32,
     stack_ports: Option<&[u32]>,
 ) -> (Vec<u32>, Vec<u32>) {
-    let off = slot * stride;
+    let off = slot.saturating_mul(stride);
     (
-        project_ports.iter().map(|p| p + off).collect(),
+        project_ports
+            .iter()
+            .map(|p| p.saturating_add(off))
+            .collect(),
         stack_ports
             .unwrap_or_default()
             .iter()
-            .map(|p| p + off)
+            .map(|p| p.saturating_add(off))
             .collect(),
     )
 }
