@@ -9,8 +9,7 @@
 //! - [`emulator`] is the life of an emulator the daemon boots.
 //! - [`run`] says how a `devlab run` ended.
 //! - [`idle`] says which idle emulators and stacks to stop, and when to look again.
-//!
-//! Reservations (#17) get a module of their own beside these.
+//! - [`reserve`] sets slots aside for a lead's implementers.
 
 pub mod args;
 pub mod config;
@@ -19,6 +18,7 @@ pub mod emulator;
 pub mod grant;
 pub mod idle;
 pub mod queue;
+pub mod reserve;
 pub mod run;
 pub mod slots;
 

@@ -122,6 +122,23 @@ fn a_pane_waits_on_what_it_registered_until_the_wait_clears() {
 }
 
 #[test]
+fn a_pane_waiting_on_a_review_shows_it_by_its_label() {
+    let mut waits = Waits::default();
+    waits.register(Wait {
+        waiter: Some("w1:p1".to_owned()),
+        on: WaitOn::Review("t9-r1".to_owned()),
+    });
+
+    assert_eq!(
+        waits
+            .waiting_on("w1:p1")
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("review t9-r1")
+    );
+}
+
+#[test]
 fn a_leads_branch_is_factory_slash_its_slug() {
     assert_eq!(branch("cart"), "factory/cart");
 }

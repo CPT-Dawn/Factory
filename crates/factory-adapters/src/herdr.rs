@@ -12,6 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use factory_core::lead::AgentStatus;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -47,6 +48,15 @@ pub trait HerdrApi: Send + Sync + 'static {
         pane_id: &str,
         lines: u32,
     ) -> impl Future<Output = Result<String, HerdrError>> + Send;
+
+    /// Types `text` into the agent `target` (its name) and submits it; with `wait`, answers once
+    /// the agent reaches one of its statuses, or fails when its timeout passes first.
+    fn prompt(
+        &self,
+        target: &str,
+        text: &str,
+        wait: Option<&PromptWait>,
+    ) -> impl Future<Output = Result<(), HerdrError>> + Send;
 
     /// Opens a subscription; it streams events until it is dropped or herdr hangs up.
     fn subscribe(
@@ -148,6 +158,39 @@ pub struct Agent {
     pub agent_status: String,
     pub pane_id: String,
     pub workspace_id: String,
+    /// The agent's working directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// The agent's own session, as its integration reported it.
+    #[serde(default)]
+    pub agent_session: Option<AgentSession>,
+}
+
+/// The session an agent reported: an id (Claude Code's session id) or the path of its log.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct AgentSession {
+    pub kind: SessionKind,
+    pub value: String,
+}
+
+/// What an [`AgentSession`]'s value is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionKind {
+    /// The agent's own session id.
+    Id,
+    /// The path of the session's log.
+    Path,
+    /// A kind this adapter doesn't know.
+    #[serde(other)]
+    Other,
+}
+
+/// What a prompt waits for: the agent reaching one of `until`, at most `timeout`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptWait {
+    pub until: Vec<AgentStatus>,
+    pub timeout: Duration,
 }
 
 /// What `worktree.create` made: the workspace, its one pane and the worktree's folder.
@@ -269,6 +312,24 @@ impl HerdrApi for Herdr {
         });
         let read: Read = self.call("pane.read", params).await?;
         Ok(read.read.text)
+    }
+
+    async fn prompt(
+        &self,
+        target: &str,
+        text: &str,
+        wait: Option<&PromptWait>,
+    ) -> Result<(), HerdrError> {
+        let mut params = json!({"target": target, "text": text});
+        let mut patience = Duration::ZERO;
+        if let Some(wait) = wait {
+            let until: Vec<&str> = wait.until.iter().map(|status| status.name()).collect();
+            params["wait"] = json!({"until": until, "timeout_ms": millis(wait.timeout)});
+            patience = wait.timeout;
+        }
+        self.call_within::<Value>("agent.prompt", params, patience)
+            .await
+            .map(drop)
     }
 
     async fn subscribe(&self, watches: &[Watch]) -> Result<Events, HerdrError> {

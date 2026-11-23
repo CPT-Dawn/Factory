@@ -13,6 +13,8 @@ pub enum WaitOn {
     Lead(String),
     /// A pull request's checks, by `<owner>/<repo>#<number>`.
     Ci(String),
+    /// A review, by its label.
+    Review(String),
 }
 
 impl fmt::Display for WaitOn {
@@ -20,6 +22,7 @@ impl fmt::Display for WaitOn {
         match self {
             WaitOn::Lead(name) => f.write_str(name),
             WaitOn::Ci(pr) => write!(f, "ci {pr}"),
+            WaitOn::Review(label) => write!(f, "review {label}"),
         }
     }
 }
@@ -52,6 +55,11 @@ impl Waits {
 
     pub fn clear(&mut self, id: WaitId) {
         self.waits.remove(&id);
+    }
+
+    /// Every registered wait, oldest first.
+    pub fn all(&self) -> impl Iterator<Item = &Wait> {
+        self.waits.values()
     }
 
     /// What the oldest wait registered from `pane` is on, if any wait is.

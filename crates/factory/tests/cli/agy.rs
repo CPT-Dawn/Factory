@@ -65,12 +65,24 @@ fn usage_left() -> String {
     usage(0.14, in_two_hours())
 }
 
+/// What agy logs at startup when its `--sandbox` is in effect, as `agy -p` 1.5 logs it.
+const SANDBOX_STARTED: &str =
+    "I1123 09:37:00.811680 1 session.go:87] Print mode: enabling terminal sandbox for this session";
+
 /// A fake `agy`: `agy -p /usage` prints `usage`; any other run keeps its prompt (the
-/// value of `-p`) as `bin/agy.prompt` and runs `review`.
+/// value of `-p`) as `bin/agy.prompt` and its working directory as `bin/agy.cwd`, logs that
+/// its sandbox started to the file its `--log-file` names, and runs `review`.
 fn agy(usage: &str, review: &str) -> String {
+    agy_logging(usage, SANDBOX_STARTED, review)
+}
+
+/// A fake `agy` as [`agy`], that logs `line` instead of its sandbox starting.
+fn agy_logging(usage: &str, line: &str, review: &str) -> String {
     format!(
         "if [ \"$2\" = /usage ]; then\ncat <<'USAGE'\n{usage}\nUSAGE\nexit 0\nfi\n\
-         printf '%s' \"$2\" > \"$0.prompt\"\n{review}"
+         printf '%s' \"$2\" > \"$0.prompt\"\npwd > \"$0.cwd\"\n\
+         log=; prev=; for a in \"$@\"; do [ \"$prev\" = --log-file ] && log=$a; prev=$a; done\n\
+         [ -n \"$log\" ] && cat >> \"$log\" <<'LOG'\n{line}\nLOG\n{review}"
     )
 }
 
@@ -387,7 +399,8 @@ fn any_other_agy_exit_3_is_a_failed_review() {
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
     assert!(
-        out.stderr.starts_with("factory: agy exited 3; see "),
+        out.stderr
+            .starts_with("factory: code-review: agy exited 3; see "),
         "{out:?}"
     );
     assert!(sandbox.calls("codex").is_empty(), "no fallback");
@@ -411,13 +424,298 @@ fn a_print_timeout_ends_the_review_as_a_timeout() {
 
     assert_eq!(out.code, 124, "{out:?}");
     assert!(
-        out.stderr.starts_with("factory: agy timed out after 5s"),
+        out.stderr
+            .starts_with("factory: code-review: agy timed out after 5s"),
         "{out:?}"
     );
     assert_eq!(
         after(&reviews_run(&sandbox)[0], "--print-timeout"),
         Some("5s")
     );
+}
+
+/// The repo's worktrees, as `git worktree list --porcelain` names them.
+fn worktrees(sandbox: &Sandbox, repo: &std::path::Path) -> Vec<String> {
+    let out = sandbox
+        .command("git", &["worktree", "list", "--porcelain"])
+        .current_dir(repo)
+        .output()
+        .map(|out| out.stdout)
+        .unwrap_or_default();
+    String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The repo's status, as `git status --porcelain --ignored` prints it.
+fn status(sandbox: &Sandbox, repo: &std::path::Path) -> String {
+    let out = sandbox
+        .command("git", &["status", "--porcelain", "--ignored"])
+        .current_dir(repo)
+        .output()
+        .map(|out| out.stdout)
+        .unwrap_or_default();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Where the fake agy ran its review.
+fn agys_cwd(sandbox: &Sandbox) -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        fs::read_to_string(sandbox.path("bin/agy.cwd"))
+            .unwrap_or_default()
+            .trim_end(),
+    )
+}
+
+/// A review that writes into its working directory and moves its checkout's HEAD, as a
+/// terminal command run outside a sandbox could, and notes the commit it saw; then `then`.
+fn agy_scribbles(then: &str) -> String {
+    format!(
+        "echo scribbled > probe.txt\necho changed > a.txt\nmkdir -p sub && echo x > sub/new\n\
+         git rev-parse HEAD > \"$0.head\"\ngit checkout -q --detach HEAD~1\n{then}"
+    )
+}
+
+#[test]
+fn agy_reviews_a_throwaway_checkout_of_the_head_so_its_writes_leave_the_callers_tree_alone() {
+    let sandbox = sandboxed();
+    let repo = sandbox.repo();
+    sandbox.fake(
+        "agy",
+        &agy(&usage_left(), &agy_scribbles(&agy_writes(CLEAN_REPORT))),
+    );
+    let head = sandbox.git(&repo, &["rev-parse", "HEAD"]);
+    let before = status(&sandbox, &repo);
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(
+        status(&sandbox, &repo),
+        before,
+        "the caller's tree is unchanged"
+    );
+    assert!(!repo.join("probe.txt").exists());
+    assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(sandbox.git(&repo, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        fs::read_to_string(sandbox.path("bin/agy.head")).unwrap(),
+        head,
+        "agy saw the reviewed head"
+    );
+    let cwd = agys_cwd(&sandbox);
+    let top = fs::canonicalize(&repo).unwrap();
+    assert!(!cwd.starts_with(&top), "agy ran outside the repo: {cwd:?}");
+    assert!(!cwd.exists(), "its checkout is removed: {cwd:?}");
+    assert_eq!(worktrees(&sandbox, &repo).len(), 1, "no worktree is left");
+    let argv = &reviews_run(&sandbox)[0];
+    let shared = after(argv, "--add-dir").and_then(|dir| fs::canonicalize(dir).ok());
+    assert_eq!(shared, fs::canonicalize(repo.join(".git")).ok(), "{argv:?}");
+    let prompt = fs::read_to_string(sandbox.path("bin/agy.prompt")).unwrap();
+    let bundle = sandbox.reviews().join("t1.bundle.md");
+    assert!(
+        prompt.contains(&format!("{}.", bundle.display())),
+        "the prompt names the bundle by its full path: {prompt}"
+    );
+    assert!(bundle.is_file(), "the bundle resolves from anywhere");
+    assert_eq!(
+        fs::read_to_string(sandbox.reviews().join("t1.md")).unwrap(),
+        CLEAN_REPORT
+    );
+}
+
+#[test]
+fn agy_reviews_from_the_same_subdirectory_of_its_checkout() {
+    let sandbox = sandboxed();
+    let repo = sandbox.repo();
+    fs::create_dir(repo.join("docs")).unwrap();
+    fs::write(repo.join("docs/spec.md"), "# spec\n").unwrap();
+    sandbox.git(&repo, &["add", "."]);
+    sandbox.git(&repo, &["commit", "-q", "-m", "docs: add a spec"]);
+    sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
+
+    let out = sandbox.factory_in(&repo.join("docs"), &["review", "main", "t1", "spec.md"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let cwd = agys_cwd(&sandbox);
+    assert_eq!(cwd.file_name().and_then(|name| name.to_str()), Some("docs"));
+    assert!(
+        !cwd.starts_with(fs::canonicalize(&repo).unwrap()),
+        "{cwd:?}"
+    );
+}
+
+#[test]
+fn agys_checkout_is_removed_after_a_print_timeout() {
+    let sandbox = sandboxed();
+    let repo = sandbox.repo();
+    let timed_out = agy_fails("print timeout after 1800s", "print_timeout");
+    sandbox.fake("agy", &agy(&usage_left(), &agy_scribbles(&timed_out)));
+    let before = status(&sandbox, &repo);
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 124, "{out:?}");
+    assert!(!agys_cwd(&sandbox).exists(), "its checkout is removed");
+    assert_eq!(worktrees(&sandbox, &repo).len(), 1, "no worktree is left");
+    assert_eq!(status(&sandbox, &repo), before);
+}
+
+#[test]
+fn a_checkout_left_by_a_review_that_died_is_swept() {
+    let sandbox = sandboxed();
+    let repo = sandbox.repo();
+    // No process has an ID past the kernel's largest, 2^22.
+    let left = sandbox.path("state/factory/checkouts/repo-4194999");
+    fs::create_dir_all(&left).unwrap();
+    fs::write(left.join("a.txt"), "left\n").unwrap();
+    sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(!left.exists(), "the dead review's checkout is swept");
+}
+
+#[test]
+fn a_review_whose_sandbox_did_not_start_is_reported_and_codex_reruns_it() {
+    let sandbox = sandboxed();
+    let repo = sandbox.repo();
+    let unavailable = "W1123 09:37:00.811680 1 session.go:80] Terminal sandbox unavailable: \
+                       AppArmor restricts unprivileged user namespaces \
+                       (kernel.apparmor_restrict_unprivileged_userns = 1)";
+    sandbox.fake(
+        "agy",
+        &agy_logging(
+            &usage_left(),
+            unavailable,
+            &agy_writes("## agy's unsandboxed report\n"),
+        ),
+    );
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+
+    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let shown = shown(&out.stdout);
+    assert_eq!(shown["backend"], "codex", "{shown}");
+    assert_eq!(shown["skipped"][0]["backend"], "agy", "{shown}");
+    let reason = shown["skipped"][0]["reason"].as_str().unwrap_or_default();
+    assert!(reason.starts_with("its sandbox did not start"), "{shown}");
+    assert!(reason.contains("AppArmor"), "{shown}");
+    assert_eq!(
+        fs::read_to_string(sandbox.reviews().join("t1.md")).unwrap(),
+        CLEAN_REPORT,
+        "the unsandboxed report is not the review"
+    );
+}
+
+#[test]
+fn a_review_whose_log_never_says_its_sandbox_started_is_not_trusted() {
+    let sandbox = sandboxed();
+    let repo = sandbox.repo();
+    sandbox.fake(
+        "agy",
+        &agy_logging(
+            &usage_left(),
+            "I1123 printmode.go:209] Print mode: starting",
+            &agy_writes(CLEAN_REPORT),
+        ),
+    );
+    sandbox.fake("codex", "cat > /dev/null\nexit 1");
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
+    assert!(
+        out.stderr
+            .contains("agy skipped: its sandbox did not start"),
+        "{out:?}"
+    );
+    assert!(
+        !sandbox.reviews().join("t1.md").exists(),
+        "no report is kept"
+    );
+}
+
+/// agy's settings file in the sandbox's home, with `model` as the model chosen in agy.
+fn agy_settings(sandbox: &Sandbox, model: &str) {
+    let dir = sandbox.path("home/.gemini/antigravity-cli");
+    fs::create_dir_all(&dir).unwrap_or_default();
+    fs::write(
+        dir.join("settings.json"),
+        json!({"model": model, "trustedWorkspaces": ["~"]}).to_string(),
+    )
+    .unwrap_or_default();
+}
+
+/// agy's usage with the Gemini group full and the Claude and GPT group's five-hour bucket
+/// empty until `reset`.
+fn usage_claude_empty(reset: Timestamp) -> String {
+    let mut usage: Value = serde_json::from_str(&usage(1.0, in_two_hours())).unwrap_or_default();
+    usage["command"]["data"]["groups"][1]["buckets"][1]["remaining_fraction"] = json!(0.0);
+    usage["command"]["data"]["groups"][1]["buckets"][1]["reset_time"] = json!(reset.to_string());
+    usage.to_string()
+}
+
+#[test]
+fn with_no_model_configured_the_quota_checked_is_that_of_the_model_chosen_in_agy() {
+    let sandbox = sandboxed();
+    let repo = sandbox.repo();
+    configure(
+        &sandbox,
+        "[[review.backend]]\ncli = \"agy\"\n\n[[review.backend]]\ncli = \"codex\"\n",
+    );
+    agy_settings(&sandbox, "Claude Opus 5.5 (Thinking)");
+    sandbox.fake(
+        "agy",
+        &agy(
+            &usage_claude_empty(in_two_hours()),
+            &agy_writes(CLEAN_REPORT),
+        ),
+    );
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+
+    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let shown = shown(&out.stdout);
+    assert_eq!(shown["backend"], "codex", "{shown}");
+    assert_eq!(shown["cooled"][0]["backend"], "agy", "{shown}");
+    assert!(reviews_run(&sandbox).is_empty(), "agy never reviews");
+}
+
+#[test]
+fn with_no_model_chosen_anywhere_the_quota_checked_is_that_of_agys_default_gemini() {
+    for chosen in [None, Some("")] {
+        let sandbox = sandboxed();
+        let repo = sandbox.repo();
+        configure(
+            &sandbox,
+            "[[review.backend]]\ncli = \"agy\"\n\n[[review.backend]]\ncli = \"codex\"\n",
+        );
+        if let Some(model) = chosen {
+            agy_settings(&sandbox, model);
+        }
+        sandbox.fake(
+            "agy",
+            &agy(&usage(0.0, in_two_hours()), &agy_writes(CLEAN_REPORT)),
+        );
+        sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+
+        let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+
+        assert_eq!(out.code, 0, "{chosen:?}: {out:?}");
+        assert_eq!(
+            shown(&out.stdout)["backend"],
+            "codex",
+            "{chosen:?}: {out:?}"
+        );
+        assert!(reviews_run(&sandbox).is_empty(), "{chosen:?}");
+    }
 }
 
 /// A review that notes the `GEMINI_API_KEY` it sees in `bin/agy.key`, then writes `report`.
@@ -535,7 +833,8 @@ fn an_inactive_sandbox_stays_reported_when_the_next_backend_fails() {
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
     assert!(
-        out.stderr.starts_with("factory: codex exited 1; "),
+        out.stderr
+            .starts_with("factory: code-review: codex exited 1; "),
         "{out:?}"
     );
     assert!(
@@ -556,7 +855,8 @@ fn agy_usage_changes(first: &str, later: &str, review: &str) -> String {
     format!(
         "if [ \"$2\" = /usage ]; then\n\
          if [ -e \"$0.asked\" ]; then cat <<'USAGE'\n{later}\nUSAGE\n\
-         else : > \"$0.asked\"; cat <<'USAGE'\n{first}\nUSAGE\nfi\nexit 0\nfi\n{review}"
+         else : > \"$0.asked\"; cat <<'USAGE'\n{first}\nUSAGE\nfi\nexit 0\nfi\n{}",
+        agy(later, review)
     )
 }
 
@@ -638,12 +938,12 @@ fn a_timeout_longer_than_a_week_is_refused_before_any_backend_runs() {
     assert_eq!(out.code, 2, "{out:?}");
     assert_eq!(
         out.stderr,
-        "factory: --timeout 18446744073709551615 is longer than a week; give at most 604800\n"
+        "factory: code-review: --timeout 18446744073709551615 is longer than a week; give at most 604800\n"
     );
     assert_eq!(configured.code, 3, "{configured:?}");
     assert_eq!(
         configured.stderr,
-        "factory: backend agy has a timeout of 604801s, longer than a week; set at most 604800 in the factory config\n"
+        "factory: code-review: backend agy has a timeout of 604801s, longer than a week; set at most 604800 in the factory config\n"
     );
     assert!(
         sandbox.calls("agy").is_empty(),

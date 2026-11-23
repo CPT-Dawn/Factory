@@ -20,7 +20,7 @@ use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags, pidfd_open};
 
 use super::super::{context, host, lease, stack};
-use super::{Lab, Lease, lock_ignoring_poison, store};
+use super::{Lab, Lease, lock_ignoring_poison, reservations, store};
 use crate::lab::wire::SlotRow;
 
 /// The longest the keeper goes without a look: a changed config is read by then.
@@ -72,7 +72,9 @@ impl Lab {
         let claimed = self
             .write(|c, _| {
                 let taken = store::taken(c)?;
-                let leases = store::leases(c)?;
+                // A slot a lease or a reservation holds, or a release is stopping, isn't idle.
+                let mut holdings: Vec<_> = store::leases(c)?.iter().map(Lease::holding).collect();
+                holdings.extend(reservations::all(c)?.iter().map(|r| r.holding()));
                 let mut stopping = lock_ignoring_poison(&self.stopping);
                 let emulators: Vec<store::EmulatorRow> = store::emulators(c)?
                     .into_iter()
@@ -97,10 +99,11 @@ impl Lab {
                         project: s.project.clone(),
                         slot: s.slot,
                         stack_ours: s.stack_ours,
-                        held: leases.iter().any(|l| {
-                            l.project.as_deref() == Some(s.project.as_str())
-                                && l.slot == Some(s.slot)
-                        }),
+                        held: s.stopping
+                            || holdings.iter().any(|h| {
+                                h.project.as_deref() == Some(s.project.as_str())
+                                    && h.slot == Some(s.slot)
+                            }),
                         last_worktree: s.last_worktree.clone(),
                         idle_since: s.idle_since,
                     })

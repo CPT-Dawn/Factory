@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::support::{self, Sandbox, world};
 
-const CLEAN_REPORT: &str = r#"## Standards
+pub(crate) const CLEAN_REPORT: &str = r#"## Standards
 
 Nothing.
 
@@ -25,7 +25,7 @@ VERDICT: clean
 "#;
 
 /// A fake `codex` body that hits its usage limit, naming `reset` ("12:39 PM") as Codex does.
-fn codex_out_of_quota(reset: &str) -> String {
+pub(crate) fn codex_out_of_quota(reset: &str) -> String {
     let message = format!(
         "You\u{2019}ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at {reset}."
     );
@@ -36,7 +36,7 @@ fn codex_out_of_quota(reset: &str) -> String {
 
 /// A fake `claude` body that keeps its prompt as `bin/claude.stdin` and prints `report` as
 /// the result of `--output-format json`.
-fn claude_writes(report: &str) -> String {
+pub(crate) fn claude_writes(report: &str) -> String {
     let result =
         json!({"type": "result", "subtype": "success", "is_error": false, "result": report});
     format!("cat > \"$0.stdin\"\ncat <<'RESULT'\n{result}\nRESULT")
@@ -51,7 +51,7 @@ fn now_seconds() -> i64 {
 
 /// A minute about two hours from now, as Codex names it on a 12-hour UTC clock ("2:39 PM"),
 /// and as the moment it is.
-fn reset_in_two_hours() -> (String, Timestamp) {
+pub(crate) fn reset_in_two_hours() -> (String, Timestamp) {
     let at = (now_seconds() + 7200) / 60 * 60;
     let (hour, minute) = (at / 3600 % 24, at / 60 % 60);
     let half = if hour < 12 { "AM" } else { "PM" };
@@ -123,7 +123,7 @@ fn a_codex_usage_limit_cools_codex_down_to_its_reset_and_reruns_the_review_on_cl
 }
 
 /// Writes the factory config, `$XDG_CONFIG_HOME/factory/config.toml`.
-fn configure(sandbox: &Sandbox, toml: &str) {
+pub(crate) fn configure(sandbox: &Sandbox, toml: &str) {
     let dir = sandbox.path("config/factory");
     fs::create_dir_all(&dir).unwrap_or_default();
     fs::write(dir.join("config.toml"), toml).unwrap_or_default();
@@ -224,7 +224,8 @@ fn the_config_file_sets_codexs_model_effort_and_timeout() {
 
     assert_eq!(out.code, 124, "{out:?}");
     assert!(
-        out.stderr.starts_with("factory: codex timed out after 1s"),
+        out.stderr
+            .starts_with("factory: code-review: codex timed out after 1s"),
         "{out:?}"
     );
     let argv = &sandbox.calls("codex")[0];
@@ -449,7 +450,7 @@ fn every_backend_out_of_quota_exits_75_naming_when_to_retry() {
     assert_eq!(
         out.stderr,
         format!(
-            "factory: every review backend is out of quota (codex until {until}); retry after {until}\n"
+            "factory: code-review: every review backend is out of quota (codex until {until}); retry after {until}\n"
         )
     );
     let logged = event(&sandbox, 0);
@@ -536,7 +537,7 @@ fn a_review_queued_when_the_daemon_stops_says_to_run_it_again() {
     assert_eq!(second.code, 3, "{second:?}");
     assert_eq!(
         second.stderr,
-        "factory: the daemon stopped (a restart or an upgrade); run the review again\n"
+        "factory: code-review: the daemon stopped (a restart or an upgrade); run the review again\n"
     );
     open(&gate);
     support::finish(first);

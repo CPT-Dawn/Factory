@@ -13,8 +13,8 @@ use tokio::sync::mpsc;
 use std::time::Duration;
 
 use super::{
-    Agent, Event, Events, HerdrApi, HerdrError, NewWorktree, PROTOCOL, Pong, Source, Watch,
-    Workspace, Worktree,
+    Agent, AgentSession, Event, Events, HerdrApi, HerdrError, NewWorktree, PROTOCOL, Pong,
+    PromptWait, SessionKind, Source, Watch, Workspace, Worktree,
 };
 
 /// A herdr that answers from a script. Every request is recorded by its method name.
@@ -87,7 +87,20 @@ impl FakeHerdr {
             agent_status: status.to_owned(),
             pane_id: pane.to_owned(),
             workspace_id: pane.split(':').next().unwrap_or(pane).to_owned(),
+            cwd: None,
+            agent_session: None,
         });
+    }
+
+    /// Gives the agent in `pane` a working directory and the Claude Code session `id`.
+    pub fn session(&self, pane: &str, cwd: &str, id: &str) {
+        for agent in self.lock().agents.iter_mut().filter(|a| a.pane_id == pane) {
+            agent.cwd = Some(cwd.to_owned());
+            agent.agent_session = Some(AgentSession {
+                kind: SessionKind::Id,
+                value: id.to_owned(),
+            });
+        }
     }
 
     pub fn screen(&self, pane: &str, text: &str) {
@@ -209,6 +222,17 @@ impl HerdrApi for FakeHerdr {
         Ok(all[all.len() - keep..].join("\n"))
     }
 
+    async fn prompt(
+        &self,
+        target: &str,
+        text: &str,
+        _wait: Option<&PromptWait>,
+    ) -> Result<(), HerdrError> {
+        let mut state = self.call("agent.prompt")?;
+        state.prompts.push((target.to_owned(), text.to_owned()));
+        Ok(())
+    }
+
     async fn subscribe(&self, watches: &[Watch]) -> Result<Events, HerdrError> {
         let mut state = self.call("events.subscribe")?;
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -257,6 +281,8 @@ impl HerdrApi for FakeHerdr {
             agent_status: "idle".to_owned(),
             pane_id: pane_id.to_owned(),
             workspace_id: pane_id.split(':').next().unwrap_or(pane_id).to_owned(),
+            cwd: None,
+            agent_session: None,
         });
         Ok(())
     }
