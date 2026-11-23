@@ -297,6 +297,9 @@ fn another_failure_is_no_limit() {
         "Failed to load resets_hourly: size limit exceeded",
         "Failed to load hourly_resets: size limit exceeded",
         "Invalid API key",
+        "Invalid settings: rate_limit_config must be a number",
+        "unknown option rate_limit_retries",
+        "Failed to read ratelimit.json",
     ] {
         assert_eq!(failure_limit(text), None, "{text}");
     }

@@ -101,7 +101,7 @@ pub enum Command {
         /// Give the name back to today's devlab and start its watcher again
         #[arg(long)]
         rollback: bool,
-        /// With --rollback: skip the check that factory lab holds nothing, for a lab that no longer answers
+        /// With --rollback: skip the check that factory lab holds nothing, for a lab that no longer answers, and the need for a watcher unit to start again
         #[arg(long, requires = "rollback")]
         force: bool,
     },

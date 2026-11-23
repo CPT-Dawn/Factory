@@ -215,10 +215,20 @@ pub fn failure_limit(text: &str) -> Option<Reset> {
     let lower = text.to_lowercase();
     let named = named_reset(&lower);
     let rate = lower.contains("rate limit")
-        || lower.contains("rate_limit")
+        || names_rate_limit(&lower)
         || lower.contains("too many requests")
         || is_status(&lower, "429");
     (rate || named.is_some()).then(|| named.unwrap_or(Reset::Unknown))
+}
+
+/// Whether `lower` carries the API's `rate_limit` or `rate_limit_error` type as a whole word,
+/// not an identifier that only starts with it (`rate_limit_config`).
+fn names_rate_limit(lower: &str) -> bool {
+    lower.match_indices("rate_limit").any(|(at, word)| {
+        let rest = &lower[at + word.len()..];
+        let rest = rest.strip_prefix("_error").unwrap_or(rest);
+        !lower[..at].ends_with(is_word_char) && !rest.starts_with(is_word_char)
+    })
 }
 
 /// Whether `text` has the HTTP status `code`: the number alone, after an HTTP marker

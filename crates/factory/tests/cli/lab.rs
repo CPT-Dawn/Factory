@@ -1637,6 +1637,24 @@ fn a_run_lands_in_the_ledger_with_its_command_slot_and_exit() {
 }
 
 #[test]
+fn a_run_whose_emulator_fails_to_boot_records_no_lease_it_gave_back() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-boot-fail");
+    world.apply("break systemd-run").unwrap();
+
+    let out = owned(
+        &sandbox,
+        &wt,
+        &["run", "--emulator", "--quiet", "--", "true"],
+    );
+
+    assert_eq!(out.code, 77, "{out:?}");
+    let event = the_lab_run(&sandbox);
+    assert!(event.get("lease").is_none(), "{event}");
+    assert!(event.get("slot").is_none(), "{event}");
+}
+
+#[test]
 fn sigterm_while_queued_leaves_the_queue_and_the_ledger_says_so() {
     let (sandbox, world) = lab();
     hold_the_owners_slot(&sandbox, &world);

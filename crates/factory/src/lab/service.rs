@@ -1425,7 +1425,7 @@ pub async fn acquire<W, R, S>(
                         }
                         if let Some(mut run) = run {
                             if answered {
-                                run.granted(Some(&lease)).await;
+                                run.granted((!given_back).then_some(&lease)).await;
                                 run.follow(writer, lines, None, stopping.as_mut()).await;
                             } else {
                                 run.granted(None).await;
