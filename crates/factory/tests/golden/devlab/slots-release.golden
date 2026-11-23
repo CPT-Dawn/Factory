@@ -1,0 +1,53 @@
+# Leases end: by release, which a second time finds nothing held, and by gc once their owner has
+# exited.
+$ a@demo-a devlab acquire --no-device --quiet
+1> export DEVLAB_PROJECT=demo
+1> export DEVLAB_SLOT=0
+1> export API_PORT=27787
+1> export SUPABASE_API_PORT=27321
+1> export SUPABASE_URL=http://127.0.0.1:27321
+1> export SUPABASE_DB_PORT=27322
+1> export SUPABASE_DB_URL=postgresql://postgres:postgres@127.0.0.1:27322/postgres
+1> export SUPABASE_STUDIO_PORT=27323
+1> export SUPABASE_MAIL_PORT=27324
+1> export SUPABASE_PROJECT_ID=demo
+1> export SUPABASE_DB_CONTAINER=supabase_db_demo
+1> export API_URL=http://127.0.0.1:27787
+1> export DEVLAB_LEASE=1
+? 0
+$ b@demo-b devlab acquire --no-device --quiet
+1> export DEVLAB_PROJECT=demo
+1> export DEVLAB_SLOT=1
+1> export API_PORT=27887
+1> export SUPABASE_API_PORT=27421
+1> export SUPABASE_URL=http://127.0.0.1:27421
+1> export SUPABASE_DB_PORT=27422
+1> export SUPABASE_DB_URL=postgresql://postgres:postgres@127.0.0.1:27422/postgres
+1> export SUPABASE_STUDIO_PORT=27423
+1> export SUPABASE_MAIL_PORT=27424
+1> export SUPABASE_PROJECT_ID=demo_s1
+1> export SUPABASE_DB_CONTAINER=supabase_db_demo_s1
+1> export SUPABASE_WORKDIR=<sandbox>/state/devlab/demo/slot-1
+1> export API_URL=http://127.0.0.1:27887
+1> export DEVLAB_LEASE=2
+? 0
+$ a@demo-a devlab release
+2> devlab: released lease 1
+? 0
+$ a@demo-a devlab release
+2> devlab: nothing held here
+? 0
+$ a@demo-a devlab env
+2> devlab: no lease for <sandbox>/wt/demo-a (claude:<a>): run devlab acquire
+? 4
+kill b
+$ a@demo-a devlab gc
+1> released lease 2 (claude:<b>, owner exited)
+? 0
+$ a@demo-a devlab status
+1> devices: none attached
+1> stack slots
+1>   demo 0   down                         free (last: demo-a)
+1>   demo 1   down                         free (last: demo-b)
+1> memory <mem> GB free; watcher inactive (systemctl --user enable --now devlab-watch)
+? 0

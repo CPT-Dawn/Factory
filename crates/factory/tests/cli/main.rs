@@ -3,6 +3,7 @@
 //! Every test builds a [`support::Sandbox`] and drives the built `factory` binary inside it.
 //! Add a module per command here.
 
+mod devlab_golden;
 mod harness;
 mod help;
 mod log;

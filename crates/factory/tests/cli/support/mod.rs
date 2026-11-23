@@ -22,6 +22,9 @@ use std::time::Duration;
 use rustix::process::{Pid, Signal, kill_process_group};
 use tempfile::TempDir;
 
+pub mod golden;
+pub mod world;
+
 /// External tools faked on every sandbox's PATH. Add a tool here when a command starts using it.
 pub const FAKED_TOOLS: &[&str] = &[
     "adb",
@@ -32,6 +35,10 @@ pub const FAKED_TOOLS: &[&str] = &[
     "agy",
     "codex",
     "claude",
+    "systemd-run",
+    "avdmanager",
+    "emulator",
+    "notify-send",
 ];
 
 /// How long any one process a test runs may take before the test fails.
@@ -256,7 +263,7 @@ pub fn finish(child: Child) -> Run {
     }
 }
 
-fn kill_group(leader: u32, signal: Signal) {
+pub(crate) fn kill_group(leader: u32, signal: Signal) {
     if let Some(group) = i32::try_from(leader).ok().and_then(Pid::from_raw) {
         let _ = kill_process_group(group, signal);
     }
