@@ -24,12 +24,13 @@ pub enum PreTool {
     Allow,
     /// Refuse the call; the line says what to do instead.
     Block(String),
-    /// The call commits or pushes: the caller checks the staged diff of each with
-    /// [`private_address`] and blocks the call if one leaks.
-    CheckStaged(Vec<GitAction>),
+    /// The call commits or pushes: the caller checks what each adds, the staged diff of a commit
+    /// with [`private_address`] and the commits a push sends with [`pushed_address`], and
+    /// blocks the call if one leaks.
+    Check(Vec<GitAction>),
 }
 
-/// A commit or push in a command, and the diff to check for it.
+/// A commit or push in a command, and what to check for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitAction {
     /// The directory it runs in, relative to the call's working directory (`cd`, `pushd`,
@@ -44,6 +45,50 @@ pub struct GitAction {
     /// An earlier `git add` in the command, or the commit's own pathspecs, take more along
     /// than is staged when the hook runs: the pathspecs named, or none named for all of them.
     pub added: Option<Vec<String>>,
+    /// A push, which sends commits and takes nothing staged along: what it was told to send.
+    pub push: Option<Push>,
+}
+
+impl GitAction {
+    /// The directory, repository or working tree it names that the line cannot say before it
+    /// runs: one behind a variable or a command substitution, `cd -`, or `~user`. Which
+    /// repository such a call works in is unknown.
+    pub fn unresolved(&self) -> Option<&str> {
+        [&self.dir, &self.git_dir, &self.work_tree]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .find(|path| unknowable(path))
+    }
+}
+
+/// Whether a path from the line is only known when it runs (see [`GitAction::unresolved`]).
+fn unknowable(path: &str) -> bool {
+    let first = path.split('/').next().unwrap_or_default();
+    path.contains(['$', '`']) || first == "-" || (first.starts_with('~') && first != "~")
+}
+
+/// What a `git push` was told to send.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Push {
+    /// The remote it sends to, as named; none for the default.
+    pub remote: Option<String>,
+    /// What it sends; nothing for a push that only deletes.
+    pub refs: Vec<PushRef>,
+}
+
+/// One thing a push sends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PushRef {
+    /// The current branch, where the config sends it: a push that names no refspec.
+    Current,
+    /// `src[:dst]`: the commit `src` names, to the remote branch `dst`, or by default the
+    /// one `src` names.
+    Ref { src: String, dst: Option<String> },
+    /// Every local branch: `--all`, `--branches`, `--mirror` or a pattern.
+    Branches,
+    /// Every tag: `--tags`, `--mirror` or a pattern under `refs/tags/`.
+    Tags,
 }
 
 /// The pre-tool rules over Claude Code's hook input. `escape` says the escape variable is set
@@ -62,7 +107,7 @@ pub fn pre_tool(input: &Value, escape: bool) -> PreTool {
             }
             match git_actions(command) {
                 actions if actions.is_empty() => PreTool::Allow,
-                actions => PreTool::CheckStaged(actions),
+                actions => PreTool::Check(actions),
             }
         }
         Some("REPL") => text("code")
@@ -245,6 +290,7 @@ impl Directories {
         match call.program {
             // A bare `cd` goes home; `cd -` somewhere the line doesn't say.
             "cd" if call.args.is_empty() => here.cwd = Some("~".to_owned()),
+            "cd" if call.args.iter().any(|arg| arg == "-") => here.cwd = Some("-".to_owned()),
             "cd" => here.cwd = target,
             "pushd" => match target {
                 Some(target) => here.pushed.push(here.cwd.replace(target)),
@@ -318,12 +364,16 @@ pub fn git_actions(command: &str) -> Vec<GitAction> {
             "commit" | "push" => {
                 let mut added = here.added.clone();
                 let mut tracked = here.tracked;
+                let mut push = None;
                 if sub == "commit" {
                     let own = commit_args(args);
                     tracked |= own.all;
                     if let Some(paths) = own.paths {
                         stage_more(&mut added, paths);
                     }
+                } else {
+                    (tracked, added) = (false, None);
+                    push = Some(push_args(args));
                 }
                 let action = GitAction {
                     dir: git.dir,
@@ -331,6 +381,7 @@ pub fn git_actions(command: &str) -> Vec<GitAction> {
                     work_tree: git.work_tree,
                     tracked,
                     added,
+                    push,
                 };
                 if !actions.contains(&action) {
                     actions.push(action);
@@ -442,6 +493,101 @@ fn commit_args(args: &[String]) -> CommitArgs {
     CommitArgs { all, paths }
 }
 
+/// The long options of `git push` that take the next word as their value when no `=` gives it.
+const PUSH_LONG_VALUES: &[&str] = &["--repo", "--push-option", "--receive-pack", "--exec"];
+
+/// What `git push` was told to send: its remote, then its refspecs, and the options that send
+/// more or delete.
+fn push_args(args: &[String]) -> Push {
+    let mut remote = None;
+    let mut specs: Vec<&str> = Vec::new();
+    let (mut branches, mut tags, mut delete) = (false, false, false);
+    let mut skip_next = false;
+    let mut options_end = false;
+    for (at, arg) in args.iter().enumerate() {
+        if std::mem::take(&mut skip_next) {
+            continue;
+        }
+        if options_end || !arg.starts_with('-') {
+            if remote.is_none() {
+                remote = Some(arg.clone());
+            } else {
+                specs.push(arg);
+            }
+        } else if arg == "--" {
+            options_end = true;
+        } else if let Some(long) = arg.strip_prefix("--") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            match name {
+                "all" | "branches" => branches = true,
+                "tags" => tags = true,
+                "mirror" => (branches, tags) = (true, true),
+                "delete" => delete = true,
+                "repo" => {
+                    let given = value
+                        .map(str::to_owned)
+                        .or_else(|| args.get(at + 1).cloned());
+                    remote = remote.or(given);
+                }
+                _ => {}
+            }
+            skip_next = value.is_none() && PUSH_LONG_VALUES.contains(&arg.as_str());
+        } else {
+            for (at, flag) in arg.char_indices().skip(1) {
+                delete |= flag == 'd';
+                if flag == 'o' {
+                    // The rest of the word is the value, or else the next word is.
+                    skip_next = at + flag.len_utf8() == arg.len();
+                    break;
+                }
+            }
+        }
+    }
+    let mut refs = Vec::new();
+    let mut more = |sent: PushRef| {
+        if !refs.contains(&sent) {
+            refs.push(sent);
+        }
+    };
+    if !delete {
+        for spec in &specs {
+            let spec = spec.strip_prefix('+').unwrap_or(spec);
+            let (src, dst) = spec
+                .split_once(':')
+                .map_or((spec, None), |(s, d)| (s, Some(d)));
+            if src.is_empty() {
+                // `:dst` deletes dst.
+            } else if unknowable(src) {
+                // What it names is only known when the push runs: it could be any branch.
+                more(PushRef::Branches);
+            } else if src.contains('*') {
+                more(if src.starts_with("refs/tags/") {
+                    PushRef::Tags
+                } else {
+                    PushRef::Branches
+                });
+            } else {
+                more(PushRef::Ref {
+                    src: src.to_owned(),
+                    dst: dst.map(str::to_owned),
+                });
+            }
+        }
+        if branches {
+            more(PushRef::Branches);
+        }
+        if tags {
+            more(PushRef::Tags);
+        }
+        if specs.is_empty() && !branches && !tags {
+            more(PushRef::Current);
+        }
+    }
+    Push { remote, refs }
+}
+
 /// `next` as seen from `base`: an absolute path stands alone.
 fn join(base: Option<&str>, next: &str) -> String {
     match base {
@@ -541,20 +687,44 @@ fn all_parts(command: &str) -> Vec<Part> {
 /// the address, since the line lands in the agent's transcript. Addresses match without case;
 /// an empty one matches nothing.
 pub fn private_address(diff: &str, addresses: &[String]) -> Option<String> {
+    let named = leaking_file(diff, &needles(addresses), "git diff --cached --name-only")?;
+    Some(format!(
+        "The staged diff adds a private address in {named}: remove it, or unstage that file, then commit again."
+    ))
+}
+
+/// One commit a push sends: its short sha and its patch, a combined diff for a merge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Patch {
+    pub commit: String,
+    pub diff: String,
+}
+
+/// The refusal for a push whose commits, given oldest first, add one of the private
+/// `addresses`: it names the first commit that does and its file, as [`private_address`] does.
+pub fn pushed_address(sent: &[Patch], addresses: &[String]) -> Option<String> {
     let needles = needles(addresses);
+    sent.iter().find_map(|patch| {
+        let commit = &patch.commit;
+        let look = format!("git show --name-only {commit}");
+        let named = leaking_file(&patch.diff, &needles, &look)?;
+        Some(format!(
+            "Commit {commit} in this push adds a private address in {named}: rewrite that commit without it, then push again."
+        ))
+    })
+}
+
+/// The file in `diff` that adds one of the `needles`, as the refusal may name it: a name that
+/// has the address itself gives way to the command (`look`) that lists the names.
+fn leaking_file(diff: &str, needles: &[String], look: &str) -> Option<String> {
     if needles.is_empty() {
         return None;
     }
-    let has = |text: &str| contains_any(text, &needles);
-    let refusal = |named: &str| {
-        Some(format!(
-            "The staged diff adds a private address in {named}: remove it, or unstage that file, then commit again."
-        ))
-    };
+    let has = |text: &str| contains_any(text, needles);
     // The name may carry the address too; the line must not.
     let name_of = |file: &str| {
         if has(file) {
-            "a file whose name has it (see git diff --cached --name-only)".to_owned()
+            format!("a file whose name has it (see {look})")
         } else {
             file.to_owned()
         }
@@ -566,12 +736,18 @@ pub fn private_address(diff: &str, addresses: &[String]) -> Option<String> {
     let mut named = false;
     let mut deleted = false;
     for line in diff.lines() {
-        if let Some(names) = line.strip_prefix("diff --git ") {
+        // A merge's combined diff names the file once.
+        let header = line
+            .strip_prefix("diff --git ")
+            .map(|names| names.rsplit_once(" b/").map_or(names, |(_, new)| new))
+            .or_else(|| line.strip_prefix("diff --cc "))
+            .or_else(|| line.strip_prefix("diff --combined "));
+        if let Some(name) = header {
             if named && !deleted {
-                return refusal(&name_of(file));
+                return Some(name_of(file));
             }
             in_header = true;
-            file = names.rsplit_once(" b/").map_or(names, |(_, new)| new);
+            file = name;
             named = has(file);
             deleted = false;
         } else if line.starts_with("@@") {
@@ -579,11 +755,11 @@ pub fn private_address(diff: &str, addresses: &[String]) -> Option<String> {
         } else if in_header && line.starts_with("deleted file mode") {
             deleted = true;
         } else if !in_header && line.starts_with('+') && has(line) {
-            return refusal(&name_of(file));
+            return Some(name_of(file));
         }
     }
     if named && !deleted {
-        return refusal(&name_of(file));
+        return Some(name_of(file));
     }
     None
 }

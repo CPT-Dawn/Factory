@@ -7,6 +7,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use factory_core::hook::{Patch, Push, PushRef};
+
 use crate::process;
 
 /// How long one git command may take.
@@ -436,6 +438,129 @@ impl GitRepo {
                 })
                 .collect()
         })
+    }
+}
+
+impl GitRepo {
+    /// The commits `push` would send, oldest first, each with its patch (a merge's as a
+    /// combined diff), worked out from the refs here, with no call to the remote. A branch the
+    /// remote has, as its remote-tracking ref says, sends the commits that ref lacks; a new
+    /// branch, and a tag, every commit that no remote-tracking ref has.
+    pub fn sent(&self, push: &Push) -> Result<Vec<Patch>, GitError> {
+        let mut sent: Vec<Patch> = Vec::new();
+        for (src, dst) in self.updates(push)? {
+            // Git refuses to push a ref that names no commit, so it sends nothing. A commit made
+            // earlier in the same line is checked as a commit.
+            let Some(local) = self.commit_at(&src)? else {
+                continue;
+            };
+            let remote = match self.remote_branch(push.remote.as_deref(), &src, dst.as_deref())? {
+                Some(remote) => vec![local, format!("^{remote}")],
+                None => vec![local, "--not".to_owned(), "--remotes".to_owned()],
+            };
+            let mut args = vec![
+                "log",
+                "--reverse",
+                "-p",
+                "--cc",
+                "--no-color",
+                "--no-ext-diff",
+                "--format=%x00%h",
+            ];
+            args.extend(as_strs(&remote));
+            for chunk in self.git(&args)?.split('\0').skip(1) {
+                let (commit, diff) = chunk.split_once('\n').unwrap_or((chunk, ""));
+                // Two updates can send the same commit.
+                if !sent.iter().any(|patch| patch.commit == commit) {
+                    sent.push(Patch {
+                        commit: commit.to_owned(),
+                        diff: diff.to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(sent)
+    }
+
+    /// Each ref the push updates: what it sends, and the remote ref it goes to when the line
+    /// names one.
+    fn updates(&self, push: &Push) -> Result<Vec<(String, Option<String>)>, GitError> {
+        let mut updates = Vec::new();
+        for pushed in &push.refs {
+            match pushed {
+                PushRef::Current => updates.push((HEAD.to_owned(), None)),
+                PushRef::Ref { src, dst } => updates.push((src.clone(), dst.clone())),
+                PushRef::Branches | PushRef::Tags => {
+                    let under = if *pushed == PushRef::Branches {
+                        "refs/heads"
+                    } else {
+                        "refs/tags"
+                    };
+                    // A tag goes to the remote under its own name, which no remote-tracking ref
+                    // follows.
+                    let format = "--format=%(refname)%00%(*objecttype)%(objecttype)";
+                    for line in self.git(&["for-each-ref", format, under])?.lines() {
+                        let (name, kind) = line.split_once('\0').unwrap_or((line, ""));
+                        // A tag of a tree or blob sends no commit.
+                        if kind.starts_with("commit") {
+                            let dst = (*pushed == PushRef::Tags).then(|| name.to_owned());
+                            updates.push((name.to_owned(), dst));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(updates)
+    }
+
+    /// The commit `rev` names, none when it names none.
+    fn commit_at(&self, rev: &str) -> Result<Option<String>, GitError> {
+        let spec = format!("{rev}^{{commit}}");
+        let output = self.output(&["rev-parse", "--verify", "--quiet", &spec])?;
+        let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        Ok((output.status.success() && !commit.is_empty()).then_some(commit))
+    }
+
+    /// The remote-tracking commit of the branch an update of `src` (to `dst` when named)
+    /// goes to on `remote`: none for a branch the remote does not have, or a ref that is no
+    /// branch.
+    fn remote_branch(
+        &self,
+        remote: Option<&str>,
+        src: &str,
+        dst: Option<&str>,
+    ) -> Result<Option<String>, GitError> {
+        let branch = match dst {
+            Some(dst) if dst.starts_with("refs/") && !dst.starts_with("refs/heads/") => {
+                return Ok(None);
+            }
+            Some(dst) => dst.trim_start_matches("refs/heads/").to_owned(),
+            None => {
+                let full = self.output(&["rev-parse", "--symbolic-full-name", src])?;
+                let full = String::from_utf8_lossy(&full.stdout);
+                match full.trim().strip_prefix("refs/heads/") {
+                    Some(branch) => branch.to_owned(),
+                    None => return Ok(None),
+                }
+            }
+        };
+        // With no remote named, the branch's push or upstream ref says where it goes, else origin.
+        let mut tracking = Vec::new();
+        match remote {
+            Some(remote) => tracking.push(format!("refs/remotes/{remote}/{branch}")),
+            None => {
+                if dst.is_none() {
+                    tracking.push(format!("{branch}@{{push}}"));
+                }
+                tracking.push(format!("refs/remotes/origin/{branch}"));
+            }
+        }
+        for rev in tracking {
+            if let Some(commit) = self.commit_at(&rev)? {
+                return Ok(Some(commit));
+            }
+        }
+        Ok(None)
     }
 }
 
