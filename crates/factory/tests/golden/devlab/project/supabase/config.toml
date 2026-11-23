@@ -1,0 +1,14 @@
+project_id = "demo"
+
+[api]
+port = 27321
+
+[db]
+port = 27322
+shadow_port = 27320
+
+[studio]
+port = 27323
+
+[inbucket]
+port = 27324

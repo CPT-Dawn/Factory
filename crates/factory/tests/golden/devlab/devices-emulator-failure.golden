@@ -1,0 +1,14 @@
+# The emulator's unit cannot start: acquire exits 77 naming the unit. The lease it made stays, with
+# no device in it.
+break systemd-run
+$ a@plain-a devlab acquire --emulator
+2> devlab: booting 1 emulator(s), about a minute (quick boot) or three (first boot)
+2> devlab: could not start devlab-emu-0: Failed to start transient service unit: Unit devlab-emu-0.service was already loaded or has a fragment file.
+? 77
+$ a@plain-a devlab status
+1> devices: none attached
+1> memory <mem> GB free; watcher inactive (systemctl --user enable --now devlab-watch)
+? 0
+$ a@plain-a devlab env
+1> export DEVLAB_LEASE=1
+? 0

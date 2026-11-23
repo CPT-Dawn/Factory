@@ -1,0 +1,90 @@
+# No phone is attached, so owner a's request boots an emulator. At the emulator cap (1), owner b
+# gives up at once; once a releases it, the idle emulator is b's without a boot.
+$ a@plain-a devlab acquire
+1> export DEVLAB_LEASE=1
+1> export ANDROID_SERIAL=emulator-5580
+1> export DEVLAB_SERIALS=emulator-5580
+1> export DEVLAB_KINDS=emulator
+1> export DEVLAB_ABIS=x86_64
+2> devlab: booting 1 emulator(s), about a minute (quick boot) or three (first boot)
+2> devlab: lease 1, emulator emulator-5580
+? 0
+$ c@demo-c devlab acquire --no-device --quiet
+1> export DEVLAB_PROJECT=demo
+1> export DEVLAB_SLOT=0
+1> export API_PORT=27787
+1> export SUPABASE_API_PORT=27321
+1> export SUPABASE_URL=http://127.0.0.1:27321
+1> export SUPABASE_DB_PORT=27322
+1> export SUPABASE_DB_URL=postgresql://postgres:postgres@127.0.0.1:27322/postgres
+1> export SUPABASE_STUDIO_PORT=27323
+1> export SUPABASE_MAIL_PORT=27324
+1> export SUPABASE_PROJECT_ID=demo
+1> export SUPABASE_DB_CONTAINER=supabase_db_demo
+1> export API_URL=http://127.0.0.1:27787
+1> export DEVLAB_LEASE=2
+? 0
+$ b@plain-b devlab acquire --wait 0
+2> devlab: gave up after 0 s: no free phone (0 phone(s) busy) and the emulator cap (1) is reached
+? 75
+$ a@plain-a devlab status
+1> devices
+1>   emulator-5580      emulator sdk gphone64 x ready        lease 1 plain-a (claude:<a>)
+1> stack slots
+1>   demo 0   down                         lease 2 demo-c
+1>   demo per owner (cap 1 of 2): claude:<c> 1/1 at cap
+1> memory <mem> GB free; watcher inactive (systemctl --user enable --now devlab-watch)
+? 0
+$ a@plain-a devlab release
+2> devlab: released lease 1
+? 0
+$ a@plain-a devlab status
+1> devices
+1>   emulator-5580      emulator sdk gphone64 x ready        idle 0m
+1> stack slots
+1>   demo 0   down                         lease 2 demo-c
+1>   demo per owner (cap 1 of 2): claude:<c> 1/1 at cap
+1> memory <mem> GB free; watcher inactive (systemctl --user enable --now devlab-watch)
+? 0
+$ b@plain-b devlab acquire --emulator
+1> export DEVLAB_LEASE=3
+1> export ANDROID_SERIAL=emulator-5580
+1> export DEVLAB_SERIALS=emulator-5580
+1> export DEVLAB_KINDS=emulator
+1> export DEVLAB_ABIS=x86_64
+2> devlab: lease 3, emulator emulator-5580
+? 0
+$ b@plain-b devlab status --json
+1> {
+1>   "devices": [
+1>     {
+1>       "serial": "emulator-5580",
+1>       "kind": "emulator",
+1>       "model": "sdk gphone64 x86 64",
+1>       "state": "ready",
+1>       "holder": "lease 3 plain-b (claude:<b>)"
+1>     }
+1>   ],
+1>   "slots": [
+1>     {
+1>       "project": "demo",
+1>       "slot": 0,
+1>       "stack": "down",
+1>       "holder": "lease 2 demo-c",
+1>       "last": "demo-c"
+1>     }
+1>   ],
+1>   "owners": [
+1>     {
+1>       "project": "demo",
+1>       "owner": "claude:<c>",
+1>       "held": 1,
+1>       "cap": 1,
+1>       "maxSlots": 2
+1>     }
+1>   ],
+1>   "waiting": [],
+1>   "watcher": "inactive",
+1>   "memAvailableMB": <mem>
+1> }
+? 0
