@@ -35,6 +35,12 @@ pub fn config_dir() -> PathBuf {
         .join("factory")
 }
 
+/// The runtime dir, `$XDG_RUNTIME_DIR/factory`, when the variable is set.
+pub fn runtime_dir() -> Option<PathBuf> {
+    let dir = env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty())?;
+    Some(Path::new(&dir).join("factory"))
+}
+
 impl Paths {
     pub fn from_env() -> Result<Paths, Failure> {
         // An empty variable counts as unset, as in factory-stats.
@@ -51,12 +57,12 @@ impl Paths {
             (None, None) => Path::new(&home()).join(".config/herdr/herdr.sock"),
         };
         let config = config_dir();
-        let runtime = var("XDG_RUNTIME_DIR").ok_or_else(|| {
+        let runtime = runtime_dir().ok_or_else(|| {
             Failure::precondition("XDG_RUNTIME_DIR is not set; run factory inside a user session")
         })?;
         Ok(Paths {
             state,
-            runtime: Path::new(&runtime).join("factory"),
+            runtime,
             config,
             herdr,
         })

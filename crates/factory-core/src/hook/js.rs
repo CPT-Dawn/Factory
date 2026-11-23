@@ -2,7 +2,8 @@
 //!
 //! This is no parser: it skips comments, string and regex literals and the text of template
 //! literals (but not their `\${…}` expressions), so a word that only appears in a string is not a
-//! use. A regex literal is told from a division by the token before it.
+//! use. A regex literal is told from a division by the token before it, and a `)` by whether
+//! it closes an `if`, `while`, `for` or `with` condition.
 
 /// An identifier the script uses, and the line it is on (from 1).
 #[derive(Debug, PartialEq, Eq)]
@@ -23,6 +24,9 @@ pub fn first_use(code: &str, names: &[&'static str]) -> Option<Use> {
     // The last token: its closing character, or `a` for a word and `0` for a literal.
     let mut prev = ' ';
     let mut prev_word = String::new();
+    // Each open `(`: whether it holds the condition of `if`, `while`, `for` or `with`, after
+    // which a statement, so maybe a regex, starts.
+    let mut parens: Vec<bool> = Vec::new();
     while at < chars.len() {
         let c = chars[at];
         if in_text {
@@ -134,6 +138,17 @@ pub fn first_use(code: &str, names: &[&'static str]) -> Option<Use> {
                     at += 1;
                 }
                 prev = '0';
+            }
+            '(' => {
+                let condition =
+                    prev == 'a' && matches!(prev_word.as_str(), "if" | "while" | "for" | "with");
+                parens.push(condition);
+                prev = '(';
+                at += 1;
+            }
+            ')' => {
+                prev = if parens.pop() == Some(true) { ';' } else { ')' };
+                at += 1;
             }
             // A spread's dots are no member access.
             '.' if chars[at..].starts_with(&['.', '.', '.']) => {

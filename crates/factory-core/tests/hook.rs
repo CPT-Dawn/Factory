@@ -132,6 +132,8 @@ fn pre_tool_stops_a_repl_script_that_uses_what_the_repl_lacks() {
         ("const all = [...process.argv];", "process"),
         ("f({...BASH_REMATCH})", "BASH_REMATCH"),
         ("const o = {...require};", "require"),
+        ("const y = (a) / process.pid / 2;", "process"),
+        ("if (f(x) / process.pid) {}", "process"),
     ] {
         let reason =
             blocked(&repl(code), false).unwrap_or_else(|| panic!("{code:?} should be stopped"));
@@ -156,6 +158,10 @@ fn pre_tool_lets_a_repl_script_through_that_only_mentions_those_words() {
         "const hit = text.split(/[/]process/);",
         "const m = text.match(/(\\d+)/); m[1]",
         "const o = {process: 1}.process;",
+        "if (ready) /process/.test(text);",
+        "while (more()) /require/.exec(s);",
+        "for (;;) /BASH_REMATCH/.test(a);",
+        "if (a && (b || c)) /process/.test(t);",
         "",
     ] {
         assert!(
@@ -273,7 +279,7 @@ fn five_lines() -> Templates {
 
 #[test]
 fn subagent_stop_sends_back_a_report_longer_than_the_template() {
-    let reason = subagent_stop(&stop("implementer", &lines(6), false), &five_lines())
+    let reason = subagent_stop(&stop("implementer", &lines(6), false), &five_lines(), false)
         .expect("6 lines is over 5");
     assert!(!reason.contains('\n'), "{reason}");
     assert!(reason.contains('6') && reason.contains('5'), "{reason}");
@@ -289,7 +295,7 @@ fn subagent_stop_lets_a_report_that_fits_stop() {
         format!("{}\n\n", lines(5)),
     ] {
         assert_eq!(
-            subagent_stop(&stop("x", &report, false), &templates),
+            subagent_stop(&stop("x", &report, false), &templates, false),
             None,
             "{report:?}"
         );
@@ -306,33 +312,45 @@ fn subagent_stop_counts_characters_when_the_template_limits_them() {
         agents: Default::default(),
     };
     assert_eq!(
-        subagent_stop(&stop("x", &"é".repeat(100), false), &templates),
+        subagent_stop(&stop("x", &"é".repeat(100), false), &templates, false),
         None
     );
-    let reason = subagent_stop(&stop("x", &"é".repeat(101), false), &templates).unwrap();
+    let reason = subagent_stop(&stop("x", &"é".repeat(101), false), &templates, false).unwrap();
     assert!(reason.contains("101") && reason.contains("100"), "{reason}");
 }
 
 #[test]
-fn subagent_stop_lets_a_report_stop_the_second_time() {
-    // The agent was already sent back once: sending it back again would never end.
-    assert_eq!(
-        subagent_stop(&stop("x", &lines(50), true), &five_lines()),
-        None
-    );
+fn subagent_stop_sends_a_report_back_once_per_stop_it_asked_for() {
+    // (stop_hook_active, this hook sent the agent back, the report is sent back again)
+    for (active, sent_back, again) in [
+        // This hook asked for the revision: asking again would never end.
+        (true, true, false),
+        // Another hook kept the agent going: the template still holds.
+        (true, false, true),
+        // A fresh stop: what this hook did before is history.
+        (false, true, true),
+        (false, false, true),
+    ] {
+        let said = subagent_stop(&stop("x", &lines(50), active), &five_lines(), sent_back);
+        assert_eq!(
+            said.is_some(),
+            again,
+            "active {active}, sent back {sent_back}"
+        );
+    }
 }
 
 #[test]
 fn subagent_stop_without_a_template_or_a_report_says_nothing() {
     assert_eq!(
-        subagent_stop(&stop("x", &lines(500), false), &Templates::default()),
+        subagent_stop(&stop("x", &lines(500), false), &Templates::default(), false),
         None
     );
     assert_eq!(
-        subagent_stop(&json!({"agent_type": "x"}), &five_lines()),
+        subagent_stop(&json!({"agent_type": "x"}), &five_lines(), false),
         None
     );
-    assert_eq!(subagent_stop(&json!({}), &five_lines()), None);
+    assert_eq!(subagent_stop(&json!({}), &five_lines(), false), None);
 }
 
 #[test]
@@ -353,18 +371,25 @@ fn a_template_for_an_agent_type_overrides_the_default_field_by_field() {
     );
 
     // The implementer gets its own line limit and the default character limit.
-    assert!(subagent_stop(&stop("implementer", &lines(6), false), &templates).is_some());
-    assert!(subagent_stop(&stop("implementer", &"x".repeat(5001), false), &templates).is_some());
+    assert!(subagent_stop(&stop("implementer", &lines(6), false), &templates, false).is_some());
+    assert!(
+        subagent_stop(
+            &stop("implementer", &"x".repeat(5001), false),
+            &templates,
+            false
+        )
+        .is_some()
+    );
     assert_eq!(
-        subagent_stop(&stop("implementer", &lines(5), false), &templates),
+        subagent_stop(&stop("implementer", &lines(5), false), &templates, false),
         None
     );
     // Any other agent gets the default.
     assert_eq!(
-        subagent_stop(&stop("merger", &lines(6), false), &templates),
+        subagent_stop(&stop("merger", &lines(6), false), &templates, false),
         None
     );
-    assert!(subagent_stop(&stop("merger", &lines(41), false), &templates).is_some());
+    assert!(subagent_stop(&stop("merger", &lines(41), false), &templates, false).is_some());
 }
 
 fn git(command: &str) -> Vec<GitAction> {
@@ -499,6 +524,91 @@ fn pre_tool_asks_for_the_staged_diff_of_a_commit_or_push() {
         let mut expected = expected;
         expected.dedup();
         assert_eq!(actions, expected, "{command:?}");
+    }
+}
+
+#[test]
+fn a_cd_in_a_subshell_or_a_child_process_stays_there() {
+    for (command, expected) in [
+        (
+            "(cd sub && git commit -m x) && git push",
+            vec![action(Some("sub"), false, None), action(None, false, None)],
+        ),
+        ("(cd sub); git commit -m x", vec![action(None, false, None)]),
+        (
+            "(cd a); (cd b; git push)",
+            vec![action(Some("b"), false, None)],
+        ),
+        (
+            "cd a && (cd b && git commit) && git push",
+            vec![
+                action(Some("a/b"), false, None),
+                action(Some("a"), false, None),
+            ],
+        ),
+        (
+            "echo $(cd sub && pwd); git push",
+            vec![action(None, false, None)],
+        ),
+        ("echo `cd sub`; git push", vec![action(None, false, None)]),
+        (
+            "bash -c 'cd sub' && git push",
+            vec![action(None, false, None)],
+        ),
+        (
+            "bash -c 'cd sub && git push'",
+            vec![action(Some("sub"), false, None)],
+        ),
+        // Each command of a pipeline, and a command sent to the background, is a child.
+        ("cd sub | cat; git push", vec![action(None, false, None)]),
+        ("echo | cd sub; git push", vec![action(None, false, None)]),
+        ("cd sub & git push", vec![action(None, false, None)]),
+        (
+            "ls | (cd sub; git push)",
+            vec![action(Some("sub"), false, None)],
+        ),
+        // These are no children.
+        (
+            "cd sub || exit; git push",
+            vec![action(Some("sub"), false, None)],
+        ),
+        (
+            "cd sub 2>&1 && git push",
+            vec![action(Some("sub"), false, None)],
+        ),
+        (
+            "{ cd sub; git commit; }; git push",
+            vec![action(Some("sub"), false, None)],
+        ),
+    ] {
+        let mut actions = git(command);
+        actions.dedup();
+        assert_eq!(actions, expected, "{command:?}");
+    }
+}
+
+#[test]
+fn an_add_that_names_paths_stages_only_those_paths() {
+    for (command, expected) in [
+        (
+            "git add -u a.txt && git commit -m x",
+            action(None, false, Some(&["a.txt"])),
+        ),
+        (
+            "git add --update -- a b && git commit -m x",
+            action(None, false, Some(&["a", "b"])),
+        ),
+        (
+            "git add -A sub && git commit -m x",
+            action(None, false, Some(&["sub"])),
+        ),
+        ("git add -u && git commit -m x", action(None, true, None)),
+        (
+            "git add -A && git commit -m x",
+            action(None, false, Some(&[])),
+        ),
+    ] {
+        assert_eq!(git(command), vec![expected], "{command:?}");
     }
 }
 

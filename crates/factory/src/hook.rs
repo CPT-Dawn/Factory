@@ -7,7 +7,9 @@
 //! exit 2 would block the call.
 
 use std::env;
+use std::fs::{self, DirBuilder};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -52,10 +54,47 @@ fn answer(command: &HookCommand) -> Result<Option<Value>, Failure> {
         }
         HookCommand::SubagentStop => {
             let settings = config::hook_settings(&paths::config_dir())?;
-            hook::subagent_stop(&input, &settings.templates)
+            subagent_stop(&input, &settings.templates)
                 .map(|line| json!({"decision": "block", "reason": line}))
         }
     })
+}
+
+/// The subagent-stop rule, with a mark in the runtime dir for each agent this hook sent back, so
+/// it lets go only of an agent it kept going itself. Without a place for the mark, an agent kept
+/// going by any hook is let go, as nothing could tell this hook's send-back from another's.
+fn subagent_stop(input: &Value, templates: &hook::Templates) -> Option<String> {
+    let Some(mark) = sent_back_mark(input) else {
+        return hook::subagent_stop(input, templates, true);
+    };
+    let said = hook::subagent_stop(input, templates, mark.exists());
+    if said.is_none() {
+        let _ = fs::remove_file(&mark);
+        return None;
+    }
+    // A send-back this hook cannot remember could send the agent back forever.
+    let remembered = mark.parent().is_some_and(|dir| {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .is_ok()
+    }) && fs::write(&mark, "").is_ok();
+    said.filter(|_| remembered)
+}
+
+/// Where the mark for the agent the input names goes: `$XDG_RUNTIME_DIR/factory/sent-back/`, under
+/// the session and agent ids in hex. None without an agent id or a runtime dir.
+fn sent_back_mark(input: &Value) -> Option<PathBuf> {
+    let id = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or("");
+    let agent = id("agent_id");
+    let key = format!("{}\0{agent}", id("session_id"));
+    // A file name holds 255 bytes, two hex digits a byte.
+    if agent.is_empty() || key.len() > 120 {
+        return None;
+    }
+    let name: String = key.bytes().map(|b| format!("{b:02x}")).collect();
+    Some(paths::runtime_dir()?.join("sent-back").join(name))
 }
 
 fn deny(reason: &str) -> Value {

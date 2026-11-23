@@ -12,6 +12,8 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use shell::Part;
+
 /// The variable that lets one call use a JavaScript package manager: set in the environment the
 /// hook runs in, or in front of the command itself.
 pub const ESCAPE: &str = "FACTORY_ALLOW_NPM";
@@ -142,10 +144,12 @@ impl Templates {
 }
 
 /// The subagent-stop rule over Claude Code's hook input: the line that sends a report longer
-/// than its template back to the subagent. An agent that was already sent back once is let go,
-/// so a template it can't meet never loops.
-pub fn subagent_stop(input: &Value, templates: &Templates) -> Option<String> {
-    if input.get("stop_hook_active").and_then(Value::as_bool) == Some(true) {
+/// than its template back to the subagent. `sent_back` says this hook sent the agent back
+/// before: when that is why it is still going (`stop_hook_active`), it is let go, so a
+/// template it can't meet never loops. One kept going by another hook still meets the template.
+pub fn subagent_stop(input: &Value, templates: &Templates, sent_back: bool) -> Option<String> {
+    let continued = input.get("stop_hook_active").and_then(Value::as_bool) == Some(true);
+    if continued && sent_back {
         return None;
     }
     let report = input.get("last_assistant_message")?.as_str()?.trim();
@@ -175,19 +179,53 @@ pub fn git_actions(command: &str) -> Vec<GitAction> {
         added: Option<Vec<String>>,
     }
     let mut cwd: Option<String> = None;
+    // The directory each child that is still running started in.
+    let mut outer: Vec<Option<String>> = Vec::new();
+    // The directory before the last command, when that command was a `cd`: a `|` or `&` after
+    // it puts it in a child, so it moved nothing.
+    let mut before_cd: Option<Option<String>> = None;
+    // The command after a `|` runs in a child too.
+    let mut piped = false;
     let mut staged: BTreeMap<Option<String>, Staged> = BTreeMap::new();
     let mut actions: Vec<GitAction> = Vec::new();
-    for words in all_commands(command) {
+    for part in all_parts(command) {
+        let words = match part {
+            Part::Command(words) => words,
+            Part::Enter => {
+                outer.push(cwd.clone());
+                (before_cd, piped) = (None, false);
+                continue;
+            }
+            Part::Leave => {
+                if let Some(started) = outer.pop() {
+                    cwd = started;
+                }
+                (before_cd, piped) = (None, false);
+                continue;
+            }
+            Part::Pipe | Part::Background => {
+                if let Some(before) = before_cd.take() {
+                    cwd = before;
+                }
+                piped = part == Part::Pipe;
+                continue;
+            }
+        };
+        let in_child = std::mem::take(&mut piped);
+        before_cd = None;
         let Some(call) = shell::invocation(&words) else {
             continue;
         };
         if call.program == "cd" {
-            // A bare `cd` and `cd -` go somewhere the command line doesn't say.
-            cwd = call
-                .args
-                .iter()
-                .find(|arg| !arg.starts_with('-'))
-                .map(|target| join(cwd.as_deref(), target));
+            if !in_child {
+                before_cd = Some(cwd.clone());
+                // A bare `cd` and `cd -` go somewhere the command line doesn't say.
+                cwd = call
+                    .args
+                    .iter()
+                    .find(|arg| !arg.starts_with('-'))
+                    .map(|target| join(cwd.as_deref(), target));
+            }
             continue;
         }
         if call.program != "git" {
@@ -205,10 +243,12 @@ pub fn git_actions(command: &str) -> Vec<GitAction> {
         match sub.as_str() {
             "add" | "stage" => {
                 let (all, update, paths) = add_args(args);
-                here.tracked |= update;
-                if all || (!update && paths.is_empty()) {
+                // Pathspecs narrow `-u` and `-A` to themselves.
+                if update && !all && paths.is_empty() {
+                    here.tracked = true;
+                } else if paths.is_empty() {
                     here.added = Some(Vec::new());
-                } else if !paths.is_empty() && here.added.as_ref().is_none_or(|a| !a.is_empty()) {
+                } else if here.added.as_ref().is_none_or(|a| !a.is_empty()) {
                     // (An empty list already means every path.)
                     here.added.get_or_insert_with(Vec::new).extend(paths);
                 }
@@ -282,15 +322,22 @@ fn git_subcommand(args: &[String]) -> (Option<String>, &[String]) {
     (dir, args.get(at..).unwrap_or_default())
 }
 
-/// Every simple command of a command line, those inside `bash -c '…'` included.
-fn all_commands(command: &str) -> Vec<Vec<String>> {
+/// Every piece of a command line, those inside `bash -c '…'` included, as a child of its own.
+fn all_parts(command: &str) -> Vec<Part> {
     let mut all = Vec::new();
-    for words in shell::commands(command) {
-        let script = shell::invocation(&words)
-            .and_then(|call| shell::shell_script(&call).map(str::to_owned));
+    for part in shell::parts(command) {
+        let script = match &part {
+            Part::Command(words) => shell::invocation(words)
+                .and_then(|call| shell::shell_script(&call).map(str::to_owned)),
+            _ => None,
+        };
         match script {
-            Some(script) => all.extend(all_commands(&script)),
-            None => all.push(words),
+            Some(script) => {
+                all.push(Part::Enter);
+                all.extend(all_parts(&script));
+                all.push(Part::Leave);
+            }
+            None => all.push(part),
         }
     }
     all
@@ -364,9 +411,10 @@ pub fn package_manager(command: &str, escape: bool) -> Option<String> {
     if escape {
         return None;
     }
-    let found = all_commands(command)
-        .iter()
-        .find_map(|words| manager_in(words))?;
+    let found = all_parts(command).iter().find_map(|part| match part {
+        Part::Command(words) => manager_in(words),
+        _ => None,
+    })?;
     let fix = if found == "npx" {
         "bunx".to_owned()
     } else {

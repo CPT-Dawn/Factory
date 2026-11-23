@@ -144,6 +144,8 @@ fn config(sandbox: &Sandbox, text: &str) {
 fn subagent_stop(sandbox: &Sandbox, agent: &str, report: &str, active: bool) -> Run {
     let call = json!({
         "hook_event_name": "SubagentStop",
+        "session_id": "session-1",
+        "agent_id": format!("{agent}-1"),
         "agent_type": agent,
         "stop_hook_active": active,
         "last_assistant_message": report,
@@ -176,16 +178,41 @@ fn subagent_stop_sends_a_long_report_back_in_claude_codes_protocol() {
 }
 
 #[test]
-fn subagent_stop_lets_the_report_go_when_it_was_sent_back_once() {
+fn subagent_stop_lets_the_report_go_when_it_sent_it_back_once() {
     let sandbox = Sandbox::new();
     config(&sandbox, "[hook.report]\nmax_lines = 5\n");
 
+    assert_eq!(
+        answer(&subagent_stop(&sandbox, "implementer", SIX_LINES, false))["decision"],
+        "block"
+    );
+    // Still too long after the revision this hook asked for: asking again would never end.
     let out = subagent_stop(&sandbox, "implementer", SIX_LINES, true);
-
     assert_eq!(
         (out.code, out.stdout.as_str(), out.stderr.as_str()),
-        (0, "", "")
+        (0, "", ""),
+        "{out:?}"
     );
+    // The next time it stops of its own accord, the template holds again.
+    assert_eq!(
+        answer(&subagent_stop(&sandbox, "implementer", SIX_LINES, false))["decision"],
+        "block"
+    );
+}
+
+#[test]
+fn subagent_stop_holds_the_template_when_another_hook_kept_the_agent_going() {
+    let sandbox = Sandbox::new();
+    config(&sandbox, "[hook.report]\nmax_lines = 5\n");
+    // This hook sent another agent back, which is no reason to let this one go.
+    assert_eq!(
+        answer(&subagent_stop(&sandbox, "merger", SIX_LINES, false))["decision"],
+        "block"
+    );
+
+    let out = subagent_stop(&sandbox, "implementer", SIX_LINES, true);
+
+    assert_eq!(answer(&out)["decision"], "block");
 }
 
 #[test]
@@ -539,21 +566,92 @@ fn review_does_not_read_the_hooks_settings() {
     assert!(!out.stderr.contains("config.toml"), "{out:?}");
 }
 
+#[test]
+fn a_targeted_update_checks_what_stays_staged_beside_its_paths() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = repo_staging_the_address(&sandbox);
+    sandbox.git(&repo, &["commit", "-q", "--no-verify", "-m", "x"]);
+    // notes.txt is tracked; its next version stages the address and then scrubs the working tree.
+    std::fs::write(repo.join("notes.txt"), format!("still {OWNER}\n")).unwrap();
+    sandbox.git(&repo, &["add", "notes.txt"]);
+    std::fs::write(repo.join("notes.txt"), "scrubbed after staging\n").unwrap();
+    std::fs::write(repo.join("a.txt"), "edited\n").unwrap();
+
+    // `add -u a.txt` stages a.txt alone: the staged notes.txt goes into the commit as it is.
+    let out = pre_tool(
+        &sandbox,
+        &bash_in(&repo, "git add -u a.txt && git commit -m x"),
+    );
+
+    denied_for_the_address(&out);
+}
+
+#[test]
+fn commit_a_before_the_first_commit_checks_the_working_tree() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = sandbox.path("fresh");
+    std::fs::create_dir(&repo).unwrap();
+    sandbox.git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("notes.txt"), "clean when staged\n").unwrap();
+    sandbox.git(&repo, &["add", "notes.txt"]);
+    std::fs::write(repo.join("notes.txt"), format!("mail {OWNER}\n")).unwrap();
+
+    let out = pre_tool(&sandbox, &bash_in(&repo, "git commit -am 'feat: start'"));
+
+    denied_for_the_address(&out);
+}
+
+#[test]
+fn a_cd_inside_a_subshell_does_not_move_the_commit_after_it() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = repo_staging_the_address(&sandbox);
+    let elsewhere = sandbox.path("home");
+
+    let out = pre_tool(
+        &sandbox,
+        &bash_in(
+            &repo,
+            &format!("(cd {} && ls) && git commit -m x", elsewhere.display()),
+        ),
+    );
+
+    denied_for_the_address(&out);
+}
+
 /// Spec #1: "a hook call completes in under 5 ms on this machine". The fastest of a few runs is
 /// the call's own cost, free of the scheduler's noise.
 #[test]
 fn a_hook_call_completes_in_under_5_ms() {
     let sandbox = Sandbox::new();
-    config(&sandbox, "[hook.report]\nmax_lines = 5\n");
-    let calls: [(&str, Value); 3] = [
+    config(
+        &sandbox,
+        &format!("[hook]\nprivate_addresses = [\"{OWNER}\"]\n[hook.report]\nmax_lines = 5\n"),
+    );
+    let repo = sandbox.repo();
+    std::fs::write(repo.join("a.txt"), "edited\n").unwrap();
+    std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+    let calls: [(&str, Value); 4] = [
         ("pre-tool", bash("bun run build && rg -n todo src")),
+        // The costliest check: what is staged, and what the command stages before it commits.
+        (
+            "pre-tool",
+            bash_in(&repo, "git add a.txt new.txt && git commit -m x"),
+        ),
         (
             "post-tool",
-            json!({"tool_name": "Bash", "tool_response": {"stdout": "x".repeat(11_000)}}),
+            json!({"tool_name": "Bash", "tool_response": {"stdout": "x".repeat(13_000)}}),
         ),
         (
             "subagent-stop",
-            json!({"agent_type": "implementer", "last_assistant_message": SIX_LINES}),
+            json!({
+                "session_id": "session-1",
+                "agent_id": "implementer-1",
+                "agent_type": "implementer",
+                "last_assistant_message": SIX_LINES,
+            }),
         ),
     ];
     for (hook, call) in calls {

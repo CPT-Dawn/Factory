@@ -7,11 +7,27 @@
 /// One simple command: its words, with quotes and escapes resolved.
 pub type Words = Vec<String>;
 
-/// Every simple command of `text`, in order. A command substitution and a subshell count as
-/// commands of their own, and a here-document's body is text, not commands.
-pub fn commands(text: &str) -> Vec<Words> {
+/// A piece of a command line: a simple command, or where a child shell starts or ends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Part {
+    Command(Words),
+    /// A subshell, command substitution or `bash -c` starts: a `cd` inside stays inside.
+    Enter,
+    /// The innermost child that started ends.
+    Leave,
+    /// `|`: the commands on both sides each run in a child.
+    Pipe,
+    /// `&`: the command before it runs in a child, in the background.
+    Background,
+}
+
+/// The simple commands of `text`, in order, with where the children they run in start and end.
+/// A command substitution and a subshell hold commands of their own, and a here-document's body
+/// is text, not commands.
+pub fn parts(text: &str) -> Vec<Part> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = Lexer::default();
+    let mut in_backticks = false;
     // The `<<WORD` delimiters whose bodies start at the next line, with whether `<<-` strips tabs.
     let mut heredocs: Vec<(String, bool)> = Vec::new();
     let mut at = 0;
@@ -92,16 +108,40 @@ pub fn commands(text: &str) -> Vec<Words> {
                     at = skip_heredoc(&chars, at, &delimiter, strip_tabs);
                 }
             }
-            ';' | '&' | '|' | '(' | ')' | '`' => out.end_command(),
-            '$' if chars.get(at) == Some(&'(') => {
+            ';' => out.end_command(),
+            // `&&` and `||` only join commands.
+            '&' | '|' if chars.get(at) == Some(&c) => {
                 at += 1;
                 out.end_command();
+            }
+            // A redirection such as `2>&1` or `&>file`.
+            '&' if at >= 2 && matches!(chars[at - 2], '>' | '<') => out.push(c),
+            '&' if chars.get(at) == Some(&'>') => out.push(c),
+            '&' => out.mark(Part::Background),
+            '|' => {
+                // `|&` pipes stderr too.
+                at += usize::from(chars.get(at) == Some(&'&'));
+                out.mark(Part::Pipe);
+            }
+            '(' => out.mark(Part::Enter),
+            ')' => out.mark(Part::Leave),
+            '`' => {
+                in_backticks = !in_backticks;
+                out.mark(if in_backticks {
+                    Part::Enter
+                } else {
+                    Part::Leave
+                });
+            }
+            '$' if chars.get(at) == Some(&'(') => {
+                at += 1;
+                out.mark(Part::Enter);
             }
             c => out.push(c),
         }
     }
     out.end_command();
-    out.commands
+    out.parts
 }
 
 /// Where a here-document's body that starts at `from` ends: after its delimiter line.
@@ -128,7 +168,7 @@ fn skip_heredoc(chars: &[char], from: usize, delimiter: &str, strip_tabs: bool) 
 
 #[derive(Default)]
 struct Lexer {
-    commands: Vec<Words>,
+    parts: Vec<Part>,
     words: Words,
     word: String,
     /// A quoted empty string is still a word.
@@ -159,8 +199,15 @@ impl Lexer {
     fn end_command(&mut self) {
         self.end_word();
         if !self.words.is_empty() {
-            self.commands.push(std::mem::take(&mut self.words));
+            self.parts
+                .push(Part::Command(std::mem::take(&mut self.words)));
         }
+    }
+
+    /// Ends the command, then records `part` after it.
+    fn mark(&mut self, part: Part) {
+        self.end_command();
+        self.parts.push(part);
     }
 }
 
