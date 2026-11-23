@@ -10,6 +10,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use factory_core::agy::{self, Sandbox};
@@ -19,7 +20,7 @@ use factory_core::timestamp::Timestamp;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::git::{Checkout, GitRepo, Repo};
+use crate::git::{Checkout, Git, Repo, Repos};
 use crate::process::{self, RunError};
 
 /// One review for a backend to run.
@@ -201,6 +202,10 @@ pub struct Agy {
     usage_cache: PathBuf,
     /// Where its throwaway checkouts go, one per review process: `<repo>-<pid>`.
     checkouts: PathBuf,
+    /// The repositories it checks the head out of.
+    repos: Arc<dyn Repos>,
+    /// Whether its sandbox can start.
+    namespaces: Arc<dyn Namespaces>,
 }
 
 impl Agy {
@@ -217,7 +222,17 @@ impl Agy {
             auth,
             usage_cache,
             checkouts,
+            repos: Arc::new(Git),
+            namespaces: Arc::new(Unshare),
         }
+    }
+
+    /// The same backend, reaching repositories through `repos` and asking `namespaces` whether
+    /// its sandbox can start: how a test hands it fakes.
+    pub fn with(mut self, repos: Arc<dyn Repos>, namespaces: Arc<dyn Namespaces>) -> Agy {
+        self.repos = repos;
+        self.namespaces = namespaces;
+        self
     }
 
     /// The model whose quota a review draws on: the configured one, else the one chosen in
@@ -235,10 +250,10 @@ impl Agy {
     /// removed first.
     fn checkout(&self, job: &Job) -> Result<(Checkout, PathBuf), ReviewerError> {
         let failed = |e: crate::git::GitError| ReviewerError::Checkout(e.to_string());
-        let repo = GitRepo::at(&job.cwd);
+        let repo = self.repos.at(&job.cwd);
         let name = repo.name().map_err(failed)?;
         let top = repo.toplevel().map_err(failed)?;
-        sweep_checkouts(&self.checkouts, &repo);
+        sweep_checkouts(&self.checkouts, repo.as_ref());
         let here = self
             .checkouts
             .join(format!("{name}-{}", std::process::id()));
@@ -381,12 +396,14 @@ impl Reviewer for Agy {
                 }
             }
         }
-        sandbox_active()
+        sandbox_active(self.namespaces.as_ref())
     }
 
     fn review(&self, job: &Job) -> Result<(), ReviewerError> {
         let prompt = fs::read_to_string(&job.prompt).map_err(ReviewerError::Files)?;
-        let shared = GitRepo::at(&job.cwd)
+        let shared = self
+            .repos
+            .at(&job.cwd)
             .common_dir()
             .map_err(|e| ReviewerError::Files(io::Error::other(e.to_string())))?;
         let stream = File::create(&job.stream).map_err(ReviewerError::Files)?;
@@ -463,7 +480,7 @@ fn sandbox_started(path: &Path) -> Result<(), ReviewerError> {
 
 /// Removes the checkouts in `dir` whose review process has died, which never removed its own,
 /// and has `repo` forget them. A checkout is named `<repo>-<pid>`.
-fn sweep_checkouts(dir: &Path, repo: &GitRepo) {
+fn sweep_checkouts(dir: &Path, repo: &dyn Repo) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -484,30 +501,57 @@ fn sweep_checkouts(dir: &Path, repo: &GitRepo) {
     }
 }
 
-/// Whether agy's sandbox would be active: it needs unprivileged user namespaces, and without
+/// Whether unprivileged user namespaces are available, which agy's sandbox needs: without
 /// them `--sandbox` silently does nothing.
-fn sandbox_active() -> Result<(), ReviewerError> {
-    let mut cmd = Command::new("unshare");
-    cmd.args(["--user", "--map-root-user", "true"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let why = match process::run(cmd, AGY_CHECK_TIMEOUT) {
-        Ok(output) if output.status.success() => return Ok(()),
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let said = stderr.lines().find(|line| !line.trim().is_empty());
-            match (said, output.status.code()) {
-                (Some(said), _) => said.trim().to_owned(),
-                (None, Some(code)) => format!("unshare exited {code}"),
-                (None, None) => "unshare was killed by a signal".to_owned(),
+pub trait Namespaces: fmt::Debug + Send + Sync {
+    /// `Ok`, or why they are unavailable, in the probe's own words.
+    fn user_namespaces(&self) -> Result<(), String>;
+}
+
+/// The probe through `unshare --user --map-root-user true`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Unshare;
+
+impl Namespaces for Unshare {
+    fn user_namespaces(&self) -> Result<(), String> {
+        let mut cmd = Command::new("unshare");
+        cmd.args(["--user", "--map-root-user", "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        match process::run(cmd, AGY_CHECK_TIMEOUT) {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let said = stderr.lines().find(|line| !line.trim().is_empty());
+                Err(match (said, output.status.code()) {
+                    (Some(said), _) => said.trim().to_owned(),
+                    (None, Some(code)) => format!("unshare exited {code}"),
+                    (None, None) => "unshare was killed by a signal".to_owned(),
+                })
             }
+            Err(e) => Err(format!("unshare: {e}")),
         }
-        Err(e) => format!("unshare: {e}"),
-    };
-    Err(ReviewerError::NoSandbox(format!(
-        "its sandbox is not active (unprivileged user namespaces are unavailable: {why})"
-    )))
+    }
+}
+
+/// A probe that answers as it was told: `None` for available, else the reason they are not.
+#[derive(Clone, Debug, Default)]
+pub struct FakeNamespaces(pub Option<String>);
+
+impl Namespaces for FakeNamespaces {
+    fn user_namespaces(&self) -> Result<(), String> {
+        self.0.clone().map_or(Ok(()), Err)
+    }
+}
+
+/// Whether agy's sandbox would be active, as `namespaces` says.
+fn sandbox_active(namespaces: &dyn Namespaces) -> Result<(), ReviewerError> {
+    namespaces.user_namespaces().map_err(|why| {
+        ReviewerError::NoSandbox(format!(
+            "its sandbox is not active (unprivileged user namespaces are unavailable: {why})"
+        ))
+    })
 }
 
 /// The tools a headless Claude reviewer may not use: it reads and reports, and runs no skill
@@ -705,3 +749,79 @@ impl fmt::Display for ReviewerError {
 }
 
 impl std::error::Error for ReviewerError {}
+
+#[cfg(test)]
+mod seams {
+    use super::*;
+    use crate::git::FakeRepo;
+
+    fn agy(checkouts: &Path, repo: &FakeRepo, namespaces: Option<&str>) -> Agy {
+        Agy::new(
+            None,
+            None,
+            AgyAuth::ApiKey,
+            checkouts.join("usage.json"),
+            checkouts.to_owned(),
+        )
+        .with(
+            Arc::new(repo.clone()),
+            Arc::new(FakeNamespaces(namespaces.map(str::to_owned))),
+        )
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("factory-seams-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_checkout_mirrors_the_callers_directory_and_goes_when_dropped() {
+        let dir = scratch("checkout");
+        let top = dir.join("repo");
+        fs::create_dir_all(top.join("app")).unwrap();
+        let repo = FakeRepo {
+            name: "repo".to_owned(),
+            toplevel: top.clone(),
+            ..FakeRepo::default()
+        };
+        // What a review process that died left behind is swept.
+        let stale = dir.join("repo-999999999");
+        fs::create_dir_all(&stale).unwrap();
+        let agy = agy(&dir, &repo, None);
+        let job = Job {
+            cwd: top.join("app"),
+            head: "abc".to_owned(),
+            prompt: dir.join("prompt"),
+            report: dir.join("report"),
+            stream: dir.join("stream"),
+            timeout: Duration::from_secs(1),
+        };
+        fs::create_dir_all(dir.join(format!("repo-{}", std::process::id())).join("app")).unwrap();
+        let (checkout, within) = agy.checkout(&job).unwrap();
+        let here = dir.join(format!("repo-{}", std::process::id()));
+        assert_eq!(checkout.dir(), here);
+        assert_eq!(within, here.join("app"));
+        assert!(!stale.exists());
+        assert_eq!(*repo.checkouts.lock().unwrap(), vec![here.clone()]);
+        drop(checkout);
+        assert!(repo.checkouts.lock().unwrap().is_empty());
+        assert!(!here.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_user_namespaces_sends_the_review_on_in_the_probes_words() {
+        let off = FakeNamespaces(Some("unshare: Operation not permitted".to_owned()));
+        match sandbox_active(&off) {
+            Err(ReviewerError::NoSandbox(why)) => assert_eq!(
+                why,
+                "its sandbox is not active (unprivileged user namespaces are unavailable: \
+                 unshare: Operation not permitted)"
+            ),
+            other => panic!("expected NoSandbox, got {other:?}"),
+        }
+        assert!(sandbox_active(&FakeNamespaces(None)).is_ok());
+    }
+}

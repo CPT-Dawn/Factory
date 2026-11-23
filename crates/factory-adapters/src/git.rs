@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::process;
@@ -53,10 +54,31 @@ pub trait Repo {
     fn staged_diff(&self, tracked: bool, added: Option<&[String]>) -> Result<String, GitError>;
     /// The git dir its worktrees share, which holds their objects and refs.
     fn common_dir(&self) -> Result<PathBuf, GitError>;
+    /// A detached checkout of `rev` at `dir`, outside this repository, in a worktree of its
+    /// own: what is done in it leaves this repository's working tree alone. Whatever an earlier
+    /// checkout left at `dir` is removed first. The checkout is removed when it is dropped.
+    fn checkout(&self, rev: &str, dir: &Path) -> Result<Checkout, GitError>;
+    /// Forgets the worktrees whose directory is gone.
+    fn prune_worktrees(&self) -> Result<(), GitError>;
+}
+
+/// Opens the repository at a directory: how an adapter handed only a directory reaches it.
+pub trait Repos: fmt::Debug + Send + Sync {
+    fn at(&self, dir: &Path) -> Box<dyn Repo>;
+}
+
+/// The repositories the `git` on PATH finds.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Git;
+
+impl Repos for Git {
+    fn at(&self, dir: &Path) -> Box<dyn Repo> {
+        Box::new(GitRepo::at(dir))
+    }
 }
 
 /// The repository at a directory, through the `git` on PATH.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct GitRepo {
     dir: PathBuf,
     /// `GIT_DIR` and `GIT_WORK_TREE` for every call, when the repository is not found from `dir`.
@@ -107,65 +129,44 @@ impl GitRepo {
 }
 
 impl GitRepo {
-    /// A detached checkout of `rev` at `dir`, outside this repository, in a worktree of its
-    /// own: what is done in it leaves this repository's working tree alone. Whatever an earlier
-    /// checkout left at `dir` is removed first. The checkout is removed when it is dropped.
-    pub fn checkout(&self, rev: &str, dir: &Path) -> Result<Checkout, GitError> {
-        let path = dir
-            .to_str()
-            .ok_or_else(|| GitError(format!("{} is not UTF-8", dir.display())))?;
-        let checkout = Checkout {
-            repo: GitRepo {
-                dir: self.dir.clone(),
-                git_dir: self.git_dir.clone(),
-                work_tree: self.work_tree.clone(),
-            },
-            dir: dir.to_owned(),
-        };
-        checkout.remove();
-        if let Some(parent) = dir.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| GitError(format!("cannot create {}: {e}", parent.display())))?;
+    /// Removes the worktree at `dir` and whatever is left of the directory, and forgets it.
+    /// Nothing to remove is not a failure.
+    fn remove_worktree(&self, dir: &Path) {
+        if let Some(path) = dir.to_str() {
+            let _ = self.output(&["worktree", "remove", "--force", "--force", path]);
         }
-        self.git(&["worktree", "add", "--detach", "--quiet", path, rev])?;
-        Ok(checkout)
-    }
-
-    /// Forgets the worktrees whose directory is gone.
-    pub fn prune_worktrees(&self) -> Result<(), GitError> {
-        self.git(&["worktree", "prune"]).map(drop)
+        let _ = fs::remove_dir_all(dir);
+        let _ = self.prune_worktrees();
     }
 }
 
-/// A throwaway checkout, from [`GitRepo::checkout`]: removed, worktree and directory, when
+/// A throwaway checkout, from [`Repo::checkout`]: removed, worktree and directory, when
 /// dropped, however the work in it ended.
-#[derive(Debug)]
 pub struct Checkout {
-    repo: GitRepo,
     dir: PathBuf,
+    remove: Box<dyn Fn(&Path) + Send + Sync>,
 }
 
 impl Checkout {
+    /// The checkout at `dir`, which `remove` removes when it is dropped.
+    pub fn new(dir: PathBuf, remove: Box<dyn Fn(&Path) + Send + Sync>) -> Checkout {
+        Checkout { dir, remove }
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+}
 
-    /// Removes the worktree and whatever is left of its directory, and has the repository
-    /// forget it. Nothing to remove is not a failure.
-    fn remove(&self) {
-        if let Some(path) = self.dir.to_str() {
-            let _ = self
-                .repo
-                .output(&["worktree", "remove", "--force", "--force", path]);
-        }
-        let _ = fs::remove_dir_all(&self.dir);
-        let _ = self.repo.prune_worktrees();
+impl fmt::Debug for Checkout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Checkout").field("dir", &self.dir).finish()
     }
 }
 
 impl Drop for Checkout {
     fn drop(&mut self) {
-        self.remove();
+        (self.remove)(&self.dir);
     }
 }
 
@@ -180,6 +181,28 @@ fn failed(args: &[&str], output: &Output) -> GitError {
 }
 
 impl Repo for GitRepo {
+    fn checkout(&self, rev: &str, dir: &Path) -> Result<Checkout, GitError> {
+        let path = dir
+            .to_str()
+            .ok_or_else(|| GitError(format!("{} is not UTF-8", dir.display())))?;
+        self.remove_worktree(dir);
+        if let Some(parent) = dir.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| GitError(format!("cannot create {}: {e}", parent.display())))?;
+        }
+        let repo = self.clone();
+        let checkout = Checkout::new(
+            dir.to_owned(),
+            Box::new(move |dir| repo.remove_worktree(dir)),
+        );
+        self.git(&["worktree", "add", "--detach", "--quiet", path, rev])?;
+        Ok(checkout)
+    }
+
+    fn prune_worktrees(&self) -> Result<(), GitError> {
+        self.git(&["worktree", "prune"]).map(drop)
+    }
+
     fn name(&self) -> Result<String, GitError> {
         let common = self.common_dir()?;
         common
@@ -429,9 +452,35 @@ pub struct FakeRepo {
     pub git_dir: PathBuf,
     pub staged_diff: String,
     pub common_dir: PathBuf,
+    /// The checkouts made and not yet dropped, by directory; each is an empty directory.
+    pub checkouts: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+impl Repos for FakeRepo {
+    fn at(&self, _dir: &Path) -> Box<dyn Repo> {
+        Box::new(self.clone())
+    }
 }
 
 impl Repo for FakeRepo {
+    fn checkout(&self, _rev: &str, dir: &Path) -> Result<Checkout, GitError> {
+        fs::create_dir_all(dir)
+            .map_err(|e| GitError(format!("cannot create {}: {e}", dir.display())))?;
+        let held = Arc::clone(&self.checkouts);
+        lock(&held).push(dir.to_owned());
+        Ok(Checkout::new(
+            dir.to_owned(),
+            Box::new(move |dir| {
+                lock(&held).retain(|made| made != dir);
+                let _ = fs::remove_dir_all(dir);
+            }),
+        ))
+    }
+
+    fn prune_worktrees(&self) -> Result<(), GitError> {
+        Ok(())
+    }
+
     fn name(&self) -> Result<String, GitError> {
         Ok(self.name.clone())
     }
@@ -479,4 +528,8 @@ impl Repo for FakeRepo {
     fn staged_diff(&self, _tracked: bool, _added: Option<&[String]>) -> Result<String, GitError> {
         Ok(self.staged_diff.clone())
     }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
