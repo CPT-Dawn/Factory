@@ -81,6 +81,18 @@ fn a_failed_review_says_why_and_where_its_files_are_and_asks_for_attention() {
 }
 
 #[test]
+fn a_label_of_digits_stored_as_a_number_is_still_named() {
+    let ended = finished::of(&event(json!({
+        "type": "review", "label": 123, "outcome": "ok", "verdict": "clean",
+        "blocking": 0, "advisory": 0, "question": 0, "report": "/r/123.md",
+    })));
+    assert_eq!(
+        ended.line,
+        "review 123: clean (0 blocking, 0 advisory, 0 question) → /r/123.md"
+    );
+}
+
+#[test]
 fn counts_an_event_lacks_read_as_zero() {
     let ended = finished::of(&event(
         json!({"label": "t1", "verdict": "clean", "report": "/r"}),

@@ -5,8 +5,34 @@ use std::fs;
 use serde_json::Value;
 
 use crate::review::{CLEAN_REPORT, FINDINGS_REPORT, codex_writes};
+use crate::support::herdr::FakeHerdr;
 use crate::support::world::poll_until;
 use crate::support::{Sandbox, finish, spawn};
+
+/// A herdr with the lead `cart` in pane w1:p1, so a wait that names the pane shows up in `lead
+/// status` once the daemon holds it.
+fn shop(sandbox: &Sandbox) -> FakeHerdr {
+    let herdr = FakeHerdr::start(sandbox);
+    herdr.workspace("w1", "Shop");
+    herdr.agent(Some("lead-cart"), "w1:p1", "working");
+    herdr
+}
+
+/// Waits until the daemon holds a wait of the lead `cart` on the review `label`: from then on
+/// an answer that has not come is the wait's own doing.
+fn await_registered(sandbox: &Sandbox, label: &str) {
+    let want = format!("lead-cart waiting: review {label}");
+    assert!(
+        poll_until(|| {
+            sandbox
+                .factory(&["lead", "status", "cart"])
+                .stdout_lines()
+                .first()
+                == Some(&want.as_str())
+        }),
+        "the daemon never held the wait"
+    );
+}
 
 /// A fake codex that holds the review until the test opens its gate, then writes `report`.
 fn gated_codex(sandbox: &Sandbox, report: &str) -> std::path::PathBuf {
@@ -70,12 +96,13 @@ fn it_blocks_silent_while_the_review_runs_then_prints_its_result() {
         poll_until(|| !sandbox.calls("codex").is_empty()),
         "codex never started"
     );
+    let _herdr = shop(&sandbox);
     let mut waiter = sandbox.factory_command(&["wait", "review", "t1-r1"]);
-    waiter.current_dir(&repo);
+    waiter.current_dir(&repo).env("HERDR_PANE_ID", "w1:p1");
     let mut waiter = spawn(waiter);
 
-    // The wait has had every chance to answer by now, and the review has not ended.
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Once the daemon holds the wait it has read the ledger, and the review has not ended.
+    await_registered(&sandbox, "t1-r1");
     assert!(waiter.try_wait().unwrap().is_none(), "answered early");
     fs::write(&gate, "").unwrap();
     let review = finish(review);
@@ -104,11 +131,12 @@ fn a_rerun_under_the_same_label_is_waited_for_not_answered_from_the_last_run() {
         poll_until(|| sandbox.calls("codex").len() == 2),
         "codex never started"
     );
+    let _herdr = shop(&sandbox);
     let mut waiter = sandbox.factory_command(&["wait", "review", "t1-r1"]);
-    waiter.current_dir(&repo);
+    waiter.current_dir(&repo).env("HERDR_PANE_ID", "w1:p1");
     let mut waiter = spawn(waiter);
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    await_registered(&sandbox, "t1-r1");
     assert!(
         waiter.try_wait().unwrap().is_none(),
         "answered from the first run"

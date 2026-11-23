@@ -31,7 +31,12 @@ pub fn summary(label: &str, verdict: &str, counts: Counts, report: &str) -> Stri
 /// What the `review` event says: the counts it lacks read as zero, and a review that failed
 /// says why and asks for attention, so a caller never takes a failure for a pass.
 pub fn of(event: &Fields) -> Finished {
-    let text = |key: &str| event.get(key).and_then(Value::as_str).unwrap_or_default();
+    // A label of digits is stored as a number, as the ledger's own readers know.
+    let text = |key: &str| match event.get(key) {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(number)) => number.to_string(),
+        _ => String::new(),
+    };
     let count = |key: &str| event.get(key).and_then(Value::as_u64).unwrap_or(0);
     let label = text("label");
     let report = text("report");
@@ -55,7 +60,7 @@ pub fn of(event: &Fields) -> Finished {
         question: count("question"),
     };
     Finished {
-        line: summary(label, verdict, counts, report),
+        line: summary(&label, &verdict, counts, &report),
         exit: if verdict == Verdict::Clean.to_string() {
             Exit::Ok
         } else {

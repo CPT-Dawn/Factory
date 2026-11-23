@@ -33,9 +33,10 @@ On stdout, with the review done:
 
 With `--json`, one object: the event's fields plus `report`, `findings` and `blocking_findings`.
 
-Exit codes are the table in the code: 0 for a clean review, 10 (needs attention) for findings, 2 for usage, 3 for a
-precondition (a bad label, a base that is no commit, a missing previous report), 75 when every backend is out of quota and 124
-for a timeout. A failure prints `factory: code-review: <message>` on stderr. The `code-review: ` text is what
+Exit codes are the table in the code: 0 for a clean review, 10 (needs attention) for findings, 2 for usage (a bad
+label or tier, a base that is no commit, a missing previous report), 3 for a precondition (not in a git repo, a
+backend that failed, a report without its findings ledger, the daemon stopping while the review queued), 75 when
+every backend is out of quota and 124 for a timeout. A failure prints `factory: code-review: <message>` on stderr. The `code-review: ` text is what
 factory-stats' classifier matches; it stays.
 
 ## What the shim prints and returns
