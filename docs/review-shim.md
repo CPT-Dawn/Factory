@@ -34,7 +34,7 @@ On stdout, with the review done:
 With `--json`, one object: the event's fields plus `report`, `findings` and `blocking_findings`.
 
 Exit codes are the table in the code: 0 for a clean review, 10 (needs attention) for findings, 2 for usage, 3 for a
-precondition (a label already running, no backend, a missing base), 75 when every backend is out of quota and 124
+precondition (a bad label, a base that is no commit, a missing previous report), 75 when every backend is out of quota and 124
 for a timeout. A failure prints `factory: code-review: <message>` on stderr. The `code-review: ` text is what
 factory-stats' classifier matches; it stays.
 
