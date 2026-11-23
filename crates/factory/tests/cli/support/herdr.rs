@@ -48,7 +48,22 @@ struct State {
     before_subscribe: Option<(String, String)>,
     /// A status change that overtakes the next agent listing taken while its pane is watched.
     overtake: Option<Overtake>,
+    /// Agents still coming up, by name, as herdr 0.9.5 has them after `agent.start`.
+    launches: HashMap<String, Launch>,
+    /// Whether the next agent started stops at the folder-trust dialog.
+    block_next_start: bool,
 }
+
+/// An agent `agent.start` answered for before it is ready: herdr says `launch_pending` until
+/// `agent.get` has been asked `polls` more times, then it is ready, or blocked at the trust
+/// dialog until an enter answers it.
+struct Launch {
+    polls: u32,
+    blocked: bool,
+}
+
+/// How many `agent.get` polls a started agent takes to come up.
+const LAUNCH_POLLS: u32 = 2;
 
 struct Overtake {
     pane: String,
@@ -253,6 +268,12 @@ impl FakeHerdr {
         }
     }
 
+    /// Makes the next agent started stop at the folder-trust dialog: `agent.get` says it is
+    /// blocked during startup until an enter is pressed in it.
+    pub fn blocks_at_startup(&self) {
+        self.shared.lock().block_next_start = true;
+    }
+
     /// Makes the next request for `method` fail with herdr's error `code` and `message`.
     pub fn refuse(&self, method: &str, code: &str, message: &str) {
         self.shared
@@ -372,6 +393,15 @@ fn serve(shared: &Shared, stream: UnixStream) {
         let _ = writeln!(&stream, "{error}");
         return;
     }
+    if method == "agent.prompt" && launching(&state, &request["params"]["target"]) {
+        let target = request["params"]["target"].as_str().unwrap_or_default();
+        let error = json!({"id": id, "error": {
+            "code": "agent_not_ready",
+            "message": format!("agent {target} is not an active named agent"),
+        }});
+        let _ = writeln!(&stream, "{error}");
+        return;
+    }
     if method == "events.subscribe"
         && let Some((pane, status)) = state.before_subscribe.take()
     {
@@ -386,7 +416,9 @@ fn serve(shared: &Shared, stream: UnixStream) {
         "agent.start" => agent_started(&mut state, &request["params"]),
         "agent.read" => agent_read(&state, &request["params"]),
         "agent.prompt" => agent_prompted(&mut state, &request["params"]),
-        "agent.wait" | "agent.send_keys" => agent_answered(&state, &request["params"]),
+        "agent.get" => agent_got(&mut state, &request["params"]),
+        "agent.send_keys" => keys_sent(&mut state, &request["params"]),
+        "agent.wait" => agent_answered(&state, &request["params"]),
         "events.subscribe" => json!({"type": "subscription_started"}),
         other => {
             let error = json!({"id": id, "error": {
@@ -496,14 +528,25 @@ fn worktree_created(state: &mut State, params: &Value) -> Value {
     })
 }
 
-/// `agent.start`: an idle agent named as asked in the pane asked for.
+/// `agent.start`: an agent named as asked in the pane asked for, still coming up. herdr answers
+/// at once; the CLI's `agent start` is what waits, polling `agent.get`.
 fn agent_started(state: &mut State, params: &Value) -> Value {
     let pane = params["pane_id"].as_str().unwrap_or_default();
     let workspace = pane.split(':').next().unwrap_or(pane);
+    let name = params["name"].as_str().unwrap_or_default().to_owned();
+    let blocked = std::mem::take(&mut state.block_next_start);
+    state.launches.insert(
+        name,
+        Launch {
+            polls: LAUNCH_POLLS,
+            blocked,
+        },
+    );
     let agent = json!({
         "name": params["name"],
         "agent": params["kind"],
-        "agent_status": "idle",
+        "agent_status": "unknown",
+        "launch_pending": true,
         "pane_id": pane,
         "workspace_id": workspace,
         "tab_id": format!("{workspace}:t1"),
@@ -541,7 +584,59 @@ fn agent_prompted(state: &mut State, params: &Value) -> Value {
     json!({"type": "agent_prompted", "agent": agent.clone()})
 }
 
-/// `agent.wait` and `agent.send_keys`: the named agent, as it is.
+/// Whether the agent `target` names is still coming up.
+fn launching(state: &State, target: &Value) -> bool {
+    target
+        .as_str()
+        .is_some_and(|name| state.launches.contains_key(name))
+}
+
+/// The agent `name`, ready for input: no longer pending, idle.
+fn come_up(state: &mut State, name: &str) {
+    state.launches.remove(name);
+    if let Some(agent) = state.agents.iter_mut().find(|agent| agent["name"] == name) {
+        let fields = agent.as_object_mut().expect("an agent is an object");
+        fields.remove("launch_pending");
+        fields.insert("agent_status".to_owned(), json!("idle"));
+        fields.insert("interactive_ready".to_owned(), json!(true));
+    }
+}
+
+/// `agent.get`: the named agent, one poll further along if it is coming up.
+fn agent_got(state: &mut State, params: &Value) -> Value {
+    let name = params["target"].as_str().unwrap_or_default().to_owned();
+    if let Some(launch) = state.launches.get_mut(&name) {
+        if launch.polls > 0 {
+            launch.polls -= 1;
+        } else if launch.blocked {
+            if let Some(agent) = state.agents.iter_mut().find(|agent| agent["name"] == name) {
+                agent["agent_status"] = json!("blocked");
+            }
+        } else {
+            come_up(state, &name);
+        }
+    }
+    agent_answered(state, params)
+}
+
+/// `agent.send_keys`: an enter answers the trust dialog of an agent blocked coming up.
+fn keys_sent(state: &mut State, params: &Value) -> Value {
+    let name = params["target"].as_str().unwrap_or_default().to_owned();
+    let enter = params["keys"]
+        .as_array()
+        .is_some_and(|keys| keys.iter().any(|key| key == "enter"));
+    if enter
+        && state
+            .launches
+            .get(&name)
+            .is_some_and(|launch| launch.blocked)
+    {
+        come_up(state, &name);
+    }
+    agent_answered(state, params)
+}
+
+/// `agent.wait`: the named agent, as it is.
 fn agent_answered(state: &State, params: &Value) -> Value {
     let agent = state
         .agents

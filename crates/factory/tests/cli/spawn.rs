@@ -350,12 +350,37 @@ fn a_report_left_by_an_earlier_lead_is_cleared() {
 }
 
 #[test]
-fn a_trust_dialog_is_answered_with_down_and_enter() {
+fn a_freshly_started_claude_gets_its_prompt_only_once_it_is_ready() {
     let sandbox = Sandbox::new();
     let herdr = FakeHerdr::start(&sandbox);
     let repo = sandbox.repo();
-    herdr.refuse("agent.start", "timeout", "agent did not become ready");
-    herdr.agent(Some("lead-cart"), "w1:p1", "idle");
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let methods = herdr.methods();
+    let ready = methods
+        .iter()
+        .rposition(|method| method == "agent.get")
+        .expect("spawn asked herdr whether the agent was ready");
+    let prompted = methods
+        .iter()
+        .position(|method| method == "agent.prompt")
+        .expect("spawn typed the prompt");
+    assert!(
+        ready < prompted,
+        "prompted before it was ready: {methods:?}"
+    );
+    assert_eq!(herdr.count("agent.prompt"), 1);
+    assert_eq!(herdr.count("agent.send_keys"), 0);
+}
+
+#[test]
+fn a_trust_dialog_met_while_coming_up_is_answered_with_down_and_enter() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    herdr.blocks_at_startup();
     herdr.screen(
         "w1:p1",
         "Do you trust /worktrees/repo/cart?\n  1. Yes, I trust this folder\n  2. No\n",
