@@ -62,6 +62,12 @@ pub trait Repo {
     fn staged_diff(&self, tracked: bool, added: Option<&[String]>) -> Result<String, GitError>;
     /// The git dir its worktrees share, which holds their objects and refs.
     fn common_dir(&self) -> Result<PathBuf, GitError>;
+    /// The commits `push` would send, oldest first, each with its patch (a merge's as a
+    /// combined diff), worked out from the refs here, with no call to the remote. A branch the
+    /// remote has, as its remote-tracking ref says, sends the commits that ref lacks; a new
+    /// branch, and a tag, every commit that no remote-tracking ref has. A ref that names no
+    /// commit sends nothing, as git refuses to push it.
+    fn sent(&self, push: &Push) -> Result<Vec<Patch>, GitError>;
     /// A detached checkout of `rev` at `dir`, outside this repository, in a worktree of its
     /// own: what is done in it leaves this repository's working tree alone. Whatever an earlier
     /// checkout left at `dir` is removed first. The checkout is removed when it is dropped.
@@ -340,6 +346,10 @@ impl Repo for GitRepo {
         Ok(PathBuf::from(dir.trim_end()))
     }
 
+    fn sent(&self, push: &Push) -> Result<Vec<Patch>, GitError> {
+        self.sent_commits(push)
+    }
+
     fn staged_diff(&self, tracked: bool, added: Option<&[String]>) -> Result<String, GitError> {
         // What a commit made now takes: the index, or with `tracked` every tracked file as it is
         // in the working tree. An earlier `git add` puts its paths' working tree in the index
@@ -442,16 +452,12 @@ impl GitRepo {
 }
 
 impl GitRepo {
-    /// The commits `push` would send, oldest first, each with its patch (a merge's as a
-    /// combined diff), worked out from the refs here, with no call to the remote. A branch the
-    /// remote has, as its remote-tracking ref says, sends the commits that ref lacks; a new
-    /// branch, and a tag, every commit that no remote-tracking ref has.
-    pub fn sent(&self, push: &Push) -> Result<Vec<Patch>, GitError> {
+    fn sent_commits(&self, push: &Push) -> Result<Vec<Patch>, GitError> {
         let mut sent: Vec<Patch> = Vec::new();
         for (src, dst) in self.updates(push)? {
             // Git refuses to push a ref that names no commit, so it sends nothing. A commit made
             // earlier in the same line is checked as a commit.
-            let Some(local) = self.commit_at(&src)? else {
+            let Some(local) = self.commit(&src)? else {
                 continue;
             };
             let remote = match self.remote_branch(push.remote.as_deref(), &src, dst.as_deref())? {
@@ -513,14 +519,6 @@ impl GitRepo {
         Ok(updates)
     }
 
-    /// The commit `rev` names, none when it names none.
-    fn commit_at(&self, rev: &str) -> Result<Option<String>, GitError> {
-        let spec = format!("{rev}^{{commit}}");
-        let output = self.output(&["rev-parse", "--verify", "--quiet", &spec])?;
-        let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        Ok((output.status.success() && !commit.is_empty()).then_some(commit))
-    }
-
     /// The remote-tracking commit of the branch an update of `src` (to `dst` when named)
     /// goes to on `remote`: none for a branch the remote does not have, or a ref that is no
     /// branch.
@@ -544,23 +542,21 @@ impl GitRepo {
                 }
             }
         };
-        // With no remote named, the branch's push or upstream ref says where it goes, else origin.
-        let mut tracking = Vec::new();
-        match remote {
-            Some(remote) => tracking.push(format!("refs/remotes/{remote}/{branch}")),
+        // With no remote named, the branch's push ref says where it goes, else origin.
+        let remote = match remote {
+            Some(remote) => remote,
             None => {
                 if dst.is_none() {
-                    tracking.push(format!("{branch}@{{push}}"));
+                    // A branch with nowhere to push to fails here; origin is where git push goes then.
+                    let pushes_to = format!("{branch}@{{push}}");
+                    if let Ok(Some(commit)) = self.commit(&pushes_to) {
+                        return Ok(Some(commit));
+                    }
                 }
-                tracking.push(format!("refs/remotes/origin/{branch}"));
+                "origin"
             }
-        }
-        for rev in tracking {
-            if let Some(commit) = self.commit_at(&rev)? {
-                return Ok(Some(commit));
-            }
-        }
-        Ok(None)
+        };
+        self.commit(&format!("refs/remotes/{remote}/{branch}"))
     }
 }
 
@@ -626,6 +622,8 @@ pub struct FakeRepo {
     pub toplevel: PathBuf,
     pub git_dir: PathBuf,
     pub staged_diff: String,
+    /// What any push sends.
+    pub sent: Vec<Patch>,
     pub common_dir: PathBuf,
     /// The checkouts made and not yet dropped, by directory; each is an empty directory.
     pub checkouts: Arc<Mutex<Vec<PathBuf>>>,
@@ -706,6 +704,10 @@ impl Repo for FakeRepo {
 
     fn common_dir(&self) -> Result<PathBuf, GitError> {
         Ok(self.common_dir.clone())
+    }
+
+    fn sent(&self, _push: &Push) -> Result<Vec<Patch>, GitError> {
+        Ok(self.sent.clone())
     }
 
     fn staged_diff(&self, _tracked: bool, _added: Option<&[String]>) -> Result<String, GitError> {

@@ -438,6 +438,26 @@ fn a_push_that_deletes_a_branch_checks_nothing() {
 }
 
 #[test]
+fn a_push_whose_commits_cannot_be_read_is_denied_with_what_to_do() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = repo_with_a_remote(&sandbox);
+    commit_file(&sandbox, &repo, "notes.txt", "fine\n");
+    // The file's content is gone from the object store.
+    let blob = sandbox.git(&repo, &["rev-parse", "HEAD:notes.txt"]);
+    let (dir, file) = blob.trim().split_at(2);
+    std::fs::remove_file(repo.join(".git/objects").join(dir).join(file)).unwrap();
+
+    let out = pre_tool(&sandbox, &bash_in(&repo, "git push origin work"));
+
+    let reason = reason_of(&out);
+    assert!(
+        reason.starts_with("The hook could not read what this push would send"),
+        "{reason}"
+    );
+}
+
+#[test]
 fn a_push_sends_commits_and_not_what_is_staged() {
     let sandbox = Sandbox::new();
     leak_config(&sandbox);
@@ -699,6 +719,10 @@ fn a_commit_whose_repository_cannot_be_worked_out_is_refused_with_one_line() {
     let home = sandbox.path("home");
     let why = refused_with_one_line(&pre_tool(&sandbox, &bash_in(&home, "git commit -m x")));
     assert!(why.contains(home.to_str().unwrap()), "{why}");
+    for push in ["git push", "git push origin work", "git push --all origin"] {
+        let why = refused_with_one_line(&pre_tool(&sandbox, &bash_in(&home, push)));
+        assert!(why.contains("push"), "{push}: {why}");
+    }
 
     // With no address to look for, there is nothing to check.
     config(&sandbox, "");
