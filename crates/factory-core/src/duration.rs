@@ -1,16 +1,20 @@
-//! Durations as a command line takes them: a whole number and a unit, such as `90s`, `9m`, `2h`.
+//! Durations as a command line takes them: a bare whole number of seconds, or a whole number
+//! and a unit, such as `90`, `90s`, `9m`, `2h`. Every `--timeout` and `--wait` reads this
+//! grammar.
 
 use std::fmt;
 use std::time::Duration;
 
-/// Reads `<n>s`, `<n>m` or `<n>h`.
+/// Reads `<n>` (seconds), `<n>s`, `<n>m` or `<n>h`.
 pub fn parse(text: &str) -> Result<Duration, BadDuration> {
     let bad = || BadDuration(text.to_owned());
-    let split = text.find(|c: char| !c.is_ascii_digit()).ok_or_else(bad)?;
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
     let (number, unit) = text.split_at(split);
     let n: u64 = number.parse().map_err(|_| bad())?;
     let seconds = match unit {
-        "s" => Some(n),
+        "" | "s" => Some(n),
         "m" => n.checked_mul(60),
         "h" => n.checked_mul(3600),
         _ => None,
@@ -37,7 +41,7 @@ impl fmt::Display for BadDuration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "bad duration {:?}: give a whole number and s, m or h, such as 90s or 9m",
+            "bad duration {:?}: give seconds, or a whole number and s, m or h, such as 90, 90s, 9m or 1h",
             self.0
         )
     }

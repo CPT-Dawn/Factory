@@ -171,7 +171,26 @@ fn a_wait_that_is_no_number_of_seconds_is_refused() {
         (
             2,
             "",
-            "devlab: --wait takes a number of seconds (0 = do not wait)\n"
+            "devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)\n"
+        )
+    );
+}
+
+#[test]
+fn a_wait_takes_a_unit_too() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-unit");
+
+    let unit = owned(&sandbox, &wt, &["acquire", "--no-device", "--wait", "1m"]);
+    let bad = owned(&sandbox, &wt, &["acquire", "--no-device", "--wait", "1.5m"]);
+
+    assert_eq!(unit.code, 0, "{unit:?}");
+    assert!(unit.stdout.contains("DEVLAB_SLOT="), "{unit:?}");
+    assert_eq!(
+        (bad.code, bad.stderr.as_str()),
+        (
+            2,
+            "devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)\n"
         )
     );
 }
@@ -201,7 +220,7 @@ fn a_wait_that_is_no_number_of_seconds_stops_run_before_it_runs_anything() {
         (
             2,
             "",
-            "devlab: --wait takes a number of seconds (0 = do not wait)\n"
+            "devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)\n"
         )
     );
     assert!(!marker.exists(), "the command ran");
@@ -268,7 +287,7 @@ fn a_bad_wait_is_refused_even_when_the_machine_config_is_broken() {
         (out.code, out.stderr.as_str()),
         (
             2,
-            "devlab: --wait takes a number of seconds (0 = do not wait)\n"
+            "devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)\n"
         )
     );
 }

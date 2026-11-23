@@ -6,7 +6,7 @@
 //! its own lease. [`plan` ](plan) decides what a request is given; the rest reads a reserve
 //! command's options and words its answers.
 
-use super::args::number_arg;
+use super::args::wait_arg;
 use super::grant::{Ask, Board, Decision, ProjectAsk, decide};
 use super::queue::{Holding, held_by};
 
@@ -149,13 +149,7 @@ pub fn parse_reserve(args: &[String]) -> Result<ReserveOpts, String> {
                     .filter(|n| *n >= 1)
                     .ok_or("--slots takes a whole number of 1 or more")?;
             }
-            "--wait" => {
-                let sec = number_arg(rest.next());
-                if !sec.is_finite() || sec < 0.0 {
-                    return Err("--wait takes a number of seconds (0 = do not wait)".to_owned());
-                }
-                opts.wait_sec = Some(sec);
-            }
+            "--wait" => opts.wait_sec = Some(wait_arg(rest.next())?),
             "--json" => opts.json = true,
             "--release" => opts.release = true,
             other => {
@@ -367,6 +361,7 @@ mod tests {
             })
         );
         assert!(args(&["--release"]).unwrap().release);
+        assert_eq!(args(&["--wait", "9m"]).unwrap().wait_sec, Some(540.0));
     }
 
     #[test]
@@ -384,7 +379,7 @@ mod tests {
         );
         assert_eq!(
             args(&["--wait", "soon"]),
-            Err("--wait takes a number of seconds (0 = do not wait)".to_owned())
+            Err(crate::lab::args::WAIT_REFUSAL.to_owned())
         );
         assert_eq!(
             args(&["--lots", "2"]),

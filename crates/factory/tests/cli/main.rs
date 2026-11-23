@@ -12,6 +12,7 @@ mod claude;
 #[cfg(test)]
 mod cutover;
 mod devlab_golden;
+mod durations;
 mod harness;
 mod help;
 mod install;
