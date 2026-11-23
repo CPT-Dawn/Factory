@@ -28,6 +28,8 @@ pub struct Lab {
     pub leases: Vec<Lease>,
     /// By project, then slot: every slot the lab has used.
     pub slots: Vec<Slot>,
+    /// Slots set aside for a lead's implementers, by id.
+    pub reservations: Vec<Reservation>,
     /// Oldest first.
     pub queue: Vec<Queued>,
 }
@@ -53,12 +55,28 @@ pub struct Slot {
     pub slot: u32,
     /// The lease that holds it; none when it is free.
     pub lease: Option<i64>,
+    /// The reservation that holds it; none when it is free or leased.
+    pub reservation: Option<i64>,
     pub last_worktree: Option<String>,
     /// devlab started its stack, so the idle timer may stop it.
     pub stack_ours: bool,
     /// A `release --stop-stack` is stopping its stack.
     pub stopping: bool,
     pub idle_since: Option<i64>,
+}
+
+/// A slot set aside for one of a lead's implementers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reservation {
+    pub id: i64,
+    pub project: String,
+    pub slot: u32,
+    /// The lead's worktree.
+    pub worktree: String,
+    /// `<comm>:<pid>` of the lead.
+    pub owner: String,
+    /// Seconds since the epoch.
+    pub created: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,17 +187,25 @@ pub fn screen(status: &Status) -> Vec<String> {
 
 fn lab(status: &Status, rows: &mut Vec<String>) {
     let lab = &status.lab;
-    if lab.leases.is_empty() && lab.slots.is_empty() && lab.queue.is_empty() {
+    if lab.leases.is_empty()
+        && lab.slots.is_empty()
+        && lab.reservations.is_empty()
+        && lab.queue.is_empty()
+    {
         rows.push("lab: idle".to_owned());
         return;
     }
     let free = lab
         .slots
         .iter()
-        .filter(|slot| slot.lease.is_none() && !slot.stopping)
+        .filter(|slot| slot.lease.is_none() && slot.reservation.is_none() && !slot.stopping)
         .count();
+    let reserved = match lab.reservations.len() {
+        0 => String::new(),
+        n => format!(", {n} reserved"),
+    };
     rows.push(format!(
-        "lab: {} leased, {free} free, {} queued",
+        "lab: {} leased{reserved}, {free} free, {} queued",
         lab.leases.len(),
         lab.queue.len()
     ));
@@ -206,10 +232,20 @@ fn lab(status: &Status, rows: &mut Vec<String>) {
             )
         })
         .collect();
+    held.extend(lab.reservations.iter().map(|reservation| {
+        format!(
+            "  reserved {}/{} {} {} {}",
+            reservation.project,
+            reservation.slot,
+            base_name(&reservation.worktree),
+            reservation.owner,
+            ago(now, reservation.created)
+        )
+    }));
     held.extend(
         lab.slots
             .iter()
-            .filter(|slot| slot.lease.is_none())
+            .filter(|slot| slot.lease.is_none() && slot.reservation.is_none())
             .map(|slot| {
                 let state = if slot.stopping { "stopping" } else { "free" };
                 let last = slot

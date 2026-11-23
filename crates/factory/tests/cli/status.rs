@@ -73,7 +73,10 @@ fn json_gives_every_field_of_every_section() {
         keys
     };
     assert_eq!(keys(&shown), ["lab", "leads", "now", "review", "waits"]);
-    assert_eq!(keys(&shown["lab"]), ["leases", "queue", "slots"]);
+    assert_eq!(
+        keys(&shown["lab"]),
+        ["leases", "queue", "reservations", "slots"]
+    );
     assert_eq!(keys(&shown["leads"]), ["error", "leads", "monitor"]);
     assert!(
         shown["now"].as_i64().unwrap() > 1_700_000_000_000,
@@ -471,4 +474,45 @@ fn a_status_is_a_screen_of_plain_lines_under_the_output_contract() {
         assert!(line.chars().count() <= 80, "{line:?}");
         assert_eq!(line, line.trim_end(), "{line:?}");
     }
+}
+
+#[test]
+fn a_reserved_slot_is_the_leads_and_not_free() {
+    let (sandbox, world) = lab();
+    let (lead, other) = (Agent::start(), Agent::start());
+    let held = run(for_owner(
+        &sandbox,
+        &world.worktree("demo-other"),
+        other.pid(),
+        &["acquire", "--no-device", "--quiet"],
+    ));
+    assert_eq!(held.code, 0, "{held:?}");
+    let reserved = run(for_owner(
+        &sandbox,
+        &world.worktree("demo-lead"),
+        lead.pid(),
+        &["reserve"],
+    ));
+    assert_eq!(reserved.code, 0, "{reserved:?}");
+
+    let out = status(&sandbox);
+
+    let lines = out.stdout_lines();
+    assert!(
+        lines.contains(&"lab: 1 leased, 1 reserved, 0 free, 0 queued"),
+        "{out:?}"
+    );
+    let row = lines.iter().find(|l| l.starts_with("  reserved ")).unwrap();
+    assert!(
+        row.contains("demo-lead") && row.contains(&format!("sleep:{}", lead.pid())),
+        "{out:?}"
+    );
+    let shown = record(&sandbox);
+    assert_eq!(shown["lab"]["reservations"][0]["id"], 1, "{shown}");
+    assert_eq!(shown["lab"]["reservations"][0]["slot"], 1, "{shown}");
+    assert_eq!(
+        shown["lab"]["slots"][0]["reservation"],
+        Value::Null,
+        "{shown}"
+    );
 }

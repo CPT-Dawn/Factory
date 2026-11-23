@@ -4,6 +4,7 @@
 use factory_core::status::{self, Queued};
 
 use super::{Answer, Lab, store};
+use crate::lab::reservations;
 
 impl Lab {
     /// The leases, slots and queue now, after the same housekeeping every lab call does (a
@@ -18,6 +19,7 @@ impl Lab {
     fn overview_now(&self) -> Answer<status::Lab> {
         self.write(|c, _| {
             let leases = store::leases(c)?;
+            let held = reservations::all(c)?;
             let slots = store::slots(c)?
                 .into_iter()
                 .map(|row| status::Slot {
@@ -28,6 +30,10 @@ impl Lab {
                                 && lease.slot == Some(row.slot)
                         })
                         .map(|lease| lease.id),
+                    reservation: held
+                        .iter()
+                        .find(|r| r.project == row.project && r.slot == row.slot)
+                        .map(|r| r.id),
                     project: row.project,
                     slot: row.slot,
                     last_worktree: row.last_worktree,
@@ -59,9 +65,21 @@ impl Lab {
                     devices: lease.devices.into_iter().map(|d| d.serial).collect(),
                 })
                 .collect();
+            let reservations = held
+                .into_iter()
+                .map(|r| status::Reservation {
+                    id: r.id,
+                    project: r.project,
+                    slot: r.slot,
+                    worktree: r.worktree,
+                    owner: r.owner_label,
+                    created: r.created,
+                })
+                .collect();
             Ok(status::Lab {
                 leases,
                 slots,
+                reservations,
                 queue,
             })
         })

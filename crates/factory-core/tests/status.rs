@@ -2,8 +2,8 @@
 //! ticket names (three slots, three backends, five leads) fits one terminal screen.
 
 use factory_core::status::{
-    Backend, COLUMNS, Lab, Lead, Leads, Lease, Queued, QuotaState, ROWS, Slot, Status, Subagent,
-    Wait, screen,
+    Backend, COLUMNS, Lab, Lead, Leads, Lease, Queued, QuotaState, ROWS, Reservation, Slot, Status,
+    Subagent, Wait, screen,
 };
 use factory_core::timestamp::Timestamp;
 
@@ -44,6 +44,7 @@ fn slot(n: u32, lease: Option<i64>, last: Option<&str>) -> Slot {
         project: "demo".to_owned(),
         slot: n,
         lease,
+        reservation: None,
         last_worktree: last.map(|wt| format!("/work/{wt}")),
         stack_ours: false,
         stopping: false,
@@ -113,6 +114,7 @@ fn the_lab_counts_leases_free_slots_and_the_queue_and_lists_each() {
             created: now() - 120,
             deadline_ms: None,
         }],
+        ..Lab::default()
     };
 
     assert_eq!(
@@ -136,6 +138,7 @@ fn a_lease_names_the_devices_it_holds() {
         leases: vec![held],
         slots: vec![slot(0, Some(1), None)],
         queue: Vec::new(),
+        ..Lab::default()
     };
 
     assert_eq!(
@@ -310,6 +313,7 @@ fn five_leads_three_slots_and_three_backends_fit_one_terminal_screen() {
                 deadline_ms: None,
             })
             .collect(),
+        ..Lab::default()
     };
     status.review = vec![
         backend(
@@ -431,4 +435,34 @@ fn a_row_wider_than_the_screen_ends_in_an_ellipsis() {
 
     assert_eq!(row.chars().count(), COLUMNS);
     assert!(row.ends_with('…'), "{row}");
+}
+
+#[test]
+fn a_reservation_holds_its_slot_and_is_listed_with_its_lead() {
+    let mut status = idle();
+    let mut reserved = slot(1, None, Some("demo-c"));
+    reserved.reservation = Some(7);
+    status.lab = Lab {
+        leases: vec![lease(1, Some(0), "demo-a", "claude:123", 4)],
+        slots: vec![slot(0, Some(1), None), reserved, slot(2, None, None)],
+        reservations: vec![Reservation {
+            id: 7,
+            project: "demo".to_owned(),
+            slot: 1,
+            worktree: "/work/demo-lead".to_owned(),
+            owner: "claude:77".to_owned(),
+            created: now() - 180,
+        }],
+        ..Lab::default()
+    };
+
+    assert_eq!(
+        &rows(&status)[1..5],
+        [
+            "lab: 1 leased, 1 reserved, 1 free, 0 queued",
+            "  lease 1 demo/0 demo-a claude:123 4m",
+            "  reserved demo/1 demo-lead claude:77 3m",
+            "  demo/2 free",
+        ]
+    );
 }
