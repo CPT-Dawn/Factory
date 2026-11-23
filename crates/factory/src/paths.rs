@@ -21,10 +21,7 @@ pub struct Paths {
 impl Paths {
     pub fn from_env() -> Result<Paths, Failure> {
         // An empty variable counts as unset, as in factory-stats.
-        Paths::resolve(|key| env::var_os(key).filter(|value| !value.is_empty()))
-    }
-
-    fn resolve(var: impl Fn(&str) -> Option<OsString>) -> Result<Paths, Failure> {
+        let var = |key: &str| env::var_os(key).filter(|value| !value.is_empty());
         let state = match (var("FACTORY_STATE"), var("XDG_STATE_HOME")) {
             (Some(dir), _) => PathBuf::from(dir),
             (None, Some(dir)) => Path::new(&dir).join("factory"),
