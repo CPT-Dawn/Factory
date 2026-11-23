@@ -353,7 +353,9 @@ impl<H: HerdrApi> Leads<H> {
         report
     }
 
-    fn register(self: &Arc<Self>, wait: Wait) -> Registered<H> {
+    /// Registers a wait, so the lead in the waiter's pane shows as waiting until the returned
+    /// guard drops.
+    pub fn register(self: &Arc<Self>, wait: Wait) -> Registered<H> {
         let id = self.lock().waits.register(wait);
         self.bump();
         Registered {
@@ -381,7 +383,7 @@ impl<H: HerdrApi> Leads<H> {
 }
 
 /// A registered wait, cleared when it is dropped: answered, timed out or abandoned.
-struct Registered<H: HerdrApi> {
+pub struct Registered<H: HerdrApi> {
     leads: Arc<Leads<H>>,
     id: WaitId,
 }

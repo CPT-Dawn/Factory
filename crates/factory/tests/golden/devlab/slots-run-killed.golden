@@ -1,0 +1,12 @@
+# A command a signal kills while devlab is not signalled is named, with the signal, and its code
+# passes through as 128 plus the signal's number (#24; today's devlab said nothing). The command
+# here is killed from outside, as the OOM killer would.
+& k a@demo-a exec devlab run --no-device -- sh -c 'echo $$ > child.pid; echo started; sleep 30'
+until k started
+$ a@demo-a kill -KILL "$(cat child.pid)"
+? 0
+wait k
+1> started
+2> devlab: lease 1, slot 0 (stack http://127.0.0.1:27321, down)
+2> devlab: sh killed by SIGKILL after <n> s
+? 137

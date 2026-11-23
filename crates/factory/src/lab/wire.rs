@@ -6,7 +6,17 @@ use serde::{Deserialize, Serialize};
 
 /// Waits in the queue until a lease can be granted: [`AcquireParams`] in, notes while it waits
 /// (`{"id", "note"}`), then [`Granted`] or an error.
+///
+/// For `devlab run` ([`AcquireParams::run`]) the connection then follows the run: the client
+/// sends [`RUN_START`] when its command starts and [`RUN_END`] when the run ends, and the
+/// daemon writes one `lab-run` ledger event. A run that closes the connection without a
+/// [`RUN_END`] is `lost`.
 pub const ACQUIRE: &str = "lab.acquire";
+/// A notification on a run's connection, unanswered: its command started. No params.
+pub const RUN_START: &str = "lab.run.start";
+/// A notification on a run's connection, unanswered: how the run ended, [`RunEnd`]. Sent while
+/// queued, it also takes the run out of the queue, and the acquire is answered with an error.
+pub const RUN_END: &str = "lab.run.end";
 /// The caller's lease, touched: [`FindParams`] in, `Option<Lease>` out.
 pub const LEASE: &str = "lab.lease";
 /// Drops the caller's lease: [`FindParams`] in, the lease it dropped (`Option<Lease>`) out.
@@ -65,6 +75,26 @@ pub struct AcquireParams {
     pub project: Option<ProjectAsk>,
     /// How long to queue; 0 gives up at once.
     pub wait_sec: f64,
+    /// The acquire is a `devlab run`'s: the daemon records it in the ledger.
+    #[serde(default)]
+    pub run: Option<RunAsk>,
+}
+
+/// The run an acquire is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunAsk {
+    /// The command line, its words joined by spaces.
+    pub command: String,
+    /// The Claude Code session it runs in, `CLAUDE_CODE_SESSION_ID`.
+    pub session: Option<String>,
+}
+
+/// How a run ended, in the ledger's words: [`factory_core::lab::run::End::outcome`] and
+/// [`factory_core::lab::run::Phase::word`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunEnd {
+    pub outcome: String,
+    pub phase: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

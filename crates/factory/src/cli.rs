@@ -65,6 +65,14 @@ pub enum Command {
     },
     /// Run the daemon; other commands start it when it isn't running
     Daemon,
+    /// Install or upgrade factory in ~/.local/bin and its systemd units, and start the socket
+    Install {
+        /// Link the units from here (DotFiles' factory/.config/systemd/user); else they are in place
+        #[arg(long, value_name = "DIR")]
+        units: Option<PathBuf>,
+    },
+    /// Stop the daemon and remove the binary and units install put in place; state stays
+    Uninstall,
     /// Lease this PC's local stack slots, in devlab's words: factory lab help (or run it as devlab)
     #[command(disable_help_flag = true)]
     Lab {
@@ -100,6 +108,14 @@ pub enum WaitCommand {
     Lead {
         /// The lead's slug, or lead-<slug>
         lead: String,
+        /// Give up after this long with exit 124, such as 90s, 9m or 2h
+        #[arg(long, default_value = "9m", value_parser = duration)]
+        timeout: Duration,
+    },
+    /// Until every check on a PR's head finished: all passed (exit 0) or some failed (exit 10)
+    Ci {
+        /// The PR: its number (from its repo's checkout), URL or branch
+        pr: String,
         /// Give up after this long with exit 124, such as 90s, 9m or 2h
         #[arg(long, default_value = "9m", value_parser = duration)]
         timeout: Duration,

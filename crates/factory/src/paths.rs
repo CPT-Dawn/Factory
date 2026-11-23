@@ -3,13 +3,16 @@
 //! State resolves as factory-stats resolves it (`$FACTORY_STATE`, else
 //! `${XDG_STATE_HOME:-$HOME/.local/state}/factory`), so both read and write one ledger. The
 //! daemon's socket, locks and pid live in `$XDG_RUNTIME_DIR/factory`, and the config in
-//! `${XDG_CONFIG_HOME:-$HOME/.config}/factory`.
+//! `${XDG_CONFIG_HOME:-$HOME/.config}/factory`. `factory install` puts the binary in
+//! `~/.local/bin` and links the units into systemd's user unit dir.
 
 use std::env;
 use std::ffi::OsString;
 use std::fs::DirBuilder;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
+
+use factory_core::ci::PullRequest;
 
 use crate::output::Failure;
 
@@ -21,6 +24,11 @@ pub struct Paths {
     /// herdr's socket: `$HERDR_SOCKET_PATH`, as herdr sets it in its panes, else herdr's
     /// default `${XDG_CONFIG_HOME:-$HOME/.config}/herdr/herdr.sock`.
     pub herdr: PathBuf,
+    /// Where `factory install` puts the binary: `$HOME/.local/bin`, where the service unit
+    /// runs it from.
+    pub bin: PathBuf,
+    /// systemd's user unit dir: `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user`.
+    pub units: PathBuf,
 }
 
 /// The config dir, `${XDG_CONFIG_HOME:-$HOME/.config}/factory`: all a hook needs of the paths, since
@@ -51,11 +59,10 @@ impl Paths {
             (None, Some(dir)) => Path::new(&dir).join("factory"),
             (None, None) => Path::new(&home()).join(".local/state/factory"),
         };
-        let herdr = match (var("HERDR_SOCKET_PATH"), var("XDG_CONFIG_HOME")) {
-            (Some(socket), _) => PathBuf::from(socket),
-            (None, Some(dir)) => Path::new(&dir).join("herdr/herdr.sock"),
-            (None, None) => Path::new(&home()).join(".config/herdr/herdr.sock"),
-        };
+        let config_home = var("XDG_CONFIG_HOME")
+            .map_or_else(|| Path::new(&home()).join(".config"), PathBuf::from);
+        let herdr = var("HERDR_SOCKET_PATH")
+            .map_or_else(|| config_home.join("herdr/herdr.sock"), PathBuf::from);
         let config = config_dir();
         let runtime = runtime_dir().ok_or_else(|| {
             Failure::precondition("XDG_RUNTIME_DIR is not set; run factory inside a user session")
@@ -65,6 +72,8 @@ impl Paths {
             runtime,
             config,
             herdr,
+            bin: Path::new(&home()).join(".local/bin"),
+            units: config_home.join("systemd/user"),
         })
     }
 
@@ -81,6 +90,21 @@ impl Paths {
     /// The daemon's database: reviewer quotas, and later leases and waits.
     pub fn database(&self) -> PathBuf {
         self.state.join("factory.db")
+    }
+
+    /// The failed checks of a pull request's head, with their URLs and log tails: one file per
+    /// head, so a late read of an old head never overwrites a newer one's.
+    pub fn ci_failures(&self, pr: &PullRequest, head: &str) -> PathBuf {
+        self.state
+            .join("ci")
+            .join(&pr.host)
+            .join(&pr.owner)
+            .join(&pr.repo)
+            .join(format!(
+                "{}-{}.md",
+                pr.number,
+                head.get(..12).unwrap_or(head)
+            ))
     }
 
     pub fn config_file(&self) -> PathBuf {

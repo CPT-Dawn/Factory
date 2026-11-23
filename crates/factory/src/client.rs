@@ -27,6 +27,8 @@ use crate::protocol::{Outcome, Request, Response};
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a CLI waits for another CLI that is starting the daemon.
 const START_LOCK_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a stopping daemon may take to exit: its drain, then its runtime's shutdown.
+const STOPPING_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the daemon may take to answer a request that doesn't wait on an event.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 /// The next step when the daemon fails to start for no reason it gave.
@@ -68,13 +70,7 @@ pub fn call_streaming<P: Serialize, R: DeserializeOwned>(
     read_timeout: Option<Duration>,
     mut on_note: impl FnMut(&str),
 ) -> Result<R, Failure> {
-    Session::open(paths)?.exchange(
-        method,
-        params,
-        read_timeout,
-        Exit::Precondition,
-        &mut on_note,
-    )
+    Session::open(paths)?.call_streaming(method, params, read_timeout, &mut on_note)
 }
 
 /// One connection to the daemon, kept open across requests: what the daemon grants on it (a
@@ -107,6 +103,23 @@ impl Session {
             Exit::Precondition,
             &mut |_| {},
         )
+    }
+
+    /// [`call_streaming`] on this session's connection.
+    pub fn call_streaming<P: Serialize, R: DeserializeOwned>(
+        &mut self,
+        method: &str,
+        params: &P,
+        read_timeout: Option<Duration>,
+        on_note: &mut dyn FnMut(&str),
+    ) -> Result<R, Failure> {
+        self.exchange(method, params, read_timeout, Exit::Precondition, on_note)
+    }
+
+    /// A second handle on the connection, to send notifications on (requests the daemon doesn't
+    /// answer) from another thread, even while a request waits for its answer.
+    pub fn notifier(&self) -> std::io::Result<UnixStream> {
+        self.reader.get_ref().try_clone()
     }
 
     /// Sends a request the daemon answers when what it waits on happens, however long that is.
@@ -208,13 +221,39 @@ fn connect(paths: &Paths) -> Result<UnixStream, Failure> {
     if let Ok(stream) = UnixStream::connect(paths.socket()) {
         return Ok(stream);
     }
+    await_stopping_daemon(paths).map_err(unreachable)?;
     start_daemon(paths).map_err(unreachable)?;
     UnixStream::connect(paths.socket()).map_err(|e| unreachable(format!("{e}; retry")))
 }
 
+/// Waits for a daemon that holds the daemon lock but no longer answers, as one does while it
+/// stops, to exit, so the next can start.
+fn await_stopping_daemon(paths: &Paths) -> Result<(), String> {
+    let path = paths.daemon_lock();
+    let cannot = |e: &dyn std::fmt::Display| {
+        format!("cannot lock {}: {e}; check XDG_RUNTIME_DIR", path.display())
+    };
+    let lock = match File::options().write(true).open(&path) {
+        Ok(lock) => lock,
+        // No daemon has run in this session.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(cannot(&e)),
+    };
+    match within(STOPPING_TIMEOUT, move || lock.lock()) {
+        // Dropping the file frees the lock for the daemon this CLI starts.
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(cannot(&e)),
+        None => Err(format!(
+            "a daemon holds {} without answering for over {}s; stop it, then retry",
+            path.display(),
+            STOPPING_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 /// Takes the start lock, which a CLI holds while it starts the daemon. Dropping the file
 /// releases it.
-fn take_start_lock(paths: &Paths) -> Result<File, String> {
+pub(crate) fn take_start_lock(paths: &Paths) -> Result<File, String> {
     let path = paths.start_lock();
     let file = File::options()
         .create(true)
@@ -290,7 +329,7 @@ fn start_daemon(paths: &Paths) -> Result<(), String> {
 }
 
 /// Runs `work` on its own thread and returns its result, or none once `limit` has passed.
-fn within<T: Send + 'static>(
+pub(crate) fn within<T: Send + 'static>(
     limit: Duration,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
