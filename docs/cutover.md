@@ -55,10 +55,12 @@ before #30 records no unit, so a missing unit with such a marker makes the rollb
 one line, changing nothing: link the unit again with `dots link`, then run
 `factory cutover --rollback` again.
 `--force` goes on instead when the unit is missing and cannot be linked again (the marker records
-no link, or the link cannot be made, or it dangles so the watcher will not start): devlab and the
-marker are put right, one line names the unit it skipped (`"watcher": "skipped"` and `"skipped"`
-in `--json`), and the watcher stays off until you link the unit and enable it. Where the unit can
-be linked again, `--force` does that as above.
+no link, or the link cannot be made), or when it is a link to nothing: devlab and the marker are
+put right, `enable --now` is not called, one line names the unit it skipped (`"watcher": "skipped"`
+and `"skipped"` in `--json`), and the watcher stays off until you link the unit and enable it.
+Where the unit can be linked again, `--force` does that as above. A unit that is there and
+that systemd will not start stops the rollback, `--force` or not, with the marker kept: fix
+systemd, then run the rollback again.
 `--force` also skips the check that factory lab holds nothing, for a factory lab that no longer
 answers. A second rollback says `not cut over` and changes nothing.
 

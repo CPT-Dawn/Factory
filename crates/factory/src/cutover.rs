@@ -301,22 +301,23 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
             linked => linked?,
         }
     }
-    let retire = unit_present(&place)?;
-    // What is said follows what happened, not what was found first: a unit that came back
-    // meanwhile is enabled, one that went again is skipped.
-    let mut skipped = force && !retire && marker.watcher != Unit::Absent;
+    // What is said follows what is there now, not what was found first: a unit that came back
+    // meanwhile is enabled, one that went again (or links to nothing) is skipped.
+    let present = unit_present(&place)?;
+    let dangles = present
+        && matches!(fs::metadata(&place.watcher), Err(e) if e.kind() == io::ErrorKind::NotFound);
+    let retire = present && !(force && dangles);
+    let skipped = force && !retire && (marker.watcher != Unit::Absent || !unit_gone || present);
     if retire {
-        match Systemctl.enable_now(WATCHER) {
-            // A unit that is only a dangling link will not start.
-            Err(_) if force => skipped = true,
-            started => started.map_err(systemd_failed("cutover --rollback"))?,
-        }
+        Systemctl
+            .enable_now(WATCHER)
+            .map_err(systemd_failed("cutover --rollback"))?;
     }
     remove(&place.marker(), "cutover --rollback")?;
     Ok(Done::new(
         if skipped {
             format!(
-                "rolled back: {} runs today's devlab again; skipped {}, which is gone or did not start",
+                "rolled back: {} runs today's devlab again; skipped {}, which is gone or links to nothing",
                 place.link.display(),
                 place.watcher.display()
             )
