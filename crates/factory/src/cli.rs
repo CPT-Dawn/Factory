@@ -65,6 +65,12 @@ pub enum Command {
     },
     /// Run the daemon; other commands start it when it isn't running
     Daemon,
+    /// Lease this PC's local stack slots, in devlab's words: factory lab help (or run it as devlab)
+    #[command(disable_help_flag = true)]
+    Lab {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
