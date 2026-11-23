@@ -76,6 +76,7 @@ fn list_says_what_each_lead_is_doing() {
     );
     herdr.agent(None, "w5:p1", "working");
     herdr.agent(Some("reviewer"), "w5:p2", "idle");
+    herdr.agent(Some("lead-Not_A_Slug"), "w5:p3", "working");
     let shipped = report(&sandbox, "ship");
 
     let out = sandbox.factory(&["lead", "list"]);

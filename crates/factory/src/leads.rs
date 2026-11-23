@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use factory_adapters::herdr::{Event, Events, Herdr, HerdrError, PROTOCOL, Watch};
+use factory_adapters::herdr::{Event, Events, Herdr, HerdrApi, HerdrError, PROTOCOL, Watch};
 use factory_core::duration;
 use factory_core::exit::Exit;
 use factory_core::lead::{self, AgentStatus, LeadFacts, LeadState};
@@ -34,8 +34,8 @@ const SCREEN_LINES: usize = 10;
 /// How many lines are read to find them: the blank rows below a prompt don't count.
 const READ_LINES: u32 = 60;
 
-pub struct Leads {
-    herdr: Herdr,
+pub struct Leads<H: HerdrApi = Herdr> {
+    herdr: H,
     paths: Paths,
     inner: Mutex<Inner>,
     /// Held while the picture is rebuilt from herdr, so one rebuild runs at a time.
@@ -64,10 +64,10 @@ struct Lead {
     agent: Option<AgentStatus>,
 }
 
-impl Leads {
-    pub fn new(paths: Paths) -> Arc<Leads> {
+impl<H: HerdrApi> Leads<H> {
+    pub fn new(paths: Paths, herdr: H) -> Arc<Leads<H>> {
         Arc::new(Leads {
-            herdr: Herdr::new(paths.herdr.clone()),
+            herdr,
             paths,
             inner: Mutex::new(Inner {
                 down: Some("herdr not checked yet".to_owned()),
@@ -209,9 +209,7 @@ impl Leads {
         if self.lock().leads.contains_key(name) {
             Ok(())
         } else {
-            Err(Failure::precondition(format!(
-                "herdr has no lead named {name}; see factory lead list"
-            )))
+            Err(no_lead(name))
         }
     }
 
@@ -230,7 +228,7 @@ impl Leads {
             let mut inner = self.lock();
             let mut seen = BTreeSet::new();
             for agent in agents {
-                let Some(name) = agent.name.filter(|name| name.starts_with(lead::PREFIX)) else {
+                let Some(name) = agent.name.filter(|name| is_lead(name)) else {
                     continue;
                 };
                 let report = repos
@@ -338,11 +336,7 @@ impl Leads {
         if let Some(down) = &inner.down {
             return Err(Failure::precondition(down.clone()));
         }
-        let lead = inner.leads.get(name).ok_or_else(|| {
-            Failure::precondition(format!(
-                "herdr has no lead named {name}; see factory lead list"
-            ))
-        })?;
+        let lead = inner.leads.get(name).ok_or_else(|| no_lead(name))?;
         let state = state_of(&inner, lead);
         Ok((report(name, lead, &state), state))
     }
@@ -359,7 +353,7 @@ impl Leads {
         report
     }
 
-    fn register(self: &Arc<Self>, wait: Wait) -> Registered {
+    fn register(self: &Arc<Self>, wait: Wait) -> Registered<H> {
         let id = self.lock().waits.register(wait);
         self.bump();
         Registered {
@@ -387,12 +381,12 @@ impl Leads {
 }
 
 /// A registered wait, cleared when it is dropped: answered, timed out or abandoned.
-struct Registered {
-    leads: Arc<Leads>,
+struct Registered<H: HerdrApi> {
+    leads: Arc<Leads<H>>,
     id: WaitId,
 }
 
-impl Drop for Registered {
+impl<H: HerdrApi> Drop for Registered<H> {
     fn drop(&mut self) {
         self.leads.lock().waits.clear(self.id);
         self.leads.bump();
@@ -411,6 +405,17 @@ fn last_lines(text: &str) -> Vec<String> {
         .iter()
         .map(|line| (*line).to_owned())
         .collect()
+}
+
+/// Whether an agent's name is one a lead can have, so every lead listed can be named.
+fn is_lead(name: &str) -> bool {
+    lead::lead_name(name).is_ok_and(|named| named == name)
+}
+
+fn no_lead(name: &str) -> Failure {
+    Failure::precondition(format!(
+        "herdr has no lead named {name}; see factory lead list"
+    ))
 }
 
 fn state_of(inner: &Inner, lead: &Lead) -> LeadState {

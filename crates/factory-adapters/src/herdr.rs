@@ -7,6 +7,7 @@
 //! new connection.
 
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,14 +17,43 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
-use tokio::net::unix::OwnedReadHalf;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
+
+pub mod fake;
 
 /// The herdr protocol this adapter speaks (herdr 0.9.5). Another one is refused, not guessed at.
 pub const PROTOCOL: u32 = 22;
 
 /// How long herdr may take to answer one request.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What the factory asks of herdr. [`Herdr`] asks the server on a socket; [`fake::FakeHerdr`]
+/// answers from a script.
+pub trait HerdrApi: Send + Sync + 'static {
+    /// Where this herdr listens, for messages.
+    fn socket(&self) -> &Path;
+
+    fn ping(&self) -> impl Future<Output = Result<Pong, HerdrError>> + Send;
+
+    fn agents(&self) -> impl Future<Output = Result<Vec<Agent>, HerdrError>> + Send;
+
+    fn workspaces(&self) -> impl Future<Output = Result<Vec<Workspace>, HerdrError>> + Send;
+
+    /// The last `lines` lines of a pane's recent output, without ANSI escapes.
+    fn read_pane(
+        &self,
+        pane_id: &str,
+        lines: u32,
+    ) -> impl Future<Output = Result<String, HerdrError>> + Send;
+
+    /// Opens a subscription; it streams events until it is dropped or herdr hangs up.
+    fn subscribe(
+        &self,
+        watches: &[Watch],
+    ) -> impl Future<Output = Result<Events, HerdrError>> + Send;
+}
 
 /// The herdr server listening on one socket.
 #[derive(Clone, Debug)]
@@ -115,27 +145,40 @@ pub enum Event {
     Other(String),
 }
 
-/// The stream of a subscribed connection.
+/// The events of one subscription.
 pub struct Events {
-    lines: Lines<BufReader<OwnedReadHalf>>,
-    /// Kept so the connection stays open while the stream is read.
-    _writer: tokio::net::unix::OwnedWriteHalf,
+    source: Source,
 }
+
+enum Source {
+    /// A subscribed connection to herdr.
+    Socket {
+        lines: Lines<BufReader<OwnedReadHalf>>,
+        /// Kept so the connection stays open while the stream is read.
+        _writer: OwnedWriteHalf,
+    },
+    /// What a [`fake::FakeHerdr`] tells its subscribers.
+    Script(mpsc::UnboundedReceiver<Event>),
+}
+
+type Connection = (Lines<BufReader<OwnedReadHalf>>, OwnedWriteHalf);
 
 impl Herdr {
     pub fn new(socket: PathBuf) -> Herdr {
         Herdr { socket }
     }
+}
 
-    pub fn socket(&self) -> &Path {
+impl HerdrApi for Herdr {
+    fn socket(&self) -> &Path {
         &self.socket
     }
 
-    pub async fn ping(&self) -> Result<Pong, HerdrError> {
+    async fn ping(&self) -> Result<Pong, HerdrError> {
         self.call("ping", json!({})).await
     }
 
-    pub async fn agents(&self) -> Result<Vec<Agent>, HerdrError> {
+    async fn agents(&self) -> Result<Vec<Agent>, HerdrError> {
         #[derive(Deserialize)]
         struct List {
             agents: Vec<Agent>,
@@ -144,7 +187,7 @@ impl Herdr {
         Ok(list.agents)
     }
 
-    pub async fn workspaces(&self) -> Result<Vec<Workspace>, HerdrError> {
+    async fn workspaces(&self) -> Result<Vec<Workspace>, HerdrError> {
         #[derive(Deserialize)]
         struct List {
             workspaces: Vec<Workspace>,
@@ -153,8 +196,7 @@ impl Herdr {
         Ok(list.workspaces)
     }
 
-    /// The last `lines` lines of a pane's recent output, without ANSI escapes.
-    pub async fn read_pane(&self, pane_id: &str, lines: u32) -> Result<String, HerdrError> {
+    async fn read_pane(&self, pane_id: &str, lines: u32) -> Result<String, HerdrError> {
         #[derive(Deserialize)]
         struct Read {
             read: Text,
@@ -173,8 +215,7 @@ impl Herdr {
         Ok(read.read.text)
     }
 
-    /// Opens a subscribed connection; it streams events until it is dropped or herdr hangs up.
-    pub async fn subscribe(&self, watches: &[Watch]) -> Result<Events, HerdrError> {
+    async fn subscribe(&self, watches: &[Watch]) -> Result<Events, HerdrError> {
         let subscriptions: Vec<Value> = watches
             .iter()
             .flat_map(|watch| match watch {
@@ -188,40 +229,33 @@ impl Herdr {
                 Watch::AgentDetected => vec![json!({"type": "pane.agent_detected"})],
             })
             .collect();
-        let (lines, writer) = self
+        let (mut lines, writer) = self
             .send("events.subscribe", json!({"subscriptions": subscriptions}))
             .await?;
-        let mut events = Events {
-            lines,
-            _writer: writer,
-        };
-        events.answer().await?;
-        Ok(events)
+        answer(&mut lines).await?;
+        Ok(Events {
+            source: Source::Socket {
+                lines,
+                _writer: writer,
+            },
+        })
     }
+}
 
+impl Herdr {
+    /// Sends one request on a connection of its own and reads its answer.
     async fn call<R: DeserializeOwned>(
         &self,
         method: &str,
         params: Value,
     ) -> Result<R, HerdrError> {
-        let (lines, _writer) = self.send(method, params).await?;
-        let mut events = Events { lines, _writer };
-        let result = events.answer().await?;
+        let (mut lines, _writer) = self.send(method, params).await?;
+        let result = answer(&mut lines).await?;
         serde_json::from_value(result)
             .map_err(|e| HerdrError::Broken(format!("unreadable answer to {method}: {e}")))
     }
 
-    async fn send(
-        &self,
-        method: &str,
-        params: Value,
-    ) -> Result<
-        (
-            Lines<BufReader<OwnedReadHalf>>,
-            tokio::net::unix::OwnedWriteHalf,
-        ),
-        HerdrError,
-    > {
+    async fn send(&self, method: &str, params: Value) -> Result<Connection, HerdrError> {
         let stream = timeout(ANSWER_TIMEOUT, UnixStream::connect(&self.socket))
             .await
             .map_err(|_| {
@@ -242,44 +276,45 @@ impl Herdr {
     }
 }
 
-impl Events {
-    /// Reads the answer line every connection starts with.
-    async fn answer(&mut self) -> Result<Value, HerdrError> {
-        let line = timeout(ANSWER_TIMEOUT, self.lines.next_line())
-            .await
-            .map_err(|_| {
-                HerdrError::Broken(format!("no answer within {}s", ANSWER_TIMEOUT.as_secs()))
-            })?
-            .map_err(|e| HerdrError::Broken(format!("lost herdr: {e}")))?
-            .ok_or_else(|| HerdrError::Broken("herdr hung up without answering".to_owned()))?;
-        let mut answer: Value = serde_json::from_str(&line)
-            .map_err(|e| HerdrError::Broken(format!("unreadable answer: {e}")))?;
-        if let Some(error) = answer.get("error") {
-            let text = |key: &str| {
-                error
-                    .get(key)
-                    .and_then(Value::as_str)
-                    .unwrap_or("?")
-                    .to_owned()
-            };
-            return Err(HerdrError::Refused {
-                code: text("code"),
-                message: text("message"),
-            });
-        }
-        Ok(answer
-            .get_mut("result")
-            .map(Value::take)
-            .unwrap_or(Value::Null))
+/// Reads the answer line every connection starts with.
+async fn answer(lines: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<Value, HerdrError> {
+    let line = timeout(ANSWER_TIMEOUT, lines.next_line())
+        .await
+        .map_err(|_| HerdrError::Broken(format!("no answer within {}s", ANSWER_TIMEOUT.as_secs())))?
+        .map_err(|e| HerdrError::Broken(format!("lost herdr: {e}")))?
+        .ok_or_else(|| HerdrError::Broken("herdr hung up without answering".to_owned()))?;
+    let mut answer: Value = serde_json::from_str(&line)
+        .map_err(|e| HerdrError::Broken(format!("unreadable answer: {e}")))?;
+    if let Some(error) = answer.get("error") {
+        let text = |key: &str| {
+            error
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_owned()
+        };
+        return Err(HerdrError::Refused {
+            code: text("code"),
+            message: text("message"),
+        });
     }
+    Ok(answer
+        .get_mut("result")
+        .map(Value::take)
+        .unwrap_or(Value::Null))
+}
 
+impl Events {
     /// The next event; none once herdr hangs up.
     pub async fn next(&mut self) -> Option<Event> {
-        loop {
-            let line = self.lines.next_line().await.ok()??;
-            if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                return Some(event(&value));
-            }
+        match &mut self.source {
+            Source::Socket { lines, .. } => loop {
+                let line = lines.next_line().await.ok()??;
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    return Some(event(&value));
+                }
+            },
+            Source::Script(events) => events.recv().await,
         }
     }
 }

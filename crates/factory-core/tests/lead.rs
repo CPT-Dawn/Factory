@@ -25,7 +25,7 @@ fn the_state_follows_the_report_then_herdr_then_the_wait() {
         (Some("done"), false, None, "asking"),
         (Some("idle"), true, None, "finished"),
         (Some("done"), true, None, "finished"),
-        (Some("blocked"), true, None, "finished"),
+        (Some("blocked"), true, None, "blocked"),
         (Some("working"), true, None, "working"),
         (None, true, None, "finished"),
         (None, false, None, "dead"),

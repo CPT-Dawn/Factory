@@ -62,9 +62,10 @@ pub enum LeadState {
 }
 
 impl LeadState {
-    /// Decides a lead's state. The report is the completion signal; a gone agent is dead; a
-    /// blocked one comes before a registered wait, which comes before working or asking. An
-    /// unknown status counts as working: herdr has not settled on one yet.
+    /// Decides a lead's state. A blocked lead is blocked even with a report, since a prompt
+    /// still waits on an answer. Otherwise the report is the completion signal, unless the lead
+    /// is still working; a gone agent without one is dead; a registered wait comes before working
+    /// or asking. An unknown status counts as working: herdr has not settled on one yet.
     pub fn of(facts: LeadFacts<'_>) -> LeadState {
         let Some(status) = facts.agent else {
             return if facts.reported {
@@ -73,11 +74,11 @@ impl LeadState {
                 LeadState::Dead
             };
         };
-        if facts.reported && status != AgentStatus::Working {
-            return LeadState::Finished;
-        }
         if status == AgentStatus::Blocked {
             return LeadState::Blocked;
+        }
+        if facts.reported && status != AgentStatus::Working {
+            return LeadState::Finished;
         }
         if let Some(on) = facts.waiting_on {
             return LeadState::Waiting(on.to_owned());

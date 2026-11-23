@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use factory_adapters::herdr::Herdr;
+
 use crate::leads::Leads;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
@@ -47,7 +49,7 @@ pub fn run(json: bool) -> Result<Done, Failure> {
         ))
     })?;
     let ledger = Arc::new(Ledger::open(paths.ledger())?);
-    let leads = Leads::new(paths.clone());
+    let leads = Leads::new(paths.clone(), Herdr::new(paths.herdr.clone()));
     let _lock = take_daemon_lock(&paths)?;
     let listener = bind(&paths)?;
     let pid = std::process::id();
@@ -173,11 +175,11 @@ async fn respond(line: &str, daemon: &Daemon) -> Response {
     };
     let outcome = match request.method.as_str() {
         LEAD_LIST => answered(daemon.leads.list().await),
-        LEAD_STATUS => match params::<LeadParams>(request.params) {
+        LEAD_STATUS => match params::<LeadParams>(LEAD_STATUS, request.params) {
             Ok(params) => answered(daemon.leads.status(&params.lead).await),
             Err(refused) => refused,
         },
-        WAIT_LEAD => match params::<WaitLeadParams>(request.params) {
+        WAIT_LEAD => match params::<WaitLeadParams>(WAIT_LEAD, request.params) {
             Ok(params) => answered(
                 daemon
                     .leads
@@ -213,14 +215,9 @@ async fn respond(line: &str, daemon: &Daemon) -> Response {
 }
 
 fn log(params: Value, ledger: &Ledger) -> Outcome {
-    let params: LogParams = match serde_json::from_value(params) {
+    let params: LogParams = match self::params(LOG, params) {
         Ok(params) => params,
-        Err(e) => {
-            return Outcome::Error(refusal(
-                Exit::Usage,
-                format!("bad log params: {e}; {MISMATCH}"),
-            ));
-        }
+        Err(refused) => return refused,
     };
     let event = match Event::new(&params.kind, params.fields) {
         Ok(event) => event,
@@ -244,9 +241,14 @@ fn log(params: Value, ledger: &Ledger) -> Outcome {
     }
 }
 
-fn params<P: DeserializeOwned>(params: Value) -> Result<P, Outcome> {
-    serde_json::from_value(params)
-        .map_err(|e| Outcome::Error(refusal(Exit::Usage, format!("bad params: {e}; {MISMATCH}"))))
+/// The params of a `method` request, or the refusal of params that don't fit it.
+fn params<P: DeserializeOwned>(method: &str, params: Value) -> Result<P, Outcome> {
+    serde_json::from_value(params).map_err(|e| {
+        Outcome::Error(refusal(
+            Exit::Usage,
+            format!("bad {method} params: {e}; {MISMATCH}"),
+        ))
+    })
 }
 
 fn answered<R: Serialize>(outcome: Result<R, Failure>) -> Outcome {

@@ -1,0 +1,193 @@
+//! A scripted herdr in memory, for code that runs against [`HerdrApi`] inside one process.
+//!
+//! The binary-seam tests can't reach into the daemon, so they run a fake herdr server on a socket
+//! instead (`crates/factory/tests/cli/support/herdr.rs`). Both fakes answer the same way: agents,
+//! workspaces and screens as scripted, status changes told to whoever watches the pane.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+
+use tokio::sync::mpsc;
+
+use super::{
+    Agent, Event, Events, HerdrApi, HerdrError, PROTOCOL, Pong, Source, Watch, Workspace, Worktree,
+};
+
+/// A herdr that answers from a script. Every request is recorded by its method name.
+#[derive(Debug)]
+pub struct FakeHerdr {
+    socket: PathBuf,
+    state: Mutex<State>,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    protocol: u32,
+    /// Answer every request with this refusal instead, as a herdr that isn't running.
+    down: bool,
+    agents: Vec<Agent>,
+    workspaces: Vec<Workspace>,
+    screens: HashMap<String, String>,
+    calls: Vec<String>,
+    subscribers: Vec<(Vec<Watch>, mpsc::UnboundedSender<Event>)>,
+}
+
+impl Default for FakeHerdr {
+    fn default() -> FakeHerdr {
+        FakeHerdr::new()
+    }
+}
+
+impl FakeHerdr {
+    /// A running herdr on protocol [`PROTOCOL`] with no workspaces or agents.
+    pub fn new() -> FakeHerdr {
+        FakeHerdr {
+            socket: PathBuf::from("fake-herdr.sock"),
+            state: Mutex::new(State {
+                protocol: PROTOCOL,
+                ..State::default()
+            }),
+        }
+    }
+
+    pub fn protocol(&self, protocol: u32) {
+        self.lock().protocol = protocol;
+    }
+
+    /// Stops answering, as a herdr that has quit: requests fail and subscriptions end.
+    pub fn stop(&self) {
+        let mut state = self.lock();
+        state.down = true;
+        state.subscribers.clear();
+    }
+
+    /// A workspace on a worktree of the repo `repo`.
+    pub fn workspace(&self, id: &str, repo: &str) {
+        self.lock().workspaces.push(Workspace {
+            workspace_id: id.to_owned(),
+            worktree: Some(Worktree {
+                repo_name: repo.to_owned(),
+            }),
+        });
+    }
+
+    /// An agent in `pane`, whose workspace is the part of the pane id before `:`.
+    pub fn agent(&self, name: Option<&str>, pane: &str, status: &str) {
+        self.lock().agents.push(Agent {
+            name: name.map(str::to_owned),
+            agent: Some("claude".to_owned()),
+            agent_status: status.to_owned(),
+            pane_id: pane.to_owned(),
+            workspace_id: pane.split(':').next().unwrap_or(pane).to_owned(),
+        });
+    }
+
+    pub fn screen(&self, pane: &str, text: &str) {
+        self.lock().screens.insert(pane.to_owned(), text.to_owned());
+    }
+
+    /// Changes the status of the agent in `pane` and tells whoever watches it.
+    pub fn status(&self, pane: &str, status: &str) {
+        let mut state = self.lock();
+        for agent in state
+            .agents
+            .iter_mut()
+            .filter(|agent| agent.pane_id == pane)
+        {
+            status.clone_into(&mut agent.agent_status);
+        }
+        let event = Event::AgentStatus {
+            pane_id: pane.to_owned(),
+            agent_status: status.to_owned(),
+            agent: Some("claude".to_owned()),
+        };
+        tell(&mut state, &event, |watch| {
+            *watch == Watch::AgentStatus(pane.to_owned())
+        });
+    }
+
+    /// Closes `pane`: its agent leaves the list and whoever watches panes go hears of it.
+    pub fn close(&self, pane: &str) {
+        let mut state = self.lock();
+        state.agents.retain(|agent| agent.pane_id != pane);
+        let event = Event::PaneGone {
+            pane_id: pane.to_owned(),
+        };
+        tell(&mut state, &event, |watch| *watch == Watch::PaneGone);
+    }
+
+    /// The method of every request, oldest first.
+    pub fn calls(&self) -> Vec<String> {
+        self.lock().calls.clone()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Records a request, refusing it when the fake is stopped.
+    fn call(&self, method: &str) -> Result<MutexGuard<'_, State>, HerdrError> {
+        let mut state = self.lock();
+        state.calls.push(method.to_owned());
+        if state.down {
+            return Err(HerdrError::Unreachable(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused,
+            )));
+        }
+        Ok(state)
+    }
+}
+
+fn tell(state: &mut State, event: &Event, wanted: impl Fn(&Watch) -> bool) {
+    state.subscribers.retain(|(watches, events)| {
+        !watches.iter().any(&wanted) || events.send(event.clone()).is_ok()
+    });
+}
+
+impl HerdrApi for FakeHerdr {
+    fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    async fn ping(&self) -> Result<Pong, HerdrError> {
+        let state = self.call("ping")?;
+        Ok(Pong {
+            version: "fake".to_owned(),
+            protocol: state.protocol,
+        })
+    }
+
+    async fn agents(&self) -> Result<Vec<Agent>, HerdrError> {
+        Ok(self.call("agent.list")?.agents.clone())
+    }
+
+    async fn workspaces(&self) -> Result<Vec<Workspace>, HerdrError> {
+        Ok(self.call("workspace.list")?.workspaces.clone())
+    }
+
+    async fn read_pane(&self, pane_id: &str, lines: u32) -> Result<String, HerdrError> {
+        let state = self.call("pane.read")?;
+        let text = state
+            .screens
+            .get(pane_id)
+            .ok_or_else(|| HerdrError::Refused {
+                code: "pane_not_found".to_owned(),
+                message: format!("no pane {pane_id}"),
+            })?;
+        let all: Vec<&str> = text.lines().collect();
+        let keep = usize::try_from(lines).unwrap_or(usize::MAX).min(all.len());
+        Ok(all[all.len() - keep..].join("\n"))
+    }
+
+    async fn subscribe(&self, watches: &[Watch]) -> Result<Events, HerdrError> {
+        let mut state = self.call("events.subscribe")?;
+        let (sender, receiver) = mpsc::unbounded_channel();
+        state.subscribers.push((watches.to_vec(), sender));
+        Ok(Events {
+            source: Source::Script(receiver),
+        })
+    }
+}
