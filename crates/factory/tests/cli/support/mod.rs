@@ -11,6 +11,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -165,6 +166,20 @@ impl Sandbox {
     /// Runs the built `factory` binary to completion.
     pub fn factory(&self, args: &[&str]) -> Run {
         run(self.factory_command(args))
+    }
+
+    /// Runs the built `factory` binary to completion with `input` on its stdin.
+    pub fn factory_stdin(&self, args: &[&str], input: &str) -> Run {
+        let mut cmd = self.factory_command(args);
+        cmd.stdin(Stdio::piped());
+        let mut child = spawn(cmd);
+        child
+            .stdin
+            .take()
+            .expect("the child's stdin")
+            .write_all(input.as_bytes())
+            .expect("write the child's stdin");
+        finish(child)
     }
 
     /// Runs the built `factory` binary to completion with `dir` as its working directory.
