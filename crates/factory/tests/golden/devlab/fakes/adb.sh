@@ -32,7 +32,9 @@ track-devices)
   if [ "$state" != device ]; then echo "adb: device $state" >&2; exit 1; fi
   case "$1" in
   shell)
-    case "$2" in
+    # adb runs its arguments as one command line, whether they come as one or several.
+    shift
+    case "$*" in
     *ro.product.cpu.abi*) case "$serial" in emulator-*) echo x86_64 ;; *) echo arm64-v8a ;; esac ;;
     *sys.boot_completed*) echo 1 ;;
     *dumpsys\ window*) grep -qxF "$serial" "$w/locked" && echo "  mDreamingLockscreen=true" ;;

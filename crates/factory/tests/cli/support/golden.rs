@@ -23,13 +23,11 @@ use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use rustix::process::Signal;
 
 pub use super::world::fixtures;
-use super::world::{World, wait_until};
+use super::world::{World, poll_until};
 use super::{DEADLINE, Sandbox, kill_group};
 
 /// The devlab the transcripts replay against: the path in `GOLDEN_DEVLAB`, or none, which skips
@@ -37,7 +35,18 @@ use super::{DEADLINE, Sandbox, kill_group};
 /// `devlab` in the sandbox, so a multicall binary sees that name; once `factory lab` answers to
 /// it, this returns the built `factory` binary when the variable is unset.
 pub fn devlab_under_test() -> Option<PathBuf> {
-    std::env::var_os("GOLDEN_DEVLAB").map(PathBuf::from)
+    std::env::var_os("GOLDEN_DEVLAB").map(|path| resolve_devlab(Path::new(&path)))
+}
+
+/// `path` as given, or read from the workspace root when relative: `cargo test` runs in the
+/// crate's directory, but `GOLDEN_DEVLAB=target/debug/factory` is written from the root.
+pub fn resolve_devlab(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_owned();
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(path)
 }
 
 /// `GOLDEN_RECORD=1` rewrites each transcript with what the devlab under test showed.
@@ -54,7 +63,7 @@ pub fn replay(fixture: &Path, devlab: &Path, record: bool) -> Result<(), String>
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     let text = fs::read_to_string(fixture).map_err(|e| format!("{name}: {e}"))?;
     let steps = parse(&text).map_err(|(line, e)| format!("{name}:{line}: {e}"))?;
-    let mut stage = Stage::new(devlab);
+    let mut stage = Stage::new(devlab).map_err(|e| format!("{name}: {e}"))?;
     let mut report = String::new();
     let mut recorded = String::new();
     for step in &steps {
@@ -237,10 +246,11 @@ fn compare(what: &str, expected: Option<&Shown>, actual: &Shown) -> String {
 
 /// The sandbox a transcript plays in: its world, its owners and its background calls.
 struct Stage {
-    sandbox: Sandbox,
-    world: World,
-    owners: BTreeMap<String, Owner>,
+    // Background calls and owners end before the sandbox they run in is removed.
     background: BTreeMap<String, Background>,
+    owners: BTreeMap<String, Owner>,
+    world: World,
+    sandbox: Sandbox,
 }
 
 struct Owner {
@@ -255,11 +265,14 @@ struct Background {
 }
 
 impl Stage {
-    fn new(devlab: &Path) -> Stage {
+    fn new(devlab: &Path) -> Result<Stage, String> {
+        let devlab = fs::canonicalize(devlab)
+            .ok()
+            .filter(|path| path.is_file())
+            .ok_or_else(|| format!("no devlab at {}", devlab.display()))?;
         let sandbox = Sandbox::new();
         let world = World::install(&sandbox);
         let bin = sandbox.path("bin");
-        let devlab = fs::canonicalize(devlab).unwrap_or_else(|_| devlab.to_owned());
         std::os::unix::fs::symlink(devlab, bin.join("devlab")).expect("link the devlab under test");
         // Today's devlab is a bun script; its launcher finds bun on PATH.
         if let Some(bun) = on_path("bun") {
@@ -270,12 +283,12 @@ impl Stage {
         }
         std::os::unix::fs::symlink(sleep_binary(), sandbox.path("owners/claude"))
             .expect("link the owner binary");
-        Stage {
-            sandbox,
-            world,
-            owners: BTreeMap::new(),
+        Ok(Stage {
             background: BTreeMap::new(),
-        }
+            owners: BTreeMap::new(),
+            world,
+            sandbox,
+        })
     }
 
     /// Plays one step; returns what it showed, if it is a step that shows output.
@@ -294,6 +307,9 @@ impl Stage {
         }
         if let Some(rest) = step.strip_prefix("& ") {
             let (tag, call) = rest.split_once(' ').ok_or("& needs a tag and a call")?;
+            if self.background.get(tag).is_some_and(|b| b.child.is_some()) {
+                return Err(format!("background call {tag} is still running"));
+            }
             let stdout = self.sandbox.path(format!("background/{tag}.out"));
             let stderr = self.sandbox.path(format!("background/{tag}.err"));
             let mut cmd = self.call(call)?;
@@ -317,16 +333,8 @@ impl Stage {
                 .background
                 .get(tag)
                 .ok_or(format!("no background call {tag}"))?;
-            let seen = |_: &str| {
-                fs::read_to_string(&call.stdout)
-                    .unwrap_or_default()
-                    .contains(text)
-                    || fs::read_to_string(&call.stderr)
-                        .unwrap_or_default()
-                        .contains(text)
-            };
-            wait_until(&call.stderr, seen);
-            if !seen("") {
+            let shows = |path: &Path| fs::read_to_string(path).unwrap_or_default().contains(text);
+            if !poll_until(|| shows(&call.stdout) || shows(&call.stderr)) {
                 return Err(format!("{tag} did not show {text:?} within {DEADLINE:?}"));
             }
             return Ok(None);
@@ -421,8 +429,8 @@ impl Stage {
                     &format!("claude:<{name}>"),
                 );
             }
-            text = hide_number(&text, "memory ", " GB free");
-            hide_number(&text, "\"memAvailableMB\": ", "")
+            text = hide_memory(&text, "memory ", " GB free");
+            hide_memory(&text, "\"memAvailableMB\": ", "")
         };
         Shown {
             stdout: clean(shown.stdout),
@@ -432,37 +440,39 @@ impl Stage {
     }
 }
 
-impl Drop for Stage {
+impl Drop for Background {
     fn drop(&mut self) {
-        for call in self.background.values_mut() {
-            if let Some(mut child) = call.child.take() {
-                kill_group(child.id(), Signal::KILL);
-                let _ = child.wait();
-            }
+        if let Some(mut child) = self.child.take() {
+            kill_group(child.id(), Signal::KILL);
+            let _ = child.wait();
         }
-        for owner in self.owners.values_mut() {
-            if let Some(mut child) = owner.child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+    }
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
 
 /// Waits for `child` up to [`DEADLINE`]; kills its group and returns none when it outlives it.
 fn wait_child(child: &mut Child) -> Option<i32> {
-    let start = Instant::now();
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Some(status.code().unwrap_or(-1));
+    let mut code = None;
+    let ended = poll_until(|| match child.try_wait() {
+        Ok(Some(status)) => {
+            code = Some(status.code().unwrap_or(-1));
+            true
         }
-        if start.elapsed() > DEADLINE {
-            kill_group(child.id(), Signal::KILL);
-            let _ = child.wait();
-            return None;
-        }
-        thread::sleep(Duration::from_millis(20));
+        _ => false,
+    });
+    if !ended {
+        kill_group(child.id(), Signal::KILL);
+        let _ = child.wait();
     }
+    code
 }
 
 /// Replaces `from` with `to` wherever no digit follows it, so pid 12 leaves pid 123 alone.
@@ -484,7 +494,7 @@ fn replace_number(text: &str, from: &str, to: &str) -> String {
 }
 
 /// Shows a number that follows `before` and precedes `after` as `<mem>`.
-fn hide_number(text: &str, before: &str, after: &str) -> String {
+fn hide_memory(text: &str, before: &str, after: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
     while let Some(at) = rest.find(before) {

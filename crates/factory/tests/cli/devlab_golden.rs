@@ -65,9 +65,20 @@ fn the_fake_adb_answers_a_plugged_device_and_refuses_a_missing_one() {
         "adb",
         &["-s", "FAKEPHONE01", "shell", "getprop ro.product.cpu.abi"],
     ));
+    let split = run(sandbox.command(
+        "adb",
+        &[
+            "-s",
+            "FAKEPHONE01",
+            "shell",
+            "getprop",
+            "ro.product.cpu.abi",
+        ],
+    ));
     let missing = run(sandbox.command("adb", &["-s", "FAKEPHONE09", "shell", "true"]));
 
     assert_eq!((abi.code, abi.stdout.as_str()), (0, "arm64-v8a\n"));
+    assert_eq!((split.code, split.stdout.as_str()), (0, "arm64-v8a\n"));
     assert_eq!(missing.code, 1);
     assert_eq!(missing.stderr, "adb: device 'FAKEPHONE09' not found\n");
 }
@@ -329,6 +340,52 @@ fn a_step_the_replay_does_not_know_is_refused_with_its_line() {
     assert_eq!(
         golden::replay(&scenario, &devlab, false),
         Err("scenario.golden:2: unknown world step: frobnicate now".to_owned())
+    );
+}
+
+#[test]
+fn a_background_tag_still_running_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let devlab = stand_in(dir.path(), "sleep 5");
+    let scenario = fixture(
+        dir.path(),
+        "& q a@plain-a devlab acquire\n& q a@plain-a devlab acquire\n",
+    );
+
+    assert_eq!(
+        golden::replay(&scenario, &devlab, false),
+        Err("scenario.golden:2: background call q is still running".to_owned())
+    );
+}
+
+#[test]
+fn a_devlab_that_is_not_there_is_named_not_replayed() {
+    let dir = tempfile::tempdir().unwrap();
+    let scenario = fixture(dir.path(), "$ a@plain-a devlab env\n? 0\n");
+    let missing = dir.path().join("no-devlab");
+
+    assert_eq!(
+        golden::replay(&scenario, &missing, false),
+        Err(format!(
+            "scenario.golden: no devlab at {}",
+            missing.display()
+        ))
+    );
+}
+
+#[test]
+fn a_relative_devlab_path_is_read_from_the_workspace_root() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    assert_eq!(
+        golden::resolve_devlab("crates/factory/Cargo.toml".as_ref())
+            .canonicalize()
+            .unwrap(),
+        manifest.join("Cargo.toml").canonicalize().unwrap()
+    );
+    assert_eq!(
+        golden::resolve_devlab("/bin/sh".as_ref()),
+        PathBuf::from("/bin/sh")
     );
 }
 

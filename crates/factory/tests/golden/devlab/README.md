@@ -10,7 +10,8 @@ behaviour, and its commit says so.
 ```sh
 # against today's devlab
 GOLDEN_DEVLAB=$HOME/.local/bin/devlab cargo test --test cli transcript
-# against any other binary; it is linked into the sandbox as `devlab`
+# against any other binary, linked into the sandbox as `devlab`; a relative path is read from
+# the workspace root
 GOLDEN_DEVLAB=target/debug/factory cargo test --test cli transcript::slots_
 ```
 
@@ -54,3 +55,5 @@ What the sandbox cannot fix is normalised: its path shows as `<sandbox>`, owner 
 Today's devlab reuses the highest lease id once that lease ends; no transcript asks for a lease
 after its highest one was released, so a devlab with ids that only grow replays them too. Slot
 ports come from `project/` in the 27000s; a port in use on the machine would move a slot.
+Elapsed minutes (`idle 0m`, `for 0m`, `waiting since 0 min`) are recorded as they are: a
+scenario runs in seconds, so they stay 0 unless one step takes a minute.

@@ -162,11 +162,24 @@ impl Drop for Tracking {
 /// Reads `path` until `done` accepts its contents or [`DEADLINE`] passes, and returns what
 /// it read last.
 pub fn wait_until(path: &Path, done: impl Fn(&str) -> bool) -> String {
+    let mut text = String::new();
+    poll_until(|| {
+        text = fs::read_to_string(path).unwrap_or_default();
+        done(&text)
+    });
+    text
+}
+
+/// Asks `done` again every [`POLL`] until it says yes, for up to [`DEADLINE`]; returns its last
+/// answer.
+pub fn poll_until(mut done: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     loop {
-        let text = fs::read_to_string(path).unwrap_or_default();
-        if done(&text) || start.elapsed() > DEADLINE {
-            return text;
+        if done() {
+            return true;
+        }
+        if start.elapsed() > DEADLINE {
+            return false;
         }
         thread::sleep(POLL);
     }
