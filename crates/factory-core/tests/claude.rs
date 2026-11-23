@@ -269,6 +269,8 @@ fn a_rate_limit_or_a_429_is_a_limit_with_no_reset() {
         "HTTP 429",
         "HTTP/1.1 429 Too Many",
         "HTTP/2 429",
+        "HTTP/2.0 429",
+        "HTTP/1 429 Too Many Requests",
         "{\"type\":\"error\",\"status\":429}",
         "request failed with status code 429",
         "{\"error\":{\"type\":\"rate_limit_error\"}}",
@@ -288,6 +290,8 @@ fn another_failure_is_no_limit() {
         "read 429 files before it failed",
         "API Error: 500; request code 429 failed",
         "Could not load schedule presets 3:45pm and 5:00pm",
+        "Could not load schedule presets: size limit exceeded",
+        "proxy substatus 429 on a 500",
         "Invalid API key",
     ] {
         assert_eq!(failure_limit(text), None, "{text}");

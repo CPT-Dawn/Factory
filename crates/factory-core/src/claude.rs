@@ -222,8 +222,8 @@ pub fn failure_limit(text: &str) -> Option<Reset> {
 }
 
 /// Whether `text` has the HTTP status `code`: the number alone, after an HTTP marker
-/// (`API Error: 429`, `HTTP/1.1 429`, `"status":429`, `status code 429`), not a number that
-/// only follows other words (`request 429 failed`).
+/// (`API Error: 429`, `HTTP/1.1 429`, `HTTP/2 429`, `"status":429`, `status code 429`), not
+/// a number that only follows other words (`request 429 failed`, `request code 429`).
 fn is_status(text: &str, code: &str) -> bool {
     text.match_indices(code).any(|(at, _)| {
         let alone = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric());
@@ -232,28 +232,41 @@ fn is_status(text: &str, code: &str) -> bool {
             return false;
         }
         let before = text[..at].trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
-        [
-            "http",
-            "http/1.0",
-            "http/1.1",
-            "http/2",
-            "http/3",
-            "status",
-            "status code",
-            "status_code",
-            "statuscode",
-            "api error",
-        ]
-        .iter()
-        .any(|marker| before.ends_with(marker))
+        let http_version = before
+            .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
+            .strip_suffix('/')
+            .is_some_and(|head| ends_with_word(head, "http"));
+        http_version
+            || [
+                "http",
+                "status",
+                "status code",
+                "status_code",
+                "statuscode",
+                "api error",
+            ]
+            .iter()
+            .any(|marker| ends_with_word(before, marker))
     })
+}
+
+/// Whether `text` ends with `word` as a whole word: no letter or digit just before it.
+fn ends_with_word(text: &str, word: &str) -> bool {
+    text.strip_suffix(word)
+        .is_some_and(|head| !head.ends_with(|c: char| c.is_ascii_alphanumeric()))
+}
+
+/// Where `lower` says `resets ` as a word (not inside `presets `), the last first.
+fn resets_at(lower: &str) -> impl Iterator<Item = usize> + '_ {
+    lower
+        .rmatch_indices("resets")
+        .map(|(at, _)| at)
+        .filter(|at| ends_with_word(&lower[..at + "resets".len()], "resets"))
 }
 
 /// The reset `lower` names after its last `resets `: a time of day or a weekday and time.
 fn named_reset(lower: &str) -> Option<Reset> {
-    let (at, _) = lower
-        .rmatch_indices("resets ")
-        .find(|(at, _)| !lower[..*at].ends_with(|c: char| c.is_ascii_alphanumeric()))?;
+    let at = resets_at(lower).find(|at| lower[at + "resets".len()..].starts_with(' '))?;
     reset_clock(&lower[at + "resets ".len()..])
 }
 
@@ -270,7 +283,7 @@ fn plan_limit(text: &str) -> Option<Reset> {
         }
     }
     let plan = lower.contains("limit")
-        && (lower.contains("resets")
+        && (resets_at(&lower).next().is_some()
             || lower.contains("hit your")
             || lower.contains("usage limit"));
     plan.then(|| named_reset(&lower).unwrap_or(Reset::Unknown))
