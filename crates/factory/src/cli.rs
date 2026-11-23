@@ -108,17 +108,27 @@ pub enum WaitCommand {
     Lead {
         /// The lead's slug, or lead-<slug>
         lead: String,
-        /// Give up after this long with exit 124, such as 90s, 9m or 2h
-        #[arg(long, default_value = "9m", value_parser = duration)]
-        timeout: Duration,
+        /// Give up after this long with exit 124, such as 90s, 9m or 2h [default: 9m, or 2h
+        /// with --notify]
+        #[arg(long, value_parser = duration)]
+        timeout: Option<Duration>,
+        /// Return at once; the daemon posts the line into this Claude Code session when the
+        /// wait ends (off unless the config switches event delivery on)
+        #[arg(long)]
+        notify: bool,
     },
     /// Until every check on a PR's head finished: all passed (exit 0) or some failed (exit 10)
     Ci {
         /// The PR: its number (from its repo's checkout), URL or branch
         pr: String,
-        /// Give up after this long with exit 124, such as 90s, 9m or 2h
-        #[arg(long, default_value = "9m", value_parser = duration)]
-        timeout: Duration,
+        /// Give up after this long with exit 124, such as 90s, 9m or 2h [default: 9m, or 2h
+        /// with --notify]
+        #[arg(long, value_parser = duration)]
+        timeout: Option<Duration>,
+        /// Return at once; the daemon posts the line into this Claude Code session when the
+        /// wait ends (off unless the config switches event delivery on)
+        #[arg(long)]
+        notify: bool,
     },
 }
 

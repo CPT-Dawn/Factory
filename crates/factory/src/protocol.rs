@@ -33,6 +33,10 @@ pub const WAIT_LEAD: &str = "wait.lead";
 /// Answered once every check on a pull request's head has finished: [`WaitCiParams`] in,
 /// [`WaitCiResult`] out; an error with exit 124 when the time runs out first.
 pub const WAIT_CI: &str = "wait.ci";
+/// Registers a wait that outlives its CLI (`--notify`) and answers at once: [`NotifyParams`]
+/// in, [`NotifyResult`] out. When the wait ends, the daemon posts one line into the session
+/// the params address; a refusal with exit 3 when event delivery is switched off.
+pub const WAIT_NOTIFY: &str = "wait.notify";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -217,6 +221,52 @@ pub struct WaitCiParams {
     /// How often to poll GitHub when it can't listen for events; the first wait on a pull
     /// request sets it for all.
     pub poll_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NotifyParams {
+    pub on: NotifyOn,
+    /// The herdr pane the wait comes from, so the lead in it shows as waiting.
+    pub waiter: Option<String>,
+    pub timeout_secs: u64,
+    pub session: SessionParam,
+}
+
+/// What a `--notify` wait waits on.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum NotifyOn {
+    /// A pull request's checks, as [`WaitCiParams`] names them.
+    Ci {
+        pr: String,
+        cwd: String,
+        poll_secs: u64,
+    },
+    /// A lead, by its herdr agent name.
+    Lead { lead: String },
+}
+
+/// The Claude Code session a `--notify` wait posts into when it ends.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionParam {
+    /// Its inbox socket, `CLAUDE_CODE_MESSAGING_SOCKET`.
+    pub socket: String,
+    /// The token its inbox takes, `CLAUDE_CODE_MESSAGING_TOKEN`.
+    pub token: String,
+    /// The session's process, `CLAUDE_PID`, and its start time (field 22 of
+    /// `/proc/<pid>/stat`): the daemon drops the wait when that process exits.
+    pub pid: Option<i64>,
+    pub start: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NotifyResult {
+    /// The wait's number, which its line names when it ends.
+    pub id: i64,
+    /// What it waits on, as `factory lead status` shows it: `ci acme/shop#12` or a lead.
+    pub on: String,
+    /// When it gives up, in milliseconds since the epoch.
+    pub deadline: i64,
 }
 
 /// A pull request whose checks all finished.

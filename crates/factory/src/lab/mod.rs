@@ -8,7 +8,7 @@
 
 mod cli;
 mod context;
-mod host;
+pub(crate) mod host;
 mod lease;
 mod owner;
 mod run;

@@ -14,6 +14,8 @@ mod install;
 mod lab;
 mod lead;
 mod log;
+#[cfg(test)]
+mod notify;
 mod review;
 mod router;
 // Marked cfg(test) so clippy treats these as test code and lets their helpers unwrap.

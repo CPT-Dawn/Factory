@@ -12,6 +12,8 @@ mod lab;
 mod lead;
 mod leads;
 mod log;
+mod notifier;
+mod notify;
 mod output;
 mod paths;
 mod pollers;
@@ -23,9 +25,13 @@ mod store;
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use cli::{Cli, Command, LeadCommand, WaitCommand};
 use output::{Done, Failure};
+
+/// How long a `factory wait` blocks without `--timeout`.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(9 * 60);
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
@@ -69,11 +75,33 @@ fn run(command: Command, json: bool) -> ExitCode {
             command: LeadCommand::Status { lead },
         } => lead::status(&lead),
         Command::Wait {
-            command: WaitCommand::Lead { lead, timeout },
-        } => lead::wait(&lead, timeout),
+            command:
+                WaitCommand::Lead {
+                    lead,
+                    timeout,
+                    notify,
+                },
+        } => {
+            if notify {
+                lead::notify(&lead, timeout.unwrap_or(notify::TIMEOUT))
+            } else {
+                lead::wait(&lead, timeout.unwrap_or(WAIT_TIMEOUT))
+            }
+        }
         Command::Wait {
-            command: WaitCommand::Ci { pr, timeout },
-        } => ci::wait(&pr, timeout),
+            command:
+                WaitCommand::Ci {
+                    pr,
+                    timeout,
+                    notify,
+                },
+        } => {
+            if notify {
+                ci::notify(&pr, timeout.unwrap_or(notify::TIMEOUT))
+            } else {
+                ci::wait(&pr, timeout.unwrap_or(WAIT_TIMEOUT))
+            }
+        }
         Command::Review {
             base,
             label,

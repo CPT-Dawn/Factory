@@ -9,10 +9,11 @@ use factory_core::lead::lead_name;
 use serde_json::{Value, json};
 
 use crate::client;
+use crate::notify;
 use crate::output::{Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{
-    LEAD_LIST, LEAD_STATUS, LeadList, LeadParams, LeadReport, WAIT_LEAD, WaitLeadParams,
+    LEAD_LIST, LEAD_STATUS, LeadList, LeadParams, LeadReport, NotifyOn, WAIT_LEAD, WaitLeadParams,
     WaitLeadResult,
 };
 
@@ -54,6 +55,12 @@ pub fn wait(lead: &str, timeout: Duration) -> Result<Done, Failure> {
     Ok(done)
 }
 
+/// `factory wait lead --notify`: registers the wait, and the daemon posts its line when it ends.
+pub fn notify(lead: &str, timeout: Duration) -> Result<Done, Failure> {
+    let lead = lead_name(lead).map_err(|e| Failure::usage(e.to_string()))?;
+    notify::register(NotifyOn::Lead { lead }, timeout)
+}
+
 /// A lead's line, then its pane's last lines when it is blocked or asking.
 fn shown(report: &LeadReport, exit: Exit) -> Done {
     let mut done = Done::new(
@@ -65,7 +72,7 @@ fn shown(report: &LeadReport, exit: Exit) -> Done {
     done
 }
 
-fn line(report: &LeadReport) -> String {
+pub fn line(report: &LeadReport) -> String {
     match &report.report {
         Some(path) if report.state == "finished" => format!("{} finished: {path}", report.lead),
         _ => format!("{} {}", report.lead, report.status),
