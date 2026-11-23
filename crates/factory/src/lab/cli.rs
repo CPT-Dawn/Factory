@@ -12,8 +12,9 @@ use factory_core::lab::config::ProjectConfig;
 
 use super::lease;
 use super::wire::Lease;
-use super::{run, stack, status};
+use super::{android, run, stack, status};
 use crate::output::Failure;
+use factory_adapters::adb::AdbCli;
 
 const HELP: &str = include_str!("help.txt");
 
@@ -102,7 +103,25 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
             }
             Ok(0)
         }
-        "prep" | "watch" => Err(Failure::usage(format!(
+        "prep" => {
+            let ctx = context()?;
+            let serials = if args.is_empty() {
+                status::ready_serials()?
+            } else {
+                args.to_vec()
+            };
+            for serial in serials {
+                let warning = android::prep(
+                    &AdbCli,
+                    &serial,
+                    ctx.cfg.prep_stay_awake,
+                    ctx.cfg.prep_animations_off,
+                );
+                println!("{serial}: {}", warning.unwrap_or("ready"));
+            }
+            Ok(0)
+        }
+        "watch" => Err(Failure::usage(format!(
             "devlab {cmd} is not in factory lab yet; run today's devlab for it"
         ))),
         other => Err(Failure::usage(format!(

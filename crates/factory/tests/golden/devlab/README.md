@@ -15,10 +15,9 @@ GOLDEN_DEVLAB=$HOME/.local/bin/devlab cargo test --test cli transcript
 GOLDEN_DEVLAB=target/debug/factory cargo test --test cli transcript::slots_
 ```
 
-Without `GOLDEN_DEVLAB`, the `slots-*` and `cli-*` transcripts replay against the built
-`factory` (`factory lab`, #14), and the rest pass with a note that they were skipped. A failure
-names the transcript line, the step, the stream and the first byte that differs, and shows both
-outputs. `GOLDEN_RECORD=1` rewrites the transcripts with what the binary showed instead.
+Without `GOLDEN_DEVLAB`, every transcript replays against the built `factory` (`factory lab`,
+#14 and #16). A failure names the transcript line, the step, the stream and the first byte that
+differs, and shows both outputs. `GOLDEN_RECORD=1` rewrites the transcripts with what the binary showed instead.
 
 Groups: `slots-*` (stack slots, #14), `devices-*` (phones and emulators, #16), `cli-*` (usage
 and help). Every transcript has a test in `tests/cli/devlab_golden.rs`.
@@ -29,9 +28,12 @@ A call runs with a fresh HOME, XDG state, config and runtime dirs inside a temp 
 whose first entry holds fakes of adb, docker, systemctl, systemd-run, avdmanager, supabase, git and
 notify-send (`fakes/*.sh`). They play back the state in the sandbox's `world` directory, which
 the transcript's world steps change. Nothing reaches a real device, container, unit or devlab
-database. The machine config is `machine.json` (one emulator, no memory floor); a worktree whose
-name starts with `demo-` holds `project/` (devlab.json and a supabase config), any other is
-empty.
+database. `adb track-devices -l` streams `world/devices` and writes what it streamed last to
+`world/tracked.<pid>`; after a `plug` or `unplug` the replay waits until every running stream has
+streamed the change, so the daemon's device tracker has seen it before the next call. An
+emulator's unit and its adb listing end together, on `systemctl --user stop` or `adb emu kill`.
+The machine config is `machine.json` (one emulator, no memory floor); a worktree whose name
+starts with `demo-` holds `project/` (devlab.json and a supabase config), any other is empty.
 
 ## Format
 
@@ -44,7 +46,8 @@ One step per line:
   waits until its output shows `<text>`; `wait <tag>` waits for it to end.
 - `kill <owner>` ends the owner's process.
 - World steps: `plug <serial> <state> [<prop>...]` (adb lists it; plugging again replaces it),
-  `unplug <serial>`, `lock <serial>` (its lock screen stays up), `break <op>` and `mend <op>`
+  `unplug <serial>`, `lock <serial>` (its lock screen stays up), `stall <serial>` (the emulator
+  never finishes booting; for the tests beside the transcripts), `break <op>` and `mend <op>`
   where `<op>` is `supabase start` or `systemd-run`.
 
 After a `$` or `wait` step come the lines it showed: `1> ` per stdout line, `2> ` per stderr

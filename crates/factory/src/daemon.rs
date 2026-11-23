@@ -88,13 +88,15 @@ pub fn run(json: bool) -> Result<Done, Failure> {
         );
         tokio::spawn(Arc::clone(&leads).start());
         let router = Arc::new(router);
+        let lab = Arc::new(lab);
+        lab.recover();
         match serve(
             listener,
             Arc::new(Daemon {
                 ledger,
                 leads,
                 router,
-                lab: Arc::new(lab),
+                lab,
             }),
         )
         .await {}

@@ -11,19 +11,27 @@ devices)
 start-server)
   exit 0 ;;
 track-devices)
-  # One frame now and one each time the device list changes: 4 hex digits of length, then the list.
+  # One frame now and one each time the device list changes: 4 hex digits of length, then the
+  # list: "serial<TAB>state" lines, or with -l whole "serial state props..." lines. With -l it
+  # also writes the list it streamed last to world/tracked.<pid>, so the harness can wait until
+  # a stream has shown a change. It ends with the process that started it.
+  long=
+  [ "$2" = -l ] && long=1
+  [ -n "$long" ] && trap 'rm -f "$w/tracked.$$"' EXIT
   last=x
-  while :; do
-    now=$(frame)
+  while kill -0 "$PPID" 2>/dev/null; do
+    if [ -n "$long" ]; then now=$(cat "$w/devices"); else now=$(frame); fi
     if [ "$now" != "$last" ]; then
       body=$(printf '%s' "$now" | awk 'NF { print }')
       [ -n "$body" ] && body="$body
 "
       printf '%04x%s' "$(printf '%s' "$body" | wc -c)" "$body"
+      [ -n "$long" ] && printf '%s' "$now" > "$w/tracked.$$"
       last=$now
     fi
     sleep 0.05
-  done ;;
+  done
+  exit 0 ;;
 -s)
   serial=$2
   shift 2
@@ -36,11 +44,23 @@ track-devices)
     shift
     case "$*" in
     *ro.product.cpu.abi*) case "$serial" in emulator-*) echo x86_64 ;; *) echo arm64-v8a ;; esac ;;
-    *sys.boot_completed*) echo 1 ;;
+    *sys.boot_completed*) grep -qxF "$serial" "$w/stalled" || echo 1 ;;
     *dumpsys\ window*) grep -qxF "$serial" "$w/locked" && echo "  mDreamingLockscreen=true" ;;
     esac
     exit 0 ;;
-  reverse | emu)
+  emu)
+    # emu kill: the emulator saves its snapshot and exits, and its unit with it.
+    if [ "$2" = kill ]; then
+      unit=$(awk -v p="${serial#emulator-}" '$2 == p { print $1 }' "$w/unit-ports" | tail -1)
+      if [ -n "$unit" ]; then
+        grep -vxF "$unit" "$w/units" > "$w/units.new"
+        mv "$w/units.new" "$w/units"
+      fi
+      awk -v s="$serial" '$1 != s' "$w/devices" > "$w/devices.new"
+      mv "$w/devices.new" "$w/devices"
+    fi
+    exit 0 ;;
+  reverse)
     exit 0 ;;
   esac ;;
 esac

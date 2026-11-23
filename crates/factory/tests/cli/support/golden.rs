@@ -45,8 +45,8 @@ pub fn devlab_under_test(file: &str) -> Option<PathBuf> {
     }
 }
 
-/// The transcript groups the built `factory` replays; `devices-*` waits for #16.
-const SERVED: [&str; 2] = ["slots-", "cli-"];
+/// The transcript groups the built `factory` replays.
+const SERVED: [&str; 3] = ["slots-", "devices-", "cli-"];
 
 /// `path` as given, or read from the workspace root when relative: `cargo test` runs in the
 /// crate's directory, but `GOLDEN_DEVLAB=target/debug/factory` is written from the root.

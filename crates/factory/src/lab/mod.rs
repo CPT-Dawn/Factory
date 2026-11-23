@@ -3,9 +3,11 @@
 //! with the golden transcripts (#13).
 //!
 //! The CLI reads the configs, finds the owner, runs stacks and commands; the daemon keeps the
-//! lease store and decides who is granted what ([`service`]). Devices (#16), reservations
-//! (#17) and the watcher (#18) build on these modules beside them.
+//! lease store and decides who is granted what ([`service`]). Phones and emulators (#16) are the
+//! daemon's too: it follows one `adb track-devices` stream and boots and watches emulators.
+//! Reservations (#17) and the watcher (#18) build on these modules beside them.
 
+mod android;
 mod cli;
 mod context;
 mod host;

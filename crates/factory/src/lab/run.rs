@@ -5,17 +5,20 @@ use std::process::Command;
 
 use super::cli::note;
 use super::context::Ctx;
-use super::lease::lease_env;
+use super::lease::{apply_reverses, lease_env, wake};
 use super::wire::Lease;
 use crate::output::Failure;
 
-/// Runs `argv` in the lease and returns its exit code (128 + the signal that ended it); 127
+/// Runs `argv` in the lease, its devices woken and the project's ports reversed onto them, and
+/// returns its exit code (128 + the signal that ended it); 127
 /// when it can't be run.
 pub fn exec_in(ctx: &Ctx, lease: &Lease, argv: &[String]) -> Result<u8, Failure> {
     let env = lease_env(lease, ctx.project.as_ref())?;
     let Some((program, args)) = argv.split_first() else {
         return Err(Failure::usage("devlab exec -- <cmd...>"));
     };
+    wake(lease);
+    apply_reverses(lease, ctx.project.as_ref())?;
     let status = Command::new(program)
         .args(args)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
