@@ -1,8 +1,8 @@
 //! The hook rules, as tables: each row is one tool call and what the hook says to it.
 
 use factory_core::hook::{
-    GitAction, PreTool, RESULT_LIMIT, Template, Templates, mentions_private, post_tool, pre_tool,
-    private_address, subagent_stop,
+    GitAction, Patch, PreTool, Push, PushRef, RESULT_LIMIT, Template, Templates, mentions_private,
+    post_tool, pre_tool, private_address, pushed_address, subagent_stop,
 };
 use serde_json::{Value, json};
 
@@ -66,7 +66,7 @@ fn pre_tool_lets_everything_else_through() {
         assert!(
             matches!(
                 pre_tool(&bash(command), false),
-                PreTool::Allow | PreTool::CheckStaged(_)
+                PreTool::Allow | PreTool::Check(_)
             ),
             "{command:?} should pass"
         );
@@ -392,10 +392,144 @@ fn a_template_for_an_agent_type_overrides_the_default_field_by_field() {
     assert!(subagent_stop(&stop("merger", &lines(41), false), &templates, false).is_some());
 }
 
+/// The commits and pushes a command runs, each as where it runs and what it takes along.
 fn git(command: &str) -> Vec<GitAction> {
+    actions(command)
+        .into_iter()
+        .map(|action| GitAction {
+            push: None,
+            ..action
+        })
+        .collect()
+}
+
+fn actions(command: &str) -> Vec<GitAction> {
     match pre_tool(&bash(command), false) {
-        PreTool::CheckStaged(actions) => actions,
+        PreTool::Check(actions) => actions,
         _ => Vec::new(),
+    }
+}
+
+/// What each push in a command sends, as the command names it.
+fn pushes(command: &str) -> Vec<Push> {
+    actions(command)
+        .into_iter()
+        .filter_map(|action| action.push)
+        .collect()
+}
+
+#[test]
+fn a_repository_the_line_does_not_name_is_unresolved() {
+    for (command, unresolved) in [
+        ("cd \"$REPO\" && git commit -m x", Some("$REPO")),
+        ("cd $REPO && cd sub && git push", Some("$REPO/sub")),
+        ("cd - && git commit -m x", Some("-")),
+        (
+            "git -C \"$(git rev-parse --show-toplevel)\" commit",
+            Some("$(git rev-parse --show-toplevel)"),
+        ),
+        ("GIT_DIR=$X git commit", Some("$X")),
+        ("git --work-tree=${W} commit", Some("${W}")),
+        ("cd ~other && git commit -m x", Some("~other")),
+        ("pushd $A && git commit -m x", Some("$A")),
+        // A later directory the line names takes over.
+        ("cd $X && cd /abs && git commit", None),
+        ("cd - && popd; pushd /a && git commit", None),
+        ("cd ~/p && git commit", None),
+        ("cd ./- && git commit", None),
+        ("git commit -m \"$MSG\"", None),
+        // A command substitution is part of the word it is in.
+        (
+            "git -C $(git rev-parse --show-toplevel) commit -m x",
+            Some("$(…)"),
+        ),
+        ("cd $(mktemp -d)/x && git commit -m x", Some("$(…)/x")),
+        ("git -C `pwd` commit -m x", Some("$(…)")),
+        ("git commit -m $(cat msg) a", None),
+    ] {
+        let found = actions(command);
+        assert_eq!(found.len(), 1, "{command:?}");
+        assert_eq!(found[0].unresolved(), unresolved, "{command:?}");
+    }
+}
+
+#[test]
+fn a_push_names_what_it_sends() {
+    let push = |remote: Option<&str>, refs: Vec<PushRef>| Push {
+        remote: remote.map(str::to_owned),
+        refs,
+    };
+    let current = |remote: Option<&str>| push(remote, vec![PushRef::Current]);
+    let sends = |src: &str, dst: Option<&str>| PushRef::Ref {
+        src: src.to_owned(),
+        dst: dst.map(str::to_owned),
+    };
+    let origin = Some("origin");
+    for (command, expected) in [
+        ("git push", vec![current(None)]),
+        ("git push origin", vec![current(origin)]),
+        ("git push --follow-tags", vec![current(None)]),
+        ("git push -o ci.skip --repo=up", vec![current(Some("up"))]),
+        (
+            "git push -u origin HEAD",
+            vec![push(origin, vec![sends("HEAD", None)])],
+        ),
+        (
+            "git push origin a:b +c refs/heads/d:refs/heads/e",
+            vec![push(
+                origin,
+                vec![
+                    sends("a", Some("b")),
+                    sends("c", None),
+                    sends("refs/heads/d", Some("refs/heads/e")),
+                ],
+            )],
+        ),
+        (
+            "git push --force-with-lease --push-option x origin main",
+            vec![push(origin, vec![sends("main", None)])],
+        ),
+        (
+            "git push --all origin",
+            vec![push(origin, vec![PushRef::Branches])],
+        ),
+        (
+            "git push --branches",
+            vec![push(None, vec![PushRef::Branches])],
+        ),
+        (
+            "git push --mirror backup",
+            vec![push(Some("backup"), vec![PushRef::Branches, PushRef::Tags])],
+        ),
+        (
+            "git push origin --tags",
+            vec![push(origin, vec![PushRef::Tags])],
+        ),
+        (
+            "git push origin main --tags",
+            vec![push(origin, vec![sends("main", None), PushRef::Tags])],
+        ),
+        (
+            "git push origin 'refs/heads/*:refs/heads/*' 'refs/tags/*'",
+            vec![push(origin, vec![PushRef::Branches, PushRef::Tags])],
+        ),
+        // A branch the line cannot name could be any of them.
+        (
+            "git push -u origin \"$(git branch --show-current)\"",
+            vec![push(origin, vec![PushRef::Branches])],
+        ),
+        (
+            "git push origin $BRANCH:main",
+            vec![push(origin, vec![PushRef::Branches])],
+        ),
+        // A deletion sends nothing.
+        ("git push origin :gone", vec![push(origin, vec![])]),
+        ("git push origin --delete gone", vec![push(origin, vec![])]),
+        ("git push -d origin gone other", vec![push(origin, vec![])]),
+        // A commit is no push.
+        ("git commit -m push", vec![]),
+    ] {
+        assert_eq!(pushes(command), expected, "{command:?}");
     }
 }
 
@@ -408,11 +542,12 @@ fn action(dir: Option<&str>, tracked: bool, added: Option<&[&str]>) -> GitAction
         work_tree: None,
         tracked,
         added: added.map(|paths| paths.iter().map(|p| (*p).to_owned()).collect()),
+        push: None,
     }
 }
 
 #[test]
-fn pre_tool_asks_for_the_staged_diff_of_a_commit_or_push() {
+fn pre_tool_asks_to_check_each_commit_or_push_where_it_runs() {
     let plain = action(None, false, None);
     let nothing: Vec<GitAction> = Vec::new();
     for (command, expected) in [
@@ -493,16 +628,11 @@ fn pre_tool_asks_for_the_staged_diff_of_a_commit_or_push() {
             "git add . && git commit -am x",
             vec![action(None, true, Some(&["."]))],
         ),
-        (
-            "git add a && git push",
-            vec![action(None, false, Some(&["a"]))],
-        ),
+        // A push sends commits, not what is staged.
+        ("git add a && git push", vec![plain.clone()]),
         (
             "git add . && git commit -m x && git push",
-            vec![
-                action(None, false, Some(&["."])),
-                action(None, false, Some(&["."])),
-            ],
+            vec![action(None, false, Some(&["."])), plain.clone()],
         ),
         ("git commit -m x && git add y", vec![plain.clone()]),
         // A repository's staging is its own.
@@ -521,7 +651,7 @@ fn pre_tool_asks_for_the_staged_diff_of_a_commit_or_push() {
         ("git", nothing),
     ] {
         let mut actions = git(command);
-        // A commit and the push after it check the same thing once.
+        // A commit and the push after it run in the same place.
         actions.dedup();
         let mut expected = expected;
         expected.dedup();
@@ -862,6 +992,57 @@ fn a_new_or_renamed_file_named_with_the_address_is_refused_even_with_clean_conte
         );
     }
     assert_eq!(private_address(deleted, &addresses), None);
+}
+
+fn patch(commit: &str, diff: &str) -> Patch {
+    Patch {
+        commit: commit.to_owned(),
+        diff: diff.to_owned(),
+    }
+}
+
+const CLEAN: &str = "diff --git a/c.txt b/c.txt\n--- a/c.txt\n+++ b/c.txt\n@@ -0,0 +1 @@\n+fine\n";
+
+#[test]
+fn a_push_is_refused_naming_the_commit_that_adds_the_address() {
+    let me = addresses(&["me@example.invalid"]);
+    let sent = [
+        patch("1111111", CLEAN),
+        patch("2222222", DIFF),
+        patch("3333333", CLEAN),
+    ];
+
+    let reason = pushed_address(&sent, &me).unwrap();
+
+    assert!(
+        reason.contains("2222222") && reason.contains("src/a.txt"),
+        "{reason}"
+    );
+    assert!(!reason.contains("1111111") && !reason.contains("3333333"));
+    assert!(!reason.contains("example.invalid"), "{reason}");
+    assert!(
+        !reason.contains('\n') && reason.chars().count() <= 200,
+        "{reason}"
+    );
+    assert_eq!(pushed_address(&[patch("1111111", CLEAN)], &me), None);
+    assert_eq!(pushed_address(&[], &me), None);
+}
+
+#[test]
+fn a_merge_that_adds_the_address_in_its_own_lines_is_refused() {
+    // A combined diff: lines the merge itself adds start with `++`, or with `+` in a column.
+    let merge = "diff --cc notes.txt\nindex 111,222..333\n--- a/notes.txt\n+++ b/notes.txt\n@@@ -1,1 -1,1 +1,1 @@@\n- a\n -b\n++me@example.invalid\n";
+
+    let reason = pushed_address(
+        &[patch("4444444", merge)],
+        &addresses(&["me@example.invalid"]),
+    );
+
+    let reason = reason.unwrap();
+    assert!(
+        reason.contains("4444444") && reason.contains("notes.txt"),
+        "{reason}"
+    );
 }
 
 #[test]
