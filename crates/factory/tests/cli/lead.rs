@@ -398,6 +398,8 @@ fn a_wait_that_loses_herdr_fails_and_the_next_command_reconnects() {
     cmd.env("HERDR_PANE_ID", "w2:p1");
     let child = spawn(cmd);
     await_status(&sandbox, "pay", "lead-pay waiting: lead-cart");
+    // And the daemon's subscription is live in the fake, which hangs up only on the ones it has.
+    herdr.await_watch("w1:p1");
 
     herdr.hang_up();
     let out = finish(child);
