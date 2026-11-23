@@ -324,15 +324,17 @@ fn try_grant(
 /// Serves one `lab.acquire`: queues it, writes a note each time the reason it waits changes,
 /// then the grant or the error. A client that hangs up leaves the queue. A run's acquire is then
 /// followed to its end, which lands in the ledger.
-pub async fn acquire<W, R>(
+pub async fn acquire<W, R, S>(
     lab: Arc<Lab>,
     ledger: Arc<Ledger>,
     request: Request,
     writer: &mut W,
     lines: &mut Lines<R>,
+    stopping: S,
 ) where
     W: AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
+    S: Future<Output = ()>,
 {
     let id = Some(request.id);
     let p: AcquireParams = match parse(request.params) {
@@ -429,7 +431,7 @@ pub async fn acquire<W, R>(
                     run.granted = Some(Instant::now());
                     if answered {
                         run.lease = Some(lease);
-                        run.follow(lines).await;
+                        run.follow(lines, stopping).await;
                     } else {
                         run.record(End::Lost.outcome(), Phase::Queued.word()).await;
                     }
@@ -545,10 +547,20 @@ struct Run {
 
 impl Run {
     /// Reads the run's connection after the grant: its start, then its end, or the connection
-    /// closing without one, which is a lost run.
-    async fn follow<R: AsyncBufRead + Unpin>(&mut self, lines: &mut Lines<R>) {
+    /// closing without one, which is a lost run. A daemon stopping under a run loses it too: the
+    /// run may outlast any drain, and its end would reach no one.
+    async fn follow<R, S>(&mut self, lines: &mut Lines<R>, stopping: S)
+    where
+        R: AsyncBufRead + Unpin,
+        S: Future<Output = ()>,
+    {
+        tokio::pin!(stopping);
         loop {
-            let Ok(Some(line)) = lines.next_line().await else {
+            let line = tokio::select! {
+                line = lines.next_line() => line,
+                () = &mut stopping => Ok(None),
+            };
+            let Ok(Some(line)) = line else {
                 let phase = if self.started.is_some() {
                     Phase::Running
                 } else {

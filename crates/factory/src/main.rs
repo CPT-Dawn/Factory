@@ -6,6 +6,7 @@ mod client;
 mod clock;
 mod config;
 mod daemon;
+mod install;
 mod lab;
 mod lead;
 mod leads;
@@ -41,13 +42,20 @@ fn main() -> ExitCode {
             command: Command::Lab { args },
             json,
         }) => lab::main(&lab_args(args, json)),
-        Ok(cli) => output::finish(run(cli.command, cli.json), cli.json),
+        Ok(cli) => run(cli.command, cli.json),
         Err(refusal) => cli::refuse(refusal, json),
     }
 }
 
-fn run(command: Command, json: bool) -> Result<Done, Failure> {
-    match command {
+fn run(command: Command, json: bool) -> ExitCode {
+    let outcome: Result<Done, Failure> = match command {
+        // The daemon prints its ready line itself, and nothing when it stops.
+        Command::Daemon => {
+            return daemon::run(json).map_or_else(
+                |failure| output::finish(Err(failure), json),
+                |()| ExitCode::SUCCESS,
+            );
+        }
         Command::Log { kind, pairs } => log::run(&kind, &pairs),
         Command::Lead {
             command: LeadCommand::List,
@@ -74,10 +82,12 @@ fn run(command: Command, json: bool) -> Result<Done, Failure> {
             previous,
             timeout: timeout.map(std::time::Duration::from_secs),
         }),
-        Command::Daemon => daemon::run(json),
+        Command::Install { units } => install::install(units.as_deref()),
+        Command::Uninstall => install::uninstall(),
         // main hands every `factory lab` to the lab; this arm is never reached.
         Command::Lab { .. } => Err(Failure::usage("run factory lab help")),
-    }
+    };
+    output::finish(outcome, json)
 }
 
 /// The lab's arguments when global flags came before `lab` (`factory --json lab status`): the

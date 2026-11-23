@@ -574,3 +574,29 @@ fn a_client_killed_while_queued_is_recorded_as_lost_and_leaves_the_queue() {
     let status = run(devlab(&sandbox, &wt, &["status"]));
     assert!(!status.stdout.contains("waiting:"), "{status:?}");
 }
+
+#[test]
+fn a_daemon_stopping_under_a_run_records_it_as_lost_without_waiting_for_it() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-restart");
+    let child = spawn_run(&sandbox, &wt, "echo $$ > child.pid; exec sleep 30");
+    assert!(
+        poll_until(|| wt.join("child.pid").exists()),
+        "the command never started"
+    );
+    let devlab_pid = child.id();
+
+    let stopping = std::time::Instant::now();
+    stop_daemon(&sandbox);
+    let took = stopping.elapsed();
+    let event = the_lab_run(&sandbox);
+    kill_group(devlab_pid, Signal::KILL);
+    let _ = finish(child);
+
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "the stop took {took:?}"
+    );
+    assert_eq!(event["outcome"], "lost", "{event}");
+    assert_eq!(event["phase"], "running", "{event}");
+}

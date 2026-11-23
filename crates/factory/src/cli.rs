@@ -60,6 +60,14 @@ pub enum Command {
     },
     /// Run the daemon; other commands start it when it isn't running
     Daemon,
+    /// Install or upgrade factory in ~/.local/bin and its systemd units, and start the socket
+    Install {
+        /// Link the units from here (DotFiles' factory/.config/systemd/user); else they are in place
+        #[arg(long, value_name = "DIR")]
+        units: Option<PathBuf>,
+    },
+    /// Stop the daemon and remove the binary and units install put in place; state stays
+    Uninstall,
     /// Lease this PC's local stack slots, in devlab's words: factory lab help (or run it as devlab)
     #[command(disable_help_flag = true)]
     Lab {

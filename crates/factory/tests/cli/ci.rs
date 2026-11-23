@@ -7,7 +7,8 @@ use std::os::unix::fs::PermissionsExt;
 use crate::support::github::{FakeGitHub, HEAD, PR_URL};
 use crate::support::herdr::FakeHerdr;
 use crate::support::world::poll_until;
-use crate::support::{Sandbox, finish, spawn};
+use crate::support::{Sandbox, finish, kill_group, spawn};
+use rustix::process::Signal;
 
 /// A sandbox whose config polls GitHub every `seconds`.
 // cfg(test), as the harness is, so clippy lets it unwrap.
@@ -159,6 +160,29 @@ fn a_head_without_checks_yet_is_pending() {
     assert_eq!(
         (out.code, out.stdout.as_str()),
         (0, "acme/shop#12: 1 passed, 0 failed\n"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_wait_the_daemon_stops_under_says_to_wait_again() {
+    let sandbox = polling_every(1);
+    let github = FakeGitHub::install(&sandbox);
+    github.checks(&[(1, "test", "in_progress", None)]);
+    let child = spawn(sandbox.factory_command(&["wait", "ci", "12"]));
+    assert!(poll_until(|| !github.polls().is_empty()), "never polled");
+
+    // As systemd stops it for a restart or an upgrade.
+    let daemon = fs::read_to_string(sandbox.path("run/factory/daemon.pid")).unwrap();
+    kill_group(daemon.trim().parse().unwrap(), Signal::TERM);
+    let out = finish(child);
+
+    assert_eq!(
+        (out.code, out.stderr.as_str()),
+        (
+            3,
+            "factory: the daemon stopped (a restart or an upgrade); run the wait again\n"
+        ),
         "{out:?}"
     );
 }
