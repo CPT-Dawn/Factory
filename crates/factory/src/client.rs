@@ -314,7 +314,9 @@ impl Session {
     }
 
     /// The connection's reader, to read what the daemon sends unasked.
+    /// It waits as long as it takes: an exchange's patience no longer holds.
     pub fn into_reader(self) -> BufReader<UnixStream> {
+        let _ = self.reader.get_ref().set_read_timeout(None);
         self.reader
     }
 

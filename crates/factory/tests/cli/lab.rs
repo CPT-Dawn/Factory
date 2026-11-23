@@ -1675,6 +1675,67 @@ fn a_run_whose_command_runs_across_a_daemon_restart_keeps_its_lease_and_records_
 }
 
 #[test]
+fn a_run_whose_command_outlasts_a_daemon_answer_is_still_followed_across_a_restart() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-long");
+    // Longer than devlab waits for any one answer of the daemon's (10 s).
+    let script = "sleep 11; touch slept; while [ ! -e go ]; do sleep 0.1; done; exit 4".to_owned();
+    let child = spawn_run(&sandbox, &wt, &script);
+    assert!(
+        poll_until(|| wt.join("slept").exists()),
+        "the command never slept"
+    );
+
+    stop_daemon(&sandbox);
+    let _ = board(&sandbox, &wt);
+    fs::write(wt.join("go"), "").expect("write go");
+    let out = finish(child);
+
+    assert_eq!(out.code, 4, "{out:?}");
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "exit 4", "{event}");
+    assert_eq!(event["phase"], "running", "{event}");
+}
+
+#[test]
+fn a_signal_while_a_run_waits_for_its_end_to_be_recorded_keeps_the_commands_exit() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-settling");
+    // A daemon a devlab started would be hung up on, frozen, once that devlab exits (its
+    // process group orphaned): this one's starter is gone before the freeze.
+    let _ = board(&sandbox, &wt);
+    let child = spawn_run(&sandbox, &wt, &until_go(3));
+    assert!(
+        poll_until(|| wt.join("child.pid").exists()),
+        "the command never started"
+    );
+    let command: u32 = fs::read_to_string(wt.join("child.pid"))
+        .expect("child.pid")
+        .trim()
+        .parse()
+        .expect("a pid");
+    let daemon: u32 = fs::read_to_string(sandbox.path("run/factory/daemon.pid"))
+        .expect("a daemon runs")
+        .trim()
+        .parse()
+        .expect("a pid");
+
+    // A frozen daemon never answers the run's end, so devlab waits for it.
+    kill_group(daemon, Signal::STOP);
+    fs::write(wt.join("go"), "").expect("write go");
+    let ended = poll_until(|| !Path::new(&format!("/proc/{command}")).exists());
+    signal(child.id(), Signal::TERM);
+    let out = finish(child);
+    kill_group(daemon, Signal::CONT);
+
+    assert!(ended, "the command never ended");
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(out.stderr, "", "{out:?}");
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "exit 3", "{event}");
+}
+
+#[test]
 fn runs_queued_across_a_daemon_restart_keep_their_places_and_are_granted_in_turn() {
     let (sandbox, world) = lab();
     hold_the_owners_slot(&sandbox, &world);

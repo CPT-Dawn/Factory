@@ -345,7 +345,7 @@ impl Watch {
         let started = Instant::now();
         thread::spawn(move || {
             for signal in signals.forever() {
-                stopped(&watched.0, &program, started, signal, &say);
+                stopped(&watched, &program, started, signal, &say);
             }
         });
         Ok(Watch { state })
@@ -426,9 +426,24 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 
 /// devlab got `signal`: it says so before anything else. While the command runs, the command
 /// gets the signal too, and the main thread exits once it is gone; while queued, the run leaves
-/// the queue, and exits when the daemon has taken it out, or after [`LEAVE_GRACE`].
-fn stopped(state: &Mutex<State>, program: &str, started: Instant, signal: i32, say: &Say) {
+/// the queue, and exits when the daemon has taken it out, or after [`LEAVE_GRACE`]. Once the
+/// command is over, it only cuts short the wait for the daemon to record the run's end.
+fn stopped(
+    state: &(Mutex<State>, Condvar),
+    program: &str,
+    started: Instant,
+    signal: i32,
+    say: &Say,
+) {
+    let (state, settled) = state;
     let mut s = lock(state);
+    if s.started && s.child.is_none() {
+        // The command is over: devlab only waits for its end to be recorded, and stops
+        // waiting, with the command's code.
+        s.settled = true;
+        settled.notify_all();
+        return;
+    }
     let first = s.stopped.is_none();
     if first {
         s.stopped = Some(signal);
