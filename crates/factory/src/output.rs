@@ -1,6 +1,7 @@
 //! The output contract (spec #1, "Output contract").
 //!
-//! Every command prints one line on stdout, or one JSON object with `--json`, and exits with a
+//! Every command prints one line on stdout (at most [`LINE_LIMIT`] characters), or one JSON
+//! object with `--json`, and exits with a
 //! code from the one table in [`factory_core::exit`]. A failure is one line on stderr starting
 //! `factory: `, or one JSON object on stdout with `--json`.
 
@@ -9,6 +10,9 @@ use std::process::ExitCode;
 
 use factory_core::exit::Exit;
 use serde_json::{Value, json};
+
+/// The most characters a default line shows; a longer one is cut and ends in `…`.
+pub const LINE_LIMIT: usize = 200;
 
 /// What a command that succeeded shows.
 #[derive(Debug)]
@@ -46,7 +50,7 @@ pub fn print(done: &Done, json: bool) {
     let line = if json {
         done.json.to_string()
     } else {
-        one_line(&done.line)
+        bounded(&one_line(&done.line))
     };
     let _ = writeln!(io::stdout(), "{line}");
 }
@@ -68,6 +72,15 @@ pub fn finish(outcome: Result<Done, Failure>, json: bool) -> ExitCode {
             ExitCode::from(failure.exit.code())
         }
     }
+}
+
+fn bounded(line: &str) -> String {
+    if line.chars().count() <= LINE_LIMIT {
+        return line.to_owned();
+    }
+    let mut cut: String = line.chars().take(LINE_LIMIT - 1).collect();
+    cut.push('…');
+    cut
 }
 
 fn one_line(text: &str) -> String {

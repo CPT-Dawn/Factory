@@ -15,6 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use factory_core::exit::Exit;
+use rustix::process::{Pid, Signal, kill_process_group};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -28,6 +29,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 const START_LOCK_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long the daemon may take to answer a request that doesn't wait on an event.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+/// The next step when the daemon fails to start for no reason it gave.
+const RUN_IT: &str = "run `factory daemon` to see why";
 
 /// Sends one request and returns its result, or the daemon's error as a [`Failure`].
 pub fn call<P: Serialize, R: DeserializeOwned>(
@@ -38,8 +41,9 @@ pub fn call<P: Serialize, R: DeserializeOwned>(
     let stream = connect(paths)?;
     let broken = |e: &dyn std::fmt::Display| {
         Failure::precondition(format!(
-            "lost the daemon at {}: {e}",
-            paths.socket().display()
+            "lost the daemon at {}: {e}; see {} and retry",
+            paths.socket().display(),
+            paths.daemon_log().display()
         ))
     };
     let request = Request {
@@ -105,7 +109,7 @@ fn connect(paths: &Paths) -> Result<UnixStream, Failure> {
         return Ok(stream);
     }
     start_daemon(paths).map_err(unreachable)?;
-    UnixStream::connect(paths.socket()).map_err(|e| unreachable(e.to_string()))
+    UnixStream::connect(paths.socket()).map_err(|e| unreachable(format!("{e}; retry")))
 }
 
 /// Takes the start lock, which a CLI holds while it starts the daemon. Dropping the file
@@ -117,24 +121,33 @@ fn take_start_lock(paths: &Paths) -> Result<File, String> {
         .truncate(false)
         .write(true)
         .open(&path)
-        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        .map_err(|e| format!("cannot open {}: {e}; check XDG_RUNTIME_DIR", path.display()))?;
     match within(START_LOCK_TIMEOUT, move || file.lock().map(|()| file)) {
         Some(Ok(file)) => Ok(file),
-        Some(Err(e)) => Err(format!("cannot lock {}: {e}", path.display())),
+        Some(Err(e)) => Err(format!(
+            "cannot lock {}: {e}; check XDG_RUNTIME_DIR",
+            path.display()
+        )),
         None => Err(format!(
-            "another factory held {} for over {}s",
+            "another factory held {} for over {}s; retry",
             path.display(),
             START_LOCK_TIMEOUT.as_secs()
         )),
     }
 }
 
-/// Starts `factory daemon` in its own process group and waits for its ready line.
+/// Starts `factory daemon` in its own process group and waits for its ready line, killing the
+/// whole group when it isn't ready in time.
 fn start_daemon(paths: &Paths) -> Result<(), String> {
     let log_path = paths.daemon_log();
-    let log = File::create(&log_path)
-        .map_err(|e| format!("cannot create {}: {e}", log_path.display()))?;
-    let exe = env::current_exe().map_err(|e| format!("cannot find the factory binary: {e}"))?;
+    let log = File::create(&log_path).map_err(|e| {
+        format!(
+            "cannot create {}: {e}; check XDG_RUNTIME_DIR",
+            log_path.display()
+        )
+    })?;
+    let exe = env::current_exe()
+        .map_err(|e| format!("cannot find the factory binary: {e}; reinstall factory"))?;
     let mut daemon = Command::new(exe)
         .arg("daemon")
         .stdin(Stdio::null())
@@ -142,9 +155,9 @@ fn start_daemon(paths: &Paths) -> Result<(), String> {
         .stderr(log)
         .process_group(0)
         .spawn()
-        .map_err(|e| format!("cannot run factory daemon: {e}"))?;
+        .map_err(|e| format!("cannot run factory daemon: {e}; reinstall factory"))?;
     let Some(stdout) = daemon.stdout.take() else {
-        return Err("factory daemon has no stdout".to_owned());
+        return Err(format!("factory daemon has no stdout; {RUN_IT}"));
     };
     let ready = within(START_TIMEOUT, move || {
         let mut line = String::new();
@@ -156,13 +169,16 @@ fn start_daemon(paths: &Paths) -> Result<(), String> {
             let _ = daemon.wait();
             let log = fs::read_to_string(&log_path).unwrap_or_default();
             let last = log.lines().rev().find(|line| !line.trim().is_empty());
-            let reason = last.map_or("it exited without a word", |line| {
-                line.strip_prefix("factory: ").unwrap_or(line)
-            });
-            Err(reason.to_owned())
+            Err(last.map_or_else(
+                || format!("it exited without a word; {RUN_IT}"),
+                |line| line.strip_prefix("factory: ").unwrap_or(line).to_owned(),
+            ))
         }
         None => {
-            let _ = daemon.kill();
+            // The daemon leads its own process group (process_group(0) above).
+            if let Some(group) = i32::try_from(daemon.id()).ok().and_then(Pid::from_raw) {
+                let _ = kill_process_group(group, Signal::KILL);
+            }
             let _ = daemon.wait();
             Err(format!(
                 "it was not ready within {}s; see {}",

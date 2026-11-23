@@ -9,15 +9,17 @@
 //! adds with [`Sandbox::env`], reach it. A daemon the binary starts is stopped when the sandbox
 //! drops.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use rustix::process::{Pid, Signal, kill_process_group};
 use tempfile::TempDir;
 
 /// External tools faked on every sandbox's PATH. Add a tool here when a command starts using it.
@@ -42,7 +44,7 @@ const CALL_END: char = '\u{1e}';
 
 pub struct Sandbox {
     dir: TempDir,
-    env: Vec<(String, String)>,
+    env: Vec<(String, OsString)>,
 }
 
 /// What a finished process showed: its exit code, stdout and stderr.
@@ -86,12 +88,13 @@ impl Sandbox {
 
     /// Adds a variable to the environment of every process the sandbox runs.
     pub fn env(mut self, key: &str, value: impl AsRef<OsStr>) -> Sandbox {
-        let value = value.as_ref().to_string_lossy().into_owned();
-        self.env.push((key.to_owned(), value));
+        self.env.push((key.to_owned(), value.as_ref().to_owned()));
         self
     }
 
-    /// The event ledger factory-stats reads, under the sandbox's default state dir.
+    /// The event ledger factory-stats reads, under the sandbox's default state dir. Tests read it
+    /// directly because it is a public output format, read by another tool, not daemon state; no
+    /// factory command reads it back.
     pub fn ledger(&self) -> PathBuf {
         self.path("state/factory/events.jsonl")
     }
@@ -156,8 +159,9 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
+        // The daemon leads its own process group; stop it and anything it started.
         if let Ok(pid) = fs::read_to_string(self.path("run/factory/daemon.pid")) {
-            let _ = Command::new("kill").arg(pid.trim()).status();
+            kill_group(pid.trim().parse().unwrap_or(0), Signal::TERM);
         }
     }
 }
@@ -177,15 +181,18 @@ pub fn run(cmd: Command) -> Run {
     finish(spawn(cmd))
 }
 
-/// Starts `cmd` with its stdout and stderr captured, for tests that run several at once.
+/// Starts `cmd` in its own process group with its stdout and stderr captured, for tests that
+/// run several at once.
 pub fn spawn(mut cmd: Command) -> Child {
-    cmd.stdout(Stdio::piped())
+    cmd.process_group(0)
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn the command")
 }
 
-/// Waits for a child [`spawn`] started, failing the test when it outlives [`DEADLINE`].
+/// Waits for a child [`spawn`] started, failing the test and killing its process group when it
+/// outlives [`DEADLINE`].
 pub fn finish(child: Child) -> Run {
     let pid = child.id();
     let (tx, rx) = mpsc::channel();
@@ -193,7 +200,7 @@ pub fn finish(child: Child) -> Run {
     let output: Output = match rx.recv_timeout(DEADLINE) {
         Ok(output) => output.expect("wait for the command"),
         Err(_) => {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            kill_group(pid, Signal::KILL);
             panic!("process {pid} outlived {DEADLINE:?}");
         }
     };
@@ -201,6 +208,12 @@ pub fn finish(child: Child) -> Run {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+fn kill_group(leader: u32, signal: Signal) {
+    if let Some(group) = i32::try_from(leader).ok().and_then(Pid::from_raw) {
+        let _ = kill_process_group(group, signal);
     }
 }
 

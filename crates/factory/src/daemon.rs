@@ -1,8 +1,9 @@
 //! `factory daemon`: the one long-running process, and the ledger's only writer.
 //!
 //! It takes the daemon lock (so one runs), binds the socket, writes its pid, prints one ready
-//! line, then answers requests until it is stopped.
+//! line once it can answer, then answers requests until it is stopped.
 
+use std::convert::Infallible;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::net::UnixListener as StdListener;
@@ -21,6 +22,9 @@ use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{ErrorBody, LOG, LogParams, LogResult, Outcome, Request, Response};
 
+/// What to do when the CLI and the daemon don't speak the same protocol.
+const MISMATCH: &str = "the daemon may be older than this factory: restart it";
+
 pub fn run(json: bool) -> Result<Done, Failure> {
     let paths = Paths::from_env()?;
     paths.create_runtime()?;
@@ -36,32 +40,40 @@ pub fn run(json: bool) -> Result<Done, Failure> {
     let pid = std::process::id();
     fs::write(paths.daemon_pid(), format!("{pid}\n")).map_err(|e| {
         Failure::precondition(format!(
-            "cannot write {}: {e}",
+            "cannot write {}: {e}; check XDG_RUNTIME_DIR",
             paths.daemon_pid().display()
         ))
     })?;
-    let socket = paths.socket();
-    output::print(
-        &Done {
-            line: format!("factory daemon ready on {}", socket.display()),
-            json: json!({"socket": socket, "pid": pid}),
-        },
-        json,
-    );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
         .build()
-        .map_err(|e| Failure::precondition(format!("cannot start the daemon's runtime: {e}")))?;
-    let stopped = runtime.block_on(serve(listener, Arc::new(ledger)));
-    Err(Failure::precondition(format!(
-        "the daemon stopped: {stopped}"
-    )))
+        .map_err(|e| {
+            Failure::precondition(format!("cannot start the daemon's runtime: {e}; retry"))
+        })?;
+    let socket = paths.socket();
+    runtime.block_on(async {
+        let listener = UnixListener::from_std(listener).map_err(|e| {
+            Failure::precondition(format!("cannot listen on {}: {e}; retry", socket.display()))
+        })?;
+        // Ready only once requests can be answered, so this is the one line the daemon prints.
+        output::print(
+            &Done {
+                line: format!("factory daemon ready on {}", socket.display()),
+                json: json!({"socket": socket.to_string_lossy(), "pid": pid}),
+            },
+            json,
+        );
+        match serve(listener, Arc::new(ledger)).await {}
+    })
 }
 
 fn take_daemon_lock(paths: &Paths) -> Result<File, Failure> {
     let path = paths.daemon_lock();
     let cannot = |e: &dyn std::fmt::Display| {
-        Failure::precondition(format!("cannot lock {}: {e}", path.display()))
+        Failure::precondition(format!(
+            "cannot lock {}: {e}; check XDG_RUNTIME_DIR",
+            path.display()
+        ))
     };
     let lock = File::options()
         .create(true)
@@ -82,8 +94,12 @@ fn take_daemon_lock(paths: &Paths) -> Result<File, Failure> {
 /// Binds the socket, replacing one a dead daemon left behind (the daemon lock says none runs).
 fn bind(paths: &Paths) -> Result<StdListener, Failure> {
     let socket = paths.socket();
-    let cannot =
-        |e: io::Error| Failure::precondition(format!("cannot listen on {}: {e}", socket.display()));
+    let cannot = |e: io::Error| {
+        Failure::precondition(format!(
+            "cannot listen on {}: {e}; check XDG_RUNTIME_DIR (a socket path must be under 108 bytes)",
+            socket.display()
+        ))
+    };
     match fs::remove_file(&socket) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -94,11 +110,7 @@ fn bind(paths: &Paths) -> Result<StdListener, Failure> {
     Ok(listener)
 }
 
-async fn serve(listener: StdListener, ledger: Arc<Ledger>) -> io::Error {
-    let listener = match UnixListener::from_std(listener) {
-        Ok(listener) => listener,
-        Err(e) => return e,
-    };
+async fn serve(listener: UnixListener, ledger: Arc<Ledger>) -> Infallible {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
@@ -133,7 +145,10 @@ async fn respond(line: &str, ledger: &Arc<Ledger>) -> Response {
         Err(e) => {
             return Response {
                 id: None,
-                outcome: Outcome::Error(refusal(Exit::Usage, format!("unreadable request: {e}"))),
+                outcome: Outcome::Error(refusal(
+                    Exit::Usage,
+                    format!("unreadable request: {e}; send one JSON request per line"),
+                )),
             };
         }
     };
@@ -143,10 +158,16 @@ async fn respond(line: &str, ledger: &Arc<Ledger>) -> Response {
             let params = request.params;
             match tokio::task::spawn_blocking(move || log(params, &ledger)).await {
                 Ok(outcome) => outcome,
-                Err(e) => Outcome::Error(refusal(Exit::Precondition, format!("log failed: {e}"))),
+                Err(e) => Outcome::Error(refusal(
+                    Exit::Precondition,
+                    format!("log failed in the daemon: {e}; retry"),
+                )),
             }
         }
-        other => Outcome::Error(refusal(Exit::Usage, format!("unknown method {other:?}"))),
+        other => Outcome::Error(refusal(
+            Exit::Usage,
+            format!("unknown method {other:?}; {MISMATCH}"),
+        )),
     };
     Response {
         id: Some(request.id),
@@ -157,7 +178,12 @@ async fn respond(line: &str, ledger: &Arc<Ledger>) -> Response {
 fn log(params: Value, ledger: &Ledger) -> Outcome {
     let params: LogParams = match serde_json::from_value(params) {
         Ok(params) => params,
-        Err(e) => return Outcome::Error(refusal(Exit::Usage, format!("bad log params: {e}"))),
+        Err(e) => {
+            return Outcome::Error(refusal(
+                Exit::Usage,
+                format!("bad log params: {e}; {MISMATCH}"),
+            ));
+        }
     };
     let event = match Event::new(&params.kind, params.fields) {
         Ok(event) => event,
@@ -166,14 +192,17 @@ fn log(params: Value, ledger: &Ledger) -> Outcome {
     match ledger.append(&event) {
         Ok(landed) => {
             let result = LogResult {
-                ledger: ledger.path.clone(),
+                ledger: ledger.path.to_string_lossy().into_owned(),
                 event: landed,
             };
             Outcome::Result(serde_json::to_value(result).unwrap_or(Value::Null))
         }
         Err(e) => Outcome::Error(refusal(
             Exit::Precondition,
-            format!("cannot append to {}: {e}", ledger.path.display()),
+            format!(
+                "cannot append to {}: {e}; check the disk and FACTORY_STATE, then retry",
+                ledger.path.display()
+            ),
         )),
     }
 }
@@ -186,7 +215,7 @@ fn refusal(exit: Exit, message: String) -> ErrorBody {
 }
 
 /// The append-only event ledger. Each event is stamped and written as one line under one lock,
-/// so lines never interleave and their timestamps never go backwards.
+/// so lines never interleave.
 struct Ledger {
     path: PathBuf,
     file: Mutex<File>,
@@ -198,7 +227,12 @@ impl Ledger {
             .create(true)
             .append(true)
             .open(&path)
-            .map_err(|e| Failure::precondition(format!("cannot open {}: {e}", path.display())))?;
+            .map_err(|e| {
+                Failure::precondition(format!(
+                    "cannot open {}: {e}; check FACTORY_STATE and XDG_STATE_HOME",
+                    path.display()
+                ))
+            })?;
         Ok(Ledger {
             path,
             file: Mutex::new(file),

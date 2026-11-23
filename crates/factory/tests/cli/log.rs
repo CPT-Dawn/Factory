@@ -180,3 +180,29 @@ fn a_refusal_with_json_is_one_object_on_stdout() {
         serde_json::json!({"exit": 2, "error": "expected key=value, got: label"})
     );
 }
+
+#[test]
+fn a_state_dir_that_is_not_utf8_still_gets_its_event() {
+    use std::os::unix::ffi::OsStrExt;
+    let sandbox = Sandbox::new();
+    let state = sandbox.path(std::ffi::OsStr::from_bytes(b"state-\xff"));
+    let sandbox = sandbox.env("FACTORY_STATE", &state);
+
+    let out = sandbox.factory(&["log", "review", "repo=X"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(lines_of(&state.join("events.jsonl")).len(), 1);
+}
+
+#[test]
+fn the_confirmation_stays_one_short_line_however_long_the_event() {
+    let sandbox = Sandbox::new();
+    let long = format!("ts={}", "x".repeat(300));
+
+    let out = sandbox.factory(&["log", "review", &long]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(out.stdout_lines().len(), 1, "{out:?}");
+    assert!(out.stdout_lines()[0].chars().count() <= 200, "{out:?}");
+    assert!(sandbox.ledger_lines()[0].contains(&"x".repeat(300)));
+}

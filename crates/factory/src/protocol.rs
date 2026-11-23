@@ -4,8 +4,6 @@
 //! line per request, `{"id", "result"}` or `{"id", "error": {"code", "message"}}`, where
 //! `code` is an exit code from [`factory_core::exit`].
 
-use std::path::PathBuf;
-
 use factory_core::event::Fields;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -51,7 +49,8 @@ pub struct LogParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LogResult {
-    pub ledger: PathBuf,
+    /// The ledger's path, lossily UTF-8 so any path can be answered.
+    pub ledger: String,
     /// The line as it landed.
     pub event: Fields,
 }

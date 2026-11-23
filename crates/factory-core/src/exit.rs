@@ -2,21 +2,22 @@
 //!
 //! The `devlab` name keeps devlab's own codes and text; `run` passes its child's code through.
 
-/// What a command's exit code says.
+/// What a command's exit code says; the discriminant is the code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Exit {
-    Ok,
-    Usage,
+    Ok = 0,
+    Usage = 2,
     /// A precondition or config is missing, or the daemon is unreachable.
-    Precondition,
-    NoLease,
-    NeedsAttention,
+    Precondition = 3,
+    NoLease = 4,
+    NeedsAttention = 10,
     /// Busy or out of quota; the line names the ETA.
-    Busy,
-    DeviceLost,
-    Emulator,
-    Stack,
-    Timeout,
+    Busy = 75,
+    DeviceLost = 76,
+    Emulator = 77,
+    Stack = 78,
+    Timeout = 124,
 }
 
 impl Exit {
@@ -34,18 +35,7 @@ impl Exit {
     ];
 
     pub const fn code(self) -> u8 {
-        match self {
-            Exit::Ok => 0,
-            Exit::Usage => 2,
-            Exit::Precondition => 3,
-            Exit::NoLease => 4,
-            Exit::NeedsAttention => 10,
-            Exit::Busy => 75,
-            Exit::DeviceLost => 76,
-            Exit::Emulator => 77,
-            Exit::Stack => 78,
-            Exit::Timeout => 124,
-        }
+        self as u8
     }
 
     /// A few words for `--help`.
