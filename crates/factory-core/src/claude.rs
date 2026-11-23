@@ -221,8 +221,9 @@ pub fn failure_limit(text: &str) -> Option<Reset> {
     (rate || named.is_some()).then(|| named.unwrap_or(Reset::Unknown))
 }
 
-/// Whether `text` has the HTTP status `code`: the number alone, after `http`, `status`,
-/// `code` or `error` (`API Error: 429`, `"status":429`, `status code 429`).
+/// Whether `text` has the HTTP status `code`: the number alone, after an HTTP marker
+/// (`API Error: 429`, `HTTP/1.1 429`, `"status":429`, `status code 429`), not a number that
+/// only follows other words (`request 429 failed`).
 fn is_status(text: &str, code: &str) -> bool {
     text.match_indices(code).any(|(at, _)| {
         let alone = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric());
@@ -231,15 +232,28 @@ fn is_status(text: &str, code: &str) -> bool {
             return false;
         }
         let before = text[..at].trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
-        ["http", "status", "code", "error"]
-            .iter()
-            .any(|word| before.ends_with(word))
+        [
+            "http",
+            "http/1.0",
+            "http/1.1",
+            "http/2",
+            "http/3",
+            "status",
+            "status code",
+            "status_code",
+            "statuscode",
+            "api error",
+        ]
+        .iter()
+        .any(|marker| before.ends_with(marker))
     })
 }
 
 /// The reset `lower` names after its last `resets `: a time of day or a weekday and time.
 fn named_reset(lower: &str) -> Option<Reset> {
-    let at = lower.rfind("resets ")?;
+    let (at, _) = lower
+        .rmatch_indices("resets ")
+        .find(|(at, _)| !lower[..*at].ends_with(|c: char| c.is_ascii_alphanumeric()))?;
     reset_clock(&lower[at + "resets ".len()..])
 }
 
