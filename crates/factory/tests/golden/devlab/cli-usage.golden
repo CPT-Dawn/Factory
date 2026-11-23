@@ -29,7 +29,7 @@ $ a@plain-a devlab
 1> Exit codes: 2 usage, 3 config, 4 no lease, 75 nothing free in time, 76 a leased device went away,
 1> 77 emulator failed to boot, 78 stack failed. Anything else from run/exec is the command's own.
 1>
-1> Also: devlab stack up|down|status, devlab prep [serial...], devlab watch (the systemd unit), devlab gc.
+1> Also: devlab stack up|down|status, devlab prep [serial...], devlab watch (the daemon is the watcher), devlab gc.
 1> Config: ~/.config/devlab/config.json (machine), devlab.json at a repo root (ports, stack, reverse,
 1> maxSlotsPerOwner, which wins over the machine's).
 ? 0
@@ -63,7 +63,7 @@ $ a@plain-a devlab help
 1> Exit codes: 2 usage, 3 config, 4 no lease, 75 nothing free in time, 76 a leased device went away,
 1> 77 emulator failed to boot, 78 stack failed. Anything else from run/exec is the command's own.
 1>
-1> Also: devlab stack up|down|status, devlab prep [serial...], devlab watch (the systemd unit), devlab gc.
+1> Also: devlab stack up|down|status, devlab prep [serial...], devlab watch (the daemon is the watcher), devlab gc.
 1> Config: ~/.config/devlab/config.json (machine), devlab.json at a repo root (ports, stack, reverse,
 1> maxSlotsPerOwner, which wins over the machine's).
 ? 0
@@ -81,6 +81,13 @@ $ a@plain-a devlab acquire --devices two
 ? 2
 $ a@plain-a devlab acquire --no-device
 2> devlab: no devlab.json in <sandbox>/wt/plain-a: nothing to lease without a device
+? 2
+# --wait -1 is the configured default wait; any other negative is refused.
+$ a@plain-a devlab acquire --no-device --wait -1
+2> devlab: no devlab.json in <sandbox>/wt/plain-a: nothing to lease without a device
+? 2
+$ a@plain-a devlab acquire --no-device --wait -2
+2> devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)
 ? 2
 $ a@plain-a devlab exec
 2> devlab: devlab exec -- <cmd...>
