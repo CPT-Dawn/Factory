@@ -15,8 +15,8 @@ use super::cli::note;
 use super::context::Ctx;
 use super::stack;
 use super::wire::{
-    ACQUIRE, AcquireParams, DeviceAsk, GC, Granted, LEASE, Lease, ProjectAsk, RELEASE, SLOT,
-    SlotParams, StackAsk,
+    ACQUIRE, AcquireParams, DeviceAsk, GC, Granted, LEASE, Lease, ProjectAsk, RELEASE, RunAsk,
+    SLOT, SlotParams, StackAsk,
 };
 use crate::client;
 use crate::output::Failure;
@@ -28,7 +28,7 @@ const ANSWER_GRACE: Duration = Duration::from_secs(60);
 /// AVDs, starting their units and booting them, then stopping them when that fails.
 const BOOT_GRACE: Duration = Duration::from_secs(BOOT_TIMEOUT_SEC + 300);
 
-fn paths() -> Result<Paths, Failure> {
+pub fn paths() -> Result<Paths, Failure> {
     Paths::from_env()
 }
 
@@ -44,6 +44,18 @@ pub fn base_name(path: &str) -> &str {
 /// started, and the project's ports reversed onto each device. A stack that fails to start, or
 /// an emulator that fails to boot (exit 77), keeps the lease.
 pub fn acquire(ctx: &Ctx, opts: &Opts) -> Result<Lease, Failure> {
+    let (params, listen) = ask(ctx, opts, None)?;
+    let granted: Granted = client::call_streaming(&paths()?, ACQUIRE, &params, listen, note)?;
+    take(ctx, opts, granted)
+}
+
+/// The acquire to send for `opts` (for `run`, if any) and how long to listen for its answer;
+/// none listens as long as it takes.
+pub fn ask(
+    ctx: &Ctx,
+    opts: &Opts,
+    run: Option<RunAsk>,
+) -> Result<(AcquireParams, Option<Duration>), Failure> {
     if opts.want == 0 && ctx.project.is_none() {
         return Err(Failure::usage(format!(
             "no devlab.json in {}: nothing to lease without a device",
@@ -62,6 +74,7 @@ pub fn acquire(ctx: &Ctx, opts: &Opts) -> Result<Lease, Failure> {
         project,
         wait_sec,
         devices: (opts.want > 0).then(|| device_ask(&ctx.cfg, opts)),
+        run,
     };
     let listen = Duration::try_from_secs_f64(wait_sec)
         .ok()
@@ -73,7 +86,12 @@ pub fn acquire(ctx: &Ctx, opts: &Opts) -> Result<Lease, Failure> {
                 Some(wait)
             }
         });
-    let granted: Granted = client::call_streaming(&paths()?, ACQUIRE, &params, listen, note)?;
+    Ok((params, listen))
+}
+
+/// Takes a granted lease: prepares the slot's workdir, with `--stack` starts its stack, and
+/// reverses the project's ports onto each device.
+pub fn take(ctx: &Ctx, opts: &Opts, granted: Granted) -> Result<Lease, Failure> {
     let lease = granted.lease;
     if let (Some(p), Some(slot)) = (&ctx.project, lease.slot) {
         stack::prepare_workdir(p, &ctx.worktree, slot)?;

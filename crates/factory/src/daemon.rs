@@ -1,9 +1,13 @@
 //! `factory daemon`: the one long-running process, and the ledger's only writer.
 //!
-//! It takes the daemon lock (so one runs), binds the socket, writes its pid, prints one ready
+//! It takes the daemon lock (so one runs), listens on the socket systemd passes it (socket
+//! activation, `LISTEN_FDS`) or else binds the socket itself, writes its pid, prints one ready
 //! line once it can answer, then answers requests until it is stopped.
+//!
+//! On SIGTERM (systemd stopping or restarting it) or SIGINT it stops accepting, answers every
+//! request it has taken, cuts short the waits it holds, and exits 0. Calls that arrive meanwhile
+//! wait in systemd's socket for the next daemon, so a restart loses no ledger line.
 
-use std::convert::Infallible;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::net::UnixListener as StdListener;
@@ -11,14 +15,22 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use factory_adapters::herdr::Herdr;
+use factory_adapters::gh::Gh;
+use factory_core::duration;
 use factory_core::event::{Event, Fields};
 use factory_core::exit::Exit;
+use factory_core::wait::{Wait, WaitOn};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
+
+use factory_adapters::herdr::Herdr;
+use listenfd::ListenFd;
 
 use crate::clock;
 use crate::lab::service::{self, Lab};
@@ -26,23 +38,36 @@ use crate::lab::wire::ACQUIRE;
 use crate::leads::Leads;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
+use crate::pollers::Pollers;
 use crate::protocol::{
     ErrorBody, LEAD_LIST, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH, Outcome,
-    REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, WAIT_LEAD, WaitLeadParams,
+    REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, WAIT_CI, WAIT_LEAD, WaitCiParams,
+    WaitCiResult, WaitLeadParams,
 };
 use crate::router::Router;
 use crate::store::Store;
 
 /// What every connection answers from: the ledger, the picture of the leads, the reviewer
-/// router and the lab's lease store.
+/// router, the lab's lease store and the CI pollers.
 struct Daemon {
     ledger: Arc<Ledger>,
     leads: Arc<Leads>,
     router: Arc<Router>,
     lab: Arc<Lab>,
+    pollers: Pollers,
 }
 
-pub fn run(json: bool) -> Result<Done, Failure> {
+/// How long a stopping daemon gives the connections it holds to finish their requests.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs the daemon until it is stopped; the ready line is all it prints.
+pub fn run(json: bool) -> Result<(), Failure> {
+    // First, while the daemon is one thread: taking the socket clears LISTEN_FDS.
+    let activated = ListenFd::from_env().take_unix_listener(0).map_err(|e| {
+        Failure::precondition(format!(
+            "the socket systemd passed is not a unix socket: {e}; check factory.socket"
+        ))
+    })?;
     let paths = Paths::from_env()?;
     paths.create_runtime()?;
     fs::create_dir_all(&paths.state).map_err(|e| {
@@ -53,13 +78,23 @@ pub fn run(json: bool) -> Result<Done, Failure> {
     })?;
     let ledger = Arc::new(Ledger::open(paths.ledger())?);
     let leads = Leads::new(paths.clone(), Herdr::new(paths.herdr.clone()));
+    let pollers = Pollers::new(paths.clone(), Gh);
     let _lock = take_daemon_lock(&paths)?;
-    let router = Router::open(Store::open(&paths.database())?)?;
+    let router = Arc::new(Router::open(Store::open(&paths.database())?)?);
     // Opened under the lock: it forgets the waiters a dead daemon left.
     let lab = Lab::open(&paths.lab_db()).map_err(|e| {
         Failure::precondition(format!("{e}; check FACTORY_STATE and XDG_STATE_HOME"))
     })?;
-    let listener = bind(&paths)?;
+    let listener = match activated {
+        Some(listener) => listener,
+        None => bind(&paths)?,
+    };
+    listener.set_nonblocking(true).map_err(|e| {
+        Failure::precondition(format!(
+            "cannot listen on {}: {e}; retry",
+            paths.socket().display()
+        ))
+    })?;
     let pid = std::process::id();
     fs::write(paths.daemon_pid(), format!("{pid}\n")).map_err(|e| {
         Failure::precondition(format!(
@@ -78,6 +113,8 @@ pub fn run(json: bool) -> Result<Done, Failure> {
         let listener = UnixListener::from_std(listener).map_err(|e| {
             Failure::precondition(format!("cannot listen on {}: {e}; retry", socket.display()))
         })?;
+        // Before the ready line, so a stop that follows it drains, and a failure is the one line.
+        let stop = stop_on_signal()?;
         // Ready only once requests can be answered, so this is the one line the daemon prints.
         output::print(
             &Done::new(
@@ -87,20 +124,57 @@ pub fn run(json: bool) -> Result<Done, Failure> {
             json,
         );
         tokio::spawn(Arc::clone(&leads).start());
-        let router = Arc::new(router);
         let lab = Arc::new(lab);
         lab.recover();
-        match serve(
-            listener,
-            Arc::new(Daemon {
-                ledger,
-                leads,
-                router,
-                lab,
-            }),
-        )
-        .await {}
-    })
+        let daemon = Daemon {
+            ledger,
+            leads,
+            router,
+            lab,
+            pollers,
+        };
+        serve(listener, Arc::new(daemon), stop).await;
+        Ok(())
+    })?;
+    // Nothing is left to answer; the herdr watcher and any stray task may go.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    Ok(())
+}
+
+/// A switch that flips once SIGTERM or SIGINT arrives.
+fn stop_on_signal() -> Result<Stop, Failure> {
+    let cannot =
+        |e: io::Error| Failure::precondition(format!("cannot watch for SIGTERM: {e}; retry"));
+    let mut term = signal(SignalKind::terminate()).map_err(cannot)?;
+    let mut int = signal(SignalKind::interrupt()).map_err(cannot)?;
+    let (flip, stop) = watch::channel(false);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        let _ = flip.send(true);
+        // Keep the sender, so the switch never reads as dropped.
+        std::future::pending::<()>().await;
+    });
+    Ok(Stop(stop))
+}
+
+/// Whether the daemon is stopping.
+#[derive(Clone)]
+struct Stop(watch::Receiver<bool>);
+
+impl Stop {
+    fn is_stopping(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Resolves once the daemon is stopping.
+    async fn stopping(mut self) {
+        if self.0.wait_for(|&stopping| stopping).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 fn take_daemon_lock(paths: &Paths) -> Result<File, Failure> {
@@ -141,55 +215,105 @@ fn bind(paths: &Paths) -> Result<StdListener, Failure> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(cannot(e)),
     }
-    let listener = StdListener::bind(&socket).map_err(cannot)?;
-    listener.set_nonblocking(true).map_err(cannot)?;
-    Ok(listener)
+    StdListener::bind(&socket).map_err(cannot)
 }
 
-async fn serve(listener: UnixListener, daemon: Arc<Daemon>) -> Infallible {
+/// Answers connections until the daemon is stopping, then lets the ones it took finish, for
+/// up to [`DRAIN_TIMEOUT`]. Connections it never took stay queued in the socket.
+async fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Stop) {
+    // The connections hear of the stop only once the listener is gone, so a call made after
+    // a cut-short answer queues for the next daemon instead of in this one's closing backlog.
+    let (hang_up, hung_up) = watch::channel(false);
+    let hung_up = Stop(hung_up);
+    let mut connections = JoinSet::new();
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                tokio::spawn(answer(stream, Arc::clone(&daemon)));
-            }
-            Err(e) => {
-                let _ = writeln!(io::stderr(), "factory: accept failed: {e}");
-            }
+        tokio::select! {
+            biased;
+            () = stop.clone().stopping() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    connections.spawn(answer(stream, Arc::clone(&daemon), hung_up.clone()));
+                }
+                Err(e) => {
+                    let _ = writeln!(io::stderr(), "factory: accept failed: {e}");
+                }
+            },
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
+    }
+    drop(listener);
+    let _ = hang_up.send(true);
+    let drained = async { while connections.join_next().await.is_some() {} };
+    if tokio::time::timeout(DRAIN_TIMEOUT, drained).await.is_err() {
+        let _ = writeln!(
+            io::stderr(),
+            "factory: stopped with {} connections unanswered after {}s",
+            connections.len(),
+            DRAIN_TIMEOUT.as_secs()
+        );
     }
 }
 
 /// Answers each request line on one connection until the client hangs up, then frees the
 /// review slot the connection holds. A client sends one request at a time; one that hangs up,
 /// or sends more, before its answer abandons the request, so a wait whose CLI is gone stops
-/// waiting. A `lab.acquire` holds the connection while it waits, writing notes before its answer.
-async fn answer(stream: UnixStream, daemon: Arc<Daemon>) {
+/// waiting. A `lab.acquire` holds the connection while it waits, writing notes before its
+/// answer. A stopping daemon still answers the first request of a connection it took, then
+/// hangs up.
+async fn answer(stream: UnixStream, daemon: Arc<Daemon>, stop: Stop) {
     let mut held = None;
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if let Ok(request) = serde_json::from_str::<Request>(&line)
-            && request.method == ACQUIRE
-        {
-            service::acquire(Arc::clone(&daemon.lab), request, &mut writer, &mut lines).await;
-            continue;
-        }
-        let response = tokio::select! {
-            response = respond(&line, &daemon, &mut held) => response,
-            _ = lines.next_line() => break,
-        };
-        let Ok(mut out) = serde_json::to_string(&response) else {
-            break;
-        };
-        out.push('\n');
-        if writer.write_all(out.as_bytes()).await.is_err() {
-            break;
-        }
-    }
+    converse(stream, &daemon, &stop, &mut held).await;
     daemon.router.release(&mut held);
 }
 
-async fn respond(line: &str, daemon: &Daemon, held: &mut Option<String>) -> Response {
+/// The requests and answers of one connection; `held` names the review slot it holds.
+async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut Option<String>) {
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    let mut first = true;
+    loop {
+        let next = if first {
+            lines.next_line().await
+        } else {
+            tokio::select! {
+                next = lines.next_line() => next,
+                () = stop.clone().stopping() => return,
+            }
+        };
+        let Ok(Some(line)) = next else {
+            return;
+        };
+        first = false;
+        if let Ok(request) = serde_json::from_str::<Request>(&line)
+            && request.method == ACQUIRE
+        {
+            // Not cut short by a stop: a lease granted as it was dropped would go unanswered.
+            service::acquire(
+                Arc::clone(&daemon.lab),
+                Arc::clone(&daemon.ledger),
+                request,
+                &mut writer,
+                &mut lines,
+                stop.clone().stopping(),
+            )
+            .await;
+            continue;
+        }
+        let response = tokio::select! {
+            response = respond(&line, daemon, stop, held) => response,
+            _ = lines.next_line() => return,
+        };
+        let Ok(mut out) = serde_json::to_string(&response) else {
+            return;
+        };
+        out.push('\n');
+        if writer.write_all(out.as_bytes()).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<String>) -> Response {
     let request: Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(e) => {
@@ -209,16 +333,28 @@ async fn respond(line: &str, daemon: &Daemon, held: &mut Option<String>) -> Resp
             Err(refused) => refused,
         },
         WAIT_LEAD => match params::<WaitLeadParams>(WAIT_LEAD, request.params) {
-            Ok(params) => answered(
-                daemon
-                    .leads
-                    .wait(
-                        &params.lead,
-                        params.waiter,
-                        Duration::from_secs(params.timeout_secs),
-                    )
-                    .await,
-            ),
+            Ok(params) => {
+                let wait = daemon.leads.wait(
+                    &params.lead,
+                    params.waiter,
+                    Duration::from_secs(params.timeout_secs),
+                );
+                // Biased: a stopping daemon answers no wait, even one that ends as it stops.
+                tokio::select! {
+                    biased;
+                    () = stop.clone().stopping() => stopped("wait"),
+                    waited = wait => answered(waited),
+                }
+            }
+            Err(refused) => refused,
+        },
+        WAIT_CI => match params::<WaitCiParams>(WAIT_CI, request.params) {
+            // Biased, as a lead wait: a stopping daemon answers no wait.
+            Ok(params) => tokio::select! {
+                biased;
+                () = stop.clone().stopping() => stopped("wait"),
+                waited = wait_ci(daemon, params) => answered(waited),
+            },
             Err(refused) => refused,
         },
         LOG => {
@@ -232,7 +368,23 @@ async fn respond(line: &str, daemon: &Daemon, held: &mut Option<String>) -> Resp
                 )),
             }
         }
-        REVIEW_ACQUIRE => daemon.router.acquire(request.params, held).await,
+        REVIEW_ACQUIRE => {
+            let granted = tokio::select! {
+                biased;
+                () = stop.clone().stopping() => None,
+                granted = daemon.router.acquire(request.params, held) => Some(granted),
+            };
+            match granted {
+                // Checked again after the grant: a connection the stop hung up may have freed
+                // the slot while this acquire ran on another thread.
+                Some(granted) if !stop.is_stopping() => granted,
+                // A stopping daemon grants no slot; one it just granted goes back.
+                _ => {
+                    daemon.router.release(held);
+                    stopped("review")
+                }
+            }
+        }
         REVIEW_QUOTA => {
             let router = Arc::clone(&daemon.router);
             let params = request.params;
@@ -256,6 +408,35 @@ async fn respond(line: &str, daemon: &Daemon, held: &mut Option<String>) -> Resp
         id: Some(request.id),
         outcome,
     }
+}
+
+/// Joins the pull request's poller, then shows the waiter's lead as waiting on it until the
+/// checks finish.
+async fn wait_ci(daemon: &Daemon, params: WaitCiParams) -> Result<WaitCiResult, Failure> {
+    let limit = Duration::from_secs(params.timeout_secs);
+    // The timeout counts from the request, finding the pull request included.
+    let deadline = tokio::time::Instant::now() + limit;
+    let poll = Duration::from_secs(params.poll_secs.max(1));
+    let found = daemon
+        .pollers
+        .watch(&params.pr, PathBuf::from(params.cwd), poll);
+    let watch = tokio::time::timeout_at(deadline, found)
+        .await
+        .map_err(|_| {
+            Failure::new(
+                Exit::Timeout,
+                format!(
+                    "gh found no pull request {} within {}; wait again",
+                    params.pr,
+                    duration::show(limit)
+                ),
+            )
+        })??;
+    let _wait = daemon.leads.register(Wait {
+        waiter: params.waiter,
+        on: WaitOn::Ci(watch.pr().to_string()),
+    });
+    watch.finished(deadline, limit).await
 }
 
 fn log(params: Value, ledger: &Ledger) -> Outcome {
@@ -285,6 +466,14 @@ fn log(params: Value, ledger: &Ledger) -> Outcome {
     }
 }
 
+/// The answer to a request the daemon stopped under: `factory <command>` again.
+fn stopped(command: &str) -> Outcome {
+    Outcome::Error(refusal(
+        Exit::Precondition,
+        format!("the daemon stopped (a restart or an upgrade); run the {command} again"),
+    ))
+}
+
 /// The params of a `method` request, or the refusal of params that don't fit it.
 fn params<P: DeserializeOwned>(method: &str, params: Value) -> Result<P, Outcome> {
     serde_json::from_value(params).map_err(|e| {
@@ -311,7 +500,7 @@ fn refusal(exit: Exit, message: String) -> ErrorBody {
 
 /// The append-only event ledger. Each event is stamped and written as one line under one lock,
 /// so lines never interleave.
-struct Ledger {
+pub(crate) struct Ledger {
     path: PathBuf,
     file: Mutex<File>,
 }
@@ -334,7 +523,7 @@ impl Ledger {
         })
     }
 
-    fn append(&self, event: &Event) -> io::Result<Fields> {
+    pub(crate) fn append(&self, event: &Event) -> io::Result<Fields> {
         let mut file = self
             .file
             .lock()

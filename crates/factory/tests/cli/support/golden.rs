@@ -9,14 +9,16 @@
 //!   (see [`World::worktree`]) on behalf of owner `<owner>`: a live process named `claude` that
 //!   the call names in `DEVLAB_OWNER_PID`. `devlab` on its PATH is the binary under test.
 //! - `& <tag> <owner>@<worktree> <shell>` starts such a call in the background;
-//!   `until <tag> <text>` waits until its output shows `<text>`; `wait <tag>` waits for it to end.
+//!   `until <tag> <text>` waits until its output shows `<text>`; `wait <tag>` waits for it to end;
+//!   `signal <tag> <TERM|INT|HUP|KILL>` sends its process (the shell, or what it `exec`s) a signal.
 //! - `kill <owner>` ends the owner's process.
 //! - Anything else is a world step ([`World::apply`]): `plug`, `unplug`, `lock`, `break`, `mend`.
 //!
 //! After a `$` or `wait` step come the lines it showed: `1> ` for each stdout line, `2> ` for
 //! each stderr line, `1~ ` or `2~ ` for a last line with no newline, and `? <exit code>`.
-//! The sandbox's path shows as `<sandbox>`, owner `a`'s pid as `claude:<a>`, and free memory,
-//! which no fake controls, as `<mem>`.
+//! The sandbox's path shows as `<sandbox>`, owner `a`'s pid as `claude:<a>`, free memory,
+//! which no fake controls, as `<mem>`, and the seconds a run lasted before a signal ended it
+//! (`killed by SIGKILL after <n> s`) as `<n>`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -24,7 +26,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use rustix::process::Signal;
+use rustix::process::{Pid, Signal, kill_process};
 
 pub use super::world::fixtures;
 use super::world::{World, poll_until};
@@ -367,6 +369,27 @@ impl Stage {
                 code,
             }));
         }
+        if let Some(rest) = step.strip_prefix("signal ") {
+            let (tag, name) = rest
+                .split_once(' ')
+                .ok_or("signal needs a tag and a signal")?;
+            let signal = match name {
+                "TERM" => Signal::TERM,
+                "INT" => Signal::INT,
+                "HUP" => Signal::HUP,
+                "KILL" => Signal::KILL,
+                other => return Err(format!("signal knows TERM, INT, HUP and KILL, not {other}")),
+            };
+            let pid = self
+                .background
+                .get(tag)
+                .and_then(|call| call.child.as_ref())
+                .and_then(|child| i32::try_from(child.id()).ok())
+                .and_then(Pid::from_raw)
+                .ok_or(format!("no background call {tag} is running"))?;
+            kill_process(pid, signal).map_err(|e| format!("signal {tag}: {e}"))?;
+            return Ok(None);
+        }
         if let Some(name) = step.strip_prefix("kill ") {
             let owner = self.owner(name)?;
             if let Some(mut child) = owner.child.take() {
@@ -440,7 +463,8 @@ impl Stage {
                 );
             }
             text = hide_memory(&text, "memory ", " GB free");
-            hide_memory(&text, "\"memAvailableMB\": ", "")
+            text = hide_memory(&text, "\"memAvailableMB\": ", "");
+            hide_signal_seconds(&text)
         };
         Shown {
             stdout: clean(shown.stdout),
@@ -498,6 +522,33 @@ fn replace_number(text: &str, from: &str, to: &str) -> String {
             out.push_str(to);
         }
         rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Shows the seconds in `by SIG<NAME> after <n> s` as `<n>`: how long a run took before a
+/// signal ended it depends on how busy the machine is.
+fn hide_signal_seconds(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(" after ") {
+        let head = &rest[..at];
+        let tail = &rest[at + " after ".len()..];
+        let by_signal = head
+            .rsplit_once(" by ")
+            .is_some_and(|(_, name)| name.starts_with("SIG") && !name.contains(' '));
+        let len = tail
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(tail.len());
+        out.push_str(head);
+        out.push_str(" after ");
+        if by_signal && len > 0 && tail[len..].starts_with(" s") {
+            out.push_str("<n>");
+            rest = &tail[len..];
+        } else {
+            rest = tail;
+        }
     }
     out.push_str(rest);
     out

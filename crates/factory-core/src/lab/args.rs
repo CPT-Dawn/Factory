@@ -50,7 +50,7 @@ pub fn parse_opts(args: &[String]) -> Result<(Opts, &[String], Vec<String>), Str
             "--wait" => {
                 i += 1;
                 let sec = number_arg(args.get(i));
-                if sec.is_nan() || sec < 0.0 {
+                if !sec.is_finite() || sec < 0.0 {
                     return Err("--wait takes a number of seconds (0 = do not wait)".to_owned());
                 }
                 opts.wait_sec = Some(sec);
@@ -137,7 +137,7 @@ mod tests {
             opts(&["--devices"]).unwrap_err(),
             "--devices takes a whole number"
         );
-        for bad in ["soon", "-1", "nan"] {
+        for bad in ["soon", "-1", "nan", "Infinity", "1e999"] {
             assert!(
                 opts(&["--wait", bad])
                     .unwrap_err()
