@@ -188,14 +188,19 @@ pub struct Invocation<'a> {
 /// `sudo` and `env`.
 pub fn invocation(words: &[String]) -> Option<Invocation<'_>> {
     let mut assignments = Vec::new();
-    let mut after_wrapper = false;
+    // The wrapper whose options come next, and how many words the last option still takes.
+    let mut wrapper = None;
+    let mut skip = 0;
     for (at, word) in words.iter().enumerate() {
-        if is_assignment(word) {
+        if skip > 0 {
+            skip -= 1;
+        } else if is_assignment(word) {
             assignments.push(word.as_str());
-        } else if WRAPPERS.contains(&word.as_str()) {
-            after_wrapper = true;
-        } else if after_wrapper && word.starts_with('-') {
-            // An option of the wrapper, such as `sudo -E`.
+        } else if let Some(name) = WRAPPERS.iter().find(|name| **name == word) {
+            wrapper = Some(*name);
+        } else if let (Some(name), true) = (wrapper, word.starts_with('-')) {
+            // An option of the wrapper, such as `sudo -E`, with its value when it takes one.
+            skip = usize::from(OPTIONS_WITH_VALUE.contains(&(name, word.as_str())));
         } else {
             return Some(Invocation {
                 program: word.rsplit('/').next().unwrap_or(word),
@@ -206,6 +211,25 @@ pub fn invocation(words: &[String]) -> Option<Invocation<'_>> {
     }
     None
 }
+
+/// Wrapper options that take the next word as their value.
+const OPTIONS_WITH_VALUE: &[(&str, &str)] = &[
+    ("sudo", "-u"),
+    ("sudo", "-g"),
+    ("sudo", "-h"),
+    ("sudo", "-p"),
+    ("sudo", "-C"),
+    ("sudo", "-D"),
+    ("sudo", "-R"),
+    ("sudo", "-T"),
+    ("sudo", "-U"),
+    ("doas", "-u"),
+    ("doas", "-C"),
+    ("env", "-u"),
+    ("env", "-C"),
+    ("env", "-S"),
+    ("nice", "-n"),
+];
 
 fn is_assignment(word: &str) -> bool {
     let Some((name, _)) = word.split_once('=') else {

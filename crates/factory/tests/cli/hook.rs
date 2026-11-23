@@ -384,6 +384,161 @@ fn pre_tool_refuses_a_commit_it_cannot_check_because_the_config_is_broken() {
     assert_eq!((out.code, out.stdout.as_str()), (0, ""), "{out:?}");
 }
 
+fn reason_of(out: &Run) -> String {
+    let said = answer(out);
+    assert_eq!(
+        said["hookSpecificOutput"]["permissionDecision"], "deny",
+        "{out:?}"
+    );
+    said["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn allowed(out: &Run) {
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "", ""),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn commit_a_takes_tracked_changes_along_but_not_untracked_files() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = sandbox.repo();
+    std::fs::write(repo.join("untracked.txt"), format!("{OWNER}\n")).unwrap();
+
+    let out = pre_tool(&sandbox, &bash_in(&repo, "git commit -am 'fix: a'"));
+
+    allowed(&out);
+}
+
+#[test]
+fn a_targeted_add_checks_its_paths_and_what_is_already_staged() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = sandbox.repo();
+    std::fs::write(repo.join("unrelated.txt"), format!("{OWNER}\n")).unwrap();
+    std::fs::write(repo.join("clean.txt"), "fine\n").unwrap();
+    // An unrelated untracked file with the address is not part of `git add clean.txt`.
+    allowed(&pre_tool(
+        &sandbox,
+        &bash_in(&repo, "git add clean.txt && git commit -m x"),
+    ));
+    // The path it names is.
+    let reason = reason_of(&pre_tool(
+        &sandbox,
+        &bash_in(&repo, "git add unrelated.txt && git commit -m x"),
+    ));
+    assert!(reason.contains("unrelated.txt"), "{reason}");
+
+    // The index keeps the address even when the working tree no longer has it.
+    sandbox.git(&repo, &["add", "unrelated.txt"]);
+    std::fs::write(repo.join("unrelated.txt"), "scrubbed after staging\n").unwrap();
+    let reason = reason_of(&pre_tool(
+        &sandbox,
+        &bash_in(&repo, "git add clean.txt && git commit -m x"),
+    ));
+    assert!(reason.contains("unrelated.txt"), "{reason}");
+}
+
+#[test]
+fn pre_tool_follows_cd_to_the_repo_the_command_commits_in() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = repo_staging_the_address(&sandbox);
+    let elsewhere = sandbox.path("home");
+
+    let out = pre_tool(
+        &sandbox,
+        &bash_in(
+            &elsewhere,
+            &format!("cd {} && git commit -m x", repo.display()),
+        ),
+    );
+    denied_for_the_address(&out);
+    // `~` is the home directory the hook runs with.
+    let out = pre_tool(
+        &sandbox,
+        &bash_in(&elsewhere, "cd ~/../repo && git commit -m x"),
+    );
+    denied_for_the_address(&out);
+}
+
+#[test]
+fn pre_tool_checks_every_repo_a_command_commits_in() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let leaking = repo_staging_the_address(&sandbox);
+    let clean = sandbox.path("clean");
+    std::fs::create_dir(&clean).unwrap();
+    sandbox.git(&clean, &["init", "-q", "-b", "main"]);
+    let (leaking, clean) = (leaking.display(), clean.display());
+
+    for command in [
+        format!("cd {clean} && git commit -m a && cd {leaking} && git commit -m b"),
+        format!("cd {leaking} && git commit -m a && cd {clean} && git commit -m b"),
+        format!("git -C {clean} commit -m a && git -C {leaking} commit -m b"),
+    ] {
+        let reason = reason_of(&pre_tool(
+            &sandbox,
+            &bash_in(&sandbox.path("home"), &command),
+        ));
+        assert!(reason.contains("notes.txt"), "{command}: {reason}");
+    }
+    let both_clean = format!("cd {clean} && git commit -m a; git -C {clean} push");
+    allowed(&pre_tool(
+        &sandbox,
+        &bash_in(&sandbox.path("home"), &both_clean),
+    ));
+}
+
+#[test]
+fn a_commit_whose_diff_cannot_be_read_is_denied_with_what_to_do() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    // The working directory is no repository.
+    let out = pre_tool(&sandbox, &bash_in(&sandbox.path("home"), "git commit -m x"));
+
+    let reason = reason_of(&out);
+    assert!(
+        reason.contains("could not read") && reason.contains("git -C"),
+        "{reason}"
+    );
+    assert!(!reason.contains('\n'), "{reason}");
+}
+
+#[test]
+fn a_broken_config_never_echoes_what_was_in_it() {
+    let sandbox = Sandbox::new();
+    // A string where a list belongs: toml's own message would quote it.
+    config(
+        &sandbox,
+        &format!("[hook]\nprivate_addresses = \"{OWNER}\"\n"),
+    );
+    let repo = sandbox.repo();
+
+    let reason = reason_of(&pre_tool(&sandbox, &bash_in(&repo, "git commit -m x")));
+
+    assert!(!reason.contains(OWNER), "{reason}");
+    assert!(reason.contains("config.toml line 2"), "{reason}");
+}
+
+#[test]
+fn review_does_not_read_the_hooks_settings() {
+    let sandbox = Sandbox::new();
+    config(&sandbox, "[hook]\nprivate_addresses = 3\n");
+    let repo = sandbox.repo();
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t-1"]);
+
+    // It may fail for other reasons (no reviewer is scripted); not for the hook table.
+    assert!(!out.stderr.contains("config.toml"), "{out:?}");
+}
+
 /// Spec #1: "a hook call completes in under 5 ms on this machine". The fastest of a few runs is
 /// the call's own cost, free of the scheduler's noise.
 #[test]

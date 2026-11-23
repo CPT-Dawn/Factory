@@ -38,9 +38,9 @@ fn answer(command: &HookCommand) -> Result<Option<Value>, Failure> {
         HookCommand::PreTool => match hook::pre_tool(&input, escape_set()) {
             PreTool::Allow => None,
             PreTool::Block(reason) => Some(deny(&reason)),
-            PreTool::CheckStaged(action) => {
+            PreTool::CheckStaged(actions) => {
                 // A config that can't be read refuses the call: a leak must not slip by on a typo.
-                match leak(&input, &action) {
+                match leak(&input, &actions) {
                     Ok(None) => None,
                     Ok(Some(reason)) => Some(deny(&reason)),
                     Err(failure) => Some(deny(&failure.message)),
@@ -66,8 +66,10 @@ fn deny(reason: &str) -> Value {
     }})
 }
 
-/// The refusal for a commit or push whose diff adds a private address from the config.
-fn leak(input: &Value, action: &GitAction) -> Result<Option<String>, Failure> {
+/// The refusal for a commit or push, in any of its repositories, whose diff adds a private
+/// address from the config. A diff that cannot be read is refused too: the hook cannot say it is
+/// clean, and the line says how to look.
+fn leak(input: &Value, actions: &[GitAction]) -> Result<Option<String>, Failure> {
     let addresses = config::hook_settings(&paths::config_dir())?.private_addresses;
     if addresses.is_empty() {
         return Ok(None);
@@ -76,12 +78,36 @@ fn leak(input: &Value, action: &GitAction) -> Result<Option<String>, Failure> {
         Some(cwd) => PathBuf::from(cwd),
         None => env::current_dir().unwrap_or_default(),
     };
-    let dir = action.dir.as_ref().map_or(cwd.clone(), |dir| cwd.join(dir));
-    // Where git can't say what would be committed, git itself will refuse the commit.
-    Ok(GitRepo::at(&dir)
-        .staged_diff(action.all)
-        .ok()
-        .and_then(|diff| hook::private_address(&diff, &addresses)))
+    for action in actions {
+        let dir = match &action.dir {
+            Some(dir) => cwd.join(expand_home(dir)),
+            None => cwd.clone(),
+        };
+        let diff = GitRepo::at(&dir)
+            .staged_diff(action.tracked, action.added.as_deref())
+            .map_err(|e| {
+                Failure::precondition(format!(
+                    "The hook could not read what would be committed in {} ({}): run git -C {} status to see why, then commit again.",
+                    dir.display(),
+                    e.0.lines().next().unwrap_or_default(),
+                    dir.display()
+                ))
+            })?;
+        if let Some(reason) = hook::private_address(&diff, &addresses) {
+            return Ok(Some(reason));
+        }
+    }
+    Ok(None)
+}
+
+/// `~` and `~/x` the way the shell the command runs in would.
+fn expand_home(dir: &str) -> PathBuf {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    match (dir, dir.strip_prefix("~/"), home) {
+        ("~", _, Some(home)) => home,
+        (_, Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(dir),
+    }
 }
 
 fn read_input() -> Result<Value, Failure> {

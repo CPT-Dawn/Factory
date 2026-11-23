@@ -8,6 +8,7 @@ mod js;
 mod shell;
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde_json::Value;
 
@@ -21,27 +22,21 @@ pub enum PreTool {
     Allow,
     /// Refuse the call; the line says what to do instead.
     Block(String),
-    /// The call commits or pushes: the caller checks the staged diff with [`private_address`]
-    /// and blocks the call if it leaks.
-    CheckStaged(GitAction),
+    /// The call commits or pushes: the caller checks the staged diff of each with
+    /// [`private_address`] and blocks the call if one leaks.
+    CheckStaged(Vec<GitAction>),
 }
 
-/// Whether a git command records or publishes work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GitKind {
-    Commit,
-    Push,
-}
-
-/// A commit or push in a command, and where its diff to check is.
+/// A commit or push in a command, and the diff to check for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitAction {
-    pub kind: GitKind,
-    /// What the command stages itself, with `commit -a` or an earlier `git add`, is not staged yet
-    /// when the hook runs: the diff to check is the whole working tree against HEAD.
-    pub all: bool,
-    /// The directory of `git -C <dir>`, relative to the call's working directory.
+    /// The directory it runs in, relative to the call's working directory (`cd` and `-C`).
     pub dir: Option<String>,
+    /// It takes every tracked change along: `commit -a` or an earlier `git add -u`.
+    pub tracked: bool,
+    /// An earlier `git add` in the command stages more, which is not staged yet when the hook
+    /// runs: the pathspecs it named, or none named for all of them.
+    pub added: Option<Vec<String>>,
 }
 
 /// The pre-tool rules over Claude Code's hook input. `escape` says the escape variable is set
@@ -58,7 +53,10 @@ pub fn pre_tool(input: &Value, escape: bool) -> PreTool {
             if let Some(reason) = package_manager(command, escape) {
                 return PreTool::Block(reason);
             }
-            git_action(command).map_or(PreTool::Allow, PreTool::CheckStaged)
+            match git_actions(command) {
+                actions if actions.is_empty() => PreTool::Allow,
+                actions => PreTool::CheckStaged(actions),
+            }
         }
         Some("REPL") => text("code")
             .and_then(repl_misuse)
@@ -168,43 +166,96 @@ pub fn subagent_stop(input: &Value, templates: &Templates) -> Option<String> {
     ))
 }
 
-/// The commit or push a command runs, if any. A commit wins over a push.
-pub fn git_action(command: &str) -> Option<GitAction> {
-    let mut staged_before = false;
-    let mut commit = None;
-    let mut push = None;
+/// The commits and pushes a command runs, each once.
+pub fn git_actions(command: &str) -> Vec<GitAction> {
+    /// What the command has staged so far in one directory.
+    #[derive(Default)]
+    struct Staged {
+        tracked: bool,
+        added: Option<Vec<String>>,
+    }
+    let mut cwd: Option<String> = None;
+    let mut staged: BTreeMap<Option<String>, Staged> = BTreeMap::new();
+    let mut actions: Vec<GitAction> = Vec::new();
     for words in all_commands(command) {
         let Some(call) = shell::invocation(&words) else {
             continue;
         };
+        if call.program == "cd" {
+            // A bare `cd` and `cd -` go somewhere the command line doesn't say.
+            cwd = call
+                .args
+                .iter()
+                .find(|arg| !arg.starts_with('-'))
+                .map(|target| join(cwd.as_deref(), target));
+            continue;
+        }
         if call.program != "git" {
             continue;
         }
-        let (dir, rest) = git_subcommand(call.args);
+        let (dash_c, rest) = git_subcommand(call.args);
+        let dir = match (dash_c, &cwd) {
+            (Some(dash_c), base) => Some(join(base.as_deref(), &dash_c)),
+            (None, base) => base.clone(),
+        };
         let Some((sub, args)) = rest.split_first() else {
             continue;
         };
+        let here = staged.entry(dir.clone()).or_default();
         match sub.as_str() {
-            "add" | "stage" => staged_before = true,
-            "commit" if commit.is_none() => {
-                let all = args.iter().any(|a| a == "--all" || is_short_flag(a, 'a'));
-                commit = Some(GitAction {
-                    kind: GitKind::Commit,
-                    all: all || staged_before,
-                    dir,
-                });
+            "add" | "stage" => {
+                let (all, update, paths) = add_args(args);
+                here.tracked |= update;
+                if all || (!update && paths.is_empty()) {
+                    here.added = Some(Vec::new());
+                } else if !paths.is_empty() && here.added.as_ref().is_none_or(|a| !a.is_empty()) {
+                    // (An empty list already means every path.)
+                    here.added.get_or_insert_with(Vec::new).extend(paths);
+                }
             }
-            "push" if push.is_none() => {
-                push = Some(GitAction {
-                    kind: GitKind::Push,
-                    all: staged_before,
+            "commit" | "push" => {
+                let own =
+                    sub == "commit" && args.iter().any(|a| a == "--all" || is_short_flag(a, 'a'));
+                let action = GitAction {
                     dir,
-                });
+                    tracked: own || here.tracked,
+                    added: here.added.clone(),
+                };
+                if !actions.contains(&action) {
+                    actions.push(action);
+                }
             }
             _ => {}
         }
     }
-    commit.or(push)
+    actions
+}
+
+/// What `git add` was told: whether `-A`, whether `-u`, and the pathspecs.
+fn add_args(args: &[String]) -> (bool, bool, Vec<String>) {
+    let (mut all, mut update) = (false, false);
+    let mut paths = Vec::new();
+    let mut options_end = false;
+    for arg in args {
+        if options_end || !arg.starts_with('-') {
+            paths.push(arg.clone());
+        } else if arg == "--" {
+            options_end = true;
+        } else if arg == "--all" || is_short_flag(arg, 'A') {
+            all = true;
+        } else if arg == "--update" || is_short_flag(arg, 'u') {
+            update = true;
+        }
+    }
+    (all, update, paths)
+}
+
+/// `next` as seen from `base`: an absolute path stands alone.
+fn join(base: Option<&str>, next: &str) -> String {
+    match base {
+        Some(base) => Path::new(base).join(next).to_string_lossy().into_owned(),
+        None => next.to_owned(),
+    }
 }
 
 fn is_short_flag(word: &str, flag: char) -> bool {
@@ -268,8 +319,18 @@ pub fn private_address(diff: &str, addresses: &[String]) -> Option<String> {
         } else if !in_header && line.starts_with('+') {
             let added = line.to_lowercase();
             if needles.iter().any(|needle| added.contains(needle.as_str())) {
+                // The name may carry the address too; the line must not.
+                let lowered = file.to_lowercase();
+                let named = if needles
+                    .iter()
+                    .any(|needle| lowered.contains(needle.as_str()))
+                {
+                    "a file whose name has it (see git diff --cached --name-only)"
+                } else {
+                    file
+                };
                 return Some(format!(
-                    "The staged diff adds a private address in {file}: remove it, or unstage that file, then commit again."
+                    "The staged diff adds a private address in {named}: remove it, or unstage that file, then commit again."
                 ));
             }
         }

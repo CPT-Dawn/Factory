@@ -135,6 +135,11 @@ pub fn first_use(code: &str, names: &[&'static str]) -> Option<Use> {
                 }
                 prev = '0';
             }
+            // A spread's dots are no member access.
+            '.' if chars[at..].starts_with(&['.', '.', '.']) => {
+                prev = ',';
+                at += 3;
+            }
             c => {
                 prev = c;
                 at += 1;

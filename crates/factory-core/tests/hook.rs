@@ -1,8 +1,8 @@
 //! The hook rules, as tables: each row is one tool call and what the hook says to it.
 
 use factory_core::hook::{
-    GitAction, GitKind, PreTool, RESULT_LIMIT, Template, Templates, post_tool, pre_tool,
-    private_address, subagent_stop,
+    GitAction, PreTool, RESULT_LIMIT, Template, Templates, post_tool, pre_tool, private_address,
+    subagent_stop,
 };
 use serde_json::{Value, json};
 
@@ -129,6 +129,9 @@ fn pre_tool_stops_a_repl_script_that_uses_what_the_repl_lacks() {
         ("const x = a / process.pid / 2;", "process"),
         ("if (ok) { require('x') }", "require"),
         ("const p = (typeof x) + process;", "process"),
+        ("const all = [...process.argv];", "process"),
+        ("f({...BASH_REMATCH})", "BASH_REMATCH"),
+        ("const o = {...require};", "require"),
     ] {
         let reason =
             blocked(&repl(code), false).unwrap_or_else(|| panic!("{code:?} should be stopped"));
@@ -364,64 +367,154 @@ fn a_template_for_an_agent_type_overrides_the_default_field_by_field() {
     assert!(subagent_stop(&stop("merger", &lines(41), false), &templates).is_some());
 }
 
-fn git(command: &str) -> Option<GitAction> {
+fn git(command: &str) -> Vec<GitAction> {
     match pre_tool(&bash(command), false) {
-        PreTool::CheckStaged(action) => Some(action),
-        _ => None,
+        PreTool::CheckStaged(actions) => actions,
+        _ => Vec::new(),
     }
 }
 
-fn action(kind: GitKind, all: bool, dir: Option<&str>) -> Option<GitAction> {
-    Some(GitAction {
-        kind,
-        all,
+/// A commit or push in `dir`: `tracked` when it takes every tracked change along, `added` the
+/// pathspecs an earlier `git add` named (none named: all of them).
+fn action(dir: Option<&str>, tracked: bool, added: Option<&[&str]>) -> GitAction {
+    GitAction {
         dir: dir.map(str::to_owned),
-    })
+        tracked,
+        added: added.map(|paths| paths.iter().map(|p| (*p).to_owned()).collect()),
+    }
 }
 
 #[test]
 fn pre_tool_asks_for_the_staged_diff_of_a_commit_or_push() {
-    use GitKind::{Commit, Push};
+    let plain = action(None, false, None);
+    let nothing: Vec<GitAction> = Vec::new();
     for (command, expected) in [
-        ("git commit -m x", action(Commit, false, None)),
-        ("git commit --amend --no-edit", action(Commit, false, None)),
-        ("git commit -am x", action(Commit, true, None)),
-        ("git commit -a", action(Commit, true, None)),
-        ("git commit --all -m x", action(Commit, true, None)),
-        ("git commit -m 'add -a flag'", action(Commit, false, None)),
-        ("git push", action(Push, false, None)),
-        ("git push origin main", action(Push, false, None)),
-        ("git -C /r commit -m x", action(Commit, false, Some("/r"))),
+        ("git commit -m x", vec![plain.clone()]),
+        ("git commit --amend --no-edit", vec![plain.clone()]),
+        ("git commit -am x", vec![action(None, true, None)]),
+        ("git commit -a", vec![action(None, true, None)]),
+        ("git commit --all -m x", vec![action(None, true, None)]),
+        ("git commit -m 'add -a flag'", vec![plain.clone()]),
+        ("git push", vec![plain.clone()]),
+        ("git push origin main", vec![plain.clone()]),
+        ("git --no-pager commit -m x", vec![plain.clone()]),
+        ("FOO=1 git commit -m x", vec![plain.clone()]),
+        ("sudo git push", vec![plain.clone()]),
+        ("git commit -m x && git push", vec![plain.clone()]),
+        // The directory the command works in.
+        (
+            "git -C /r commit -m x",
+            vec![action(Some("/r"), false, None)],
+        ),
         (
             "git -c user.name=x -C r push",
-            action(Push, false, Some("r")),
+            vec![action(Some("r"), false, None)],
         ),
-        ("git --no-pager commit -m x", action(Commit, false, None)),
-        ("cd r && git commit -m x", action(Commit, false, None)),
-        ("FOO=1 git commit -m x", action(Commit, false, None)),
-        ("sudo git push", action(Push, false, None)),
-        // What an earlier `git add` in the same command stages is not staged yet.
-        ("git add -A && git commit -m x", action(Commit, true, None)),
-        ("git stage a; git commit -m x", action(Commit, true, None)),
+        (
+            "cd r && git commit -m x",
+            vec![action(Some("r"), false, None)],
+        ),
+        (
+            "cd /a && git -C b commit -m x",
+            vec![action(Some("/a/b"), false, None)],
+        ),
+        (
+            "cd a && cd /b && git push",
+            vec![action(Some("/b"), false, None)],
+        ),
+        (
+            "cd ~/proj && git commit -m x",
+            vec![action(Some("~/proj"), false, None)],
+        ),
+        (
+            "cd a && git commit -m x && cd ../b && git commit -m y",
+            vec![
+                action(Some("a"), false, None),
+                action(Some("a/../b"), false, None),
+            ],
+        ),
+        // What an earlier `git add` stages is not staged yet when the hook runs.
+        (
+            "git add -A && git commit -m x",
+            vec![action(None, false, Some(&[]))],
+        ),
+        (
+            "git add --all; git commit -m x",
+            vec![action(None, false, Some(&[]))],
+        ),
+        (
+            "git add a.txt b/c && git commit -m x",
+            vec![action(None, false, Some(&["a.txt", "b/c"]))],
+        ),
+        (
+            "git add -f a && git add b && git commit",
+            vec![action(None, false, Some(&["a", "b"]))],
+        ),
+        (
+            "git add . && git commit -m x",
+            vec![action(None, false, Some(&["."]))],
+        ),
+        (
+            "git add -u && git commit -m x",
+            vec![action(None, true, None)],
+        ),
+        (
+            "git add -- -odd && git commit -m x",
+            vec![action(None, false, Some(&["-odd"]))],
+        ),
+        (
+            "git add . && git commit -am x",
+            vec![action(None, true, Some(&["."]))],
+        ),
+        (
+            "git add a && git push",
+            vec![action(None, false, Some(&["a"]))],
+        ),
         (
             "git add . && git commit -m x && git push",
-            action(Commit, true, None),
+            vec![
+                action(None, false, Some(&["."])),
+                action(None, false, Some(&["."])),
+            ],
         ),
-        ("git commit -m x && git add y", action(Commit, false, None)),
-        ("git commit -m x && git push", action(Commit, false, None)),
-        ("git add . && git push", action(Push, true, None)),
-        ("git status", None),
-        ("git log --grep=commit", None),
-        ("git diff --cached", None),
-        ("git stash push", None),
-        ("git commit-tree abc", None),
-        ("git pushall", None),
-        ("echo git push", None),
-        ("gh pr create", None),
-        ("git", None),
+        ("git commit -m x && git add y", vec![plain.clone()]),
+        // A repository's staging is its own.
+        (
+            "git -C a add . && git commit -m x",
+            vec![action(None, false, None)],
+        ),
+        ("git status", nothing.clone()),
+        ("git log --grep=commit", nothing.clone()),
+        ("git diff --cached", nothing.clone()),
+        ("git stash push", nothing.clone()),
+        ("git commit-tree abc", nothing.clone()),
+        ("git pushall", nothing.clone()),
+        ("echo git push", nothing.clone()),
+        ("gh pr create", nothing.clone()),
+        ("git", nothing),
     ] {
-        assert_eq!(git(command), expected, "{command:?}");
+        let mut actions = git(command);
+        // A commit and the push after it check the same thing once.
+        actions.dedup();
+        let mut expected = expected;
+        expected.dedup();
+        assert_eq!(actions, expected, "{command:?}");
     }
+}
+
+#[test]
+fn a_wrappers_option_values_are_not_the_command() {
+    for command in [
+        "sudo -u root npm i",
+        "sudo -u root -g wheel -- npm i",
+        "env -u HOME npm i",
+        "nice -n 5 npx tsc",
+        "doas -u root pnpm i",
+        "sudo -E FOO=1 yarn",
+    ] {
+        assert!(blocked(&bash(command), false).is_some(), "{command:?}");
+    }
+    assert!(git("sudo -u me git push").len() == 1);
 }
 
 #[test]
@@ -440,7 +533,7 @@ fn a_heredoc_body_is_text_not_commands() {
         PreTool::Allow
     ));
     assert!(blocked(&bash("cat <<'EOF'\nnpm i\nEOF\nnpm i"), false).is_some());
-    assert!(git("cat <<EOF\ngit push\nEOF").is_none());
+    assert!(git("cat <<EOF\ngit push\nEOF").is_empty());
 }
 
 const DIFF: &str = "diff --git a/src/a.txt b/src/a.txt
@@ -509,4 +602,14 @@ fn any_of_several_addresses_is_private() {
         &addresses(&["me@example.invalid", "other@example.invalid"]),
     );
     assert!(reason.unwrap().contains(" x"));
+}
+
+#[test]
+fn a_file_named_with_the_private_address_is_not_named_in_the_line() {
+    let diff = "diff --git a/me@example.invalid.txt b/me@example.invalid.txt\n--- a/me@example.invalid.txt\n+++ b/me@example.invalid.txt\n@@ -0,0 +1 @@\n+me@example.invalid\n";
+    let reason = private_address(diff, &addresses(&["me@example.invalid"])).unwrap();
+    assert!(
+        !reason.to_lowercase().contains("example.invalid"),
+        "{reason}"
+    );
 }

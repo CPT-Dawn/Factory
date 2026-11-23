@@ -41,9 +41,10 @@ pub trait Repo {
     fn toplevel(&self) -> Result<PathBuf, GitError>;
     /// The git dir of this worktree, where the implementer leaves its evidence.
     fn git_dir(&self) -> Result<PathBuf, GitError>;
-    /// What a commit made now would add: the staged diff, or with `all` the whole working tree
-    /// against HEAD, untracked files included, for a command that stages as it commits.
-    fn staged_diff(&self, all: bool) -> Result<String, GitError>;
+    /// What a commit made now would add: the staged diff; with `tracked`, every tracked change
+    /// too (`commit -a`); with `added`, what `git add` of those pathspecs would stage as well,
+    /// the whole tree for none, untracked files included.
+    fn staged_diff(&self, tracked: bool, added: Option<&[String]>) -> Result<String, GitError>;
 }
 
 /// The repository at a directory, through the `git` on PATH.
@@ -150,25 +151,61 @@ impl Repo for GitRepo {
         Ok(PathBuf::from(dir.trim_end()))
     }
 
-    fn staged_diff(&self, all: bool) -> Result<String, GitError> {
+    fn staged_diff(&self, tracked: bool, added: Option<&[String]>) -> Result<String, GitError> {
         let diff = ["diff", "--no-color", "--no-ext-diff"];
-        let cached = [&diff[..], &["--cached"]].concat();
-        if !all {
-            return self.git(&cached);
+        let mut text = if tracked {
+            // Before the first commit there is no HEAD to compare with.
+            self.git(&[&diff[..], &["HEAD"]].concat())
+                .or_else(|_| self.git(&[&diff[..], &["--cached"]].concat()))?
+        } else {
+            self.git(&[&diff[..], &["--cached"]].concat())?
+        };
+        let Some(paths) = added else {
+            return Ok(text);
+        };
+        // What `git add paths` stages: no paths named is the whole tree.
+        let top = GitRepo::at(&self.toplevel()?);
+        let all = [String::from(":/")];
+        let paths = if paths.is_empty() { &all[..] } else { paths };
+        let spec: Vec<&str> = paths.iter().map(String::as_str).collect();
+        if !tracked {
+            let tail = [&["--"][..], &spec].concat();
+            text.push_str(
+                &self
+                    .git(&[&diff[..], &["HEAD"], &tail].concat())
+                    .or_else(|_| self.git(&[&diff[..], &tail].concat()))?,
+            );
         }
-        // Before the first commit there is no HEAD to compare with.
-        let mut text = self
-            .git(&[&diff[..], &["HEAD"]].concat())
-            .or_else(|_| self.git(&cached))?;
-        let untracked = self.git(&["ls-files", "--others", "--exclude-standard", "-z"])?;
-        for file in untracked
+        let listing = [
+            &[
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--full-name",
+                "--",
+            ][..],
+            &spec,
+        ]
+        .concat();
+        let untracked = self.git(&listing)?;
+        let files: Vec<&str> = untracked
             .split('\0')
             .filter(|file| !file.is_empty())
-            .take(UNTRACKED_LIMIT)
-        {
+            .collect();
+        if files.len() > UNTRACKED_LIMIT {
+            return Err(GitError(format!(
+                "{} untracked files are to be added, more than the {UNTRACKED_LIMIT} it checks",
+                files.len()
+            )));
+        }
+        for file in files {
+            let args = [&diff[..], &["--no-index", "--", "/dev/null", file]].concat();
+            let output = top.output(&args)?;
             // Exit 1 is how `--no-index` says the files differ.
-            let output =
-                self.output(&[&diff[..], &["--no-index", "--", "/dev/null", file]].concat())?;
+            if !matches!(output.status.code(), Some(0 | 1)) {
+                return Err(failed(&args, &output));
+            }
             text.push_str(&String::from_utf8_lossy(&output.stdout));
         }
         Ok(text)
@@ -222,7 +259,7 @@ impl Repo for FakeRepo {
         Ok(self.git_dir.clone())
     }
 
-    fn staged_diff(&self, _all: bool) -> Result<String, GitError> {
+    fn staged_diff(&self, _tracked: bool, _added: Option<&[String]>) -> Result<String, GitError> {
         Ok(self.staged_diff.clone())
     }
 }

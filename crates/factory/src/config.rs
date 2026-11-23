@@ -70,6 +70,12 @@ pub struct Backend {
 struct ConfigFile {
     #[serde(default)]
     review: Review,
+}
+
+/// The file as the hooks read it: `[hook]` alone, so a mistake in `[review]` cannot stop a
+/// hook and a mistake in `[hook]` cannot stop a review.
+#[derive(Deserialize, Default)]
+struct HookConfigFile {
     #[serde(default)]
     hook: HookFile,
 }
@@ -111,21 +117,29 @@ impl From<TemplateFile> for Template {
 /// What the hooks read from the config.
 #[derive(Debug, Default)]
 pub struct HookSettings {
-    /// Addresses a commit or push must not add; lower-cased, none empty.
+    /// Addresses a commit or push must not add.
     pub private_addresses: Vec<String>,
     pub templates: Templates,
 }
 
 /// The hooks' settings from the config file in `config_dir`; defaults without the file.
 pub fn hook_settings(config_dir: &Path) -> Result<HookSettings, Failure> {
-    let hook = load(&config_dir.join("config.toml"))?.hook;
+    let path = config_dir.join("config.toml");
+    let text = read(&path)?;
+    // The message is left out of the failure: toml quotes the value it choked on, and the value
+    // may be the private address the hook is there to keep out of the output.
+    let hook = toml::from_str::<HookConfigFile>(&text)
+        .map_err(|e| {
+            bad(
+                &path,
+                &text,
+                "a value is not what [hook] takes (see the docs in config.rs)",
+                &e,
+            )
+        })?
+        .hook;
     Ok(HookSettings {
-        private_addresses: hook
-            .private_addresses
-            .iter()
-            .map(|address| address.trim().to_lowercase())
-            .filter(|address| !address.is_empty())
-            .collect(),
+        private_addresses: hook.private_addresses,
         templates: Templates {
             default: Template {
                 max_lines: hook.report.max_lines,
@@ -201,6 +215,12 @@ pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
 
 /// Reads the config file at `path`; an absent file is an empty config.
 fn load(path: &Path) -> Result<ConfigFile, Failure> {
+    let text = read(path)?;
+    toml::from_str(&text).map_err(|e| bad(path, &text, e.message().trim(), &e))
+}
+
+/// The text of the config file at `path`; an absent file is empty.
+fn read(path: &Path) -> Result<String, Failure> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
@@ -211,7 +231,7 @@ fn load(path: &Path) -> Result<ConfigFile, Failure> {
             )));
         }
     };
-    toml::from_str(&text).map_err(|e| bad(path, &text, &e))
+    Ok(text)
 }
 
 fn backend(entry: Entry) -> Backend {
@@ -255,14 +275,10 @@ pub fn cli_name(cli: Cli) -> &'static str {
 }
 
 /// A config the file can't be read as: its path, line and toml's reason, in one line.
-fn bad(path: &Path, text: &str, e: &toml::de::Error) -> Failure {
+fn bad(path: &Path, text: &str, message: &str, e: &toml::de::Error) -> Failure {
     let line = e
         .span()
         .map(|span| text[..span.start.min(text.len())].lines().count().max(1));
     let at = line.map_or_else(String::new, |line| format!(" line {line}"));
-    Failure::precondition(format!(
-        "{}{at}: {}; fix the config",
-        path.display(),
-        e.message().trim()
-    ))
+    Failure::precondition(format!("{}{at}: {message}; fix the config", path.display()))
 }
