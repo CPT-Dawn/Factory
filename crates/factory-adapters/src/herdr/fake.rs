@@ -11,8 +11,8 @@ use std::sync::{Mutex, MutexGuard};
 use tokio::sync::mpsc;
 
 use super::{
-    Agent, AgentSession, Event, Events, HerdrApi, HerdrError, PROTOCOL, Pong, PromptWait, Source,
-    Watch, Workspace, Worktree,
+    Agent, AgentSession, Event, Events, HerdrApi, HerdrError, PROTOCOL, Pong, PromptWait,
+    SessionKind, Source, Watch, Workspace, Worktree,
 };
 
 /// A herdr that answers from a script. Every request is recorded by its method name.
@@ -92,7 +92,7 @@ impl FakeHerdr {
         for agent in self.lock().agents.iter_mut().filter(|a| a.pane_id == pane) {
             agent.cwd = Some(cwd.to_owned());
             agent.agent_session = Some(AgentSession {
-                kind: "id".to_owned(),
+                kind: SessionKind::Id,
                 value: id.to_owned(),
             });
         }

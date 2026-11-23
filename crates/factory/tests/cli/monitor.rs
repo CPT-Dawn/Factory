@@ -4,6 +4,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -388,6 +389,88 @@ fn the_monitor_and_what_it_told_outlive_a_daemon_restart() {
 
     assert_eq!(shown["leads"][0]["subagents"][0]["told"], true, "{shown}");
     assert_eq!(herdr.prompts().len(), 1, "{:?}", herdr.prompts());
+}
+
+#[test]
+fn an_asked_lead_is_not_asked_again_after_a_daemon_restart() {
+    let sandbox = Sandbox::new();
+    configure(&sandbox, "[monitor]\ngrace = \"1h\"\n");
+    let herdr = FakeHerdr::start(&sandbox);
+    let log = lead(&sandbox, &herdr, 1, "cart", "idle");
+    append(&log, &[usage(312_000, false)]);
+    start(&sandbox);
+    herdr.await_prompts(1);
+    await_status(&sandbox, "the lead asked", |s| {
+        s["leads"][0]["asked"] == true
+    });
+
+    kill_daemon(&sandbox);
+    let shown = await_status(&sandbox, "the monitor back with the lead", |s| {
+        s["running"] == true && s["leads"][0]["tokens"] == 312_000
+    });
+
+    assert_eq!(shown["leads"][0]["asked"], true, "{shown}");
+    assert_eq!(herdr.prompts().len(), 1, "{:?}", herdr.prompts());
+}
+
+#[test]
+fn a_wait_registered_after_the_ask_holds_the_compaction_off() {
+    let sandbox = Sandbox::new();
+    configure(&sandbox, "[monitor]\ngrace = \"3s\"\n");
+    let herdr = FakeHerdr::start(&sandbox);
+    let held = lead(&sandbox, &herdr, 1, "cart", "idle");
+    let free = lead(&sandbox, &herdr, 2, "pay", "idle");
+    lead(&sandbox, &herdr, 3, "ship", "working");
+    append(&held, &[usage(330_000, false)]);
+    append(&free, &[usage(320_000, false)]);
+    start(&sandbox);
+    let asked = herdr.await_prompts(2);
+    assert_eq!(asked[0].0, "lead-cart", "{asked:?}");
+    let mut cmd = sandbox.factory_command(&["wait", "lead", "ship"]);
+    cmd.env("HERDR_PANE_ID", "w1:p1");
+    let waiter = spawn(cmd);
+    assert!(
+        poll_until(|| sandbox.factory(&["lead", "status", "cart"]).stdout
+            == "lead-cart waiting: lead-ship\n"),
+        "the wait never registered"
+    );
+
+    // The free lead, asked after the held one, is compacted once both graces are over.
+    let prompts = herdr.await_prompts(4);
+    assert!(
+        prompts[2..].iter().all(|(target, _)| target == "lead-pay"),
+        "{prompts:?}"
+    );
+
+    herdr.status("w3:p1", "done");
+    finish(waiter);
+    let prompts = herdr.await_prompts(6);
+    assert_eq!(prompts[4].0, "lead-cart", "{prompts:?}");
+    assert!(prompts[4].1.starts_with("/compact Keep: "), "{prompts:?}");
+}
+
+#[test]
+fn a_lead_that_works_after_the_ask_gets_its_whole_grace_once_idle_again() {
+    let sandbox = Sandbox::new();
+    configure(&sandbox, "[monitor]\ngrace = \"2s\"\n");
+    let herdr = FakeHerdr::start(&sandbox);
+    let log = lead(&sandbox, &herdr, 1, "cart", "idle");
+    append(&log, &[usage(312_000, false)]);
+    start(&sandbox);
+    herdr.await_watch("w1:p1");
+    herdr.await_prompts(1);
+
+    herdr.status("w1:p1", "working");
+    let idle = Instant::now();
+    herdr.status("w1:p1", "idle");
+
+    let prompts = herdr.await_prompts(2);
+    let waited = idle.elapsed();
+    assert!(prompts[1].1.starts_with("/compact Keep: "), "{prompts:?}");
+    assert!(
+        waited >= Duration::from_secs(2),
+        "compacted {waited:?} after it went idle again"
+    );
 }
 
 fn kill_daemon(sandbox: &Sandbox) {

@@ -91,19 +91,14 @@ fn an_idle_lead_over_the_threshold_is_asked_once_then_compacted_after_the_grace_
 }
 
 #[test]
-fn a_subagent_over_its_threshold_is_told_about_once_unless_it_finished() {
+fn a_subagent_over_its_threshold_is_told_about_once() {
     let cases = [
-        // tokens, told already, finished, tell
-        (249_999, false, false, false),
-        (250_000, false, false, true),
-        (400_000, true, false, false),
-        (400_000, false, true, false),
+        // tokens, told already, tell
+        (249_999, false, false),
+        (250_000, false, true),
+        (400_000, true, false),
     ];
-    for (tokens, told, finished, expected) in cases {
-        assert_eq!(
-            POLICY.tells(tokens, told, finished),
-            expected,
-            "{tokens} told={told} finished={finished}"
-        );
+    for (tokens, told, expected) in cases {
+        assert_eq!(POLICY.tells(tokens, told), expected, "{tokens} told={told}");
     }
 }

@@ -110,9 +110,8 @@ impl Policy {
         }
     }
 
-    /// Whether a subagent at `tokens` is told about to its lead: once, and never once it has
-    /// finished, since then there is no work left to hand on.
-    pub fn tells(&self, tokens: u64, told: bool, finished: bool) -> bool {
-        tokens >= self.subagent_at && !told && !finished
+    /// Whether a subagent at `tokens` is told about to its lead: once.
+    pub fn tells(&self, tokens: u64, told: bool) -> bool {
+        tokens >= self.subagent_at && !told
     }
 }

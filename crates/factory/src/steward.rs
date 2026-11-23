@@ -25,7 +25,7 @@ use crate::monitor::kilo;
 use crate::output::Failure;
 use crate::paths::Paths;
 use crate::protocol::{LeadContext, MonitorStatus, MonitorSwitch, SubagentContext};
-use crate::sessions::{self, Change, Inotify, Tail};
+use crate::sessions::{self, Change, Inotify, SubagentFile, Tail};
 use crate::store::{Context, Store};
 
 /// How long the steward waits before it tries again what herdr refused or couldn't do.
@@ -87,7 +87,7 @@ impl<H: HerdrApi> Steward<H> {
 
     pub async fn start(self: &Arc<Self>) -> Result<MonitorSwitch, Failure> {
         let _turn = self.turn.lock().await;
-        if lock(&self.task).is_some() {
+        if self.running() {
             return Ok(switched(true, false));
         }
         let policy = config::monitor_policy(&self.paths)?;
@@ -106,17 +106,26 @@ impl<H: HerdrApi> Steward<H> {
     /// Stops the steward; a compaction under way still finishes.
     pub async fn stop(&self) -> Result<MonitorSwitch, Failure> {
         let _turn = self.turn.lock().await;
-        let Some(task) = lock(&self.task).take() else {
-            return Ok(switched(false, false));
-        };
-        task.abort();
-        lock(&self.table).clear();
-        self.remember(false)?;
-        Ok(switched(false, true))
+        let task = lock(&self.task).take();
+        let was = task.as_ref().is_some_and(|task| !task.is_finished());
+        if let Some(task) = task {
+            task.abort();
+            lock(&self.table).clear();
+            // A task that ended on its own left the switch on; it goes off here too.
+            self.remember(false)?;
+        }
+        Ok(switched(false, was))
+    }
+
+    /// Whether the steward's task runs: one that ended on its own, or panicked, does not.
+    fn running(&self) -> bool {
+        lock(&self.task)
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
     }
 
     pub fn status(&self) -> MonitorStatus {
-        let running = lock(&self.task).is_some();
+        let running = self.running();
         MonitorStatus {
             running,
             leads: if running {
@@ -180,7 +189,9 @@ impl<H: HerdrApi> Steward<H> {
                 Woke::Stop => return,
                 Woke::Files(Ok(files)) => self.changed(&mut state, &inotify, files),
                 Woke::Files(Err(e)) => {
-                    eprintln!("factory: monitor: lost inotify: {e}; stopping, start it again");
+                    eprintln!(
+                        "factory: monitor: lost inotify: {e}; stopped, run factory monitor start to start it again"
+                    );
                     return;
                 }
                 Woke::Compacted(compaction) => self.compacted(&mut state, compaction),
@@ -212,8 +223,10 @@ impl<H: HerdrApi> Steward<H> {
             watched.session = lead.session.as_ref().map(|session| session.value.clone());
             let idle = matches!(lead.agent, Some(AgentStatus::Idle | AgentStatus::Done));
             watched.waiting = lead.waiting;
+            // A lead that worked since it went idle, even unseen between two looks, is idle anew.
+            let moved = lead.since.into_std();
             watched.idle_since = if idle && !lead.waiting {
-                watched.idle_since.or(Some(now))
+                Some(watched.idle_since.map_or(now, |since| since.max(moved)))
             } else {
                 None
             };
@@ -240,7 +253,7 @@ impl<H: HerdrApi> Steward<H> {
                 watched.tokens = reading.map(|r| r.tokens);
                 self.save_lead(name, watched);
             }
-            Err(e) => eprintln!("factory: monitor: cannot read {}: {e}", log.display()),
+            Err(e) => unreadable(&log, &e),
         }
     }
 
@@ -278,7 +291,12 @@ impl<H: HerdrApi> Steward<H> {
                         );
                     }
                     Err(e) => {
-                        eprintln!("factory: monitor: cannot watch {}: {e}", dir.display());
+                        eprintln!(
+                            "factory: monitor: cannot watch {}: {e}; raise \
+                             fs.inotify.max_user_watches if it is out of watches, then run \
+                             factory monitor stop and start",
+                            dir.display()
+                        );
                         continue;
                     }
                 }
@@ -302,7 +320,7 @@ impl<H: HerdrApi> Steward<H> {
             return;
         };
         for entry in entries.flatten() {
-            if let Some((agent, true)) = sessions::subagent_file(&entry.file_name()) {
+            if let Some(SubagentFile::Log(agent)) = sessions::subagent_file(&entry.file_name()) {
                 self.subagent(state, lead, &agent, &entry.path());
             }
         }
@@ -323,7 +341,7 @@ impl<H: HerdrApi> Steward<H> {
                     self.save_subagent(lead, agent, sub);
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("factory: monitor: cannot read {}: {e}", log.display()),
+                Err(e) => unreadable(log, &e),
             }
             return;
         }
@@ -345,7 +363,7 @@ impl<H: HerdrApi> Steward<H> {
                 self.save_subagent(lead, agent, &sub);
                 watched.subagents.insert(agent.to_owned(), sub);
             }
-            Err(e) => eprintln!("factory: monitor: cannot read {}: {e}", log.display()),
+            Err(e) => unreadable(log, &e),
         }
     }
 
@@ -373,11 +391,7 @@ impl<H: HerdrApi> Steward<H> {
                             continue;
                         }
                         known = true;
-                        if watched.tail.is_none() {
-                            self.open_lead(lead, watched, Instant::now());
-                        } else {
-                            self.read_lead(lead, watched);
-                        }
+                        self.read_lead(lead, watched);
                     }
                     let log = path.extension().is_some_and(|ext| ext == "jsonl");
                     // A lead may have started a session herdr hasn't said yet.
@@ -392,8 +406,10 @@ impl<H: HerdrApi> Steward<H> {
                     }
                 }
                 Role::Subagents(lead) => match sessions::subagent_file(&name) {
-                    Some((agent, true)) => self.subagent(state, &lead, &agent, &path),
-                    Some((agent, false)) => self.meta_changed(state, &lead, &agent, &path),
+                    Some(SubagentFile::Log(agent)) => self.subagent(state, &lead, &agent, &path),
+                    Some(SubagentFile::Meta(agent)) => {
+                        self.meta_changed(state, &lead, &agent, &path);
+                    }
                     None => {}
                 },
             }
@@ -421,11 +437,7 @@ impl<H: HerdrApi> Steward<H> {
     /// Reads every log again after inotify lost events.
     fn reread(&self, state: &mut State, inotify: &Inotify) {
         for (lead, watched) in &mut state.leads {
-            if watched.tail.is_none() {
-                self.open_lead(lead, watched, Instant::now());
-            } else {
-                self.read_lead(lead, watched);
-            }
+            self.read_lead(lead, watched);
         }
         let dirs: Vec<(String, PathBuf)> = state
             .dirs
@@ -441,8 +453,10 @@ impl<H: HerdrApi> Steward<H> {
         self.watch_dirs(state, inotify);
     }
 
+    /// Reads a lead's new lines, opening its log first if it isn't yet.
     fn read_lead(&self, name: &str, watched: &mut Watched) {
         let Some(tail) = watched.tail.as_mut() else {
+            self.open_lead(name, watched, Instant::now());
             return;
         };
         match tail.read() {
@@ -451,10 +465,7 @@ impl<H: HerdrApi> Steward<H> {
                 self.save_lead(name, watched);
             }
             Ok(None) => {}
-            Err(e) => eprintln!(
-                "factory: monitor: cannot read {}: {e}",
-                tail.path().display()
-            ),
+            Err(e) => unreadable(tail.path(), &e),
         }
     }
 
@@ -471,7 +482,7 @@ impl<H: HerdrApi> Steward<H> {
         for (name, lead) in &mut state.leads {
             for (agent, sub) in &mut lead.subagents {
                 let Some(tokens) = sub.tokens else { continue };
-                if !policy.tells(tokens, sub.told, false) {
+                if !policy.tells(tokens, sub.told) {
                     continue;
                 }
                 if let Some(retry) = sub.retry_at.filter(|retry| now < *retry) {
@@ -484,14 +495,17 @@ impl<H: HerdrApi> Steward<H> {
                     tokens,
                     policy.subagent_at,
                 );
-                match self.leads.herdr().prompt(name, &text, None).await {
+                match self.leads.prompt(name, &text, None).await {
                     Ok(()) => {
                         sub.told = true;
                         sub.retry_at = None;
                         self.save_subagent(name, agent, sub);
                     }
                     Err(e) => {
-                        eprintln!("factory: monitor: cannot tell {name} about {agent}: {e}");
+                        eprintln!(
+                            "factory: monitor: cannot tell {name} about {agent}: {e}; trying again in {}s",
+                            RETRY.as_secs()
+                        );
                         sub.retry_at = Some(now + RETRY);
                         at(now + RETRY);
                     }
@@ -517,9 +531,14 @@ impl<H: HerdrApi> Steward<H> {
                     lead.asked_at = None;
                     self.save_lead(name, lead);
                 }
+                // Prompts to the leads before took time: a wait registered meanwhile still holds.
+                Step::Ask | Step::Compact if self.leads.waiting(name) => {
+                    lead.waiting = true;
+                    lead.idle_since = None;
+                }
                 Step::Ask => {
                     let text = ask(lead.tokens.unwrap_or_default());
-                    match self.leads.herdr().prompt(name, &text, None).await {
+                    match self.leads.prompt(name, &text, None).await {
                         Ok(()) => {
                             lead.asked_at = Some(now);
                             lead.retry_at = None;
@@ -529,7 +548,10 @@ impl<H: HerdrApi> Steward<H> {
                             }
                         }
                         Err(e) => {
-                            eprintln!("factory: monitor: cannot ask {name} to stop: {e}");
+                            eprintln!(
+                                "factory: monitor: cannot ask {name} to stop: {e}; trying again in {}s",
+                                RETRY.as_secs()
+                            );
                             lead.retry_at = Some(now + RETRY);
                             at(now + RETRY);
                         }
@@ -541,7 +563,7 @@ impl<H: HerdrApi> Steward<H> {
                     let compaction = Compacted {
                         lead: name.clone(),
                         log: lead.log.clone(),
-                        ok: false,
+                        outcome: Outcome::Failed,
                     };
                     tokio::spawn(compact(leads, compaction, done.clone()));
                 }
@@ -559,12 +581,14 @@ impl<H: HerdrApi> Steward<H> {
             return;
         }
         lead.compacting = false;
-        if compaction.ok {
-            lead.tokens = None;
-            lead.asked_at = None;
-            self.save_lead(&compaction.lead, lead);
-        } else {
-            lead.retry_at = Some(Instant::now() + RETRY);
+        match compaction.outcome {
+            Outcome::Done => {
+                lead.tokens = None;
+                lead.asked_at = None;
+                self.save_lead(&compaction.lead, lead);
+            }
+            Outcome::Failed => lead.retry_at = Some(Instant::now() + RETRY),
+            Outcome::Waiting => {}
         }
     }
 
@@ -601,14 +625,16 @@ impl<H: HerdrApi> Steward<H> {
         lock(&self.store)
             .context(&log.to_string_lossy())
             .unwrap_or_else(|e| {
-                eprintln!("factory: monitor: cannot read the context table: {e}");
+                eprintln!("factory: monitor: cannot read the context table: {e}; check the disk, then run factory monitor stop and start");
                 None
             })
     }
 
     fn save(&self, context: &Context) {
         if let Err(e) = lock(&self.store).set_context(context) {
-            eprintln!("factory: monitor: cannot write the context table: {e}");
+            eprintln!(
+                "factory: monitor: cannot write the context table: {e}; check the disk, else a restart may ask or tell again"
+            );
         }
     }
 
@@ -642,20 +668,29 @@ async fn compact<H: HerdrApi>(
     mut compaction: Compacted,
     done: mpsc::UnboundedSender<Compacted>,
 ) {
-    let herdr = leads.herdr();
     let name = compaction.lead.clone();
     let wait = PromptWait {
-        until: vec!["idle".to_owned(), "done".to_owned()],
+        until: vec![AgentStatus::Idle, AgentStatus::Done],
         timeout: COMPACT_TIMEOUT,
     };
-    let result = match herdr.prompt(&name, COMPACT, Some(&wait)).await {
-        Ok(()) => herdr.prompt(&name, CONTINUE, None).await,
-        Err(e) => Err(e),
+    compaction.outcome = if leads.waiting(&name) {
+        Outcome::Waiting
+    } else {
+        let result = match leads.prompt(&name, COMPACT, Some(&wait)).await {
+            Ok(()) => leads.prompt(&name, CONTINUE, None).await,
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(()) => Outcome::Done,
+            Err(e) => {
+                eprintln!(
+                    "factory: monitor: cannot compact {name}: {e}; trying again in {}s",
+                    RETRY.as_secs()
+                );
+                Outcome::Failed
+            }
+        }
     };
-    if let Err(e) = &result {
-        eprintln!("factory: monitor: cannot compact {name}: {e}");
-    }
-    compaction.ok = result.is_ok();
     // A stopped steward hears nothing; the compaction still happened.
     let _ = done.send(compaction);
 }
@@ -776,7 +811,25 @@ struct Sub {
 struct Compacted {
     lead: String,
     log: Option<PathBuf>,
-    ok: bool,
+    outcome: Outcome,
+}
+
+/// How a compaction went.
+enum Outcome {
+    Done,
+    /// herdr refused or failed it: it is tried again after [`RETRY`].
+    Failed,
+    /// The lead registered a wait first: nothing was sent.
+    Waiting,
+}
+
+/// Says in the daemon's log that a session log can't be read.
+fn unreadable(log: &Path, e: &std::io::Error) {
+    eprintln!(
+        "factory: monitor: cannot read {}: {e}; its context stays as last read until it can be, \
+         check its permissions",
+        log.display()
+    );
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

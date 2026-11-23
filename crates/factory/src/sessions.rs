@@ -15,7 +15,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use factory_adapters::herdr::AgentSession;
+use factory_adapters::herdr::{AgentSession, SessionKind};
 use factory_core::steward::{Reading, reading};
 use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
 use rustix::io::Errno;
@@ -31,7 +31,7 @@ const CHUNK: u64 = 1 << 20;
 /// for in every project; one found nowhere is where it will appear, when the cwd is known.
 pub fn lead_log(projects: &Path, cwd: Option<&str>, session: &AgentSession) -> Option<PathBuf> {
     let value = session.value.as_str();
-    if session.kind == "path" {
+    if session.kind == SessionKind::Path {
         return Some(PathBuf::from(value));
     }
     if value.is_empty() || value.contains('/') || value.starts_with('.') {
@@ -62,18 +62,26 @@ pub fn session_dir(log: &Path) -> PathBuf {
     log.with_extension("")
 }
 
-/// The subagent a file in a session's `subagents` directory belongs to, `agent-<id>`, and
-/// whether it is the subagent's log (else its meta file).
-pub fn subagent_file(name: &OsStr) -> Option<(String, bool)> {
+/// A file in a session's `subagents` directory, naming the subagent `agent-<id>` it belongs to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SubagentFile {
+    /// The subagent's log.
+    Log(String),
+    /// The subagent's meta file.
+    Meta(String),
+}
+
+/// What the file `name` in a session's `subagents` directory is, if it is a subagent's.
+pub fn subagent_file(name: &OsStr) -> Option<SubagentFile> {
     let name = name.to_str()?;
     if !name.starts_with("agent-") {
         return None;
     }
     if let Some(agent) = name.strip_suffix(".jsonl") {
-        return Some((agent.to_owned(), true));
+        return Some(SubagentFile::Log(agent.to_owned()));
     }
     name.strip_suffix(".meta.json")
-        .map(|agent| (agent.to_owned(), false))
+        .map(|agent| SubagentFile::Meta(agent.to_owned()))
 }
 
 /// What a subagent's meta file says: what it was started to do, and whether it finished.
@@ -118,7 +126,6 @@ impl Tail {
     pub fn open(path: &Path, sidechain: bool) -> io::Result<(Tail, Option<Reading>)> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
-        let counts = |reading: &Reading| sidechain || !reading.sidechain;
         // Bytes [pos, len) are read; `head` holds the start of a line split at `pos`.
         let mut pos = len;
         let mut head: Vec<u8> = Vec::new();
@@ -145,7 +152,7 @@ impl Tail {
                 .iter()
                 .rev()
                 .filter_map(|line| read_line(line))
-                .find(counts);
+                .find(|reading| counts(sidechain, reading));
             head = split.to_vec();
             pos = start;
         }
@@ -189,8 +196,14 @@ impl Tail {
             .split(|b| *b == b'\n')
             .rev()
             .filter_map(read_line)
-            .find(|reading| sidechain || !reading.sidechain))
+            .find(|reading| counts(sidechain, reading)))
     }
+}
+
+/// Whether `reading` is one a log read with `sidechain` takes: a lead's own log also carries
+/// its subagents' sidechain lines, which are not its context.
+fn counts(sidechain: bool, reading: &Reading) -> bool {
+    sidechain || !reading.sidechain
 }
 
 fn read_line(line: &[u8]) -> Option<Reading> {

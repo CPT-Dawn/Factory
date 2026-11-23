@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use factory_adapters::herdr::{
-    AgentSession, Event, Events, Herdr, HerdrApi, HerdrError, PROTOCOL, Watch,
+    AgentSession, Event, Events, Herdr, HerdrApi, HerdrError, PROTOCOL, PromptWait, Watch,
 };
 use factory_core::duration;
 use factory_core::exit::Exit;
@@ -66,6 +66,8 @@ struct Lead {
     agent: Option<AgentStatus>,
     cwd: Option<String>,
     session: Option<AgentSession>,
+    /// When its agent's status last changed, as the daemon heard it.
+    since: Instant,
 }
 
 /// A lead as the context steward sees it.
@@ -80,6 +82,8 @@ pub struct Seen {
     pub reported: bool,
     pub cwd: Option<String>,
     pub session: Option<AgentSession>,
+    /// When its agent's status last changed, as the daemon heard it.
+    pub since: Instant,
 }
 
 impl<H: HerdrApi> Leads<H> {
@@ -103,18 +107,28 @@ impl<H: HerdrApi> Leads<H> {
     /// Checks herdr at the daemon's start; a failure goes to the daemon's log, and each lead
     /// command checks again.
     pub async fn start(self: Arc<Self>) {
-        if let Err(failure) = self.up().await {
+        if let Err(failure) = self.check().await {
             eprintln!("factory: {}", failure.message);
         }
     }
 
-    /// Brings the link to herdr up, or says why it can't.
-    pub async fn check(self: &Arc<Self>) -> Result<(), Failure> {
-        self.up().await
+    /// Sends `text` to the lead `name` as a prompt, through herdr.
+    pub async fn prompt(
+        &self,
+        name: &str,
+        text: &str,
+        wait: Option<&PromptWait>,
+    ) -> Result<(), HerdrError> {
+        self.herdr.prompt(name, text, wait).await
     }
 
-    pub fn herdr(&self) -> &H {
-        &self.herdr
+    /// Whether the lead `name` has a wait registered in its pane now.
+    pub fn waiting(&self, name: &str) -> bool {
+        let inner = self.lock();
+        inner
+            .leads
+            .get(name)
+            .is_some_and(|lead| inner.waits.waiting_on(&lead.pane).is_some())
     }
 
     /// Every lead seen since the daemon started, or none while the link to herdr is down.
@@ -133,6 +147,7 @@ impl<H: HerdrApi> Leads<H> {
                 reported: lead.report.as_ref().is_some_and(|path| path.is_file()),
                 cwd: lead.cwd.clone(),
                 session: lead.session.clone(),
+                since: lead.since,
             })
             .collect();
         Some(seen)
@@ -149,7 +164,7 @@ impl<H: HerdrApi> Leads<H> {
     }
 
     pub async fn list(self: &Arc<Self>) -> Result<LeadList, Failure> {
-        self.up().await?;
+        self.check().await?;
         let inner = self.lock();
         let leads = inner
             .leads
@@ -160,7 +175,7 @@ impl<H: HerdrApi> Leads<H> {
     }
 
     pub async fn status(self: &Arc<Self>, name: &str) -> Result<LeadReport, Failure> {
-        self.up().await?;
+        self.check().await?;
         self.known(name).await?;
         let (report, state) = self.look(name)?;
         Ok(self.with_screen(report, &state).await)
@@ -173,7 +188,7 @@ impl<H: HerdrApi> Leads<H> {
         waiter: Option<String>,
         limit: Duration,
     ) -> Result<WaitLeadResult, Failure> {
-        self.up().await?;
+        self.check().await?;
         self.known(name).await?;
         let deadline = Instant::now() + limit;
         let _wait = self.register(Wait {
@@ -218,7 +233,8 @@ impl<H: HerdrApi> Leads<H> {
     }
 
     /// Brings the link up unless it is: checks herdr's protocol, then rebuilds the picture.
-    async fn up(self: &Arc<Self>) -> Result<(), Failure> {
+    /// Brings the link to herdr up, or says why it can't.
+    pub async fn check(self: &Arc<Self>) -> Result<(), Failure> {
         if self.lock().down.is_none() {
             return Ok(());
         }
@@ -296,6 +312,11 @@ impl<H: HerdrApi> Leads<H> {
                     .agent
                     .as_ref()
                     .map(|_| AgentStatus::parse(&agent.agent_status));
+                let since = inner
+                    .leads
+                    .get(&name)
+                    .filter(|old| old.agent == status)
+                    .map_or_else(Instant::now, |old| old.since);
                 seen.insert(name.clone());
                 inner.leads.insert(
                     name,
@@ -305,12 +326,14 @@ impl<H: HerdrApi> Leads<H> {
                         agent: status,
                         cwd: agent.cwd,
                         session: agent.agent_session,
+                        since,
                     },
                 );
             }
             for (name, lead) in &mut inner.leads {
-                if !seen.contains(name) {
+                if !seen.contains(name) && lead.agent.is_some() {
                     lead.agent = None;
+                    lead.since = Instant::now();
                 }
             }
             let panes: BTreeSet<String> = inner
@@ -384,7 +407,10 @@ impl<H: HerdrApi> Leads<H> {
         {
             let mut inner = self.lock();
             for lead in inner.leads.values_mut().filter(|lead| lead.pane == pane) {
-                lead.agent = agent;
+                if lead.agent != agent {
+                    lead.agent = agent;
+                    lead.since = Instant::now();
+                }
             }
         }
         self.bump();

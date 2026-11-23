@@ -12,6 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use factory_core::lead::AgentStatus;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -120,16 +121,27 @@ pub struct Agent {
 /// The session an agent reported: an id (Claude Code's session id) or the path of its log.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct AgentSession {
-    /// `id` or `path`.
-    pub kind: String,
+    pub kind: SessionKind,
     pub value: String,
+}
+
+/// What an [`AgentSession`]'s value is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionKind {
+    /// The agent's own session id.
+    Id,
+    /// The path of the session's log.
+    Path,
+    /// A kind this adapter doesn't know.
+    #[serde(other)]
+    Other,
 }
 
 /// What a prompt waits for: the agent reaching one of `until`, at most `timeout`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PromptWait {
-    /// herdr's statuses: idle, working, blocked, done, unknown.
-    pub until: Vec<String>,
+    pub until: Vec<AgentStatus>,
     pub timeout: Duration,
 }
 
@@ -256,7 +268,8 @@ impl HerdrApi for Herdr {
         let mut limit = ANSWER_TIMEOUT;
         if let Some(wait) = wait {
             let timeout_ms = u64::try_from(wait.timeout.as_millis()).unwrap_or(u64::MAX);
-            params["wait"] = json!({"until": wait.until, "timeout_ms": timeout_ms});
+            let until: Vec<&str> = wait.until.iter().map(|status| status.name()).collect();
+            params["wait"] = json!({"until": until, "timeout_ms": timeout_ms});
             limit += wait.timeout;
         }
         let (mut lines, _writer) = self.send("agent.prompt", params).await?;

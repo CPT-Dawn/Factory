@@ -22,6 +22,17 @@ pub enum AgentStatus {
 }
 
 impl AgentStatus {
+    /// herdr's spelling of the status.
+    pub fn name(self) -> &'static str {
+        match self {
+            AgentStatus::Idle => "idle",
+            AgentStatus::Working => "working",
+            AgentStatus::Blocked => "blocked",
+            AgentStatus::Done => "done",
+            AgentStatus::Unknown => "unknown",
+        }
+    }
+
     /// Reads herdr's spelling; a status this factory doesn't know reads as unknown.
     pub fn parse(status: &str) -> AgentStatus {
         match status {
