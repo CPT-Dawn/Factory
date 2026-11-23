@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::support::herdr::FakeHerdr;
-use crate::support::{DEADLINE, Sandbox, finish, freeze, spawn, stop_daemon, thaw};
+use crate::support::{DEADLINE, Sandbox, finish, freeze, spawn, stop_daemon, thaw, waited_on};
 
 #[test]
 fn a_herdr_on_another_protocol_is_reported_and_not_used() {
@@ -457,6 +457,48 @@ fn a_wait_carries_on_across_a_daemon_restart_and_hears_what_happened_meanwhile()
         ),
         (10, Some("lead-cart blocked"), ""),
         "{out:?}"
+    );
+}
+
+#[test]
+fn a_lead_whose_pane_closed_while_no_daemon_ran_is_dead_to_its_resumed_wait() {
+    let sandbox = Sandbox::new();
+    let herdr = shop(&sandbox, &[("lead-cart", "w1:p1", "working")]);
+    let child = waiting(&sandbox, &herdr, &["cart"], "w1:p1");
+
+    freeze(&child);
+    stop_daemon(&sandbox);
+    herdr.close("w1:p1");
+    thaw(&child);
+    let out = finish(child);
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (10, "lead-cart dead\n", ""),
+        "{out:?}"
+    );
+    assert!(
+        !waited_on(&sandbox, "lead", "lead-cart"),
+        "the wait outlived its answer"
+    );
+}
+
+#[test]
+fn a_lead_that_reported_and_left_while_no_daemon_ran_has_finished_for_its_resumed_wait() {
+    let sandbox = Sandbox::new();
+    let herdr = shop(&sandbox, &[("lead-cart", "w1:p1", "working")]);
+    let child = waiting(&sandbox, &herdr, &["cart"], "w1:p1");
+
+    freeze(&child);
+    stop_daemon(&sandbox);
+    let shipped = report(&sandbox, "cart");
+    herdr.close("w1:p1");
+    thaw(&child);
+    let out = finish(child);
+
+    assert_eq!(
+        (out.code, out.stdout, out.stderr.as_str()),
+        (0, format!("lead-cart finished: {shipped}\n"), ""),
     );
 }
 

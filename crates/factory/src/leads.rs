@@ -480,6 +480,63 @@ impl<H: HerdrApi> Leads<H> {
         self.known(name).await
     }
 
+    /// Where the lead `name` is: its pane and, when its repo is known, its report.
+    pub fn whereabouts(&self, name: &str) -> Option<(String, Option<String>)> {
+        self.lock().leads.get(name).map(|lead| {
+            (
+                lead.pane.clone(),
+                lead.report
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+            )
+        })
+    }
+
+    /// [`Leads::settled`] for a wait an earlier daemon may have held on the lead that was at
+    /// `pane`, reporting to `report`: one herdr no longer has went while no daemon watched it,
+    /// and answers as it ended, finished with its report written and dead without.
+    pub async fn resettled(
+        self: &Arc<Self>,
+        name: &str,
+        pane: Option<String>,
+        report: Option<String>,
+        deadline: Instant,
+        limit: Duration,
+    ) -> Result<WaitLeadResult, Failure> {
+        self.check().await?;
+        match self.known(name).await {
+            Ok(()) => self.settled(name, deadline, limit).await,
+            Err(failure) => {
+                let gone = {
+                    let inner = self.lock();
+                    inner.down.is_none() && !inner.leads.contains_key(name)
+                };
+                let Some(pane) = pane.filter(|_| gone) else {
+                    return Err(failure);
+                };
+                let state = LeadState::of(LeadFacts {
+                    agent: None,
+                    reported: report
+                        .as_ref()
+                        .is_some_and(|path| Path::new(path).is_file()),
+                    waiting_on: None,
+                });
+                let exit = state.wait_exit().unwrap_or(Exit::NeedsAttention).code();
+                Ok(WaitLeadResult {
+                    lead: LeadReport {
+                        lead: name.to_owned(),
+                        state: state.kind().to_owned(),
+                        status: state.to_string(),
+                        pane,
+                        report,
+                        lines: Vec::new(),
+                    },
+                    exit,
+                })
+            }
+        }
+    }
+
     /// Answers once the lead settles, or fails at `deadline`, `limit` after the wait began.
     /// The caller registers the wait.
     pub async fn settled(

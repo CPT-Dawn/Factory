@@ -35,16 +35,15 @@ pub fn wait(label: &str, timeout: Duration) -> Result<Done, Failure> {
     let repo = env::current_dir()
         .ok()
         .and_then(|cwd| GitRepo::at(&cwd).name().ok());
-    let params = WaitReviewParams {
+    let waiter = client::waiter();
+    let params = |resume, timeout_secs| WaitReviewParams {
         label: label.to_owned(),
-        repo,
-        waiter: env::var("HERDR_PANE_ID")
-            .ok()
-            .filter(|pane| !pane.is_empty()),
-        timeout_secs: timeout.as_secs(),
-        resume: None,
+        repo: repo.clone(),
+        waiter: waiter.clone(),
+        timeout_secs,
+        resume,
     };
-    let event: Fields = client::hold(&paths, WAIT_REVIEW, &params, timeout)?;
+    let event: Fields = client::hold(&paths, WAIT_REVIEW, params, timeout)?;
     let ended = finished::of(&event);
     let mut json = event;
     json.insert("exit".to_owned(), Value::from(ended.exit.code()));

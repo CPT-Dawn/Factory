@@ -326,37 +326,35 @@ async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut O
             return;
         };
         first = false;
-        if let Ok(request) = serde_json::from_str::<Request>(&line)
-            && request.method == RESERVE
-        {
-            service::reserve(Arc::clone(&daemon.lab), request, &mut writer, &mut lines).await;
-            continue;
-        }
-        if let Ok(request) = serde_json::from_str::<Request>(&line)
-            && WAITS.contains(&request.method.as_str())
-        {
-            if hold_wait(request, daemon, stop, &mut writer, &mut lines).await {
+        let request = serde_json::from_str::<Request>(&line);
+        match request {
+            Ok(request) if request.method == RESERVE => {
+                service::reserve(Arc::clone(&daemon.lab), request, &mut writer, &mut lines).await;
                 continue;
             }
-            return;
-        }
-        if let Ok(request) = serde_json::from_str::<Request>(&line)
-            && request.method == ACQUIRE
-        {
-            // Not cut short by a stop: a lease granted as it was dropped would go unanswered.
-            service::acquire(
-                Arc::clone(&daemon.lab),
-                Arc::clone(&daemon.ledger),
-                request,
-                &mut writer,
-                &mut lines,
-                stop.clone().stopping(),
-            )
-            .await;
-            continue;
+            Ok(request) if WAITS.contains(&request.method.as_str()) => {
+                if hold_wait(request, daemon, stop, &mut writer, &mut lines).await {
+                    continue;
+                }
+                return;
+            }
+            Ok(request) if request.method == ACQUIRE => {
+                // Not cut short by a stop: a lease granted as it was dropped would go unanswered.
+                service::acquire(
+                    Arc::clone(&daemon.lab),
+                    Arc::clone(&daemon.ledger),
+                    request,
+                    &mut writer,
+                    &mut lines,
+                    stop.clone().stopping(),
+                )
+                .await;
+                continue;
+            }
+            _ => {}
         }
         let response = tokio::select! {
-            response = respond(&line, daemon, stop, held) => response,
+            response = respond(request, daemon, stop, held) => response,
             _ = lines.next_line() => return,
         };
         let Ok(mut out) = serde_json::to_string(&response) else {
@@ -369,8 +367,13 @@ async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut O
     }
 }
 
-async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<String>) -> Response {
-    let request: Request = match serde_json::from_str(line) {
+async fn respond(
+    request: serde_json::Result<Request>,
+    daemon: &Daemon,
+    stop: &Stop,
+    held: &mut Option<String>,
+) -> Response {
+    let request = match request {
         Ok(request) => request,
         Err(e) => {
             return Response {
@@ -564,13 +567,14 @@ impl Asked {
     }
 }
 
-/// A blocking wait the daemon holds: until when, how long it was given, and for a review, when
-/// the run it waits on began.
+/// A blocking wait the daemon holds: until when, how long it was given, for a review when the
+/// run it waits on began, and for a lead its pane and report when the wait began.
 struct Held {
     registered: Registered<Herdr>,
     deadline: tokio::time::Instant,
     limit: Duration,
     since: Option<Timestamp>,
+    lead: (Option<String>, Option<String>),
 }
 
 /// Holds a blocking wait: keeps it (or picks up the one an earlier daemon kept, by its
@@ -597,7 +601,9 @@ where
         Ok(asked) => asked,
         Err(outcome) => return send(writer, &Response { id, outcome }).await,
     };
+    // A wait an earlier daemon held answers even for a lead gone since; a new one needs it.
     if let Asked::Lead(p) = &asked
+        && p.resume.is_none()
         && let Err(failure) = daemon.leads.find(&p.lead).await
     {
         let outcome = answered::<()>(Err(failure));
@@ -612,6 +618,7 @@ where
         deadline,
         limit,
         since,
+        lead: (pane, report),
     } = held;
     if let Some(row) = registered.row()
         && !send(
@@ -627,7 +634,12 @@ where
     }
     let waited = async {
         match &asked {
-            Asked::Lead(p) => answered(daemon.leads.settled(&p.lead, deadline, limit).await),
+            Asked::Lead(p) => answered(
+                daemon
+                    .leads
+                    .resettled(&p.lead, pane, report, deadline, limit)
+                    .await,
+            ),
             Asked::Ci(p) => answered(wait_ci(daemon, p, &registered, deadline, limit).await),
             Asked::Review(p) => answered(
                 daemon
@@ -671,6 +683,7 @@ fn hold(daemon: &Daemon, asked: &Asked) -> Result<Held, Outcome> {
                 + Duration::from_millis(u64::try_from(left).unwrap_or(0)),
             limit: Duration::from_secs(kept.limit_secs),
             since: kept.since,
+            lead: (kept.lead_pane, kept.lead_report),
         });
     }
     let limit = Duration::from_secs(timeout_secs);
@@ -683,6 +696,13 @@ fn hold(daemon: &Daemon, asked: &Asked) -> Result<Held, Outcome> {
         Asked::Review(p) => daemon.reviews.began(p.repo.as_deref(), &p.label),
         _ => None,
     };
+    let (lead_pane, lead_report) = match asked {
+        Asked::Lead(p) => daemon
+            .leads
+            .whereabouts(&p.lead)
+            .map_or((None, None), |(pane, report)| (Some(pane), report)),
+        _ => (None, None),
+    };
     let registered = daemon
         .leads
         .hold(&WaitRow {
@@ -692,6 +712,8 @@ fn hold(daemon: &Daemon, asked: &Asked) -> Result<Held, Outcome> {
             deadline_ms,
             limit_secs: timeout_secs,
             since,
+            lead_pane: lead_pane.clone(),
+            lead_report: lead_report.clone(),
         })
         .map_err(|failure| answered::<()>(Err(failure)))?;
     Ok(Held {
@@ -699,6 +721,7 @@ fn hold(daemon: &Daemon, asked: &Asked) -> Result<Held, Outcome> {
         deadline,
         limit,
         since,
+        lead: (lead_pane, lead_report),
     })
 }
 

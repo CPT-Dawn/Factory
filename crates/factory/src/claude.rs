@@ -160,13 +160,14 @@ pub fn quota() -> Result<Done, Failure> {
 /// `factory wait claude`: blocks, silent, until a lead may dispatch.
 pub fn wait(timeout: Duration) -> Result<Done, Failure> {
     let paths = Paths::from_env()?;
-    let params = WaitClaudeParams {
-        hold_at: config::claude_hold_at(&paths)?,
-        waiter: client::waiter(),
-        timeout_secs: timeout.as_secs(),
-        resume: None,
+    let (hold_at, waiter) = (config::claude_hold_at(&paths)?, client::waiter());
+    let params = |resume, timeout_secs| WaitClaudeParams {
+        hold_at,
+        waiter: waiter.clone(),
+        timeout_secs,
+        resume,
     };
-    let verdict: ClaudeVerdict = client::hold(&paths, WAIT_CLAUDE, &params, timeout)?;
+    let verdict: ClaudeVerdict = client::hold(&paths, WAIT_CLAUDE, params, timeout)?;
     let json = serde_json::to_value(&verdict).unwrap_or(Value::Null);
     Ok(Done::new("claude: the window has room; dispatch", json))
 }

@@ -104,7 +104,9 @@ impl Store {
                  waiter TEXT,
                  deadline_ms INTEGER NOT NULL,
                  limit_secs INTEGER NOT NULL,
-                 since_ms INTEGER
+                 since_ms INTEGER,
+                 lead_pane TEXT,
+                 lead_report TEXT
              );
              PRAGMA user_version = 5;",
         )
@@ -409,6 +411,9 @@ pub struct WaitRow {
     pub limit_secs: u64,
     /// For a review: when the run it waits for began, so an older run's end does not answer it.
     pub since: Option<Timestamp>,
+    /// For a lead: its pane and report, so a lead gone while no daemon ran still answers.
+    pub lead_pane: Option<String>,
+    pub lead_report: Option<String>,
 }
 
 impl Store {
@@ -416,8 +421,9 @@ impl Store {
     pub fn add_wait(&self, row: &WaitRow) -> rusqlite::Result<i64> {
         let (kind, target) = row.on.parts();
         self.db.execute(
-            "INSERT INTO wait (kind, target, waiter, deadline_ms, limit_secs, since_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO wait (kind, target, waiter, deadline_ms, limit_secs, since_ms,
+                               lead_pane, lead_report)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 kind,
                 target,
@@ -425,6 +431,8 @@ impl Store {
                 row.deadline_ms,
                 sql_int(row.limit_secs),
                 row.since.map(Timestamp::unix_millis),
+                row.lead_pane,
+                row.lead_report,
             ],
         )?;
         Ok(self.db.last_insert_rowid())
@@ -433,7 +441,8 @@ impl Store {
     /// Every blocking wait kept, oldest first; a row this daemon cannot read is left out.
     pub fn waits(&self) -> rusqlite::Result<Vec<WaitRow>> {
         let mut rows = self.db.prepare(
-            "SELECT id, kind, target, waiter, deadline_ms, limit_secs, since_ms
+            "SELECT id, kind, target, waiter, deadline_ms, limit_secs, since_ms,
+                    lead_pane, lead_report
              FROM wait ORDER BY id",
         )?;
         let read = rows.query_map([], |row| {
@@ -450,6 +459,8 @@ impl Store {
                         since: row
                             .get::<_, Option<i64>>(6)?
                             .map(Timestamp::from_unix_millis),
+                        lead_pane: row.get(7)?,
+                        lead_report: row.get(8)?,
                     })
                 }),
             )
