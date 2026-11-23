@@ -5,9 +5,10 @@
 //! board (a grant, a release, a waiter leaving) or the re-check tick, never in a sleep loop of
 //! the CLI's.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,7 @@ use factory_adapters::docker::{Containers, Docker};
 use factory_adapters::emulator::{EmulatorSpec, Emulators, SystemdEmulators};
 use factory_core::event::{Event, Fields};
 use factory_core::exit::Exit;
+use factory_core::lab::args::{LONGEST_WAIT, wait_span};
 use factory_core::lab::devices::{
     Attached, EmulatorView, HeldBy, Mode, Plan, PlanInput, device_rows, plan_devices,
 };
@@ -35,10 +37,12 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::lease::base_name;
+use super::reservations;
 use super::store::{self, Store};
 use super::wire::{
     AcquireParams, Board, DeviceAsk, DeviceLine, FindParams, GC, Granted, LEASE, Lease,
-    LeaseDevice, RELEASE, RUN_END, RUN_START, RunAsk, RunEnd, SLOT, STATUS, SlotParams, Waiter,
+    LeaseDevice, ProjectAsk, RECEIVED, RELEASE, RUN_END, RUN_START, ReleaseParams, RunAsk, RunEnd,
+    SLOT, STATUS, STOPPING, SlotParams, StopParams, UNRESERVE, Waiter,
 };
 use super::{android, host};
 use crate::ledger::Ledger;
@@ -51,6 +55,14 @@ const RECHECK: Duration = Duration::from_secs(3);
 const FIRST_LIST: Duration = Duration::from_secs(15);
 /// How often a booting emulator is looked at without a change to the device list.
 const BOOT_LOOK: Duration = Duration::from_secs(2);
+/// How long past its deadline a waiter whose caller is away keeps its place, so a caller that
+/// lost the daemon as its wait ran out still hears that it gave up.
+const AWAY_GRACE_MS: i64 = 30_000;
+/// How long a caller may take to say it has its grant before the grant is given back.
+const RECEIVED_TIMEOUT: Duration = Duration::from_secs(10);
+
+mod reserve;
+pub use reserve::reserve;
 
 pub struct Lab {
     path: PathBuf,
@@ -61,6 +73,9 @@ pub struct Lab {
     attached: watch::Sender<Option<Vec<Attached>>>,
     /// Starts the one device tracker, on the first call that needs the device list.
     tracking: Once,
+    /// The waiters whose callers are connected to this daemon; the rest are kept for callers
+    /// that come back after a restart, until they can't.
+    callers: Mutex<HashSet<i64>>,
 }
 
 type Answer<T> = Result<T, ErrorBody>;
@@ -75,6 +90,7 @@ impl Lab {
             changed: watch::Sender::new(0),
             attached: watch::Sender::new(None),
             tracking: Once::new(),
+            callers: Mutex::new(HashSet::new()),
         })
     }
 
@@ -141,7 +157,8 @@ impl Lab {
         });
     }
 
-    /// One write transaction; dead owners' leases are dropped first, telling waiters.
+    /// One write transaction; dead owners' leases, dead stoppers' holds and waiters that can't
+    /// come back are dropped first, telling waiters.
     fn write<T>(&self, work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>) -> Answer<T> {
         self.write_gc(work).map(|(_, out)| out)
     }
@@ -156,32 +173,53 @@ impl Lab {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = now();
-        let (freed, out) = store
+        let (freed, unstopped, out) = store
             .write(|c| {
                 let freed = store::gc(c, now, &host::alive)?;
-                Ok((freed, work(c, now)?))
+                let unstopped = store::clear_dead_stoppers(c, &host::alive)?;
+                let attached = self.callers().clone();
+                let pruned = store::prune_waiters(
+                    c,
+                    now_ms(),
+                    AWAY_GRACE_MS,
+                    &|id| attached.contains(&id),
+                    &host::alive,
+                )?;
+                Ok((freed, unstopped + pruned, work(c, now)?))
             })
             .map_err(|e| ErrorBody {
                 code: Exit::Precondition.code(),
                 message: format!("lab store {}: {e}; retry", self.path.display()),
             })?;
-        if !freed.is_empty() {
+        if !freed.is_empty() || unstopped > 0 {
             self.notify();
         }
         Ok((freed, out))
+    }
+
+    fn callers(&self) -> std::sync::MutexGuard<'_, HashSet<i64>> {
+        self.callers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn notify(&self) {
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
-    fn drop_unanswered(&self, lease: &Lease) {
-        if self
-            .write(|c, now| store::drop_lease(c, lease, now))
-            .is_ok()
-        {
+    /// Ends a granted request once its caller said it has the answer, or can't: `unanswered` is
+    /// the lease to give back, which its caller never learned of.
+    fn settle(&self, waiter: i64, unanswered: Option<&Lease>) -> Answer<()> {
+        self.write(|c, now| {
+            if let Some(lease) = unanswered {
+                store::drop_lease(c, lease, now)?;
+            }
+            store::delete_waiter(c, waiter)
+        })?;
+        if unanswered.is_some() {
             self.notify();
         }
+        Ok(())
     }
 
     fn remove_waiter(&self, id: i64) {
@@ -196,9 +234,11 @@ pub async fn respond(lab: &Arc<Lab>, method: &str, params: Value) -> Option<Outc
     let work: fn(&Lab, Value, &[Attached]) -> Answer<Value> = match method {
         LEASE => |lab, p, seen| reply(lab_lease(lab, parse(p)?, seen)),
         RELEASE => |lab, p, _| reply(release(lab, parse(p)?)),
+        STOPPING => |lab, p, _| reply(stopping(lab, parse(p)?)),
         GC => |lab, _, _| reply(lab.write_gc(|_, _| Ok(())).map(|(freed, ())| freed)),
         STATUS => |lab, _, seen| reply(status(lab, seen)),
         SLOT => |lab, p, _| reply(slot(lab, parse(p)?)),
+        UNRESERVE => |lab, p, _| reply(reserve::unreserve(lab, parse(p)?)),
         _ => return None,
     };
     // A lease's devices and the status table are told as adb lists them now.
@@ -262,18 +302,40 @@ fn state_of<'a>(seen: &'a [Attached], serial: &str) -> Option<&'a str> {
         .map(|a| a.state.as_str())
 }
 
-fn release(lab: &Lab, p: FindParams) -> Answer<Option<Lease>> {
-    let dropped = lab.write(|c, now| {
-        let lease = store::find_lease(c, &p.worktree, &p.owner, p.lease)?;
+fn release(lab: &Lab, p: ReleaseParams) -> Answer<Option<Lease>> {
+    let (dropped, unstopped) = lab.write(|c, now| {
+        let f = &p.find;
+        let lease = store::find_lease(c, &f.worktree, &f.owner, f.lease)?;
         if let Some(lease) = &lease {
             store::drop_lease(c, lease, now)?;
         }
-        Ok(lease)
+        let unstopped = match &p.stopper {
+            Some(stopper) => store::clear_stopping(c, stopper)?,
+            None => 0,
+        };
+        Ok((lease, unstopped))
     })?;
-    if dropped.is_some() {
+    if dropped.is_some() || unstopped > 0 {
         lab.notify();
     }
     Ok(dropped)
+}
+
+/// The caller's lease, its slot marked as stopping for `p.stopper`.
+fn stopping(lab: &Lab, p: StopParams) -> Answer<Option<Lease>> {
+    lab.write(|c, _| {
+        let f = &p.find;
+        let lease = store::find_lease(c, &f.worktree, &f.owner, f.lease)?;
+        if let Some(Lease {
+            project: Some(project),
+            slot: Some(slot),
+            ..
+        }) = &lease
+        {
+            store::mark_stopping(c, project, *slot, &p.stopper)?;
+        }
+        Ok(lease)
+    })
 }
 
 fn status(lab: &Lab, seen: &[Attached]) -> Answer<Board> {
@@ -318,6 +380,7 @@ fn status(lab: &Lab, seen: &[Attached]) -> Answer<Board> {
             leases,
             slots: store::slots(c)?,
             waiters: store::waiters(c)?,
+            reservations: reservations::all(c)?,
             devices,
         })
     })
@@ -344,7 +407,16 @@ fn gather(lab: &Lab, p: &AcquireParams, attached: Vec<Attached>) -> Facts {
     } else {
         0
     };
-    let running = match &p.project {
+    Facts {
+        attached,
+        mem_available_mb,
+        ..gather_stack(p.project.as_ref())
+    }
+}
+
+/// The facts about a project's stacks and the host's ports, for a request that asks for no device.
+fn gather_stack(project: Option<&ProjectAsk>) -> Facts {
+    let running = match project {
         Some(project) => match &project.stack {
             Some(stack) => (0..project.max_slots)
                 .map(|slot| {
@@ -361,8 +433,8 @@ fn gather(lab: &Lab, p: &AcquireParams, attached: Vec<Attached>) -> Facts {
     Facts {
         listening: host::listening_ports(),
         running,
-        attached,
-        mem_available_mb,
+        attached: Vec::new(),
+        mem_available_mb: 0,
     }
 }
 
@@ -469,33 +541,141 @@ struct Planned {
     used: Vec<u32>,
 }
 
-fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<i64> {
+/// Leaves the waiter to callers that come back, once its caller's connection ends.
+struct Present(Arc<Lab>, i64);
+
+impl Drop for Present {
+    fn drop(&mut self) {
+        self.0.callers().remove(&self.1);
+    }
+}
+
+/// Where a request stands once queued.
+enum Queued {
+    /// In the queue at `id`, giving up at `deadline_ms`; `resumed`: a place it had before.
+    Waiting {
+        id: i64,
+        deadline_ms: Option<i64>,
+        resumed: bool,
+    },
+    /// Granted before the daemon could answer it.
+    Granted { id: i64, granted: Granted },
+}
+
+/// Queues the request, or takes back the place it had if it is still its own: the one it names,
+/// else the one its devlab call holds, so a caller that never heard of its place keeps it too.
+/// The caller counts as attached from here.
+fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<Queued> {
     lab.write(|c, now| {
-        let existing = store::find_lease(c, &p.worktree, &p.owner, p.lease)?;
-        let ask = project_ask(p);
-        let name = base_name(&p.worktree);
-        store::insert_waiter(
-            c,
-            &Waiter {
-                id: 0,
-                created: now,
-                label: format!("{} @ {name}", p.owner.label),
-                owner: p.owner.key(),
-                owner_label: p.owner.label.clone(),
-                project: p.project.as_ref().map(|project| project.name.clone()),
-                slot_cap: grant::request_cap(ask.as_ref(), existing.is_some()),
-                max_slots: p.project.as_ref().map_or(0, |project| project.max_slots),
+        let kept = store::place(c, p)?;
+        let queued = match kept {
+            Some(store::Place {
+                waiter,
+                granted: Some(granted),
+            }) => Queued::Granted {
+                id: waiter.id,
+                granted,
             },
-        )
+            Some(store::Place { waiter, .. }) => Queued::Waiting {
+                id: waiter.id,
+                deadline_ms: waiter.deadline_ms,
+                resumed: true,
+            },
+            None => {
+                let (id, deadline_ms) = insert(c, p, now)?;
+                Queued::Waiting {
+                    id,
+                    deadline_ms,
+                    resumed: false,
+                }
+            }
+        };
+        lab.callers().insert(match &queued {
+            Queued::Waiting { id, .. } | Queued::Granted { id, .. } => *id,
+        });
+        Ok(queued)
     })
 }
 
+fn insert(c: &Connection, p: &AcquireParams, now: i64) -> rusqlite::Result<(i64, Option<i64>)> {
+    let deadline_ms = i64::try_from(wait_span(p.wait_sec).as_millis())
+        .ok()
+        .and_then(|wait| now_ms().checked_add(wait));
+    let name = base_name(&p.worktree);
+    let id = store::insert_waiter(
+        c,
+        &Waiter {
+            id: 0,
+            created: now,
+            label: format!("{} @ {name}", p.owner.label),
+            owner: p.owner.key(),
+            owner_label: p.owner.label.clone(),
+            worktree: p.worktree.clone(),
+            lease: p.lease,
+            project: p.project.as_ref().map(|project| project.name.clone()),
+            slot_cap: p.project.as_ref().map(|project| project.cap),
+            max_slots: p.project.as_ref().map_or(0, |project| project.max_slots),
+            deadline_ms,
+            client_pid: p.client.as_ref().map(|client| client.pid),
+            client_start: p.client.as_ref().map(|client| client.start.clone()),
+        },
+    )?;
+    Ok((id, deadline_ms))
+}
+
 fn project_ask(p: &AcquireParams) -> Option<grant::ProjectAsk> {
-    p.project.as_ref().map(|project| grant::ProjectAsk {
+    p.project.as_ref().map(grant_project)
+}
+
+fn grant_project(project: &ProjectAsk) -> grant::ProjectAsk {
+    grant::ProjectAsk {
         name: project.name.clone(),
         max_slots: project.max_slots,
         cap: project.cap,
         has_stack: project.stack.is_some(),
+    }
+}
+
+/// The board a request is decided on: the leases and the reservations (both hold a slot of their
+/// owner's), the queue, and the asker's project's slots.
+fn grant_board(
+    c: &Connection,
+    project: Option<&ProjectAsk>,
+    worktree: &str,
+    facts: &Facts,
+) -> rusqlite::Result<grant::Board> {
+    let mut leases: Vec<_> = store::leases(c)?.iter().map(Lease::holding).collect();
+    leases.extend(reservations::all(c)?.iter().map(|r| r.holding()));
+    let rows = store::slots(c)?;
+    Ok(grant::Board {
+        leases,
+        queue: store::waiters(c)?.iter().map(Waiter::entry).collect(),
+        slots: project.map_or_else(Vec::new, |project| {
+            (0..project.max_slots)
+                .map(|slot| {
+                    let (own_ports, stack_ports) = slot_host_ports(
+                        &project.ports,
+                        project.stride,
+                        slot,
+                        project.stack.as_ref().map(|s| s.ports.as_slice()),
+                    );
+                    SlotView {
+                        held: rows
+                            .iter()
+                            .any(|r| r.project == project.name && r.slot == slot && r.stopping),
+                        last_is_mine: rows.iter().any(|r| {
+                            r.project == project.name
+                                && r.slot == slot
+                                && r.last_worktree.as_deref() == Some(worktree)
+                        }),
+                        stack_running: facts.running.get(slot as usize).copied().unwrap_or(false),
+                        own_ports,
+                        stack_ports,
+                    }
+                })
+                .collect()
+        }),
+        listening: facts.listening.clone(),
     })
 }
 
@@ -507,7 +687,38 @@ fn try_grant(
     facts: &Facts,
 ) -> Answer<Result<Taken, String>> {
     lab.write(|c, now| {
-        let lease = store::find_lease(c, &p.worktree, &p.owner, p.lease)?;
+        let mut lease = store::find_lease(c, &p.worktree, &p.owner, p.lease)?;
+        // A reservation of the caller's project is used once: it becomes the caller's lease,
+        // without a turn in the queue. One that is gone (used, released or its lead exited)
+        // asks for a slot the normal way.
+        let mut claimed = false;
+        if lease.is_none()
+            && let (Some(id), Some(project)) = (p.reservation, &p.project)
+        {
+            lease = reservations::claim(c, id, &project.name, &p.worktree, &p.owner, now)?;
+            claimed = lease.is_some();
+        }
+        if claimed
+            && p.devices.is_none()
+            && let (Some(lease), Some(project)) = (&lease, &p.project)
+        {
+            let previous = match lease.slot {
+                Some(slot) => store::claim_slot(c, &project.name, slot, &p.worktree)?,
+                None => None,
+            };
+            store::touch(c, lease.id, now)?;
+            store::delete_waiter(c, waiter)?;
+            return Ok(Ok(Taken {
+                granted: Granted {
+                    lease: lease.clone(),
+                    previous,
+                },
+                fresh: true,
+                boots: Vec::new(),
+                phones: Vec::new(),
+                reused: Vec::new(),
+            }));
+        }
         let planned = match &p.devices {
             Some(ask) => plan(
                 c,
@@ -522,40 +733,7 @@ fn try_grant(
             Ok(planned) => (planned, None),
             Err(why) => (None, Some(why)),
         };
-        let leases = store::leases(c)?;
-        let rows = store::slots(c)?;
-        let board = grant::Board {
-            leases: leases.iter().map(Lease::holding).collect(),
-            queue: store::waiters(c)?.iter().map(Waiter::entry).collect(),
-            slots: p.project.as_ref().map_or_else(Vec::new, |project| {
-                (0..project.max_slots)
-                    .map(|slot| {
-                        let (own_ports, stack_ports) = slot_host_ports(
-                            &project.ports,
-                            project.stride,
-                            slot,
-                            project.stack.as_ref().map(|s| s.ports.as_slice()),
-                        );
-                        SlotView {
-                            held: false,
-                            last_is_mine: rows.iter().any(|r| {
-                                r.project == project.name
-                                    && r.slot == slot
-                                    && r.last_worktree.as_deref() == Some(p.worktree.as_str())
-                            }),
-                            stack_running: facts
-                                .running
-                                .get(slot as usize)
-                                .copied()
-                                .unwrap_or(false),
-                            own_ports,
-                            stack_ports,
-                        }
-                    })
-                    .collect()
-            }),
-            listening: facts.listening.clone(),
-        };
+        let board = grant_board(c, p.project.as_ref(), &p.worktree, facts)?;
         let ask = Ask {
             waiter,
             project: project_ask(p),
@@ -566,7 +744,7 @@ fn try_grant(
             Decision::Wait(why) => return Ok(Err(why)),
             Decision::Grant { slot, new } => (slot, new),
         };
-        let fresh = new || lease.is_none();
+        let fresh = new || lease.is_none() || claimed;
         let lease = match lease {
             Some(lease) if !new => lease,
             _ => store::insert_lease(
@@ -614,7 +792,13 @@ fn try_grant(
             }
         }
         store::touch(c, lease.id, now)?;
-        store::delete_waiter(c, waiter)?;
+        // A grant that boots emulators can't be handed to a caller again after a restart: the
+        // daemon that comes back stops them, so the place goes now, as it did before.
+        if fresh && boots.is_empty() {
+            store::mark_granted(c, waiter, lease.id, previous.as_deref())?;
+        } else {
+            store::delete_waiter(c, waiter)?;
+        }
         let lease = store::lease(c, lease.id)?.unwrap_or(lease);
         Ok(Ok(Taken {
             granted: Granted { lease, previous },
@@ -918,6 +1102,7 @@ pub async fn acquire<W, R, S>(
         );
     }
     let p = Arc::new(p);
+    tokio::pin!(stopping);
     let mut run = p.run.clone().map(|ask| Run {
         ask,
         worktree: p.worktree.clone(),
@@ -931,8 +1116,21 @@ pub async fn acquire<W, R, S>(
         let (lab, p) = (Arc::clone(&lab), Arc::clone(&p));
         blocking(move || enqueue(&lab, &p)).await
     };
-    let waiter = match queued {
-        Ok(waiter) => waiter,
+    let (waiter, deadline_ms, resumed) = match queued {
+        Ok(Queued::Waiting {
+            id,
+            deadline_ms,
+            resumed,
+        }) => (id, deadline_ms, resumed),
+        Ok(Queued::Granted {
+            id: waiter,
+            granted,
+        }) => {
+            let _attached = Present(Arc::clone(&lab), waiter);
+            let place = (waiter, granted, true);
+            deliver(&lab, writer, lines, id, place, run, stopping.as_mut()).await;
+            return;
+        }
         Err(body) => {
             if let Some(run) = &run {
                 run.record(End::Exit(body.code).outcome(), Phase::Queued.word())
@@ -949,13 +1147,50 @@ pub async fn acquire<W, R, S>(
             return;
         }
     };
+    let _attached = Present(Arc::clone(&lab), waiter);
     lab.notify();
-    let year = Duration::from_secs(365 * 86400);
-    let wait = Duration::try_from_secs_f64(p.wait_sec).unwrap_or(year);
+    let place = Response {
+        id,
+        outcome: Outcome::Queued(waiter),
+    };
+    if !send(writer, place).await {
+        lab.remove_waiter(waiter);
+        if let Some(run) = &run {
+            run.record(End::Lost.outcome(), Phase::Queued.word()).await;
+        }
+        return;
+    }
+    // A wait that ran out while the daemon was away takes nothing that came free meanwhile.
+    if resumed && deadline_ms.is_some_and(|ms| ms <= now_ms()) {
+        lab.remove_waiter(waiter);
+        let body = ErrorBody {
+            code: Exit::Busy.code(),
+            message: format!(
+                "gave up after {} s: the wait ran out while the daemon restarted",
+                js_number(p.wait_sec)
+            ),
+        };
+        if let Some(run) = &run {
+            run.record(End::Exit(body.code).outcome(), Phase::Queued.word())
+                .await;
+        }
+        send(
+            writer,
+            Response {
+                id,
+                outcome: Outcome::Error(body),
+            },
+        )
+        .await;
+        return;
+    }
     let now = Instant::now();
+    let left = deadline_ms.map_or(LONGEST_WAIT, |ms| {
+        Duration::from_millis(u64::try_from(ms.saturating_sub(now_ms())).unwrap_or(0))
+    });
     let deadline = now
-        .checked_add(wait)
-        .or_else(|| now.checked_add(year))
+        .checked_add(left)
+        .or_else(|| now.checked_add(LONGEST_WAIT))
         .unwrap_or(now);
     let mut said = String::new();
     loop {
@@ -978,24 +1213,26 @@ pub async fn acquire<W, R, S>(
                 lab.notify();
                 let (fresh, previous) = (taken.fresh, taken.granted.previous.clone());
                 let lease = taken.granted.lease.clone();
-                let outcome = match settle(&lab, &p, taken, writer, id).await {
-                    Ok(lease) => Outcome::Result(
-                        serde_json::to_value(Granted { lease, previous }).unwrap_or(Value::Null),
-                    ),
-                    Err(body) => Outcome::Error(body),
-                };
-                let answered = send(writer, Response { id, outcome }).await;
-                // A caller gone before its answer never learns of the lease: give it back.
-                if !answered && fresh {
-                    lab.drop_unanswered(&lease);
-                }
-                if let Some(mut run) = run {
-                    run.granted = Some(Instant::now());
-                    if answered {
-                        run.lease = Some(lease);
-                        run.follow(lines, stopping).await;
-                    } else {
-                        run.record(End::Lost.outcome(), Phase::Queued.word()).await;
+                match settle(&lab, &p, taken, writer, id).await {
+                    Ok(lease) => {
+                        let place = (waiter, Granted { lease, previous }, fresh);
+                        deliver(&lab, writer, lines, id, place, run, stopping.as_mut()).await;
+                    }
+                    Err(body) => {
+                        // The lease is kept, its request failed: only a caller that never hears
+                        // so loses a fresh one.
+                        let outcome = Outcome::Error(body);
+                        let answered = send(writer, Response { id, outcome }).await;
+                        let _ = lab.settle(waiter, (!answered && fresh).then_some(&lease));
+                        if let Some(mut run) = run {
+                            run.granted = Some(Instant::now());
+                            if answered {
+                                run.lease = Some(lease);
+                                run.follow(lines, None, stopping.as_mut()).await;
+                            } else {
+                                run.record(End::Lost.outcome(), Phase::Queued.word()).await;
+                            }
+                        }
                     }
                 }
                 return;
@@ -1056,6 +1293,15 @@ pub async fn acquire<W, R, S>(
             _ = changed.changed() => {}
             () = tokio::time::sleep(RECHECK) => {}
             () = tokio::time::sleep_until(deadline) => {}
+            // The daemon is stopping: the place stays for its caller to ask the next daemon for,
+            // but for a run's, which asks no other daemon.
+            () = stopping.as_mut() => {
+                if let Some(run) = &run {
+                    lab.remove_waiter(waiter);
+                    run.record(End::Lost.outcome(), Phase::Queued.word()).await;
+                }
+                return;
+            }
             line = lines.next_line() => {
                 let Ok(Some(line)) = line else {
                     lab.remove_waiter(waiter);
@@ -1088,6 +1334,121 @@ pub async fn acquire<W, R, S>(
     }
 }
 
+/// How a grant's caller took it.
+enum Receipt {
+    /// The caller has it; `then`, the line of a run that said so by starting or ending.
+    Received { then: Option<String> },
+    /// The caller never had it, and a fresh lease went back; `end`, a run's, if it said one.
+    Gone { end: Option<RunEnd> },
+    /// The daemon stopped first: the grant stays for the caller to ask for again.
+    Stopping,
+}
+
+/// Answers a grant and, for a run, follows the run to its end.
+async fn deliver<W, R, S>(
+    lab: &Lab,
+    writer: &mut W,
+    lines: &mut Lines<R>,
+    id: Option<u64>,
+    (waiter, granted, fresh): (i64, Granted, bool),
+    run: Option<Run>,
+    mut stopping: Pin<&mut S>,
+) where
+    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+    S: Future<Output = ()>,
+{
+    let lease = granted.lease.clone();
+    let receipt = answer(
+        lab,
+        writer,
+        lines,
+        id,
+        (waiter, granted, fresh),
+        &mut stopping,
+    )
+    .await;
+    let Some(mut run) = run else { return };
+    run.granted = Some(Instant::now());
+    match receipt {
+        Receipt::Received { then } => {
+            run.lease = Some(lease);
+            run.follow(lines, then, stopping).await;
+        }
+        Receipt::Gone { end: Some(end) } => run.record(end.outcome, &end.phase).await,
+        Receipt::Gone { end: None } | Receipt::Stopping => {
+            run.record(End::Lost.outcome(), Phase::Queued.word()).await;
+        }
+    }
+}
+
+/// Sends the grant, then lets the waiter go once the caller says it has it ([`RECEIVED`]), and
+/// confirms. A run says so by starting or ending too, unless it ended while still queued. A
+/// caller gone before it says so never learns of a `fresh` lease: it is given back. Until the
+/// waiter goes, a daemon that restarts hands its caller the same grant.
+async fn answer<W, R, S>(
+    lab: &Lab,
+    writer: &mut W,
+    lines: &mut Lines<R>,
+    id: Option<u64>,
+    (waiter, granted, fresh): (i64, Granted, bool),
+    stopping: &mut Pin<&mut S>,
+) -> Receipt
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+    S: Future<Output = ()>,
+{
+    let lease = granted.lease.clone();
+    let give_back = |end| {
+        let _ = lab.settle(waiter, fresh.then_some(&lease));
+        Receipt::Gone { end }
+    };
+    let value = serde_json::to_value(granted).unwrap_or(Value::Null);
+    let sent = send(
+        writer,
+        Response {
+            id,
+            outcome: Outcome::Result(value),
+        },
+    )
+    .await;
+    if !sent {
+        return give_back(None);
+    }
+    let next = tokio::select! {
+        next = tokio::time::timeout(RECEIVED_TIMEOUT, lines.next_line()) => next,
+        () = stopping.as_mut() => return Receipt::Stopping,
+    };
+    let Ok(Ok(Some(line))) = next else {
+        return give_back(None);
+    };
+    match serde_json::from_str::<Request>(&line) {
+        Ok(said) if said.method == RECEIVED => {
+            let outcome = match lab.settle(waiter, None) {
+                Ok(()) => Outcome::Result(Value::Bool(true)),
+                Err(body) => Outcome::Error(body),
+            };
+            send(
+                writer,
+                Response {
+                    id: Some(said.id),
+                    outcome,
+                },
+            )
+            .await;
+            Receipt::Received { then: None }
+        }
+        _ => match run_end(&line) {
+            Some(end) if end.phase == Phase::Queued.word() => give_back(Some(end)),
+            _ => {
+                let _ = lab.settle(waiter, None);
+                Receipt::Received { then: Some(line) }
+            }
+        },
+    }
+}
+
 /// A run's end, if `line` is one.
 fn run_end(line: &str) -> Option<RunEnd> {
     let request: Request = serde_json::from_str(line).ok()?;
@@ -1108,19 +1469,24 @@ struct Run {
 }
 
 impl Run {
-    /// Reads the run's connection after the grant: its start, then its end, or the connection
-    /// closing without one, which is a lost run. A daemon stopping under a run loses it too: the
-    /// run may outlast any drain, and its end would reach no one.
-    async fn follow<R, S>(&mut self, lines: &mut Lines<R>, stopping: S)
+    /// Reads the run's connection after the grant, from its line `first` if it was read
+    /// already: its start, then its end, or the connection closing without one, which is a lost
+    /// run. A daemon stopping under a run loses it too: the run may outlast any drain, and its
+    /// end would reach no one.
+    async fn follow<R, S>(&mut self, lines: &mut Lines<R>, first: Option<String>, stopping: S)
     where
         R: AsyncBufRead + Unpin,
         S: Future<Output = ()>,
     {
         tokio::pin!(stopping);
+        let mut first = first;
         loop {
-            let line = tokio::select! {
-                line = lines.next_line() => line,
-                () = &mut stopping => Ok(None),
+            let line = match first.take() {
+                Some(line) => Ok(Some(line)),
+                None => tokio::select! {
+                    line = lines.next_line() => line,
+                    () = &mut stopping => Ok(None),
+                },
             };
             let Ok(Some(line)) = line else {
                 let phase = if self.started.is_some() {
@@ -1199,6 +1565,13 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, response: Response) -> bool
     };
     line.push('\n');
     writer.write_all(line.as_bytes()).await.is_ok()
+}
+
+/// Milliseconds since the epoch.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Seconds since the epoch.

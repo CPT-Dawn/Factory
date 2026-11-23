@@ -1,6 +1,12 @@
 //! The options devlab's `run` and `acquire` take, read as devlab read them.
 
+use std::time::Duration;
+
 use super::devices::Mode;
+
+/// The longest a wait runs. Today's devlab waits a huge `--wait` out as good as forever; a
+/// year keeps that meaning without overflowing a deadline.
+pub const LONGEST_WAIT: Duration = Duration::from_secs(365 * 86400);
 
 /// What `acquire` and `run` ask for.
 #[derive(Debug, Clone, PartialEq)]
@@ -70,9 +76,15 @@ pub fn parse_opts(args: &[String]) -> Result<(Opts, &[String], Vec<String>), Str
     Ok((opts, args.get(i..).unwrap_or_default(), flags))
 }
 
+/// How long a wait of `sec` seconds (finite and not negative, as [`parse_opts`] and the config
+/// leave it) runs: its seconds, up to [`LONGEST_WAIT`].
+pub fn wait_span(sec: f64) -> Duration {
+    Duration::try_from_secs_f64(sec).map_or(LONGEST_WAIT, |wait| wait.min(LONGEST_WAIT))
+}
+
 /// An argument read as JavaScript's `Number(text)` reads it, near enough: blank is 0, junk (or
 /// nothing) is NaN.
-fn number_arg(text: Option<&String>) -> f64 {
+pub fn number_arg(text: Option<&String>) -> f64 {
     let Some(text) = text else { return f64::NAN };
     let text = text.trim();
     if text.is_empty() {
@@ -146,5 +158,14 @@ mod tests {
             );
         }
         assert_eq!(opts(&["--wait", " 7 "]).unwrap().0.wait_sec, Some(7.0));
+    }
+
+    #[test]
+    fn a_wait_runs_its_seconds_up_to_a_year() {
+        assert_eq!(wait_span(0.0), Duration::ZERO);
+        assert_eq!(wait_span(2.5), Duration::from_millis(2500));
+        assert_eq!(wait_span(31_536_000.0), Duration::from_secs(31_536_000));
+        assert_eq!(wait_span(31_536_001.0), Duration::from_secs(31_536_000));
+        assert_eq!(wait_span(1e19), Duration::from_secs(31_536_000));
     }
 }
