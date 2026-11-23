@@ -347,8 +347,6 @@ fn serve(shared: &Shared, stream: UnixStream) {
         if let Some(overtake) = state.overtake.take_if(|_| due) {
             (overtake.first)();
             set_status(&mut state, &overtake.pane, &overtake.status, true);
-            let _ = writeln!(&stream, "{}", json!({"id": id, "result": result}));
-            return;
         }
     }
     let _ = writeln!(&stream, "{}", json!({"id": id, "result": result}));
