@@ -2,6 +2,8 @@
 
 use std::fs;
 
+use std::os::unix::fs::PermissionsExt;
+
 use crate::support::github::{FakeGitHub, HEAD, PR_URL};
 use crate::support::herdr::FakeHerdr;
 use crate::support::world::poll_until;
@@ -75,6 +77,10 @@ fn failed_checks_exit_10_naming_them_and_a_file_with_each_url_and_log_tail() {
         "{out:?}"
     );
     let text = fs::read_to_string(&file).expect("read the failures file");
+    let mode =
+        |path: &std::path::Path| fs::metadata(path).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode(&file), 0o600, "the logs can be a private repo's");
+    assert_eq!(mode(file.parent().expect("a dir")), 0o700);
     assert!(
         text.contains("https://github.com/acme/shop/actions/runs/7/job/2\n"),
         "{text}"
@@ -310,20 +316,19 @@ fn three_waiters_on_one_pr_share_one_poll_per_interval() {
 
 #[test]
 fn gh_event_listen_drives_a_wait_to_completion_with_zero_polls() {
-    let sandbox = polling_every(1);
+    // An hour between polls: a wait that ends sooner was driven by events.
+    let sandbox = polling_every(3600);
     let github = FakeGitHub::install(&sandbox);
     github.checks(&[(1, "test", "in_progress", None)]);
     github.stage_checks(&[(1, "test", "completed", Some("success"))]);
-    // Attach, wait for the read that follows, then stay quiet for longer than the poll interval
-    // before the check suite completes: a poller would have polled meanwhile.
+    // Attach, wait for the read that follows, then report the check suite completed.
     github.listen(
         r#"echo $$ > "$G/listener.pid"
 echo "Listening for events on https://github.com/acme/shop/pull/12" >&2
 while [ ! -s "$G/polls" ]; do sleep 0.05; done
-sleep 2
 mv "$G/next.json" "$G/checks.json"
 echo '{"type":"com.github.pull_request.check_suite.status.changed.v1","data":{"conclusion":"success"}}'
-exec sleep 60"#,
+exec tail -f /dev/null"#,
     );
 
     let out = sandbox.factory(&["wait", "ci", "12"]);
@@ -452,4 +457,171 @@ fn json_carries_the_whole_answer() {
             .is_some_and(|f| f.ends_with("ci/acme/shop/12.md")),
         "{answer}"
     );
+}
+
+#[test]
+fn commit_statuses_count_as_checks() {
+    let sandbox = polling_every(1);
+    let github = FakeGitHub::install(&sandbox);
+    github.checks(&[(1, "lint", "completed", Some("success"))]);
+    github.statuses(&[("ci/circleci", "pending")]);
+    let child = spawn(sandbox.factory_command(&["wait", "ci", "12"]));
+    assert!(
+        poll_until(|| github.polls().len() >= 2),
+        "never polled twice"
+    );
+
+    github.statuses(&[("ci/circleci", "failure")]);
+    let out = finish(child);
+
+    assert_eq!(out.code, 10, "{out:?}");
+    assert!(out.stdout.ends_with("; failed: ci/circleci\n"), "{out:?}");
+    let text = fs::read_to_string(sandbox.path("state/factory/ci/acme/shop/12.md"))
+        .expect("read the failures file");
+    assert!(
+        text.contains("https://ci.example.com/acme/shop/ci/circleci\n\nNo log here: a commit status keeps it at the URL."),
+        "{text}"
+    );
+}
+
+#[test]
+fn every_page_of_check_runs_is_read() {
+    let sandbox = polling_every(1);
+    let github = FakeGitHub::install(&sandbox);
+    let names: Vec<String> = (1..=150).map(|n| format!("shard-{n}")).collect();
+    let runs: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let conclusion = if i == 140 { "failure" } else { "success" };
+            (
+                i as u64 + 1,
+                name.as_str(),
+                "completed",
+                Some(conclusion),
+                "github-actions",
+            )
+        })
+        .collect();
+    github.runs(&runs);
+
+    let out = sandbox.factory(&["wait", "ci", "12"]);
+
+    assert_eq!(out.code, 10, "{out:?}");
+    assert!(
+        out.stdout
+            .starts_with("acme/shop#12: 149 passed, 1 failed;")
+            && out.stdout.ends_with("; failed: shard-141\n"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_check_from_another_app_points_at_its_url_for_the_log() {
+    let sandbox = polling_every(1);
+    let github = FakeGitHub::install(&sandbox);
+    github.runs(&[
+        (1, "lint", "completed", Some("success"), "github-actions"),
+        (2, "security", "completed", Some("failure"), "snyk"),
+    ]);
+
+    let out = sandbox.factory(&["wait", "ci", "12"]);
+
+    assert_eq!(out.code, 10, "{out:?}");
+    let text = fs::read_to_string(sandbox.path("state/factory/ci/acme/shop/12.md"))
+        .expect("read the failures file");
+    assert!(
+        text.contains("No log here: snyk keeps it at the URL."),
+        "{text}"
+    );
+    let log_reads = sandbox
+        .calls("gh")
+        .into_iter()
+        .filter(|call| call.iter().any(|arg| arg.ends_with("/logs")))
+        .count();
+    assert_eq!(
+        log_reads, 0,
+        "only an Actions job has a log behind the jobs API"
+    );
+}
+
+#[test]
+fn many_failures_name_as_many_as_fit_and_count_the_rest() {
+    let sandbox = polling_every(1);
+    let github = FakeGitHub::install(&sandbox);
+    let names: Vec<String> = (1..=30)
+        .map(|n| format!("integration-shard-{n:02}"))
+        .collect();
+    let runs: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (i as u64 + 1, name.as_str(), "completed", Some("failure")))
+        .collect();
+    github.checks(&runs);
+
+    let out = sandbox.factory(&["wait", "ci", "12"]);
+
+    assert_eq!(out.code, 10, "{out:?}");
+    let line = out.stdout.trim_end();
+    assert!(line.chars().count() <= 200, "{line:?}");
+    let file = sandbox.path("state/factory/ci/acme/shop/12.md");
+    assert!(
+        line.contains(&format!(
+            "; logs in {}; failed: integration-shard-01, ",
+            file.display()
+        )),
+        "{line:?}"
+    );
+    let (shown, rest) = line
+        .rsplit_once(" and ")
+        .and_then(|(head, tail)| Some((head, tail.strip_suffix(" more")?.parse::<usize>().ok()?)))
+        .expect("a count of the names left out");
+    let named = shown
+        .split("; failed: ")
+        .nth(1)
+        .expect("names")
+        .split(", ")
+        .count();
+    assert_eq!(named + rest, 30, "{line:?}");
+}
+
+#[test]
+fn the_timeout_counts_finding_the_pr() {
+    let sandbox = polling_every(1);
+    let github = FakeGitHub::install(&sandbox);
+    github.checks(&[(1, "lint", "completed", Some("success"))]);
+    github.hold_pr_view();
+
+    let out = sandbox.factory(&["wait", "ci", "12", "--timeout", "1s"]);
+    github.answer_pr_view();
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (
+            124,
+            "",
+            "factory: gh found no pull request 12 within 1s; wait again\n"
+        ),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_failures_file_that_cannot_be_written_is_retried_on_the_next_read() {
+    let sandbox = polling_every(1);
+    let github = FakeGitHub::install(&sandbox);
+    github.checks(&[(1, "test", "completed", Some("failure"))]);
+    // A file where the dir should be makes the first write fail.
+    let blocker = sandbox.path("state/factory/ci");
+    fs::create_dir_all(blocker.parent().expect("a parent")).expect("create the state dir");
+    fs::write(&blocker, "").expect("block the ci dir");
+    let child = spawn(sandbox.factory_command(&["wait", "ci", "12"]));
+    assert!(poll_until(|| !github.polls().is_empty()), "never polled");
+
+    fs::remove_file(&blocker).expect("unblock the ci dir");
+    let out = finish(child);
+
+    assert_eq!(out.code, 10, "{out:?}");
+    assert!(out.stdout.ends_with("; failed: test\n"), "{out:?}");
+    assert!(sandbox.path("state/factory/ci/acme/shop/12.md").exists());
 }

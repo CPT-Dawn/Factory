@@ -11,6 +11,7 @@ fn run(name: &str, status: &str, conclusion: Option<&str>) -> CheckRun {
         status: status.to_owned(),
         conclusion: conclusion.map(str::to_owned),
         url: format!("https://github.com/acme/shop/runs/{name}"),
+        app: Some("github-actions".to_owned()),
     }
 }
 

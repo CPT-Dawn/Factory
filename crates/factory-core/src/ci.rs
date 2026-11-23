@@ -5,6 +5,8 @@
 //! `skipped` or `neutral`, and failed on any other conclusion (`failure`, `cancelled`,
 //! `timed_out`, `action_required`, `startup_failure`, `stale`, or one GitHub adds later), so
 //! only a run that finished can fail. A head with no runs yet is pending: CI has not reported.
+//! A commit status (the older API some CI services still report through) is a run too: pending
+//! until it is `success`, `failure` or `error`.
 
 use std::fmt;
 
@@ -82,6 +84,9 @@ pub struct CheckRun {
     pub conclusion: Option<String>,
     /// Where a person reads it.
     pub url: String,
+    /// The app that reported it (`github-actions` keeps its log behind the jobs API); none for a
+    /// commit status.
+    pub app: Option<String>,
 }
 
 /// What a check run counts as.

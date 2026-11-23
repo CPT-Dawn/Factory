@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use factory_adapters::gh::Gh;
 use factory_adapters::herdr::Herdr;
+use factory_core::duration;
 use factory_core::event::{Event, Fields};
 use factory_core::exit::Exit;
 use factory_core::wait::{Wait, WaitOn};
@@ -270,18 +271,30 @@ async fn respond(line: &str, daemon: &Daemon, held: &mut Option<String>) -> Resp
 /// Joins the pull request's poller, then shows the waiter's lead as waiting on it until the
 /// checks finish.
 async fn wait_ci(daemon: &Daemon, params: WaitCiParams) -> Result<WaitCiResult, Failure> {
+    let limit = Duration::from_secs(params.timeout_secs);
+    // The timeout counts from the request, finding the pull request included.
+    let deadline = tokio::time::Instant::now() + limit;
     let poll = Duration::from_secs(params.poll_secs.max(1));
-    let watch = daemon
+    let found = daemon
         .pollers
-        .watch(&params.pr, PathBuf::from(params.cwd), poll)
-        .await?;
+        .watch(&params.pr, PathBuf::from(params.cwd), poll);
+    let watch = tokio::time::timeout_at(deadline, found)
+        .await
+        .map_err(|_| {
+            Failure::new(
+                Exit::Timeout,
+                format!(
+                    "gh found no pull request {} within {}; wait again",
+                    params.pr,
+                    duration::show(limit)
+                ),
+            )
+        })??;
     let _wait = daemon.leads.register(Wait {
         waiter: params.waiter,
         on: WaitOn::Ci(watch.pr().to_string()),
     });
-    watch
-        .finished(Duration::from_secs(params.timeout_secs))
-        .await
+    watch.finished(deadline, limit).await
 }
 
 fn log(params: Value, ledger: &Ledger) -> Outcome {

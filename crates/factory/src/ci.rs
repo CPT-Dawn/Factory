@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::client;
 use crate::config;
-use crate::output::{Done, Failure};
+use crate::output::{Done, Failure, LINE_LIMIT};
 use crate::paths::Paths;
 use crate::protocol::{WAIT_CI, WaitCiParams, WaitCiResult};
 
@@ -39,8 +39,8 @@ pub fn wait(pr: &str, timeout: Duration) -> Result<Done, Failure> {
     Ok(done)
 }
 
-/// `<pr>: <n> passed, <n> failed[, <n> skipped][; logs in <file>; failed: <names>]`, the names
-/// last, so a line cut short keeps the file.
+/// `<pr>: <n> passed, <n> failed[, <n> skipped][; logs in <file>; failed: <names>]`, with as
+/// many names as fit the line and a count of the rest, which the file and `--json` list.
 fn line(answer: &WaitCiResult) -> String {
     let mut line = format!(
         "{}: {} passed, {} failed",
@@ -54,8 +54,18 @@ fn line(answer: &WaitCiResult) -> String {
     if let Some(file) = &answer.file {
         line.push_str(&format!("; logs in {file}"));
     }
-    if !answer.failed.is_empty() {
-        line.push_str(&format!("; failed: {}", answer.failed.join(", ")));
+    let names = &answer.failed;
+    for shown in (1..=names.len()).rev() {
+        let rest = names.len() - shown;
+        let more = if rest > 0 {
+            format!(" and {rest} more")
+        } else {
+            String::new()
+        };
+        let candidate = format!("{line}; failed: {}{more}", names[..shown].join(", "));
+        if candidate.chars().count() <= LINE_LIMIT || shown == 1 {
+            return candidate;
+        }
     }
     line
 }

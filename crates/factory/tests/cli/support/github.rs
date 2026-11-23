@@ -3,7 +3,7 @@
 //!
 //! The fake answers `gh pr view <pr> --json url --jq .url`, `gh api -i` on the pull request
 //! and its head's check runs (with an ETag of the body, and `304 Not Modified` when the request
-//! sends it back, as GitHub does), `gh api` on a job's logs, and `gh event listen`, which
+//! sends it back, as GitHub does) and on its commit statuses, `gh api` on a job's logs, and `gh event listen`, which
 //! refuses as an account without event subscriptions does unless a test scripts it. Each read
 //! of the check runs is logged with its time and status in `github/polls`.
 
@@ -23,6 +23,9 @@ pub const HEAD: &str = "c0ffee1234567890c0ffee1234567890c0ffee12";
 const NOT_ENABLED: &str = "event subscriptions are in preview and not enabled for this account: \
      HTTP 403: Event subscriptions are not enabled for this account \
      (https://api.github.com/event-subscriptions)";
+
+/// A check run: `(id, name, status, conclusion, app)`.
+pub type Run<'a> = (u64, &'a str, &'a str, Option<&'a str>, &'a str);
 
 pub struct FakeGitHub {
     dir: PathBuf,
@@ -45,6 +48,7 @@ impl FakeGitHub {
         fs::write(github.dir.join("url"), format!("{PR_URL}\n")).expect("write the PR url");
         github.push(HEAD);
         github.checks(&[]);
+        github.statuses(&[]);
         sandbox.fake("gh", &script(&github.dir));
         github
     }
@@ -57,11 +61,21 @@ impl FakeGitHub {
         );
     }
 
-    /// Sets the head's check runs: each is `(id, name, status, conclusion)`.
+    /// Sets the head's check runs, each `(id, name, status, conclusion)` from GitHub Actions.
     pub fn checks(&self, runs: &[(u64, &str, &str, Option<&str>)]) {
+        let runs: Vec<Run> = runs
+            .iter()
+            .map(|&(id, name, status, conclusion)| (id, name, status, conclusion, "github-actions"))
+            .collect();
+        self.runs(&runs);
+    }
+
+    /// Sets the head's check runs, each `(id, name, status, conclusion, app)`, in pages of 100
+    /// as GitHub serves them.
+    pub fn runs(&self, runs: &[Run]) {
         let runs: Vec<Value> = runs
             .iter()
-            .map(|(id, name, status, conclusion)| {
+            .map(|(id, name, status, conclusion, app)| {
                 let url = format!("https://github.com/acme/shop/actions/runs/7/job/{id}");
                 json!({
                     "id": id,
@@ -70,14 +84,53 @@ impl FakeGitHub {
                     "conclusion": conclusion,
                     "html_url": url,
                     "details_url": url,
-                    "app": {"slug": "github-actions"},
+                    "app": {"slug": app},
+                })
+            })
+            .collect();
+        for page in 2..=9 {
+            let _ = fs::remove_file(self.dir.join(format!("checks-{page}.json")));
+        }
+        let pages: Vec<&[Value]> = runs.chunks(100).collect();
+        for (number, page) in pages.iter().enumerate().skip(1) {
+            self.put(
+                &format!("checks-{}.json", number + 1),
+                &json!({"total_count": runs.len(), "check_runs": page}),
+            );
+        }
+        self.put(
+            "checks.json",
+            &json!({"total_count": runs.len(), "check_runs": pages.first().copied().unwrap_or(&[])}),
+        );
+    }
+
+    /// Sets the head's commit statuses, each `(context, state)`.
+    pub fn statuses(&self, statuses: &[(&str, &str)]) {
+        let statuses: Vec<Value> = statuses
+            .iter()
+            .enumerate()
+            .map(|(id, (context, state))| {
+                json!({
+                    "id": 900 + id,
+                    "context": context,
+                    "state": state,
+                    "target_url": format!("https://ci.example.com/acme/shop/{context}"),
                 })
             })
             .collect();
         self.put(
-            "checks.json",
-            &json!({"total_count": runs.len(), "check_runs": runs}),
+            "status.json",
+            &json!({"state": "pending", "total_count": statuses.len(), "statuses": statuses}),
         );
+    }
+
+    /// Makes `gh pr view` hang until [`FakeGitHub::answer_pr_view`].
+    pub fn hold_pr_view(&self) {
+        fs::write(self.dir.join("hold"), "").expect("hold gh pr view");
+    }
+
+    pub fn answer_pr_view(&self) {
+        fs::remove_file(self.dir.join("hold")).expect("let gh pr view answer");
     }
 
     /// Stages the check runs a listen script moves in place with `mv "$G/next.json" "$G/checks.json"`.
@@ -132,6 +185,7 @@ fn script(dir: &std::path::Path) -> String {
         r#"G='{dir}'
 case "$1" in
 pr)
+    while [ -f "$G/hold" ]; do sleep 0.05; done
     if [ -f "$G/url" ]; then cat "$G/url"; else echo 'no pull requests found for branch "work"' >&2; exit 1; fi ;;
 api)
     shift
@@ -147,7 +201,9 @@ api)
     done
     case "$path" in
     repos/acme/shop/pulls/12) file="$G/pull.json" ;;
+    repos/acme/shop/commits/*/check-runs*'&page='*) file="$G/checks-${{path##*&page=}}.json" ;;
     repos/acme/shop/commits/*/check-runs*) file="$G/checks.json" ;;
+    repos/acme/shop/commits/*/status\?*) file="$G/status.json" ;;
     repos/acme/shop/actions/jobs/*/logs)
         id="${{path%/logs}}"; id="${{id##*/}}"
         if [ -f "$G/logs/$id" ]; then cat "$G/logs/$id"; exit 0; fi

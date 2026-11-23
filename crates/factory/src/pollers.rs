@@ -6,7 +6,8 @@
 //! accounts without it), or once the listener ends, it polls GitHub every interval instead,
 //! with conditional requests: each read sends back the ETag of the last answer, and GitHub
 //! answers an unchanged pull request or check list with `304 Not Modified`. A read is the pull
-//! request (for its head) and then the head's check runs.
+//! request (for its head), then the head's check runs and its commit statuses. While a
+//! listener is attached, a poller still reads every ten minutes, in case the stream stalled.
 //!
 //! Waits hold the poller; when the last one ends, the poller stops and its listener is killed.
 //!
@@ -16,7 +17,6 @@
 //! #21) needs a row in the database.
 
 use std::collections::HashMap;
-use std::fs;
 use std::future::pending;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
@@ -36,6 +36,8 @@ use crate::protocol::WaitCiResult;
 
 /// How many lines of a failed job's log the file keeps.
 const TAIL_LINES: usize = 40;
+/// How often a poller with an attached listener reads anyway.
+const ATTACHED_CHECK: Duration = Duration::from_secs(600);
 /// How many reads in a row may fail before the waits on a pull request fail with them.
 const READ_FAILURES: u32 = 3;
 
@@ -126,9 +128,13 @@ impl Watch {
         &self.pr
     }
 
-    /// Answers once every check on the head has finished, or fails at `limit`.
-    pub async fn finished(self, limit: Duration) -> Result<WaitCiResult, Failure> {
-        let deadline = Instant::now() + limit;
+    /// Answers once every check on the head has finished, or fails at `deadline`, `limit`
+    /// after the wait began.
+    pub async fn finished(
+        self,
+        deadline: Instant,
+        limit: Duration,
+    ) -> Result<WaitCiResult, Failure> {
         let mut seen = self.poller.seen.clone();
         loop {
             let now = seen.borrow_and_update().clone();
@@ -240,7 +246,15 @@ async fn run<G: PullRequests>(
         reader = back;
         let now = Instant::now();
         last_read = Some(now);
-        next_poll = (!attached).then_some(now + interval);
+        // An attached listener reads on each event, and now and then besides, in case it
+        // stalled without a word.
+        next_poll = Some(
+            now + if attached {
+                interval.max(ATTACHED_CHECK)
+            } else {
+                interval
+            },
+        );
         match read {
             Ok(Some(fresh)) => {
                 failures = 0;
@@ -252,6 +266,8 @@ async fn run<G: PullRequests>(
                 eprintln!("factory: reading {pr}'s checks failed: {e}");
                 next_poll = Some(now + interval);
                 if failures >= READ_FAILURES {
+                    // The next read that works is published, unchanged or not.
+                    reader.cache = Cache::default();
                     seen.send_replace(Seen::Broken(format!(
                         "cannot read {pr}'s checks: {e}; check gh auth status, then wait again"
                     )));
@@ -280,13 +296,45 @@ async fn sleep_until(at: Option<Instant>) {
     }
 }
 
+/// A response and the ETag it came with, to send back on the next read.
+#[derive(Clone)]
+struct Cached<T> {
+    value: T,
+    etag: Option<String>,
+}
+
+/// What a read last saw of one pull request: its head, and that head's check runs and commit
+/// statuses.
+#[derive(Default)]
+struct Cache {
+    head: Option<Cached<String>>,
+    runs: Option<Cached<Vec<CheckRun>>>,
+    statuses: Option<Cached<Vec<CheckRun>>>,
+}
+
+/// The ETag a cached response came with.
+fn etag<T>(cached: Option<&Cached<T>>) -> Option<&str> {
+    cached.and_then(|cached| cached.etag.as_deref())
+}
+
+/// What a conditional GET leaves cached, and whether it changed: the fresh response, or the
+/// one before it.
+fn refreshed<T: Clone>(
+    fetched: Fetched<T>,
+    before: Option<&Cached<T>>,
+) -> (Option<Cached<T>>, bool) {
+    match fetched {
+        Fetched::Fresh { etag, value } => (Some(Cached { value, etag }), true),
+        Fetched::NotModified => (before.cloned(), false),
+    }
+}
+
 /// Reads one pull request's head and checks, remembering each answer's ETag.
 struct Reader<G: PullRequests> {
     gh: Arc<G>,
     paths: Paths,
     pr: PullRequest,
-    head: Option<(String, Option<String>)>,
-    runs: Option<(Vec<CheckRun>, Option<String>)>,
+    cache: Cache,
 }
 
 impl<G: PullRequests> Reader<G> {
@@ -295,44 +343,67 @@ impl<G: PullRequests> Reader<G> {
             gh,
             paths,
             pr,
-            head: None,
-            runs: None,
+            cache: Cache::default(),
         }
     }
 
-    /// Reads the head and its checks: what they show now, or none when neither changed.
+    /// Reads the head and its checks: what they show now, or none when nothing changed. The
+    /// cache only moves on once the whole read, failures' file and all, has worked, so a read
+    /// that fails is tried again in full.
     fn read(&mut self) -> Result<Option<Seen>, String> {
-        let etag = self.head.as_ref().and_then(|(_, etag)| etag.as_deref());
-        let mut changed = false;
-        if let Fetched::Fresh { etag, value } = self.gh.head(&self.pr, etag).map_err(|e| e.0)? {
-            if self.head.as_ref().map(|(head, _)| head) != Some(&value) {
-                self.runs = None;
-            }
-            self.head = Some((value, etag));
-            changed = true;
-        }
-        let Some((head, _)) = &self.head else {
+        let (cache, seen) = self.read_on()?;
+        self.cache = cache;
+        Ok(seen)
+    }
+
+    /// A read on from the cache: the cache it leaves, and what it saw when anything changed.
+    fn read_on(&self) -> Result<(Cache, Option<Seen>), String> {
+        let before = &self.cache;
+        let fetched = self
+            .gh
+            .head(&self.pr, etag(before.head.as_ref()))
+            .map_err(|e| e.0)?;
+        let (head, mut changed) = refreshed(fetched, before.head.as_ref());
+        let Some(sha) = head.as_ref().map(|head| head.value.clone()) else {
             return Err("GitHub said the pull request is unchanged before it was read".to_owned());
         };
-        let head = head.clone();
-        let etag = self.runs.as_ref().and_then(|(_, etag)| etag.as_deref());
-        if let Fetched::Fresh { etag, value } =
-            self.gh.check_runs(&self.pr, &head, etag).map_err(|e| e.0)?
-        {
-            self.runs = Some((value, etag));
-            changed = true;
-        }
+        // A new head has checks of its own.
+        let same_head = before.head.as_ref().is_some_and(|head| head.value == sha);
+        let (runs, statuses) = if same_head {
+            (before.runs.as_ref(), before.statuses.as_ref())
+        } else {
+            (None, None)
+        };
+        let fetched = self
+            .gh
+            .check_runs(&self.pr, &sha, etag(runs))
+            .map_err(|e| e.0)?;
+        let (runs, fresh) = refreshed(fetched, runs);
+        changed |= fresh;
+        let fetched = self
+            .gh
+            .statuses(&self.pr, &sha, etag(statuses))
+            .map_err(|e| e.0)?;
+        let (statuses, fresh) = refreshed(fetched, statuses);
+        changed |= fresh;
+        let cache = Cache {
+            head,
+            runs,
+            statuses,
+        };
         if !changed {
-            return Ok(None);
+            return Ok((cache, None));
         }
-        let runs = self
-            .runs
-            .as_ref()
-            .map_or(&[][..], |(runs, _)| runs.as_slice());
-        Ok(Some(match ci::verdict(runs) {
+        let all: Vec<CheckRun> = [&cache.runs, &cache.statuses]
+            .into_iter()
+            .flatten()
+            .flat_map(|cached| cached.value.iter().cloned())
+            .collect();
+        let seen = match ci::verdict(&all) {
             Verdict::Pending { pending } => Seen::Pending { pending },
-            Verdict::Finished(tally) => Seen::Finished(Arc::new(self.finished(&head, &tally)?)),
-        }))
+            Verdict::Finished(tally) => Seen::Finished(Arc::new(self.finished(&sha, &tally)?)),
+        };
+        Ok((cache, Some(seen)))
     }
 
     /// The answer for a head whose checks all finished, writing the failures' file.
@@ -354,7 +425,8 @@ impl<G: PullRequests> Reader<G> {
         })
     }
 
-    /// Writes each failed run's URL and log tail to `<state>/ci/<owner>/<repo>/<number>.md`.
+    /// Writes each failed run's URL and log tail to `<state>/ci/<owner>/<repo>/<number>.md`,
+    /// readable by its owner only: the logs can be a private repo's.
     fn write_failures(&self, head: &str, failed: &[CheckRun]) -> Result<PathBuf, String> {
         let path = self.paths.ci_failures(&self.pr);
         let mut text = format!(
@@ -369,29 +441,59 @@ impl<G: PullRequests> Reader<G> {
                 "\n## {} ({conclusion})\n\n{}\n\n",
                 run.name, run.url
             ));
-            match self.gh.job_log(&self.pr, run.id) {
-                Ok(log) => {
-                    text.push_str("```text\n");
-                    for line in ci::tail(&log, TAIL_LINES) {
-                        text.push_str(line);
-                        text.push('\n');
+            match run.app.as_deref() {
+                Some(ACTIONS) => match self.gh.job_log(&self.pr, run.id) {
+                    Ok(log) => {
+                        text.push_str("```text\n");
+                        for line in ci::tail(&log, TAIL_LINES) {
+                            text.push_str(line);
+                            text.push('\n');
+                        }
+                        text.push_str("```\n");
                     }
-                    text.push_str("```\n");
-                }
-                Err(e) => text.push_str(&format!("No log: {e}\n")),
+                    Err(e) => text.push_str(&format!("No log: {e}\n")),
+                },
+                Some(app) => text.push_str(&format!("No log here: {app} keeps it at the URL.\n")),
+                None => text.push_str("No log here: a commit status keeps it at the URL.\n"),
             }
         }
-        let written = path
-            .parent()
-            .map_or(Ok(()), fs::create_dir_all)
-            .and_then(|()| fs::write(&path, text));
-        written.map_err(|e| {
+        private::write(&path, &text).map_err(|e| {
             format!(
                 "cannot write {}: {e}; check the disk and FACTORY_STATE",
                 path.display()
             )
         })?;
         Ok(path)
+    }
+}
+
+/// The app whose check runs are GitHub Actions jobs, with logs behind the jobs API.
+const ACTIONS: &str = "github-actions";
+
+mod private {
+    //! Files only their owner reads.
+
+    use std::fs::{self, DirBuilder, OpenOptions};
+    use std::io::{self, Write};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::path::Path;
+
+    /// Replaces `path` with `text`, as a file only its owner can read, in dirs only its owner
+    /// can open.
+    pub fn write(path: &Path, text: &str) -> io::Result<()> {
+        if let Some(dir) = path.parent() {
+            DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        }
+        let tmp = path.with_extension("md.tmp");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        drop(file);
+        fs::rename(&tmp, path)
     }
 }
 
