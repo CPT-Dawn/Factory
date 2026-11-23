@@ -26,6 +26,9 @@ pub struct Ask {
     /// The slot of the lease this worktree and owner already hold, when they hold one: it asks
     /// for no new slot.
     pub existing: Option<Option<u32>>,
+    /// Why the devices it asks for are not to be had now, when they are not: it waits once its
+    /// turn in the queue comes, before any slot is looked at.
+    pub devices_wait: Option<String>,
 }
 
 /// The board as the request sees it.
@@ -79,6 +82,9 @@ pub fn decide(ask: &Ask, board: &Board, now: i64) -> Decision {
     let held = held_by(&board.leases);
     if let Some(why) = queue_turn(&queue, ask.waiter, &held, now) {
         return Decision::Wait(why);
+    }
+    if let Some(why) = &ask.devices_wait {
+        return Decision::Wait(why.clone());
     }
     if let Some(slot) = ask.existing {
         return Decision::Grant { slot, new: false };
@@ -161,6 +167,7 @@ mod tests {
                 has_stack: false,
             }),
             existing,
+            devices_wait: None,
         }
     }
 
@@ -254,6 +261,7 @@ mod tests {
             waiter: 1,
             project: None,
             existing: None,
+            devices_wait: None,
         };
         assert_eq!(
             decide(&no_project, &b, 0),
@@ -261,6 +269,19 @@ mod tests {
                 slot: None,
                 new: true
             }
+        );
+    }
+
+    #[test]
+    fn devices_to_be_waited_for_hold_a_request_after_its_turn_and_before_its_slot() {
+        let b = board(vec![], vec![entry(1, 0, 0, 1, 2)], 2);
+        let no_phone = Ask {
+            devices_wait: Some("no free phone: 1 phone(s) busy".to_owned()),
+            ..ask(1, 2, 1, None)
+        };
+        assert_eq!(
+            decide(&no_phone, &b, 0),
+            Decision::Wait("no free phone: 1 phone(s) busy".to_owned())
         );
     }
 

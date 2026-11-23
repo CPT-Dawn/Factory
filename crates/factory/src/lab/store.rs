@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::wire::{Lease, Owner, SlotRow, Waiter};
+use super::wire::{Lease, LeaseDevice, Owner, SlotRow, Waiter};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS leases (
@@ -39,7 +39,31 @@ CREATE TABLE IF NOT EXISTS waiters (
   slot_cap INTEGER,
   max_slots INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS lease_devices (
+  serial TEXT PRIMARY KEY,
+  lease_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  abi TEXT,
+  model TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS emulators (
+  idx INTEGER PRIMARY KEY,
+  serial TEXT NOT NULL,
+  state TEXT NOT NULL,
+  idle_since INTEGER
+);
 ";
+
+/// An emulator devlab runs: `booting` from its start until adb says it finished booting, then
+/// `ready`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmulatorRow {
+    pub idx: u32,
+    pub serial: String,
+    pub state: String,
+    /// Since when no lease holds it; none while one does, or before its first lease ends.
+    pub idle_since: Option<i64>,
+}
 
 pub struct Store {
     conn: Connection,
@@ -82,17 +106,145 @@ fn lease_row(row: &Row<'_>) -> rusqlite::Result<Lease> {
         slot: row.get("slot")?,
         created: row.get("created")?,
         touched: row.get("touched")?,
+        devices: Vec::new(),
     })
+}
+
+/// The lease with the devices it holds.
+fn with_devices(c: &Connection, mut lease: Lease) -> rusqlite::Result<Lease> {
+    lease.devices = lease_devices(c, lease.id)?;
+    Ok(lease)
 }
 
 pub fn leases(c: &Connection) -> rusqlite::Result<Vec<Lease>> {
     let mut q = c.prepare("SELECT * FROM leases ORDER BY id")?;
-    q.query_map([], lease_row)?.collect()
+    let rows: Vec<Lease> = q
+        .query_map([], lease_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    rows.into_iter().map(|l| with_devices(c, l)).collect()
 }
 
 pub fn lease(c: &Connection, id: i64) -> rusqlite::Result<Option<Lease>> {
     c.query_row("SELECT * FROM leases WHERE id = ?1", [id], lease_row)
-        .optional()
+        .optional()?
+        .map(|l| with_devices(c, l))
+        .transpose()
+}
+
+/// The devices lease `id` holds, in the order they were granted.
+pub fn lease_devices(c: &Connection, id: i64) -> rusqlite::Result<Vec<LeaseDevice>> {
+    let mut q = c.prepare(
+        "SELECT serial, kind, abi, model FROM lease_devices WHERE lease_id = ?1 ORDER BY rowid",
+    )?;
+    q.query_map([id], |row| {
+        Ok(LeaseDevice {
+            serial: row.get(0)?,
+            kind: row.get(1)?,
+            abi: row.get(2)?,
+            model: row.get(3)?,
+            state: None,
+        })
+    })?
+    .collect()
+}
+
+/// Every serial a lease holds.
+pub fn taken(c: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut q = c.prepare("SELECT serial FROM lease_devices ORDER BY rowid")?;
+    q.query_map([], |row| row.get(0))?.collect()
+}
+
+pub fn insert_lease_device(c: &Connection, lease: i64, d: &LeaseDevice) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO lease_devices (serial, lease_id, kind, abi, model) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![d.serial, lease, d.kind, d.abi, d.model],
+    )?;
+    Ok(())
+}
+
+/// Takes `serial` from lease `lease`; a device another lease holds now stays with it.
+pub fn delete_held_device(c: &Connection, lease: i64, serial: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "DELETE FROM lease_devices WHERE serial = ?1 AND lease_id = ?2",
+        params![serial, lease],
+    )?;
+    Ok(())
+}
+
+pub fn delete_lease_device(c: &Connection, serial: &str) -> rusqlite::Result<()> {
+    c.execute("DELETE FROM lease_devices WHERE serial = ?1", [serial])?;
+    Ok(())
+}
+
+pub fn set_abi(c: &Connection, serial: &str, abi: Option<&str>) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE lease_devices SET abi = ?2 WHERE serial = ?1",
+        params![serial, abi],
+    )?;
+    Ok(())
+}
+
+pub fn emulators(c: &Connection) -> rusqlite::Result<Vec<EmulatorRow>> {
+    let mut q = c.prepare("SELECT idx, serial, state, idle_since FROM emulators ORDER BY idx")?;
+    q.query_map([], |row| {
+        Ok(EmulatorRow {
+            idx: row.get(0)?,
+            serial: row.get(1)?,
+            state: row.get(2)?,
+            idle_since: row.get(3)?,
+        })
+    })?
+    .collect()
+}
+
+pub fn insert_emulator(c: &Connection, idx: u32, serial: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO emulators (idx, serial, state) VALUES (?1, ?2, 'booting')",
+        params![idx, serial],
+    )?;
+    Ok(())
+}
+
+/// Marks a booting emulator ready, idle since `idle_since` (none: a lease holds it).
+pub fn set_emulator_ready(
+    c: &Connection,
+    idx: u32,
+    idle_since: Option<i64>,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE emulators SET state = 'ready', idle_since = ?2 WHERE idx = ?1 AND state = 'booting'",
+        params![idx, idle_since],
+    )?;
+    Ok(())
+}
+
+/// The emulator idles from `now`, unless a lease holds it.
+pub fn emulator_idle(c: &Connection, serial: &str, now: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE emulators SET idle_since = ?2
+         WHERE serial = ?1 AND serial NOT IN (SELECT serial FROM lease_devices)",
+        params![serial, now],
+    )?;
+    Ok(())
+}
+
+/// A lease holds the emulator: it no longer idles.
+pub fn emulator_held(c: &Connection, serial: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE emulators SET idle_since = NULL WHERE serial = ?1",
+        [serial],
+    )?;
+    Ok(())
+}
+
+/// Forgets emulator `idx` if it is still in `state`: a row in another state is a newer
+/// emulator at the same index.
+pub fn delete_emulator(c: &Connection, idx: u32, state: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "DELETE FROM emulators WHERE idx = ?1 AND state = ?2",
+        params![idx, state],
+    )?;
+    Ok(())
 }
 
 pub fn slots(c: &Connection) -> rusqlite::Result<Vec<SlotRow>> {
@@ -141,11 +293,19 @@ pub fn find_lease(
         params![worktree, owner.pid, owner.start],
         lease_row,
     )
-    .optional()
+    .optional()?
+    .map(|l| with_devices(c, l))
+    .transpose()
 }
 
-/// Forgets a lease; its slot starts idling.
+/// Forgets a lease; its slot and its emulators start idling, its phones are free.
 pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE emulators SET idle_since = ?1
+         WHERE serial IN (SELECT serial FROM lease_devices WHERE lease_id = ?2)",
+        params![now, lease.id],
+    )?;
+    c.execute("DELETE FROM lease_devices WHERE lease_id = ?1", [lease.id])?;
     if let (Some(project), Some(slot)) = (&lease.project, lease.slot) {
         c.execute(
             "UPDATE slots SET idle_since = ?1 WHERE project = ?2 AND slot = ?3",
@@ -229,6 +389,7 @@ pub fn insert_lease(
         slot,
         created: now,
         touched: now,
+        devices: Vec::new(),
     })
 }
 

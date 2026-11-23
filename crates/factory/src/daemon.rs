@@ -129,11 +129,13 @@ pub fn run(json: bool) -> Result<(), Failure> {
             json,
         );
         tokio::spawn(Arc::clone(&leads).start());
+        let lab = Arc::new(lab);
+        lab.recover();
         let daemon = Daemon {
             ledger,
             leads,
             router,
-            lab: Arc::new(lab),
+            lab,
             pollers,
         };
         serve(listener, Arc::new(daemon), stop).await;

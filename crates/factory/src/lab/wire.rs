@@ -1,6 +1,7 @@
 //! The lab's daemon methods and what they carry. The CLI reads configs, finds the owner and runs
 //! stacks; the daemon keeps the lease store and decides grants.
 
+use factory_core::lab::devices::{Held, lost};
 use factory_core::lab::queue::{Holding, QueueEntry};
 use serde::{Deserialize, Serialize};
 
@@ -75,9 +76,42 @@ pub struct AcquireParams {
     pub project: Option<ProjectAsk>,
     /// How long to queue; 0 gives up at once.
     pub wait_sec: f64,
+    /// The devices to lease with the slot; none for `--no-device`.
+    #[serde(default)]
+    pub devices: Option<DeviceAsk>,
     /// The acquire is a `devlab run`'s: the daemon records it in the ledger.
     #[serde(default)]
     pub run: Option<RunAsk>,
+}
+
+/// The devices a request asks for, and the machine settings their grant and boot follow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceAsk {
+    pub want: u32,
+    /// `any`, `phone` or `emulator`.
+    pub mode: String,
+    pub max_emulators: u32,
+    pub emulator_ram_mb: i64,
+    pub host_floor_mb: i64,
+    pub port_base: u32,
+    pub image: String,
+    pub device: String,
+    pub gpu: String,
+    pub stay_awake: bool,
+    pub animations_off: bool,
+}
+
+/// A device a lease holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseDevice {
+    pub serial: String,
+    /// `phone` or `emulator`.
+    pub kind: String,
+    pub abi: Option<String>,
+    pub model: String,
+    /// What adb says of it now (`device`, `offline`, ...); none when adb doesn't list it.
+    #[serde(default)]
+    pub state: Option<String>,
 }
 
 /// The run an acquire is for.
@@ -116,9 +150,28 @@ pub struct Lease {
     /// Seconds since the epoch.
     pub created: i64,
     pub touched: i64,
+    /// In the order they were granted.
+    #[serde(default)]
+    pub devices: Vec<LeaseDevice>,
 }
 
 impl Lease {
+    /// Why the lease can't be used because a device it holds is gone or not usable, by the
+    /// states its devices were filled with; none when each is attached as `device`.
+    pub fn lost(&self) -> Option<String> {
+        let held: Vec<Held> = self
+            .devices
+            .iter()
+            .map(|d| Held {
+                serial: d.serial.clone(),
+                kind: d.kind.clone(),
+                model: d.model.clone(),
+                state: d.state.clone(),
+            })
+            .collect();
+        lost(&held)
+    }
+
     pub fn owner_key(&self) -> String {
         format!("{}:{}", self.owner_pid, self.owner_start)
     }
@@ -190,6 +243,21 @@ pub struct Board {
     pub slots: Vec<SlotRow>,
     /// Oldest first.
     pub waiters: Vec<Waiter>,
+    /// Every device adb lists, a lease holds or devlab runs.
+    #[serde(default)]
+    pub devices: Vec<DeviceLine>,
+}
+
+/// One device as status shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceLine {
+    pub serial: String,
+    pub kind: String,
+    pub model: String,
+    /// `booting`, `ready`, adb's state, or `gone`.
+    pub state: String,
+    /// `lease N <worktree> (<owner>)`, `idle 3m` or `free`.
+    pub holder: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
