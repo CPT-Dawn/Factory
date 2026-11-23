@@ -170,7 +170,7 @@ fn a_wait_that_is_no_number_of_seconds_stops_run_before_it_runs_anything() {
     let (sandbox, world) = lab();
     let wt = world.worktree("demo-runwait");
     let marker = sandbox.path("ran");
-    let script = format!("touch {}", marker.display());
+    let marker_arg = marker.to_string_lossy().into_owned();
     let out = owned(
         &sandbox,
         &wt,
@@ -180,9 +180,8 @@ fn a_wait_that_is_no_number_of_seconds_stops_run_before_it_runs_anything() {
             "--wait",
             "soon",
             "--",
-            "sh",
-            "-c",
-            &script,
+            "touch",
+            &marker_arg,
         ],
     );
 
@@ -203,19 +202,13 @@ fn a_wait_that_is_no_number_of_seconds_stops_run_before_it_runs_anything() {
 fn run_and_exec_keep_devlab_alive_as_the_parent_of_the_command() {
     let (sandbox, world) = lab();
     let wt = world.worktree("demo-parent");
-    let walk = r#"pid=$PPID
-while [ "$pid" -gt 1 ]; do
-  line=$(tr '\0' ' ' < /proc/$pid/cmdline)
-  case "$line" in *"devlab run "*|*"devlab exec "*) echo "$pid $line"; exit 0;; esac
-  pid=$(sed -e 's/^.*) [A-Za-z] //' -e 's/ .*//' /proc/$pid/stat)
-done
-exit 9"#;
+    let parent = r#"echo "$PPID $(tr '\0' ' ' < /proc/$PPID/cmdline)""#;
     let ran = owned(
         &sandbox,
         &wt,
-        &["run", "--no-device", "--quiet", "--", "sh", "-c", walk],
+        &["run", "--no-device", "--quiet", "--", "sh", "-c", parent],
     );
-    let held = owned(&sandbox, &wt, &["exec", "--", "sh", "-c", walk]);
+    let held = owned(&sandbox, &wt, &["exec", "--", "sh", "-c", parent]);
 
     for (call, out) in [("run", ran), ("exec", held)] {
         assert_eq!(out.code, 0, "{call}: {out:?}");
