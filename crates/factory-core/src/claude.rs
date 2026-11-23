@@ -11,9 +11,7 @@ use crate::quota::Reset;
 use crate::status;
 use crate::timestamp::Timestamp;
 
-const MILLIS_PER_MINUTE: i64 = 60_000;
 const MILLIS_PER_HOUR: i64 = 3_600_000;
-const MILLIS_PER_DAY: i64 = 86_400_000;
 
 /// How much of the window may be spent before a lead holds new dispatches, by default.
 pub const HOLD_AT_PERCENT: f64 = 90.0;
@@ -201,11 +199,47 @@ impl LimitHit {
 /// the reset it names, read in a zone `utc_offset` seconds east of UTC: a time of day that has
 /// passed is the next day's, a weekday the next one's. None when it is no plan limit.
 pub fn limit_reset(text: &str, now: Timestamp, utc_offset: i32) -> Option<LimitHit> {
+    Some(match plan_limit(text)? {
+        Reset::Unknown => LimitHit::Unnamed,
+        reset => LimitHit::Resets(reset.until(now, utc_offset)),
+    })
+}
+
+/// Whether the text of a failed `claude -p` says it ran out of quota: a plan limit
+/// ([`limit_reset`]'s), or a rate limit (`rate_limit_error`, HTTP 429), and when it resets.
+/// [`Reset::Unknown`] when the message names no reset that can be read. None when the failure
+/// is no quota's.
+pub fn failure_limit(text: &str) -> Option<Reset> {
+    plan_limit(text).or_else(|| {
+        let lower = text.to_lowercase();
+        let rate = lower.contains("rate limit")
+            || lower.contains("rate_limit")
+            || lower.contains("too many requests")
+            || has_word(&lower, "429");
+        rate.then_some(Reset::Unknown)
+    })
+}
+
+/// Whether `word` is in `text` apart from other digits and letters.
+fn has_word(text: &str, word: &str) -> bool {
+    text.match_indices(word).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + word.len()..].chars().next();
+        [before, after]
+            .into_iter()
+            .flatten()
+            .all(|c| !c.is_ascii_alphanumeric())
+    })
+}
+
+/// The plan limit `text` says was hit, and the reset it names: [`Reset::Unknown`] when none
+/// can be read.
+fn plan_limit(text: &str) -> Option<Reset> {
     let lower = text.to_lowercase();
     if let Some((_, after)) = lower.split_once("limit reached|") {
         let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
         if let Ok(secs) = digits.parse::<i64>() {
-            return Some(LimitHit::Resets(Timestamp::from_unix_millis(
+            return Some(Reset::On(Timestamp::from_unix_millis(
                 secs.saturating_mul(1000),
             )));
         }
@@ -219,8 +253,8 @@ pub fn limit_reset(text: &str, now: Timestamp, utc_offset: i32) -> Option<LimitH
     }
     let reset = lower
         .rfind("resets ")
-        .and_then(|at| reset_time(&lower[at + "resets ".len()..], now, utc_offset));
-    Some(reset.map_or(LimitHit::Unnamed, LimitHit::Resets))
+        .and_then(|at| reset_clock(&lower[at + "resets ".len()..]));
+    Some(reset.unwrap_or(Reset::Unknown))
 }
 
 /// A `StopFailure` hook's input: the limit a turn ended on, with the reset its message names.
@@ -244,8 +278,8 @@ pub fn stop_failure(input: &Value, now: Timestamp, utc_offset: i32) -> Option<Li
 
 const WEEKDAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
-/// `3:45pm`, `11am`, `12:15 PM` or `Mon 12:00am` at the start of `text`, as its next moment.
-fn reset_time(text: &str, now: Timestamp, utc_offset: i32) -> Option<Timestamp> {
+/// `3:45pm`, `11am`, `12:15 PM` or `Mon 12:00am` at the start of `text`, as a reset.
+fn reset_clock(text: &str) -> Option<Reset> {
     let (weekday, clock) = match WEEKDAYS.iter().position(|day| text.starts_with(day)) {
         Some(day) => (Some(day), text.get(3..)?.trim_start()),
         None => (None, text),
@@ -267,19 +301,12 @@ fn reset_time(text: &str, now: Timestamp, utc_offset: i32) -> Option<Timestamp> 
         return None;
     }
     let hour = hour % 12 + if pm { 12 } else { 0 };
-    let Some(weekday) = weekday else {
-        return Some(Reset::At { hour, minute }.until(now, utc_offset));
-    };
-    let offset = i64::from(utc_offset) * 1000;
-    let local = now.unix_millis() + offset;
-    let day = local.div_euclid(MILLIS_PER_DAY);
-    // 1970-01-01 was a Thursday.
-    let today = (day + 4).rem_euclid(7);
-    let ahead = (i64::try_from(weekday).ok()? - today).rem_euclid(7);
-    let minutes = i64::from(hour) * 60 + i64::from(minute);
-    let mut until = (day + ahead) * MILLIS_PER_DAY + minutes * MILLIS_PER_MINUTE - offset;
-    if until <= now.unix_millis() {
-        until += 7 * MILLIS_PER_DAY;
-    }
-    Some(Timestamp::from_unix_millis(until))
+    Some(match weekday {
+        None => Reset::At { hour, minute },
+        Some(weekday) => Reset::Weekly {
+            weekday: u32::try_from(weekday).ok()?,
+            hour,
+            minute,
+        },
+    })
 }

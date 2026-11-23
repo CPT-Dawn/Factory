@@ -2,8 +2,9 @@
 //! lead may dispatch.
 
 use factory_core::claude::{
-    ClaudeQuota, LimitHit, Verdict, limit_reset, statusline_window, stop_failure,
+    ClaudeQuota, LimitHit, Verdict, failure_limit, limit_reset, statusline_window, stop_failure,
 };
+use factory_core::quota::Reset;
 use factory_core::timestamp::Timestamp;
 use serde_json::json;
 
@@ -235,4 +236,71 @@ fn a_stop_failure_for_a_rate_limit_is_a_limit_with_the_reset_its_message_names()
     let other = json!({"hook_event_name": "StopFailure", "error": "server_error",
         "last_assistant_message": "API Error: 500"});
     assert_eq!(stop_failure(&other, at(NOW), IST), None);
+}
+
+#[test]
+fn a_failed_claude_that_hit_a_limit_names_its_reset_when_it_can() {
+    assert_eq!(
+        failure_limit("You've hit your session limit \u{b7} resets 3:45pm"),
+        Some(Reset::At {
+            hour: 15,
+            minute: 45
+        })
+    );
+    assert_eq!(
+        failure_limit("You've hit your weekly limit \u{b7} resets Mon 12:00am"),
+        Some(Reset::Weekly {
+            weekday: 1,
+            hour: 0,
+            minute: 0
+        })
+    );
+    assert_eq!(
+        failure_limit("Claude AI usage limit reached|1795417200"),
+        Some(Reset::On(at(1_795_417_200_000)))
+    );
+    assert_eq!(failure_limit("You've hit your limit"), Some(Reset::Unknown));
+}
+
+#[test]
+fn a_rate_limit_or_a_429_is_a_limit_with_no_reset() {
+    for text in [
+        "API Error: 429 Too Many Requests",
+        "{\"error\":{\"type\":\"rate_limit_error\"}}",
+        "This request would exceed your account's rate limit.",
+    ] {
+        assert_eq!(failure_limit(text), Some(Reset::Unknown), "{text}");
+    }
+}
+
+#[test]
+fn another_failure_is_no_limit() {
+    for text in [
+        "",
+        "API Error: 500 internal server error",
+        "request 4290 failed",
+        "Invalid API key",
+    ] {
+        assert_eq!(failure_limit(text), None, "{text}");
+    }
+}
+
+#[test]
+fn a_weekly_reset_is_the_next_such_weekday_in_the_users_zone() {
+    // NOW is a Monday 05:00Z, 10:30 IST.
+    let weekly = Reset::Weekly {
+        weekday: 1,
+        hour: 0,
+        minute: 0,
+    };
+    assert_eq!(weekly.until(at(NOW), 0), at(NOW + 7 * 24 * HOUR - 5 * HOUR));
+    assert_eq!(
+        Reset::Weekly {
+            weekday: 2,
+            hour: 0,
+            minute: 0
+        }
+        .until(at(NOW), IST),
+        at(NOW + 24 * HOUR - 10 * HOUR - HOUR / 2)
+    );
 }

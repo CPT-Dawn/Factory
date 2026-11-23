@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use factory_core::agy::{self, Sandbox};
+use factory_core::claude;
 use factory_core::quota::{self, Reset};
 use factory_core::review;
 use factory_core::timestamp::Timestamp;
@@ -694,14 +695,19 @@ impl Reviewer for Claude {
             .stdin(Stdio::from(prompt))
             .stdout(Stdio::from(stream))
             .stderr(Stdio::from(log));
-        if let Some(code) = run(cmd, job.timeout)? {
-            return Err(ReviewerError::Exited(code));
-        }
+        let outcome = run(cmd, job.timeout)?;
         let result = fs::read_to_string(&job.stream).unwrap_or_default();
         let report = serde_json::from_str::<Value>(&result)
             .ok()
             .and_then(|result| Some(result.get("result")?.as_str()?.to_owned()))
             .unwrap_or_default();
+        if let Some(code) = outcome {
+            // Its failure's own words are its `result` and its stderr, not what it read.
+            let log = fs::read_to_string(job.stream.with_extension("log")).unwrap_or_default();
+            let said = format!("{report}\n{log}");
+            return Err(claude::failure_limit(&said)
+                .map_or(ReviewerError::Exited(code), ReviewerError::OutOfQuota));
+        }
         fs::write(&job.report, report).map_err(ReviewerError::Files)
     }
 }

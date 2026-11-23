@@ -575,3 +575,155 @@ fn a_review_queued_when_the_daemon_stops_says_to_run_it_again() {
     open(&gate);
     support::finish(first);
 }
+
+/// A fake `claude` body that fails as `claude -p` does at its limit: the message as the
+/// `result` of its JSON on stdout, or on stderr, and exit 1.
+fn claude_fails(message: &str, on_stderr: bool) -> String {
+    if on_stderr {
+        return format!("cat > \"$0.stdin\"\ncat >&2 <<'MESSAGE'\n{message}\nMESSAGE\nexit 1");
+    }
+    let result =
+        json!({"type": "result", "subtype": "success", "is_error": true, "result": message});
+    format!("cat > \"$0.stdin\"\ncat <<'RESULT'\n{result}\nRESULT\nexit 1")
+}
+
+/// Claude, then Codex, as the backends: Claude fails with `failure`, Codex reviews.
+fn claude_fails_then_codex_reviews(sandbox: &Sandbox, failure: &str) -> std::path::PathBuf {
+    let repo = sandbox.repo();
+    configure(
+        sandbox,
+        "[[review.backend]]\ncli = \"claude\"\n\n[[review.backend]]\ncli = \"codex\"\n",
+    );
+    sandbox.fake("claude", failure);
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+    repo
+}
+
+/// Claude's 12-hour clock for a reset, as its limit message writes it: `2:39pm`.
+fn claude_clock(reset: &str) -> String {
+    reset.replace(' ', "").to_lowercase()
+}
+
+#[test]
+fn a_claude_quota_failure_cools_the_pool_and_the_chain_moves_to_the_next_backend() {
+    let (reset, _) = reset_in_two_hours();
+    let clock = claude_clock(&reset);
+    let epoch = now_seconds() + 7200;
+    let failures = [
+        claude_fails(
+            &format!("You've hit your session limit \u{b7} resets {clock}"),
+            false,
+        ),
+        claude_fails(
+            "You've hit your weekly limit \u{b7} resets Mon 12:00am",
+            false,
+        ),
+        claude_fails(
+            &format!("Usage limit reached \u{b7} limit resets {clock}"),
+            false,
+        ),
+        claude_fails(&format!("Claude AI usage limit reached|{epoch}"), true),
+        claude_fails(
+            "API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's rate limit.\"}}",
+            false,
+        ),
+        claude_fails("You've hit your limit", true),
+    ];
+    for failure in &failures {
+        let sandbox = Sandbox::new().env("TZ", "UTC");
+        let repo = claude_fails_then_codex_reviews(&sandbox, failure);
+
+        let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+
+        assert_eq!(out.code, 0, "{failure}: {out:?}");
+        let shown: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(shown["backend"], "codex", "{failure}: {shown}");
+        assert_eq!(
+            shown["cooled"][0]["backend"], "claude",
+            "{failure}: {shown}"
+        );
+        assert_eq!(event(&sandbox, 0)["fallback_from"], "claude", "{failure}");
+        let status = sandbox.factory(&["status", "--json"]);
+        let status: Value = serde_json::from_str(&status.stdout).unwrap();
+        let claude = status["review"]
+            .as_array()
+            .and_then(|pools| pools.iter().find(|pool| pool["name"] == "claude"))
+            .unwrap_or(&Value::Null);
+        assert_eq!(claude["quota"], "cooling", "{failure}: {status}");
+        let later = sandbox.factory_in(&repo, &["review", "main", "t2"]);
+        assert_eq!(later.code, 0, "{later:?}");
+        assert_eq!(
+            sandbox.calls("claude").len(),
+            1,
+            "{failure}: claude is cooling down"
+        );
+    }
+}
+
+#[test]
+fn a_named_claude_reset_ends_the_cooldown_and_without_one_it_lasts_an_hour() {
+    let (reset, until) = reset_in_two_hours();
+    let sandbox = Sandbox::new().env("TZ", "UTC");
+    let named = format!(
+        "You've hit your session limit \u{b7} resets {}",
+        claude_clock(&reset)
+    );
+    let repo = claude_fails_then_codex_reviews(&sandbox, &claude_fails(&named, false));
+
+    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let shown: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(
+        shown["cooled"],
+        json!([{"backend": "claude", "until": until.to_string()}]),
+        "{shown}"
+    );
+
+    let sandbox = Sandbox::new().env("TZ", "UTC");
+    let repo = claude_fails_then_codex_reviews(
+        &sandbox,
+        &claude_fails("API Error: 429 rate_limit_error", false),
+    );
+    let before = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis()),
+    )
+    .unwrap_or(0);
+
+    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let shown: Value = serde_json::from_str(&out.stdout).unwrap();
+    let hour = 3_600_000;
+    let until = shown["cooled"][0]["until"]
+        .as_str()
+        .and_then(Timestamp::parse);
+    assert!(
+        until.is_some_and(
+            |until| (before + hour..=before + hour + 60_000).contains(&until.unix_millis())
+        ),
+        "an hour on: {shown}"
+    );
+}
+
+#[test]
+fn a_claude_failure_that_is_no_quota_still_exits_3_with_no_cooldown() {
+    let sandbox = Sandbox::new().env("TZ", "UTC");
+    let repo = claude_fails_then_codex_reviews(
+        &sandbox,
+        &claude_fails(
+            "API Error: 500 internal server error; request 4290 failed",
+            false,
+        ),
+    );
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(sandbox.calls("codex").is_empty(), "no fallback");
+    assert_eq!(event(&sandbox, 0)["outcome"], "error");
+    let status = sandbox.factory(&["status", "--json"]);
+    assert!(!status.stdout.contains("cooling"), "{status:?}");
+}

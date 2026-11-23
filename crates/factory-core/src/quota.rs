@@ -107,6 +107,12 @@ pub fn pick(candidates: &[Candidate], now: Timestamp) -> Pick {
 pub enum Reset {
     /// At this local time of day (24-hour), its next occurrence.
     At { hour: u32, minute: u32 },
+    /// At this local time of this weekday (0 is Sunday), its next occurrence.
+    Weekly {
+        weekday: u32,
+        hour: u32,
+        minute: u32,
+    },
     /// This long after the message.
     In { millis: i64 },
     /// At this moment.
@@ -128,6 +134,24 @@ impl Reset {
                 let mut until = local_midnight + minutes * MILLIS_PER_MINUTE - offset;
                 if until <= now {
                     until += MILLIS_PER_DAY;
+                }
+                Timestamp::from_unix_millis(until)
+            }
+            Reset::Weekly {
+                weekday,
+                hour,
+                minute,
+            } => {
+                let offset = i64::from(utc_offset) * 1000;
+                let day = (now + offset).div_euclid(MILLIS_PER_DAY);
+                // 1970-01-01 was a Thursday.
+                let today = (day + 4).rem_euclid(7);
+                let ahead = (i64::from(weekday) - today).rem_euclid(7);
+                let minutes = i64::from(hour) * 60 + i64::from(minute);
+                let mut until =
+                    (day + ahead) * MILLIS_PER_DAY + minutes * MILLIS_PER_MINUTE - offset;
+                if until <= now {
+                    until += 7 * MILLIS_PER_DAY;
                 }
                 Timestamp::from_unix_millis(until)
             }
