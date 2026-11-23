@@ -67,7 +67,7 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
             let file = save("help.txt", HELP)?;
             Done::new(
                 format!(
-                    "factory lab: acquire, run, exec, env, release, stack, status, gc; usage in {}",
+                    "factory lab: acquire, run, exec, env, release, stack, status, gc, reserve, prep, watch; usage in {}",
                     file.display()
                 ),
                 json!({ "help": HELP, "helpFile": file }),
@@ -119,6 +119,13 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
             &context()?,
             args.first().map_or("status", String::as_str),
         )?),
+        "reserve" if args.iter().any(|a| a == "-h" || a == "--help") => {
+            let file = save("reserve-help.txt", reserve::USAGE)?;
+            Done::new(
+                format!("factory lab reserve: usage in {}", file.display()),
+                json!({ "help": reserve::USAGE, "helpFile": file }),
+            )
+        }
         "reserve" => reserve::done(args)?,
         "gc" => {
             let freed = lease::gc()?;
@@ -139,11 +146,8 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
                 }
             }
         }
-        "prep" | "watch" => {
-            return Err(Failure::usage(format!(
-                "factory lab {cmd} is not here yet; run today's devlab for it"
-            )));
-        }
+        "prep" => prep_done(&cli::prep(&context()?, args)?)?,
+        "watch" => Done::new(cli::WATCH, json!({ "watcher": "daemon" })),
         other => {
             return Err(Failure::usage(format!(
                 "unknown command {other}; factory lab help"
@@ -151,6 +155,36 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
         }
     };
     Ok(Verb::Done(done))
+}
+
+/// `FAKEPHONE01: ready` for one device; for more, how many and how many warned, the file
+/// holding devlab's line for each; every device and its warning as JSON.
+fn prep_done(prepped: &[(String, Option<&str>)]) -> Result<Done, Failure> {
+    let lines: Vec<String> = prepped
+        .iter()
+        .map(|(serial, warning)| format!("{serial}: {}", warning.unwrap_or("ready")))
+        .collect();
+    let mut json = json!({
+        "devices": prepped
+            .iter()
+            .map(|(serial, warning)| json!({ "serial": serial, "warning": warning }))
+            .collect::<Vec<_>>(),
+    });
+    let line = match lines.as_slice() {
+        [] => "no ready device to prep".to_owned(),
+        [one] => one.clone(),
+        many => {
+            let file = save("prep.txt", &(many.join("\n") + "\n"))?;
+            let warned = prepped.iter().filter(|(_, w)| w.is_some()).count();
+            json["prepFile"] = json!(file);
+            format!(
+                "prepped {} devices, {warned} with a warning; list in {}",
+                many.len(),
+                file.display()
+            )
+        }
+    };
+    Ok(Done::new(line, json))
 }
 
 /// `2 leases, 1 waiting; status in <file>`, the file holding devlab's status screen; the board

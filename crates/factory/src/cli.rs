@@ -183,6 +183,14 @@ pub enum WaitCommand {
         #[arg(long, default_value = "9m", value_parser = duration)]
         timeout: Duration,
     },
+    /// Until a lab lease is held no more: released, its owner exited, or expired (exit 0)
+    Lease {
+        /// The lease's id, as factory lab acquire and status name it
+        lease: u32,
+        /// Give up after this long with exit 124, such as 90s, 9m or 2h
+        #[arg(long, default_value = "9m", value_parser = duration)]
+        timeout: Duration,
+    },
 }
 
 fn duration(text: &str) -> Result<Duration, String> {

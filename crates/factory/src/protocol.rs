@@ -38,6 +38,10 @@ pub const WAIT_CI: &str = "wait.ci";
 /// Answered once the review of a label has ended: [`WaitReviewParams`] in, the `review` event
 /// as it landed in the ledger out; an error with exit 124 when the time runs out first.
 pub const WAIT_REVIEW: &str = "wait.review";
+/// Answered once a lab lease is held no more (released, its owner exited, or expired):
+/// [`WaitLeaseParams`] in, [`WaitLeaseResult`] out; an error with exit 4 for an id never
+/// granted, and with exit 124 when the time runs out first.
+pub const WAIT_LEASE: &str = "wait.lease";
 /// Registers a wait that outlives its CLI (`--notify`) and answers at once: [`NotifyParams`]
 /// in, [`NotifyResult`] out. When the wait ends, the daemon posts one line into the session
 /// the params address; a refusal with exit 3 when event delivery is switched off.
@@ -283,6 +287,21 @@ pub struct WaitReviewParams {
     /// The herdr pane the wait comes from, so the lead in it shows as waiting.
     pub waiter: Option<String>,
     pub timeout_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WaitLeaseParams {
+    pub lease: i64,
+    /// The herdr pane the wait comes from, so the lead in it shows as waiting.
+    pub waiter: Option<String>,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WaitLeaseResult {
+    pub lease: i64,
+    /// Always false: the wait is answered once the lease is held no more.
+    pub held: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -117,33 +117,48 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
             Ok(0)
         }
         "prep" => {
-            let ctx = context()?;
-            let serials = if args.is_empty() {
-                status::ready_serials()?
-            } else {
-                args.to_vec()
-            };
-            for serial in serials {
-                let warning = android::prep(
-                    &AdbCli,
-                    &serial,
-                    ctx.cfg.prep_stay_awake,
-                    ctx.cfg.prep_animations_off,
-                );
+            for (serial, warning) in prep(&context()?, args)? {
                 println!("{serial}: {}", warning.unwrap_or("ready"));
             }
             Ok(0)
         }
         "watch" => {
-            println!(
-                "devlab watch: the factory daemon frees leases and stops idle emulators and stacks now; nothing to start"
-            );
+            println!("devlab watch: {WATCH}");
             Ok(0)
         }
         other => Err(Failure::usage(format!(
             "unknown command {other}; devlab help"
         ))),
     }
+}
+
+/// What `watch` says: there is nothing left for it to start.
+pub(super) const WATCH: &str =
+    "the factory daemon frees leases and stops idle emulators and stacks now; nothing to start";
+
+/// Readies the phones named in `serials`, or every ready device when none is named: each serial,
+/// and the warning it left, if any.
+pub(super) fn prep(
+    ctx: &Ctx,
+    serials: &[String],
+) -> Result<Vec<(String, Option<&'static str>)>, Failure> {
+    let serials = if serials.is_empty() {
+        status::ready_serials()?
+    } else {
+        serials.to_vec()
+    };
+    Ok(serials
+        .into_iter()
+        .map(|serial| {
+            let warning = android::prep(
+                &AdbCli,
+                &serial,
+                ctx.cfg.prep_stay_awake,
+                ctx.cfg.prep_animations_off,
+            );
+            (serial, warning)
+        })
+        .collect())
 }
 
 /// Gives the lease back; the lease it gave back, if one was held. With `--stop-stack` the
