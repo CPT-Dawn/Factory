@@ -623,12 +623,10 @@ fn an_idle_event_newer_than_a_listing_is_not_undone_by_it() {
     let herdr = FakeHerdr::start(&sandbox);
     let repo = sandbox.repo();
     let report = sandbox.path("state/factory/leads/repo/cart.md");
-    herdr.overtake_listing(
-        "w1:p1",
-        "idle",
-        move || fs::write(&report, "done\n").expect("write the report"),
-        std::time::Duration::from_millis(300),
-    );
+    // The event is on the subscription before the listing that predates it is answered.
+    herdr.overtake_listing("w1:p1", "idle", move || {
+        fs::write(&report, "done\n").expect("write the report");
+    });
 
     let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
     assert_eq!(out.code, 0, "{out:?}");

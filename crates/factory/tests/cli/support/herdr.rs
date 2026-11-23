@@ -13,7 +13,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -54,7 +54,6 @@ struct Overtake {
     pane: String,
     status: String,
     first: Box<dyn FnOnce() + Send>,
-    delay: Duration,
 }
 
 struct Subscriber {
@@ -144,19 +143,17 @@ impl FakeHerdr {
 
     /// The next time the agents are listed while a subscriber watches `pane`: takes the listing,
     /// then runs `first`, changes the pane's status to `status` and tells the subscribers, and
-    /// only after `delay` answers. The event is newer than the listing, and arrives first.
+    /// only then answers. The event is newer than the listing, and is sent before it.
     pub fn overtake_listing(
         &self,
         pane: &str,
         status: &str,
         first: impl FnOnce() + Send + 'static,
-        delay: Duration,
     ) {
         self.shared.lock().overtake = Some(Overtake {
             pane: pane.to_owned(),
             status: status.to_owned(),
             first: Box::new(first),
-            delay,
         });
     }
 }
@@ -350,8 +347,6 @@ fn serve(shared: &Shared, stream: UnixStream) {
         if let Some(overtake) = state.overtake.take_if(|_| due) {
             (overtake.first)();
             set_status(&mut state, &overtake.pane, &overtake.status, true);
-            drop(state);
-            thread::sleep(overtake.delay);
             let _ = writeln!(&stream, "{}", json!({"id": id, "result": result}));
             return;
         }
