@@ -5,6 +5,7 @@ mod cli;
 mod client;
 mod clock;
 mod config;
+mod cutover;
 mod daemon;
 mod hook;
 mod install;
@@ -164,6 +165,13 @@ fn run(command: Command, json: bool) -> ExitCode {
         Command::Hook { .. } => unreachable!("main answers hooks before it gets here"),
         Command::Install { units } => install::install(units.as_deref()),
         Command::Uninstall => install::uninstall(),
+        Command::Cutover {
+            rollback: false, ..
+        } => cutover::cutover(),
+        Command::Cutover {
+            rollback: true,
+            force,
+        } => cutover::rollback(force),
         // main hands every `factory lab` to the lab; this arm is never reached.
         Command::Lab { .. } => Err(Failure::usage("run factory lab help")),
     };

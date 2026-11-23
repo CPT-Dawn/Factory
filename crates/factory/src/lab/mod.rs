@@ -27,5 +27,7 @@ mod wait;
 pub mod wire;
 
 pub use cli::main;
+pub use context::devlab_state;
 pub use native::main as native;
+pub use status::board;
 pub use wait::wait as wait_lease;
