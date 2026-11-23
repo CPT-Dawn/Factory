@@ -6,6 +6,9 @@
 mod devlab_golden;
 mod harness;
 mod help;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
+mod lab;
 mod log;
 mod review;
 // Marked cfg(test) so clippy treats the harness as test code and lets it unwrap.

@@ -18,6 +18,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::lab::service::{self, Lab};
+use crate::lab::wire::ACQUIRE;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{ErrorBody, LOG, LogParams, LogResult, Outcome, Request, Response};
@@ -36,6 +38,10 @@ pub fn run(json: bool) -> Result<Done, Failure> {
     })?;
     let ledger = Ledger::open(paths.ledger())?;
     let _lock = take_daemon_lock(&paths)?;
+    // Opened under the lock: it forgets the waiters a dead daemon left.
+    let lab = Lab::open(&paths.lab_db()).map_err(|e| {
+        Failure::precondition(format!("{e}; check FACTORY_STATE and XDG_STATE_HOME"))
+    })?;
     let listener = bind(&paths)?;
     let pid = std::process::id();
     fs::write(paths.daemon_pid(), format!("{pid}\n")).map_err(|e| {
@@ -45,7 +51,7 @@ pub fn run(json: bool) -> Result<Done, Failure> {
         ))
     })?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_io()
+        .enable_all()
         .build()
         .map_err(|e| {
             Failure::precondition(format!("cannot start the daemon's runtime: {e}; retry"))
@@ -63,7 +69,7 @@ pub fn run(json: bool) -> Result<Done, Failure> {
             ),
             json,
         );
-        match serve(listener, Arc::new(ledger)).await {}
+        match serve(listener, Arc::new(ledger), Arc::new(lab)).await {}
     })
 }
 
@@ -110,11 +116,11 @@ fn bind(paths: &Paths) -> Result<StdListener, Failure> {
     Ok(listener)
 }
 
-async fn serve(listener: UnixListener, ledger: Arc<Ledger>) -> Infallible {
+async fn serve(listener: UnixListener, ledger: Arc<Ledger>, lab: Arc<Lab>) -> Infallible {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(answer(stream, Arc::clone(&ledger)));
+                tokio::spawn(answer(stream, Arc::clone(&ledger), Arc::clone(&lab)));
             }
             Err(e) => {
                 let _ = writeln!(io::stderr(), "factory: accept failed: {e}");
@@ -123,12 +129,26 @@ async fn serve(listener: UnixListener, ledger: Arc<Ledger>) -> Infallible {
     }
 }
 
-/// Answers each request line on one connection until the client hangs up.
-async fn answer(stream: UnixStream, ledger: Arc<Ledger>) {
+/// Answers each request line on one connection until the client hangs up. A `lab.acquire`
+/// holds the connection while it waits, writing notes before its answer.
+async fn answer(stream: UnixStream, ledger: Arc<Ledger>, lab: Arc<Lab>) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        let response = respond(&line, &ledger).await;
+        let response = match serde_json::from_str::<Request>(&line) {
+            Ok(request) if request.method == ACQUIRE => {
+                service::acquire(Arc::clone(&lab), request, &mut writer, &mut lines).await;
+                continue;
+            }
+            Ok(request) => respond(request, &ledger, &lab).await,
+            Err(e) => Response {
+                id: None,
+                outcome: Outcome::Error(refusal(
+                    Exit::Usage,
+                    format!("unreadable request: {e}; send one JSON request per line"),
+                )),
+            },
+        };
         let Ok(mut out) = serde_json::to_string(&response) else {
             return;
         };
@@ -139,19 +159,7 @@ async fn answer(stream: UnixStream, ledger: Arc<Ledger>) {
     }
 }
 
-async fn respond(line: &str, ledger: &Arc<Ledger>) -> Response {
-    let request: Request = match serde_json::from_str(line) {
-        Ok(request) => request,
-        Err(e) => {
-            return Response {
-                id: None,
-                outcome: Outcome::Error(refusal(
-                    Exit::Usage,
-                    format!("unreadable request: {e}; send one JSON request per line"),
-                )),
-            };
-        }
-    };
+async fn respond(request: Request, ledger: &Arc<Ledger>, lab: &Arc<Lab>) -> Response {
     let outcome = match request.method.as_str() {
         LOG => {
             let ledger = Arc::clone(ledger);
@@ -164,10 +172,13 @@ async fn respond(line: &str, ledger: &Arc<Ledger>) -> Response {
                 )),
             }
         }
-        other => Outcome::Error(refusal(
-            Exit::Usage,
-            format!("unknown method {other:?}; {MISMATCH}"),
-        )),
+        other => match service::respond(lab, other, request.params).await {
+            Some(outcome) => outcome,
+            None => Outcome::Error(refusal(
+                Exit::Usage,
+                format!("unknown method {other:?}; {MISMATCH}"),
+            )),
+        },
     };
     Response {
         id: Some(request.id),

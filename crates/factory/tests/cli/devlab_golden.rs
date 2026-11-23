@@ -389,8 +389,8 @@ fn a_relative_devlab_path_is_read_from_the_workspace_root() {
     );
 }
 
-/// One test per transcript, replayed against [`golden::devlab_under_test`]; skipped when there is
-/// none. Run one group with `cargo test transcript::slots_` (or `devices_`, `cli_`).
+/// One test per transcript, replayed against [`golden::devlab_under_test`]: the built `factory`
+/// unless `GOLDEN_DEVLAB` names another; skipped when there is none. Run one group with `cargo test transcript::slots_` (or `devices_`, `cli_`).
 mod transcript {
     use crate::support::golden;
 
@@ -420,8 +420,10 @@ mod transcript {
     }
 
     fn replay(file: &str) {
-        let Some(devlab) = golden::devlab_under_test() else {
-            eprintln!("skipped {file}: GOLDEN_DEVLAB names no devlab to replay against");
+        let Some(devlab) = golden::devlab_under_test(file) else {
+            eprintln!(
+                "skipped {file}: GOLDEN_DEVLAB names no devlab, and factory lab has none of its group yet"
+            );
             return;
         };
         let fixture = golden::fixtures().join(file);

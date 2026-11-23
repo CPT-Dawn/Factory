@@ -4,7 +4,10 @@
 //! The binary reaches external tools only through these traits. Every tool runs through
 //! [`process::run`]: in its own process group, with a timeout that kills the group whole.
 
+pub mod docker;
 pub mod gh;
 pub mod git;
 pub mod process;
 pub mod reviewer;
+pub mod supabase;
+pub mod systemd;

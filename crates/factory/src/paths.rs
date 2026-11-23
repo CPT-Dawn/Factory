@@ -44,6 +44,11 @@ impl Paths {
         self.state.join("events.jsonl")
     }
 
+    /// The lab's lease store, which the daemon alone writes.
+    pub fn lab_db(&self) -> PathBuf {
+        self.state.join("lab.db")
+    }
+
     pub fn socket(&self) -> PathBuf {
         self.runtime.join("factory.sock")
     }

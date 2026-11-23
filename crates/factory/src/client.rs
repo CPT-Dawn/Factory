@@ -38,6 +38,18 @@ pub fn call<P: Serialize, R: DeserializeOwned>(
     method: &str,
     params: &P,
 ) -> Result<R, Failure> {
+    call_streaming(paths, method, params, Some(ANSWER_TIMEOUT), |_| {})
+}
+
+/// [`call`] for a request that waits: each note the daemon sends before its answer goes to
+/// `on_note`, and each line may take up to `read_timeout` (none waits as long as it takes).
+pub fn call_streaming<P: Serialize, R: DeserializeOwned>(
+    paths: &Paths,
+    method: &str,
+    params: &P,
+    read_timeout: Option<Duration>,
+    mut on_note: impl FnMut(&str),
+) -> Result<R, Failure> {
     let stream = connect(paths)?;
     let broken = |e: &dyn std::fmt::Display| {
         Failure::precondition(format!(
@@ -57,27 +69,33 @@ pub fn call<P: Serialize, R: DeserializeOwned>(
         .write_all(line.as_bytes())
         .map_err(|e| broken(&e))?;
     stream
-        .set_read_timeout(Some(ANSWER_TIMEOUT))
+        .set_read_timeout(read_timeout)
         .map_err(|e| broken(&e))?;
-    let mut answer = String::new();
-    match BufReader::new(&stream).read_line(&mut answer) {
-        Ok(0) => return Err(broken(&"it closed the connection without answering")),
-        Ok(_) => {}
-        Err(e) if is_timeout(&e) => {
-            return Err(Failure::precondition(format!(
-                "the daemon did not answer within {}s; see {}",
-                ANSWER_TIMEOUT.as_secs(),
-                paths.daemon_log().display()
-            )));
+    let mut reader = BufReader::new(&stream);
+    loop {
+        let mut answer = String::new();
+        match reader.read_line(&mut answer) {
+            Ok(0) => return Err(broken(&"it closed the connection without answering")),
+            Ok(_) => {}
+            Err(e) if is_timeout(&e) => {
+                return Err(Failure::precondition(format!(
+                    "the daemon did not answer within {}s; see {}",
+                    read_timeout.unwrap_or_default().as_secs(),
+                    paths.daemon_log().display()
+                )));
+            }
+            Err(e) => return Err(broken(&e)),
         }
-        Err(e) => return Err(broken(&e)),
-    }
-    let response: Response = serde_json::from_str(&answer).map_err(|e| broken(&e))?;
-    match response.outcome {
-        Outcome::Result(value) => serde_json::from_value(value).map_err(|e| broken(&e)),
-        Outcome::Error(error) => {
-            let exit = Exit::from_code(error.code).unwrap_or(Exit::Precondition);
-            Err(Failure::new(exit, error.message))
+        let response: Response = serde_json::from_str(&answer).map_err(|e| broken(&e))?;
+        match response.outcome {
+            Outcome::Note(note) => on_note(&note),
+            Outcome::Result(value) => {
+                return serde_json::from_value(value).map_err(|e| broken(&e));
+            }
+            Outcome::Error(error) => {
+                let exit = Exit::from_code(error.code).unwrap_or(Exit::Precondition);
+                return Err(Failure::new(exit, error.message));
+            }
         }
     }
 }
