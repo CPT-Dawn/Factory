@@ -126,9 +126,10 @@ pub fn wait(lead: &str, timeout: Duration) -> Result<Done, Failure> {
         lead: lead_name(lead).map_err(|e| Failure::usage(e.to_string()))?,
         waiter: client::waiter(),
         timeout_secs: timeout.as_secs(),
+        resume: None,
     };
     let paths = Paths::from_env()?;
-    let answer: WaitLeadResult = client::wait(&paths, WAIT_LEAD, &params, timeout)?;
+    let answer: WaitLeadResult = client::hold(&paths, WAIT_LEAD, &params, timeout)?;
     let exit = Exit::from_code(answer.exit).unwrap_or(Exit::NeedsAttention);
     let mut done = shown(&answer.lead, exit);
     done.json = serde_json::to_value(&answer).unwrap_or(Value::Null);

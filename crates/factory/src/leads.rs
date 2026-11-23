@@ -12,11 +12,16 @@
 //!
 //! A wait on a lead registers itself in the wait registry, so the lead it runs in shows as
 //! waiting, and is answered when an event settles the lead it waits on.
+//!
+//! The registry keeps each blocking `factory wait` in the database too: a daemon that starts
+//! puts back every wait the last one held, and the CLI that lost its daemon picks its wait up
+//! again by id. A wait no CLI picks up within [`UNCLAIMED_GRACE`] is forgotten.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -38,7 +43,10 @@ use crate::output::Failure;
 use crate::paths::Paths;
 use crate::protocol::{LeadList, LeadReport, SpawnParams, SpawnResult, WaitLeadResult};
 use crate::spawn;
-use crate::store::Store;
+use crate::store::{Store, WaitRow};
+
+/// How long a wait the last daemon held stays registered for its CLI to come back for it.
+const UNCLAIMED_GRACE: Duration = Duration::from_secs(60);
 
 /// How many of a pane's last lines a blocked or asking lead shows.
 const SCREEN_LINES: usize = 10;
@@ -56,6 +64,8 @@ pub struct Leads<H: HerdrApi = Herdr> {
     turn: tokio::sync::Mutex<()>,
     /// Bumped on every change to the picture; waits wake on it.
     changed: watch::Sender<u64>,
+    /// Set once the daemon stops: the waits it holds stay in the database for the next one.
+    stopping: AtomicBool,
 }
 
 struct Inner {
@@ -64,6 +74,10 @@ struct Inner {
     /// Every lead seen since the daemon started, by agent name.
     leads: BTreeMap<String, Lead>,
     waits: Waits,
+    /// The registered waits the database keeps, by their row.
+    rows: BTreeMap<i64, WaitId>,
+    /// The rows the last daemon held that no CLI has come back for yet.
+    unclaimed: BTreeSet<i64>,
     /// The panes the live subscription watches.
     watched: BTreeSet<String>,
     /// The task reading the live subscription, and its generation.
@@ -142,6 +156,22 @@ impl<H: HerdrApi> Leads<H> {
                 },
             );
         }
+        // The blocking waits the last daemon held, until their CLIs come back for them.
+        let kept = store.waits().map_err(|e| {
+            Failure::precondition(format!(
+                "cannot read the waits from the database: {e}; check FACTORY_STATE"
+            ))
+        })?;
+        let mut waits = Waits::default();
+        let mut rows = BTreeMap::new();
+        for row in &kept {
+            let id = waits.register(Wait {
+                waiter: row.waiter.clone(),
+                on: row.on.clone(),
+            });
+            rows.insert(row.id, id);
+        }
+        let unclaimed = rows.keys().copied().collect();
         Ok(Arc::new(Leads {
             herdr,
             paths,
@@ -150,7 +180,9 @@ impl<H: HerdrApi> Leads<H> {
             inner: Mutex::new(Inner {
                 down: Some("herdr not checked yet".to_owned()),
                 leads: BTreeMap::new(),
-                waits: Waits::default(),
+                waits,
+                rows,
+                unclaimed,
                 watched: BTreeSet::new(),
                 follower: None,
                 generation: 0,
@@ -158,6 +190,7 @@ impl<H: HerdrApi> Leads<H> {
             }),
             turn: tokio::sync::Mutex::new(()),
             changed: watch::channel(0).0,
+            stopping: AtomicBool::new(false),
         }))
     }
 
@@ -165,6 +198,7 @@ impl<H: HerdrApi> Leads<H> {
     /// command checks again.
     pub async fn start(self: Arc<Self>) {
         tokio::spawn(Arc::clone(&self).settle_loop());
+        tokio::spawn(Arc::clone(&self).forget_unclaimed());
         if let Err(failure) = self.check().await {
             eprintln!("factory: {}", failure.message);
         }
@@ -238,13 +272,7 @@ impl<H: HerdrApi> Leads<H> {
                         .find(|(_, lead)| lead.pane == pane)
                         .map(|(name, _)| name.clone())
                 });
-                let (kind, on) = match &wait.on {
-                    WaitOn::Lead(name) => ("lead", name.clone()),
-                    WaitOn::Ci(pr) => ("ci", pr.clone()),
-                    WaitOn::Review(label) => ("review", label.clone()),
-                    WaitOn::Lease(id) => ("lease", id.to_string()),
-                    WaitOn::Claude => ("claude", "quota".to_owned()),
-                };
+                let (kind, on) = wait.on.parts();
                 status::Wait {
                     pane: wait.waiter.clone(),
                     lead,
@@ -444,21 +472,6 @@ impl<H: HerdrApi> Leads<H> {
         self.known(name).await?;
         let (report, state) = self.look(name)?;
         Ok(self.with_screen(report, &state).await)
-    }
-
-    /// Answers once the lead settles: finished, blocked, asking or dead.
-    pub async fn wait(
-        self: &Arc<Self>,
-        name: &str,
-        waiter: Option<String>,
-        limit: Duration,
-    ) -> Result<WaitLeadResult, Failure> {
-        self.find(name).await?;
-        let _wait = self.register(Wait {
-            waiter,
-            on: WaitOn::Lead(name.to_owned()),
-        });
-        self.settled(name, Instant::now() + limit, limit).await
     }
 
     /// Fails unless herdr is reachable and has a lead named `name`.
@@ -752,7 +765,90 @@ impl<H: HerdrApi> Leads<H> {
         Registered {
             leads: Arc::clone(self),
             id,
+            row: None,
+            answered: false,
         }
+    }
+
+    /// Registers a blocking wait and keeps it in the database, so a CLI that loses this daemon
+    /// picks it up from the next by the row id [`Registered::row`] gives. `row`'s id is ignored.
+    pub fn hold(self: &Arc<Self>, row: &WaitRow) -> Result<Registered<H>, Failure> {
+        let kept = self.store().add_wait(row).map_err(|e| {
+            Failure::precondition(format!(
+                "cannot keep the wait in the database: {e}; check FACTORY_STATE, then retry"
+            ))
+        })?;
+        let mut inner = self.lock();
+        let id = inner.waits.register(Wait {
+            waiter: row.waiter.clone(),
+            on: row.on.clone(),
+        });
+        inner.rows.insert(kept, id);
+        drop(inner);
+        self.bump();
+        Ok(Registered {
+            leads: Arc::clone(self),
+            id,
+            row: Some(kept),
+            answered: false,
+        })
+    }
+
+    /// Picks up the wait the last daemon held as `row`, for the CLI that comes back for it; none
+    /// when no daemon holds it for anyone: answered, forgotten, or picked up already.
+    pub fn resume(self: &Arc<Self>, row: i64) -> Option<(Registered<H>, WaitRow)> {
+        let id = {
+            let mut inner = self.lock();
+            if !inner.unclaimed.remove(&row) {
+                return None;
+            }
+            *inner.rows.get(&row)?
+        };
+        let registered = Registered {
+            leads: Arc::clone(self),
+            id,
+            row: Some(row),
+            answered: false,
+        };
+        let kept = match self.store().waits() {
+            Ok(waits) => waits.into_iter().find(|kept| kept.id == row),
+            Err(e) => {
+                eprintln!("factory: cannot read wait #{row} from the database: {e}");
+                None
+            }
+        };
+        // Dropping the guard forgets a row the database no longer has.
+        kept.map(|kept| (registered, kept))
+    }
+
+    /// Forgets the waits the last daemon held that no CLI came back for in [`UNCLAIMED_GRACE`].
+    pub async fn forget_unclaimed(self: Arc<Self>) {
+        tokio::time::sleep(UNCLAIMED_GRACE).await;
+        let rows: Vec<i64> = std::mem::take(&mut self.lock().unclaimed)
+            .into_iter()
+            .collect();
+        for row in rows {
+            let id = self.lock().rows.get(&row).copied();
+            if let Some(id) = id {
+                drop(Registered {
+                    leads: Arc::clone(&self),
+                    id,
+                    row: Some(row),
+                    answered: false,
+                });
+            }
+        }
+    }
+
+    /// The daemon is stopping: the waits it holds stay in the database for the next one.
+    pub fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    fn store(&self) -> MutexGuard<'_, Store> {
+        self.store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// A failure talking to herdr: the link goes down, and the next lead command retries.
@@ -773,15 +869,55 @@ impl<H: HerdrApi> Leads<H> {
     }
 }
 
-/// A registered wait, cleared when it is dropped: answered, timed out or abandoned.
+/// A registered wait, cleared when it is dropped: answered, timed out or abandoned. One the
+/// database keeps is forgotten there too, unless the daemon is stopping.
 pub struct Registered<H: HerdrApi> {
     leads: Arc<Leads<H>>,
     id: WaitId,
+    row: Option<i64>,
+    /// Its CLI has the answer, so the next daemon has nothing to resume, stopping or not.
+    answered: bool,
+}
+
+impl<H: HerdrApi> Registered<H> {
+    /// The database's id of a blocking wait, by which its CLI resumes it.
+    pub fn row(&self) -> Option<i64> {
+        self.row
+    }
+
+    /// Its CLI has the answer: the database forgets it even as the daemon stops.
+    pub fn answered(&mut self) {
+        self.answered = true;
+    }
+
+    /// Points the wait at `on` instead, as when the pull request it named is found.
+    pub fn retarget(&self, on: WaitOn) {
+        if let Some(row) = self.row
+            && let Err(e) = self.leads.store().retarget_wait(row, &on)
+        {
+            eprintln!("factory: cannot update wait #{row} in the database: {e}");
+        }
+        self.leads.lock().waits.retarget(self.id, on);
+        self.leads.bump();
+    }
 }
 
 impl<H: HerdrApi> Drop for Registered<H> {
     fn drop(&mut self) {
-        self.leads.lock().waits.clear(self.id);
+        {
+            let mut inner = self.leads.lock();
+            inner.waits.clear(self.id);
+            if let Some(row) = self.row {
+                inner.rows.remove(&row);
+                inner.unclaimed.remove(&row);
+            }
+        }
+        if let Some(row) = self.row
+            && (self.answered || !self.leads.stopping.load(Ordering::SeqCst))
+            && let Err(e) = self.leads.store().remove_wait(row)
+        {
+            eprintln!("factory: cannot forget wait #{row} in the database: {e}");
+        }
         self.leads.bump();
     }
 }

@@ -42,8 +42,9 @@ pub fn wait(label: &str, timeout: Duration) -> Result<Done, Failure> {
             .ok()
             .filter(|pane| !pane.is_empty()),
         timeout_secs: timeout.as_secs(),
+        resume: None,
     };
-    let event: Fields = client::wait(&paths, WAIT_REVIEW, &params, timeout)?;
+    let event: Fields = client::hold(&paths, WAIT_REVIEW, &params, timeout)?;
     let ended = finished::of(&event);
     let mut json = event;
     json.insert("exit".to_owned(), Value::from(ended.exit.code()));
@@ -80,7 +81,7 @@ impl Reviews {
     }
 
     /// When the latest run of `label` (in `repo`, when one is named) began, if this daemon saw it.
-    fn began(&self, repo: Option<&str>, label: &str) -> Option<Timestamp> {
+    pub fn began(&self, repo: Option<&str>, label: &str) -> Option<Timestamp> {
         self.lock()
             .iter()
             .filter(|(review, _)| {
@@ -90,20 +91,22 @@ impl Reviews {
             .max()
     }
 
-    /// The `review` event that ended the latest run of `label`. Fails with exit 124 when none
-    /// lands within the params' timeout.
+    /// The `review` event that ended the latest run of `label`, a run that began at `since` or
+    /// later (the run the wait began on, which an earlier daemon may have seen). Fails with exit
+    /// 124 when none lands by `deadline`, `limit` after the wait began.
     pub async fn wait(
         &self,
         ledger: &Arc<Ledger>,
         params: &WaitReviewParams,
+        since: Option<Timestamp>,
+        deadline: tokio::time::Instant,
+        limit: Duration,
     ) -> Result<Fields, Failure> {
-        let limit = Duration::from_secs(params.timeout_secs);
-        let deadline = tokio::time::Instant::now() + limit;
         loop {
             // Enabled before the look, so an end that lands during it is not missed.
             let mut changed = std::pin::pin!(self.changed.notified());
             changed.as_mut().enable();
-            let began = self.began(params.repo.as_deref(), &params.label);
+            let began = self.began(params.repo.as_deref(), &params.label).max(since);
             let found = {
                 let ledger = Arc::clone(ledger);
                 let (repo, label) = (params.repo.clone(), params.label.clone());

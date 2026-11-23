@@ -83,6 +83,67 @@ pub fn wait<P: Serialize, R: DeserializeOwned>(
     )
 }
 
+/// [`wait`] for a blocking wait the daemon keeps across its restarts (`wait.lead`, `wait.ci`,
+/// `wait.review`, `wait.lease`, `wait.claude`). The daemon says the wait's id in a `queued`
+/// line; when the daemon goes away, the CLI connects again (starting a daemon if none runs) for
+/// up to [`RESUME_TIMEOUT`] and asks with `resume` set to that id, and the wait carries on with
+/// what is left of its time. Lost before it heard an id, it asks afresh for what is left.
+pub fn hold<P: Serialize, R: DeserializeOwned>(
+    paths: &Paths,
+    method: &str,
+    params: &P,
+    limit: Duration,
+) -> Result<R, Failure> {
+    let begun = Instant::now();
+    let until = begun + limit + ANSWER_TIMEOUT;
+    let mut asked = serde_json::to_value(params)
+        .map_err(|e| Failure::precondition(format!("cannot write the {method} request: {e}")))?;
+    let mut kept: Option<i64> = None;
+    let mut give_up: Option<Instant> = None;
+    let mut retry = false;
+    loop {
+        if retry && let Some(fields) = asked.as_object_mut() {
+            match kept {
+                Some(row) => fields.insert("resume".to_owned(), row.into()),
+                None => fields.insert(
+                    "timeout_secs".to_owned(),
+                    limit.saturating_sub(begun.elapsed()).as_secs().into(),
+                ),
+            };
+        }
+        let patience = until
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        let mut heard = None;
+        let lost = match Session::open(paths) {
+            Ok(mut session) => match session.exchange_raw(
+                method,
+                &asked,
+                Some(patience),
+                Exit::Timeout,
+                &mut |_| {},
+                &mut |row| heard = Some(row),
+            ) {
+                Ok(answer) => return Ok(answer),
+                Err(Ended::Refused(failure)) => return Err(failure),
+                Err(Ended::Lost(failure)) => failure,
+            },
+            Err(failure) if !retry => return Err(failure),
+            Err(failure) => failure,
+        };
+        retry = true;
+        if heard.is_some() {
+            kept = heard;
+            give_up = None;
+        }
+        let stop = (*give_up.get_or_insert_with(|| Instant::now() + RESUME_TIMEOUT)).min(until);
+        if Instant::now() >= stop {
+            return Err(lost);
+        }
+        thread::sleep(RESUME_PAUSE);
+    }
+}
+
 /// [`call`] for a request that waits in a queue the daemon keeps (`lab.acquire`): each note
 /// before its answer goes to `on_note`, and each line may take up to `read_timeout` (none waits
 /// as long as it takes).

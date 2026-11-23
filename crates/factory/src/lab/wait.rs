@@ -16,8 +16,9 @@ pub fn wait(lease: u32, timeout: Duration) -> Result<Done, Failure> {
         lease: i64::from(lease),
         waiter: client::waiter(),
         timeout_secs: timeout.as_secs(),
+        resume: None,
     };
-    let answer: WaitLeaseResult = client::wait(&paths, WAIT_LEASE, &params, timeout)?;
+    let answer: WaitLeaseResult = client::hold(&paths, WAIT_LEASE, &params, timeout)?;
     Ok(Done::new(
         format!("lease {} ended", answer.lease),
         serde_json::to_value(&answer).unwrap_or(Value::Null),

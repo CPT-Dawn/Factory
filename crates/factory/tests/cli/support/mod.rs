@@ -284,6 +284,51 @@ pub fn finish(child: Child) -> Run {
     }
 }
 
+/// Stops the sandbox's daemon as systemd does for a restart (SIGTERM), and returns once it is
+/// gone; the next call starts another.
+pub fn stop_daemon(sandbox: &Sandbox) {
+    let pid: u32 = fs::read_to_string(sandbox.path("run/factory/daemon.pid"))
+        .expect("a daemon runs")
+        .trim()
+        .parse()
+        .expect("a pid");
+    kill_group(pid, Signal::TERM);
+    // A zombie leader can outlast its other threads, which still hold the socket and the lock:
+    // the daemon is gone once the leader is all that is left of it.
+    let gone = world::poll_until(|| {
+        let threads = fs::read_dir(format!("/proc/{pid}/task")).map_or(0, Iterator::count);
+        fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            threads <= 1
+                && stat
+                    .rsplit(')')
+                    .next()
+                    .is_some_and(|s| s.trim_start().starts_with('Z'))
+        })
+    });
+    assert!(gone, "daemon {pid} outlived its TERM");
+}
+
+/// Freezes a child [`spawn`] started (SIGSTOP to its process group), so it cannot notice a
+/// daemon restart until [`thaw`].
+pub fn freeze(child: &Child) {
+    kill_group(child.id(), Signal::STOP);
+}
+
+/// Lets a child [`freeze`] froze run on.
+pub fn thaw(child: &Child) {
+    kill_group(child.id(), Signal::CONT);
+}
+
+/// Whether the daemon holds a wait of `kind` on `on`, as `factory status --json` lists its
+/// waits.
+pub fn waited_on(sandbox: &Sandbox, kind: &str, on: &str) -> bool {
+    let out = sandbox.factory(&["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_str(&out.stdout).unwrap_or_default();
+    status["waits"]
+        .as_array()
+        .is_some_and(|waits| waits.iter().any(|w| w["kind"] == kind && w["on"] == on))
+}
+
 pub(crate) fn kill_group(leader: u32, signal: Signal) {
     if let Some(group) = i32::try_from(leader).ok().and_then(Pid::from_raw) {
         let _ = kill_process_group(group, signal);

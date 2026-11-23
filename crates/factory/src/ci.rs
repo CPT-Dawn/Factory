@@ -23,8 +23,9 @@ pub fn wait(pr: &str, timeout: Duration) -> Result<Done, Failure> {
         waiter: client::waiter(),
         timeout_secs: timeout.as_secs(),
         poll_secs: poll.as_secs(),
+        resume: None,
     };
-    let answer: WaitCiResult = client::wait(&paths, WAIT_CI, &params, timeout)?;
+    let answer: WaitCiResult = client::hold(&paths, WAIT_CI, &params, timeout)?;
     let mut done = Done::new(
         line(&answer),
         serde_json::to_value(&answer).unwrap_or(Value::Null),

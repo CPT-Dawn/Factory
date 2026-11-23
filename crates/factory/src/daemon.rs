@@ -19,11 +19,12 @@ use factory_adapters::gh::Gh;
 use factory_core::duration;
 use factory_core::event::Event;
 use factory_core::exit::Exit;
-use factory_core::wait::{Wait, WaitOn};
+use factory_core::timestamp::Timestamp;
+use factory_core::wait::WaitOn;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
@@ -34,9 +35,10 @@ use factory_adapters::inbox::Inbox;
 use listenfd::ListenFd;
 
 use crate::claude::Claude;
+use crate::clock;
 use crate::lab::service::{self, Lab};
 use crate::lab::wire::{ACQUIRE, RESERVE};
-use crate::leads::Leads;
+use crate::leads::{Leads, Registered};
 use crate::ledger::Ledger;
 use crate::notifier::Notifier;
 use crate::output::{self, Done, Failure};
@@ -54,7 +56,7 @@ use crate::reviews::Reviews;
 use crate::router::Router;
 use crate::status;
 use crate::steward::Steward;
-use crate::store::Store;
+use crate::store::{Store, WaitRow};
 
 /// What every connection answers from: the ledger, the picture of the leads, the reviewer
 /// router, the lab's lease store, the CI pollers and the waits that outlive their CLI.
@@ -280,6 +282,8 @@ async fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Stop) {
         }
     }
     drop(listener);
+    // Before the connections hear of it: the waits they hold stay for the next daemon.
+    daemon.leads.stop();
     let _ = hang_up.send(true);
     let drained = async { while connections.join_next().await.is_some() {} };
     if tokio::time::timeout(DRAIN_TIMEOUT, drained).await.is_err() {
@@ -327,6 +331,14 @@ async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut O
         {
             service::reserve(Arc::clone(&daemon.lab), request, &mut writer, &mut lines).await;
             continue;
+        }
+        if let Ok(request) = serde_json::from_str::<Request>(&line)
+            && WAITS.contains(&request.method.as_str())
+        {
+            if hold_wait(request, daemon, stop, &mut writer, &mut lines).await {
+                continue;
+            }
+            return;
         }
         if let Ok(request) = serde_json::from_str::<Request>(&line)
             && request.method == ACQUIRE
@@ -391,61 +403,6 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
             }
             Err(refused) => refused,
         },
-        WAIT_LEAD => match params::<WaitLeadParams>(WAIT_LEAD, request.params) {
-            Ok(params) => {
-                let wait = daemon.leads.wait(
-                    &params.lead,
-                    params.waiter,
-                    Duration::from_secs(params.timeout_secs),
-                );
-                // Biased: a stopping daemon answers no wait, even one that ends as it stops.
-                tokio::select! {
-                    biased;
-                    () = stop.clone().stopping() => stopped("wait"),
-                    waited = wait => answered(waited),
-                }
-            }
-            Err(refused) => refused,
-        },
-        WAIT_CI => match params::<WaitCiParams>(WAIT_CI, request.params) {
-            // Biased, as a lead wait: a stopping daemon answers no wait.
-            Ok(params) => tokio::select! {
-                biased;
-                () = stop.clone().stopping() => stopped("wait"),
-                waited = wait_ci(daemon, params) => answered(waited),
-            },
-            Err(refused) => refused,
-        },
-        WAIT_REVIEW => match params::<WaitReviewParams>(WAIT_REVIEW, request.params) {
-            // Biased, as a lead wait: a stopping daemon answers no wait.
-            Ok(params) => {
-                let _wait = daemon.leads.register(Wait {
-                    waiter: params.waiter.clone(),
-                    on: WaitOn::Review(params.label.clone()),
-                });
-                tokio::select! {
-                    biased;
-                    () = stop.clone().stopping() => stopped("wait"),
-                    waited = daemon.reviews.wait(&daemon.ledger, &params) => answered(waited),
-                }
-            }
-            Err(refused) => refused,
-        },
-        WAIT_LEASE => match params::<WaitLeaseParams>(WAIT_LEASE, request.params) {
-            // Biased, as a lead wait: a stopping daemon answers no wait.
-            Ok(params) => {
-                let _wait = daemon.leads.register(Wait {
-                    waiter: params.waiter.clone(),
-                    on: WaitOn::Lease(params.lease),
-                });
-                tokio::select! {
-                    biased;
-                    () = stop.clone().stopping() => stopped("wait"),
-                    waited = service::wait_lease(&daemon.lab, &params) => answered(waited),
-                }
-            }
-            Err(refused) => refused,
-        },
         CLAUDE_WINDOW => match params::<ClaudeWindowParams>(CLAUDE_WINDOW, request.params) {
             Ok(params) => answered(daemon.claude.see(&params)),
             Err(refused) => refused,
@@ -456,21 +413,6 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
         },
         CLAUDE_QUOTA => match params::<ClaudeQuotaParams>(CLAUDE_QUOTA, request.params) {
             Ok(params) => answered(Ok::<_, Failure>(daemon.claude.verdict(params.hold_at))),
-            Err(refused) => refused,
-        },
-        WAIT_CLAUDE => match params::<WaitClaudeParams>(WAIT_CLAUDE, request.params) {
-            // Biased, as a lead wait: a stopping daemon answers no wait.
-            Ok(params) => {
-                let _wait = daemon.leads.register(Wait {
-                    waiter: params.waiter.clone(),
-                    on: WaitOn::Claude,
-                });
-                tokio::select! {
-                    biased;
-                    () = stop.clone().stopping() => stopped("wait"),
-                    waited = daemon.claude.wait(&params) => answered(waited),
-                }
-            }
             Err(refused) => refused,
         },
         WAIT_NOTIFY => match params::<NotifyParams>(WAIT_NOTIFY, request.params) {
@@ -566,16 +508,223 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
     }
 }
 
-/// Joins the pull request's poller, then shows the waiter's lead as waiting on it until the
-/// checks finish.
-async fn wait_ci(daemon: &Daemon, params: WaitCiParams) -> Result<WaitCiResult, Failure> {
-    let limit = Duration::from_secs(params.timeout_secs);
-    // The timeout counts from the request, finding the pull request included.
+/// The blocking waits: each is kept in the database while the daemon holds it, so its CLI can
+/// carry on with it from the next daemon.
+const WAITS: [&str; 5] = [WAIT_LEAD, WAIT_CI, WAIT_REVIEW, WAIT_LEASE, WAIT_CLAUDE];
+
+/// A blocking wait's params.
+enum Asked {
+    Lead(WaitLeadParams),
+    Ci(WaitCiParams),
+    Review(WaitReviewParams),
+    Lease(WaitLeaseParams),
+    Claude(WaitClaudeParams),
+}
+
+impl Asked {
+    fn read(method: &str, value: Value) -> Result<Asked, Outcome> {
+        Ok(match method {
+            WAIT_LEAD => Asked::Lead(params(method, value)?),
+            WAIT_CI => Asked::Ci(params(method, value)?),
+            WAIT_REVIEW => Asked::Review(params(method, value)?),
+            WAIT_LEASE => Asked::Lease(params(method, value)?),
+            _ => Asked::Claude(params(method, value)?),
+        })
+    }
+
+    /// Who waits, on what, for how many seconds, and the kept wait it carries on with, if any.
+    fn wait(&self) -> (Option<String>, WaitOn, u64, Option<i64>) {
+        match self {
+            Asked::Lead(p) => (
+                p.waiter.clone(),
+                WaitOn::Lead(p.lead.clone()),
+                p.timeout_secs,
+                p.resume,
+            ),
+            Asked::Ci(p) => (
+                p.waiter.clone(),
+                WaitOn::Ci(p.pr.clone()),
+                p.timeout_secs,
+                p.resume,
+            ),
+            Asked::Review(p) => (
+                p.waiter.clone(),
+                WaitOn::Review(p.label.clone()),
+                p.timeout_secs,
+                p.resume,
+            ),
+            Asked::Lease(p) => (
+                p.waiter.clone(),
+                WaitOn::Lease(p.lease),
+                p.timeout_secs,
+                p.resume,
+            ),
+            Asked::Claude(p) => (p.waiter.clone(), WaitOn::Claude, p.timeout_secs, p.resume),
+        }
+    }
+}
+
+/// A blocking wait the daemon holds: until when, how long it was given, and for a review, when
+/// the run it waits on began.
+struct Held {
+    registered: Registered<Herdr>,
+    deadline: tokio::time::Instant,
+    limit: Duration,
+    since: Option<Timestamp>,
+}
+
+/// Holds a blocking wait: keeps it (or picks up the one an earlier daemon kept, by its
+/// `resume` id), says its id in a `queued` line, and answers once it ends. A stop leaves it
+/// unanswered and kept, for its CLI to carry on with from the next daemon; a CLI that hangs up
+/// abandons it. False once the conversation is over.
+async fn hold_wait<W, R>(
+    request: Request,
+    daemon: &Daemon,
+    stop: &Stop,
+    writer: &mut W,
+    lines: &mut Lines<R>,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+{
+    // A stopping daemon takes no wait: its CLI asks the next one.
+    if stop.is_stopping() {
+        return false;
+    }
+    let id = Some(request.id);
+    let asked = match Asked::read(&request.method, request.params) {
+        Ok(asked) => asked,
+        Err(outcome) => return send(writer, &Response { id, outcome }).await,
+    };
+    if let Asked::Lead(p) = &asked
+        && let Err(failure) = daemon.leads.find(&p.lead).await
+    {
+        let outcome = answered::<()>(Err(failure));
+        return send(writer, &Response { id, outcome }).await;
+    }
+    let held = match hold(daemon, &asked) {
+        Ok(held) => held,
+        Err(outcome) => return send(writer, &Response { id, outcome }).await,
+    };
+    let Held {
+        mut registered,
+        deadline,
+        limit,
+        since,
+    } = held;
+    if let Some(row) = registered.row()
+        && !send(
+            writer,
+            &Response {
+                id,
+                outcome: Outcome::Queued(row),
+            },
+        )
+        .await
+    {
+        return false;
+    }
+    let waited = async {
+        match &asked {
+            Asked::Lead(p) => answered(daemon.leads.settled(&p.lead, deadline, limit).await),
+            Asked::Ci(p) => answered(wait_ci(daemon, p, &registered, deadline, limit).await),
+            Asked::Review(p) => answered(
+                daemon
+                    .reviews
+                    .wait(&daemon.ledger, p, since, deadline, limit)
+                    .await,
+            ),
+            Asked::Lease(p) => answered(service::wait_lease(&daemon.lab, p, deadline, limit).await),
+            Asked::Claude(p) => answered(daemon.claude.wait(p, deadline, limit).await),
+        }
+    };
+    // Biased: a stopping daemon answers no wait, even one that ends as it stops; the next
+    // daemon answers it instead.
+    let outcome = tokio::select! {
+        biased;
+        () = stop.clone().stopping() => return false,
+        outcome = waited => outcome,
+        _ = lines.next_line() => return false,
+    };
+    registered.answered();
+    send(writer, &Response { id, outcome }).await
+}
+
+/// Keeps the wait `asked` names, or picks up the one it resumes; the refusal when it can't.
+fn hold(daemon: &Daemon, asked: &Asked) -> Result<Held, Outcome> {
+    let (waiter, on, timeout_secs, resume) = asked.wait();
+    if let Some(row) = resume {
+        let Some((registered, kept)) = daemon.leads.resume(row) else {
+            return Err(Outcome::Error(refusal(
+                Exit::Precondition,
+                format!("the daemon restarted and no longer holds wait {row}; run the wait again"),
+            )));
+        };
+        let left = kept
+            .deadline_ms
+            .saturating_sub(clock::now().unix_millis())
+            .max(0);
+        return Ok(Held {
+            registered,
+            deadline: tokio::time::Instant::now()
+                + Duration::from_millis(u64::try_from(left).unwrap_or(0)),
+            limit: Duration::from_secs(kept.limit_secs),
+            since: kept.since,
+        });
+    }
+    let limit = Duration::from_secs(timeout_secs);
+    // Both clocks from one moment, so a resumed wait keeps the deadline it was given.
     let deadline = tokio::time::Instant::now() + limit;
+    let deadline_ms = clock::now()
+        .unix_millis()
+        .saturating_add(i64::try_from(limit.as_millis()).unwrap_or(i64::MAX));
+    let since = match asked {
+        Asked::Review(p) => daemon.reviews.began(p.repo.as_deref(), &p.label),
+        _ => None,
+    };
+    let registered = daemon
+        .leads
+        .hold(&WaitRow {
+            id: 0,
+            on,
+            waiter,
+            deadline_ms,
+            limit_secs: timeout_secs,
+            since,
+        })
+        .map_err(|failure| answered::<()>(Err(failure)))?;
+    Ok(Held {
+        registered,
+        deadline,
+        limit,
+        since,
+    })
+}
+
+/// Writes one response line; false when the CLI is gone.
+async fn send<W: AsyncWrite + Unpin>(writer: &mut W, response: &Response) -> bool {
+    let Ok(mut out) = serde_json::to_string(response) else {
+        return false;
+    };
+    out.push('\n');
+    writer.write_all(out.as_bytes()).await.is_ok()
+}
+
+/// Joins the pull request's poller, then shows the waiter's lead as waiting on the pull request
+/// it found until the checks finish.
+async fn wait_ci(
+    daemon: &Daemon,
+    params: &WaitCiParams,
+    registered: &Registered<Herdr>,
+    deadline: tokio::time::Instant,
+    limit: Duration,
+) -> Result<WaitCiResult, Failure> {
     let poll = Duration::from_secs(params.poll_secs.max(1));
     let found = daemon
         .pollers
-        .watch(&params.pr, PathBuf::from(params.cwd), poll);
+        .watch(&params.pr, PathBuf::from(&params.cwd), poll);
+    // The timeout counts from the request, finding the pull request included.
     let watch = tokio::time::timeout_at(deadline, found)
         .await
         .map_err(|_| {
@@ -588,10 +737,7 @@ async fn wait_ci(daemon: &Daemon, params: WaitCiParams) -> Result<WaitCiResult, 
                 ),
             )
         })??;
-    let _wait = daemon.leads.register(Wait {
-        waiter: params.waiter,
-        on: WaitOn::Ci(watch.pr().to_string()),
-    });
+    registered.retarget(WaitOn::Ci(watch.pr().to_string()));
     watch.finished(deadline, limit).await
 }
 

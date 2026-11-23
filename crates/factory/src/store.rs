@@ -1,7 +1,7 @@
 //! The daemon's SQLite database, `<state>/factory.db`, in WAL mode: what a daemon restart must
 //! not lose: each review backend's quota, the Claude plan's quota, the leads spawned whose end is not yet in the
-//! ledger, whether the context steward runs and what it has done to each session, and each wait
-//! that outlives its CLI (`--notify`).
+//! ledger, whether the context steward runs and what it has done to each session, each wait
+//! that outlives its CLI (`--notify`), and each blocking `factory wait` the daemon holds.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -10,13 +10,14 @@ use std::path::Path;
 use factory_core::claude::{ClaudeQuota, Limit, Seen, Window};
 use factory_core::quota::Quota;
 use factory_core::timestamp::Timestamp;
+use factory_core::wait::WaitOn;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::output::Failure;
 use crate::protocol::{NotifyOn, SessionParam};
 
 /// The schema version this daemon writes, kept in `PRAGMA user_version`.
-const VERSION: i64 = 4;
+const VERSION: i64 = 5;
 
 pub struct Store {
     db: Connection,
@@ -96,7 +97,16 @@ impl Store {
                  limit_until_ms INTEGER,
                  limit_at_ms INTEGER
              );
-             PRAGMA user_version = 4;",
+             CREATE TABLE IF NOT EXISTS wait (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 kind TEXT NOT NULL,
+                 target TEXT NOT NULL,
+                 waiter TEXT,
+                 deadline_ms INTEGER NOT NULL,
+                 limit_secs INTEGER NOT NULL,
+                 since_ms INTEGER
+             );
+             PRAGMA user_version = 5;",
         )
         .map_err(cannot)?;
         Ok(Store { db })
@@ -384,6 +394,91 @@ pub struct Context {
     pub asked: bool,
     /// Whether the subagent's lead has been told it passed the threshold.
     pub told: bool,
+}
+
+/// A blocking `factory wait` the daemon holds, as the database keeps it, so a CLI that lost
+/// its daemon to a restart picks it up again from the next one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitRow {
+    pub id: i64,
+    pub on: WaitOn,
+    pub waiter: Option<String>,
+    /// When it gives up, in milliseconds since the epoch.
+    pub deadline_ms: i64,
+    /// How long it was given, for the line that says it ran out.
+    pub limit_secs: u64,
+    /// For a review: when the run it waits for began, so an older run's end does not answer it.
+    pub since: Option<Timestamp>,
+}
+
+impl Store {
+    /// Keeps a blocking wait; the id it returns is the database's, never reused.
+    pub fn add_wait(&self, row: &WaitRow) -> rusqlite::Result<i64> {
+        let (kind, target) = row.on.parts();
+        self.db.execute(
+            "INSERT INTO wait (kind, target, waiter, deadline_ms, limit_secs, since_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                kind,
+                target,
+                row.waiter,
+                row.deadline_ms,
+                sql_int(row.limit_secs),
+                row.since.map(Timestamp::unix_millis),
+            ],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// Every blocking wait kept, oldest first; a row this daemon cannot read is left out.
+    pub fn waits(&self) -> rusqlite::Result<Vec<WaitRow>> {
+        let mut rows = self.db.prepare(
+            "SELECT id, kind, target, waiter, deadline_ms, limit_secs, since_ms
+             FROM wait ORDER BY id",
+        )?;
+        let read = rows.query_map([], |row| {
+            let kind: String = row.get(1)?;
+            let target: String = row.get(2)?;
+            Ok(
+                WaitOn::from_parts(&kind, &target).map(|on| -> rusqlite::Result<WaitRow> {
+                    Ok(WaitRow {
+                        id: row.get(0)?,
+                        on,
+                        waiter: row.get(3)?,
+                        deadline_ms: row.get(4)?,
+                        limit_secs: unsigned(row.get(5)?),
+                        since: row
+                            .get::<_, Option<i64>>(6)?
+                            .map(Timestamp::from_unix_millis),
+                    })
+                }),
+            )
+        })?;
+        let mut waits = Vec::new();
+        for row in read {
+            if let Some(row) = row? {
+                waits.push(row?);
+            }
+        }
+        Ok(waits)
+    }
+
+    /// Points a kept wait at `on` instead.
+    pub fn retarget_wait(&self, id: i64, on: &WaitOn) -> rusqlite::Result<()> {
+        let (kind, target) = on.parts();
+        self.db.execute(
+            "UPDATE wait SET kind = ?2, target = ?3 WHERE id = ?1",
+            params![id, kind, target],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets a kept wait: it was answered, its CLI went away, or no CLI came back for it.
+    pub fn remove_wait(&self, id: i64) -> rusqlite::Result<()> {
+        self.db
+            .execute("DELETE FROM wait WHERE id = ?1", params![id])?;
+        Ok(())
+    }
 }
 
 fn sql_int(n: u64) -> i64 {
