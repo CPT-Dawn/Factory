@@ -21,6 +21,9 @@ pub struct Done {
     pub json: Value,
     /// Lines after the first, only where the spec names them (a review's blocking findings).
     pub more: Vec<String>,
+    /// Notices on stderr, only where the spec names them (a backend skipped because its
+    /// sandbox is not active); `--json` carries them in its object instead.
+    pub notes: Vec<String>,
     /// [`Exit::Ok`], or [`Exit::NeedsAttention`] for a result that asks for work.
     pub exit: Exit,
 }
@@ -31,6 +34,7 @@ impl Done {
             line: line.into(),
             json,
             more: Vec::new(),
+            notes: Vec::new(),
             exit: Exit::Ok,
         }
     }
@@ -69,6 +73,10 @@ pub fn print(done: &Done, json: bool) {
     }
     for line in std::iter::once(&done.line).chain(&done.more) {
         let _ = writeln!(out, "{}", bounded(&one_line(line)));
+    }
+    let mut err = io::stderr().lock();
+    for note in &done.notes {
+        let _ = writeln!(err, "factory: {}", one_line(note));
     }
 }
 

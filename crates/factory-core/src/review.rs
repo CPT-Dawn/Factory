@@ -426,6 +426,9 @@ pub struct Record<'a> {
     pub duration_s: u64,
     /// The backends that ran out of quota before this one took the review, comma-joined.
     pub fallback_from: &'a str,
+    /// The backends passed over without a try (agy with no usage answer or no active
+    /// sandbox), comma-joined.
+    pub skipped: &'a str,
     pub report: &'a str,
     pub stream: &'a str,
     /// The run's findings ledger file.
@@ -456,6 +459,7 @@ impl Record<'_> {
             format!("backend={}", self.backend),
             format!("duration_s={}", self.duration_s),
             format!("fallback_from={}", self.fallback_from),
+            format!("skipped={}", self.skipped),
             format!("model={}", self.model.unwrap_or_default()),
             format!("effort={}", self.effort.unwrap_or_default()),
             format!("report={}", self.report),
@@ -670,6 +674,7 @@ mod tests {
             effort: None,
             duration_s: 7,
             fallback_from: "",
+            skipped: "agy",
             report: "r.md",
             stream: "r.jsonl",
             findings: "r.findings.json",
@@ -691,6 +696,7 @@ mod tests {
             "model=m",
             "effort=",
             "duration_s=7",
+            "skipped=agy",
             "findings=r.findings.json",
             "blocking=1",
             "standards_hard=1",

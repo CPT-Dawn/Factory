@@ -22,6 +22,7 @@ use std::time::Duration;
 use rustix::process::{Pid, Signal, kill_process_group};
 use tempfile::TempDir;
 
+pub mod github;
 pub mod golden;
 pub mod herdr;
 pub mod socket_unit;
@@ -41,6 +42,7 @@ pub const FAKED_TOOLS: &[&str] = &[
     "avdmanager",
     "emulator",
     "notify-send",
+    "unshare",
 ];
 
 /// How long any one process a test runs may take before the test fails.

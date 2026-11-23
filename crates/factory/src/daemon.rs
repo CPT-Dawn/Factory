@@ -15,8 +15,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use factory_adapters::gh::Gh;
+use factory_core::duration;
 use factory_core::event::{Event, Fields};
 use factory_core::exit::Exit;
+use factory_core::wait::{Wait, WaitOn};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -35,20 +38,23 @@ use crate::lab::wire::ACQUIRE;
 use crate::leads::Leads;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
+use crate::pollers::Pollers;
 use crate::protocol::{
     ErrorBody, LEAD_LIST, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH, Outcome,
-    REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, WAIT_LEAD, WaitLeadParams,
+    REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, WAIT_CI, WAIT_LEAD, WaitCiParams,
+    WaitCiResult, WaitLeadParams,
 };
 use crate::router::Router;
 use crate::store::Store;
 
 /// What every connection answers from: the ledger, the picture of the leads, the reviewer
-/// router and the lab's lease store.
+/// router, the lab's lease store and the CI pollers.
 struct Daemon {
     ledger: Arc<Ledger>,
     leads: Arc<Leads>,
     router: Arc<Router>,
     lab: Arc<Lab>,
+    pollers: Pollers,
 }
 
 /// How long a stopping daemon gives the connections it holds to finish their requests.
@@ -72,6 +78,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
     })?;
     let ledger = Arc::new(Ledger::open(paths.ledger())?);
     let leads = Leads::new(paths.clone(), Herdr::new(paths.herdr.clone()));
+    let pollers = Pollers::new(paths.clone(), Gh);
     let _lock = take_daemon_lock(&paths)?;
     let router = Arc::new(Router::open(Store::open(&paths.database())?)?);
     // Opened under the lock: it forgets the waiters a dead daemon left.
@@ -122,6 +129,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
             leads,
             router,
             lab: Arc::new(lab),
+            pollers,
         };
         serve(listener, Arc::new(daemon), stop).await;
         Ok(())
@@ -330,6 +338,15 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
             }
             Err(refused) => refused,
         },
+        WAIT_CI => match params::<WaitCiParams>(WAIT_CI, request.params) {
+            // Biased, as a lead wait: a stopping daemon answers no wait.
+            Ok(params) => tokio::select! {
+                biased;
+                () = stop.clone().stopping() => stopped("wait"),
+                waited = wait_ci(daemon, params) => answered(waited),
+            },
+            Err(refused) => refused,
+        },
         LOG => {
             let ledger = Arc::clone(&daemon.ledger);
             let params = request.params;
@@ -383,6 +400,35 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
     }
 }
 
+/// Joins the pull request's poller, then shows the waiter's lead as waiting on it until the
+/// checks finish.
+async fn wait_ci(daemon: &Daemon, params: WaitCiParams) -> Result<WaitCiResult, Failure> {
+    let limit = Duration::from_secs(params.timeout_secs);
+    // The timeout counts from the request, finding the pull request included.
+    let deadline = tokio::time::Instant::now() + limit;
+    let poll = Duration::from_secs(params.poll_secs.max(1));
+    let found = daemon
+        .pollers
+        .watch(&params.pr, PathBuf::from(params.cwd), poll);
+    let watch = tokio::time::timeout_at(deadline, found)
+        .await
+        .map_err(|_| {
+            Failure::new(
+                Exit::Timeout,
+                format!(
+                    "gh found no pull request {} within {}; wait again",
+                    params.pr,
+                    duration::show(limit)
+                ),
+            )
+        })??;
+    let _wait = daemon.leads.register(Wait {
+        waiter: params.waiter,
+        on: WaitOn::Ci(watch.pr().to_string()),
+    });
+    watch.finished(deadline, limit).await
+}
+
 fn log(params: Value, ledger: &Ledger) -> Outcome {
     let params: LogParams = match self::params(LOG, params) {
         Ok(params) => params,
@@ -410,7 +456,6 @@ fn log(params: Value, ledger: &Ledger) -> Outcome {
     }
 }
 
-/// The params of a `method` request, or the refusal of params that don't fit it.
 /// The answer to a request the daemon stopped under: `factory <command>` again.
 fn stopped(command: &str) -> Outcome {
     Outcome::Error(refusal(
@@ -419,6 +464,7 @@ fn stopped(command: &str) -> Outcome {
     ))
 }
 
+/// The params of a `method` request, or the refusal of params that don't fit it.
 fn params<P: DeserializeOwned>(method: &str, params: Value) -> Result<P, Outcome> {
     serde_json::from_value(params).map_err(|e| {
         Outcome::Error(refusal(

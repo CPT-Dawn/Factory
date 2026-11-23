@@ -1,5 +1,6 @@
 //! `factory`: the CLI and the daemon of the agent software factory (spec #1).
 
+mod ci;
 mod cli;
 mod client;
 mod clock;
@@ -12,6 +13,7 @@ mod leads;
 mod log;
 mod output;
 mod paths;
+mod pollers;
 mod protocol;
 mod review;
 mod router;
@@ -64,6 +66,9 @@ fn run(command: Command, json: bool) -> ExitCode {
         Command::Wait {
             command: WaitCommand::Lead { lead, timeout },
         } => lead::wait(&lead, timeout),
+        Command::Wait {
+            command: WaitCommand::Ci { pr, timeout },
+        } => ci::wait(&pr, timeout),
         Command::Review {
             base,
             label,

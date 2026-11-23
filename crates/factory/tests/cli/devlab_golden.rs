@@ -416,6 +416,7 @@ mod transcript {
         slots_owner_cap => "slots-owner-cap.golden",
         slots_queue => "slots-queue.golden",
         slots_release => "slots-release.golden",
+        slots_run_exit => "slots-run-exit.golden",
         slots_stack_failure => "slots-stack-failure.golden",
     }
 
