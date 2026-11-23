@@ -61,11 +61,41 @@ pub fn issue_ref(spec: &str) -> Option<&str> {
     }
 }
 
-/// The head a review ledger says it reviewed: where a fix round's diff starts.
-pub fn reviewed_head(ledger: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(ledger).ok()?;
-    let head = value.get("head")?.as_str()?;
-    (!head.is_empty()).then(|| head.to_owned())
+/// What a fix round takes from the previous round's findings ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Previous {
+    /// The head that round reviewed: where this round's diff starts.
+    pub head: String,
+    /// That round's findings that are still open, numbered `f1`, `f2`... for the reviewer to
+    /// mark; none when its report held no readable findings ledger.
+    pub open: Option<Vec<Finding>>,
+}
+
+impl Previous {
+    /// Reads a review's findings ledger (`<label>.findings.json`); none without a head.
+    pub fn of_ledger(ledger: &str) -> Option<Previous> {
+        let value: Value = serde_json::from_str(ledger).ok()?;
+        let head = value.get("head")?.as_str().filter(|head| !head.is_empty())?;
+        let open = value.get("findings")?.as_array().and_then(|entries| {
+            let findings: Option<Vec<Finding>> = entries.iter().map(finding).collect();
+            Some(
+                findings?
+                    .into_iter()
+                    .filter(|finding| finding.status != Status::Fixed)
+                    .enumerate()
+                    .map(|(i, finding)| Finding {
+                        id: format!("f{}", i + 1),
+                        status: Status::New,
+                        ..finding
+                    })
+                    .collect(),
+            )
+        });
+        Some(Previous {
+            head: head.to_owned(),
+            open,
+        })
+    }
 }
 
 /// One named text the bundle carries: a spec, a report, a standards file, an evidence file.
@@ -86,6 +116,9 @@ pub struct Bundle<'a> {
     /// On a fix round, the head the previous round reviewed: the diff starts there, not at
     /// the base.
     pub fix_from: Option<&'a str>,
+    /// On a fix round, the previous round's open findings, which the reviewer marks fixed or
+    /// still present.
+    pub open: Option<&'a [Finding]>,
     pub commits: &'a str,
     pub diff_stat: &'a str,
     pub diff: &'a str,
@@ -123,12 +156,15 @@ impl Bundle<'_> {
             self.spec,
             "None given: skip the spec axis.",
         );
-        named(
-            &mut out,
-            "Previous review",
-            self.previous,
-            "None: this is a first round.",
-        );
+        match (self.open, self.previous) {
+            (Some(open), previous) => previous_findings(&mut out, open, previous.map(|p| p.name)),
+            (None, previous) => named(
+                &mut out,
+                "Previous review",
+                previous,
+                "None: this is a first round.",
+            ),
+        }
         if self.standards.is_empty() {
             absent(
                 &mut out,
@@ -148,6 +184,19 @@ impl Bundle<'_> {
         fenced(&mut out, "Diff", self.diff, "diff");
         out
     }
+}
+
+/// Appends the previous round's open findings as JSON, with what a fix round does with them.
+fn previous_findings(out: &mut String, open: &[Finding], report: Option<&str>) {
+    let ledger = serde_json::json!({"findings": open.iter().map(Finding::to_value).collect::<Vec<_>>()});
+    let mut text = String::from(
+        "The previous round's open findings. Mark each in your ledger by its id as fixed or still_present; report a new finding only on a line this diff touches (a security problem or a hard standards violation anywhere).\n",
+    );
+    if let Some(report) = report {
+        text.push_str(&format!("Its report, to open only to check a claim: {report}\n"));
+    }
+    out.push_str(&format!("\n## Previous findings\n\n{text}"));
+    fenced(out, "", &format!("{ledger:#}"), "json");
 }
 
 /// Appends `## heading: name` and the part, or `## heading` and `note` when there is none.
@@ -254,6 +303,40 @@ pub struct Finding {
     /// Where it is, as `path:line`.
     pub location: String,
     pub summary: String,
+    /// How a fix round numbered it for the reviewer to answer; empty on a first round.
+    pub id: String,
+    pub status: Status,
+}
+
+/// What a fix round's reviewer says of a finding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Status {
+    /// Raised this round.
+    #[default]
+    New,
+    /// An earlier finding the fix settled.
+    Fixed,
+    /// An earlier finding the fix left open.
+    StillPresent,
+}
+
+impl Status {
+    fn as_str(self) -> &'static str {
+        match self {
+            Status::New => "new",
+            Status::Fixed => "fixed",
+            Status::StillPresent => "still_present",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Status> {
+        match word {
+            "new" => Some(Status::New),
+            "fixed" => Some(Status::Fixed),
+            "still_present" => Some(Status::StillPresent),
+            _ => None,
+        }
+    }
 }
 
 impl Finding {
@@ -267,13 +350,20 @@ impl Finding {
 
     /// The finding as its findings-ledger entry.
     pub fn to_value(&self) -> Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "severity": self.severity.as_str(),
             "axis": self.axis,
             "tag": self.tag,
             "location": self.location,
             "summary": self.summary,
-        })
+        });
+        if !self.id.is_empty() {
+            value["id"] = self.id.clone().into();
+        }
+        if self.status != Status::New {
+            value["status"] = self.status.as_str().into();
+        }
+        value
     }
 }
 
@@ -542,6 +632,11 @@ fn finding(value: &Value) -> Option<Finding> {
         tag: text("tag"),
         location: text("location"),
         summary: text("summary"),
+        id: text("id"),
+        status: match value.get("status").and_then(Value::as_str) {
+            Some(word) => Status::parse(word)?,
+            None => Status::New,
+        },
     })
 }
 
@@ -571,13 +666,29 @@ mod tests {
     }
 
     #[test]
-    fn a_ledger_names_the_head_it_reviewed() {
+    fn a_ledger_names_the_head_it_reviewed_and_the_findings_still_open() {
+        let ledger = r#"{"head": "abc123", "findings": [
+            {"severity": "blocking", "axis": "spec", "tag": "t", "location": "a:1", "summary": "one", "id": "f1", "status": "fixed"},
+            {"severity": "advisory", "axis": "standards", "tag": "u", "location": "b:2", "summary": "two", "id": "f2", "status": "still_present"},
+            {"severity": "blocking", "axis": "spec", "tag": "t", "location": "c:3", "summary": "three"}
+        ]}"#;
+        let previous = Previous::of_ledger(ledger).unwrap();
+        assert_eq!(previous.head, "abc123");
+        let open: Vec<(&str, &str, Status)> = previous
+            .open
+            .iter()
+            .flatten()
+            .map(|f| (f.id.as_str(), f.summary.as_str(), f.status))
+            .collect();
+        // A fixed finding is not open; the rest are renumbered for this round.
         assert_eq!(
-            reviewed_head(r#"{"label": "t1-r1", "head": "abc123"}"#).as_deref(),
-            Some("abc123")
+            open,
+            [("f1", "two", Status::New), ("f2", "three", Status::New)]
         );
+        let bare = Previous::of_ledger(r#"{"head": "abc123", "findings": null}"#).unwrap();
+        assert_eq!(bare.open, None);
         for ledger in ["", "not json", "{}", r#"{"head": ""}"#, r#"{"head": 4}"#] {
-            assert_eq!(reviewed_head(ledger), None, "{ledger}");
+            assert_eq!(Previous::of_ledger(ledger), None, "{ledger}");
         }
     }
 

@@ -22,7 +22,7 @@ use factory_adapters::git::{GitError, GitRepo, Repo};
 use factory_adapters::reviewer::{Agy, Claude, Codex, Job, Reviewer, ReviewerError, home_of};
 use factory_core::exit::Exit;
 use factory_core::quota::Reset;
-use factory_core::review::{self, Bundle, Finding, Part, Reading, Record, Verdict, reviewed_head};
+use factory_core::review::{self, Bundle, Finding, Part, Previous, Reading, Record, Verdict};
 use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
 
@@ -438,8 +438,9 @@ struct Inputs {
     commits: String,
     diff_stat: String,
     diff: String,
-    /// On a fix round, the head the previous round reviewed, where the diff starts.
-    fix_from: Option<String>,
+    /// On a fix round, what the previous round's ledger gave: the head it reviewed, where the
+    /// diff starts, and its open findings.
+    fix: Option<Previous>,
     /// Why this fix round reviews the whole diff after all.
     notes: Vec<String>,
     spec: Option<(String, String)>,
@@ -456,17 +457,17 @@ impl Inputs {
             Failure::usage(format!("unknown ref: {base}; name a branch, tag or commit"))
         })?;
         let mut notes = Vec::new();
-        let fix_from = match &args.previous {
+        let fix = match &args.previous {
             Some(previous) => fix_start(repo, args, previous, &mut notes)?,
             None => None,
         };
-        let since = fix_from.as_deref().unwrap_or(base);
+        let since = fix.as_ref().map_or(base.as_str(), |fix| fix.head.as_str());
         let diff = repo.diff(since, DIFF_CONTEXT).map_err(git_failed)?;
         if diff.is_empty() {
-            return Err(Failure::usage(match &fix_from {
-                Some(from) => format!(
+            return Err(Failure::usage(match &fix {
+                Some(fix) => format!(
                     "no committed changes since the previous review's head {} (commit the fix first)",
-                    short(from)
+                    short(&fix.head)
                 ),
                 None => format!("no committed changes since {base} (commit first)"),
             }));
@@ -503,7 +504,7 @@ impl Inputs {
             commits: repo.commits(since).map_err(git_failed)?,
             diff_stat: repo.diff_stat(since).map_err(git_failed)?,
             diff,
-            fix_from,
+            fix,
             notes,
             spec,
             previous,
@@ -520,7 +521,8 @@ impl Inputs {
             base: &args.base,
             base_commit: &self.base_commit,
             head: &self.head,
-            fix_from: self.fix_from.as_deref(),
+            fix_from: self.fix.as_ref().map(|fix| fix.head.as_str()),
+            open: self.fix.as_ref().and_then(|fix| fix.open.as_deref()),
             commits: &self.commits,
             diff_stat: &self.diff_stat,
             diff: &self.diff,
@@ -540,14 +542,16 @@ fn fix_start(
     args: &Args,
     previous: &Path,
     notes: &mut Vec<String>,
-) -> Result<Option<String>, Failure> {
+) -> Result<Option<Previous>, Failure> {
     let ledger = previous.with_extension("findings.json");
     let named = fs::read_to_string(&ledger)
         .ok()
-        .and_then(|text| reviewed_head(&text));
+        .and_then(|text| Previous::of_ledger(&text));
     let on_branch = match named {
-        Some(head) => match repo.commit(&head).map_err(git_failed)? {
-            Some(commit) if repo.is_ancestor(&commit).map_err(git_failed)? => Some(commit),
+        Some(named) => match repo.commit(&named.head).map_err(git_failed)? {
+            Some(head) if repo.is_ancestor(&head).map_err(git_failed)? => {
+                Some(Previous { head, ..named })
+            }
             _ => None,
         },
         None => None,

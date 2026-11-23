@@ -637,3 +637,30 @@ fn a_fix_round_with_nothing_committed_since_the_previous_head_fails_with_exit_2(
     );
     assert_eq!(sandbox.calls("codex").len(), calls);
 }
+
+#[test]
+fn a_fix_rounds_bundle_carries_the_previous_open_findings_as_structured_input() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+
+    let out = fix_round(&sandbox, &repo, FINDINGS_REPORT, CLEAN_REPORT);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let bundle = fs::read_to_string(sandbox.reviews().join("t1-r2.bundle.md")).unwrap();
+    let (_, tail) = bundle
+        .split_once("## Previous findings")
+        .unwrap_or_else(|| panic!("no Previous findings in:\n{bundle}"));
+    let json = tail.split("```json\n").nth(1).unwrap().split("```").next().unwrap();
+    let carried: Value = serde_json::from_str(json).unwrap();
+    let ids: Vec<&str> = carried["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["f1", "f2", "f3", "f4"]);
+    assert_eq!(carried["findings"][3]["summary"], "nothing tests a");
+    assert_eq!(carried["findings"][3]["severity"], "blocking");
+    // The report's prose is not repeated: the findings are the input.
+    assert!(!bundle.contains("Two things."), "{bundle}");
+}
