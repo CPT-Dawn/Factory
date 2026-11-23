@@ -190,15 +190,7 @@ pub fn agy_usage(usage: &str, group: &str) -> AgyUsage {
     let Ok(usage) = serde_json::from_str::<Value>(usage) else {
         return AgyUsage::Unreadable("its answer is not JSON".to_owned());
     };
-    let buckets = usage
-        .pointer("/command/data/groups")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|candidate| candidate.get("name").and_then(Value::as_str) == Some(group))
-        .filter_map(|group| group.get("buckets")?.as_array())
-        .flatten()
-        .collect::<Vec<_>>();
+    let buckets = agy_buckets(&usage, group).collect::<Vec<_>>();
     if buckets.is_empty() {
         return AgyUsage::Unreadable(format!("it shows no {group} quota"));
     }
@@ -220,6 +212,31 @@ pub fn agy_usage(usage: &str, group: &str) -> AgyUsage {
         }
     }
     until.map_or(AgyUsage::Left, |until| AgyUsage::Empty { until })
+}
+
+/// Whether a bucket of agy's model `group` over `window` (`5h`, `weekly`) has less than
+/// `fraction` of its quota left, by its usage query: a reserve kept for the reviews that may
+/// spend it. An answer that can't be read keeps nothing back.
+pub fn agy_below(usage: &str, group: &str, window: &str, fraction: f64) -> bool {
+    let Ok(usage) = serde_json::from_str::<Value>(usage) else {
+        return false;
+    };
+    agy_buckets(&usage, group)
+        .filter(|bucket| bucket.get("window").and_then(Value::as_str) == Some(window))
+        .filter_map(|bucket| bucket.get("remaining_fraction")?.as_f64())
+        .any(|left| left < fraction)
+}
+
+/// The buckets agy's usage answer lists for the model `group`, in its order.
+fn agy_buckets<'a>(usage: &'a Value, group: &'a str) -> impl Iterator<Item = &'a Value> {
+    usage
+        .pointer("/command/data/groups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(move |candidate| candidate.get("name").and_then(Value::as_str) == Some(group))
+        .filter_map(|group| group.get("buckets")?.as_array())
+        .flatten()
 }
 
 /// The model agy runs when none is chosen, in the factory's config or in agy: its log names it

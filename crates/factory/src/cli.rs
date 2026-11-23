@@ -57,16 +57,21 @@ pub enum Command {
         base: String,
         /// Names the report: letters, digits, _ and -; a -rN suffix is the round
         label: String,
-        /// The spec: a file, an issue ref (#12, 12, an issue URL) or none
+        /// The spec: a file, an issue ref (#12, 12, owner/repo#12, an issue URL) or none
         spec: Option<String>,
         /// The previous round's report
         previous: Option<PathBuf>,
         /// Seconds a reviewer may take before its process group is killed (default: the config's)
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
-        /// The ticket's tier, recorded in the review's event: hard, standard or trivial
-        #[arg(long, value_name = "TIER", value_parser = ["hard", "standard", "trivial"])]
+        /// The ticket's tier, which picks the chain of reviewers: hard, standard or trivial
+        /// (a spec review is hard; a small or docs-only diff is trivial unless tagged hard)
+        #[arg(long, value_name = "TIER")]
         tier: Option<String>,
+        /// The reviewer skill the prompt carries (default: the config's, else
+        /// ~/.agents/skills/code-review/SKILL.md)
+        #[arg(long, value_name = "FILE")]
+        skill: Option<PathBuf>,
     },
     /// Answer a Claude Code hook: its JSON on stdin, its hook protocol on stdout
     Hook {

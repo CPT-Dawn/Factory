@@ -16,11 +16,22 @@ The shim checks the label (letters, digits, `_`, `-`) and the tier before it cal
 `code-review: ` line on stderr when either is wrong. It runs:
 
 ```
-factory review [--tier <tier>] <base> <label> <spec or none> [<previous-report>]
+factory review [--tier <tier>] --skill <its checkout's codex/code-review/SKILL.md> <base> <label> <spec or none> [<previous-report>]
 ```
 
-`--tier` is recorded as `tier=` on the `review` event. It does not yet pick a backend chain; the backends come
-from factory's own configuration.
+- The spec is a file, `none`, or an issue ref: `#12`, `12`, `owner/repo#12` or an issue URL. factory fetches
+  an issue with `gh` into `<label>.spec.md`, since the reviewers' sandboxes have no network. A path with no file
+  there is no spec: the review runs without one and says so on stderr.
+- `--skill` is the reviewer skill every backend's prompt carries, so a worktree's review.sh runs that worktree's
+  skill and no backend spends a turn loading it. Without it, factory takes `[review] skill` from its config,
+  else `~/.agents/skills/code-review/SKILL.md`.
+- The tier picks the chain of reviewers, as review.sh's did: a spec review (`spec-*`) is hard; a diff of only
+  docs and config (at most 400 lines), or of at most 5 lines and no test, is `trivial` unless tagged hard; else
+  the caller's tier, or standard. The chains and pools are factory's config (`[review.chains]`, `config.rs`),
+  review.sh's by default. Each pool has 2 slots: a busy pool passes the review to the chain's next, and the
+  chain's last waits. A pool out of quota (agy's free `/usage`, or a quota error mid-run) cools down until its
+  reset; a mid-run hit tries the same pool's next model first when it is next in the chain. Standard and
+  trivial reviews leave the Gemini pool alone while its 5-hour bucket is under 20%.
 
 ## What `factory review` prints
 
@@ -39,14 +50,29 @@ backend that failed, a report without its findings ledger, the daemon stopping w
 every backend is out of quota and 124 for a timeout. A failure prints `factory: code-review: <message>` on stderr. The `code-review: ` text is what
 factory-stats' classifier matches; it stays.
 
+## Files and the event
+
+In `<state>/reviews/<repo>/`, by label, as review.sh kept them: the bundle (`.bundle.md`: commits, diff stat,
+diff, spec, previous review, touched docs, coding standards, evidence), the prompt (`.prompt`), the report
+(`.md`), the reviewer's run record (Codex `.jsonl`, agy `.agy.json`, Claude `.claude.json`, which factory-stats
+reads), `.ledger.json` (review.sh's: `label round base from head tier pool model effort verdict report
+findings`, the head a fix round diffs from) and factory's `.findings.json`. A fix round finds the previous
+head in `.findings.json`, else `.ledger.json`, else the last ok `review` event naming that report.
+
+Every run, failed ones too, logs one `review` event with review.sh's fields: `repo label round base from head
+branch spec outcome verdict reason reviewer tier tier_source pool model effort tokens duration_s report stream
+bundle_bytes files` and the report's `FINDINGS:` words, `from` and `head` as 8 characters. `reviewer` is the
+CLI (`agy`, `codex`, `claude`), `pool` the backend. factory adds `backend`, `fallback_from`, `skipped`,
+`findings` and the counts.
+
 ## What the shim prints and returns
 
 - factory's stdout, unchanged, then `report: <path>` on a line of its own. It is the last line and nothing
   follows it. The path is read from the first line, after its last ` → `; a first line without one is a failure
   (exit 3), never a `report:` line naming nothing.
 - Exit 10 becomes 0: the review ran, and the verdict is in the report. Every other code passes through.
-- factory's stderr passes through, so a skipped backend's note and a failure's `code-review: ` line reach the
-  caller.
+- factory's stderr reaches the caller under review.sh's prefix: a line's leading `factory: ` (or
+  `factory: code-review: `) becomes `code-review: `, so a skipped backend's note and a failure read as they did.
 - When `factory` is not on PATH: `code-review: factory is not installed; run factory install`, exit 3.
 
 ## `factory wait review <label> [--timeout <duration>]`
@@ -66,7 +92,8 @@ timeout is 9 minutes.
 
 ## Limits
 
-- No tier chains yet: `--tier` is recorded, not acted on. The Gemini reserve, the automatic `trivial` tier for
-  small or docs-only diffs and the herdr tab for Codex are not in `factory review`.
+- Codex runs headless: review.sh's herdr tab for Codex is not in `factory review`.
+- review.sh's cooldown files (`~/.local/state/factory/*-cooldown`) and flock slots are not read: the daemon keeps
+  each pool's cooldown and slots.
 - A review whose CLI died before it logged the event leaves a `wait review` blocked until its timeout.
 - The live `review.sh` serves every review on the machine. The shim goes live only once `factory` is installed.

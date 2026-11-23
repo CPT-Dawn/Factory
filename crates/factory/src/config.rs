@@ -1,9 +1,20 @@
 //! The factory's config file, `${XDG_CONFIG_HOME:-$HOME/.config}/factory/config.toml`.
 //!
-//! Its `[[review.backend]]` entries are the review backends, tried in the order they are
-//! written (spec #1, "Reviewer router"). Without the file, or without entries, the backends are
-//! Antigravity's Gemini 4 Neon at high effort, then Codex on its own config, then Claude Opus at
-//! high effort.
+//! Its `[[review.backend]]` entries are the review backends, each a pool of quota with its own
+//! slots and cooldown (spec #1, "Reviewer router"), and `[review.chains]` names, per tier, the
+//! pool, model and effort each step of that tier's chain runs (spec #1, story 31). A tier the
+//! chains leave out tries the configured backends in their order, on their own model and
+//! effort. Without backends, the pools and chains are review.sh's:
+//!
+//! - pools `agy-gemini` (with a 20% reserve), `agy-argon` and `agy-claude` (agy's usage groups),
+//!   `codex` and `claude`, each with 2 slots;
+//! - hard: Gemini 4 Neon high, Argon high, agy's Opus high, Codex high, Claude Opus high;
+//! - standard: Codex medium, Neon medium, agy's Opus high, Argon high, agy's Sonnet high,
+//!   Claude Sonnet high;
+//! - trivial: Flash high, Neon low, Codex low, Claude Sonnet medium.
+//!
+//! A pool's `when_busy` left unset passes a busy pool to the next one in the chain, and waits
+//! for a slot on the chain's last.
 //!
 //! Its `[ci]` table sets how often a wait on CI polls GitHub when it can't listen for events,
 //! and its `[monitor]` table the context steward's thresholds.
@@ -39,6 +50,16 @@
 //!                          # that model's group in agy's /usage
 //! auth = "subscription"    # agy only: its "subscription" login, or an "api-key" in
 //!                          # GEMINI_API_KEY (default: subscription)
+//! reserve = 0.2            # agy only: below this share of its group's 5-hour bucket, only
+//!                          # hard reviews may take it
+//!
+//! [review]
+//! skill = "~/.agents/skills/code-review/SKILL.md"  # the reviewer skill every prompt carries
+//!
+//! [review.chains]          # per tier: "pool:model:effort", model and effort optional
+//! hard = ["agy:gemini-4-neon-high:high", "codex:gpt-6.2-sol:high"]
+//! standard = ["codex:gpt-6.2-sol:medium", "agy"]
+//! trivial = ["codex::low"]
 //! ```
 //!
 //! The hooks (`factory hook`, spec #1, "Hooks") read the `[hook]` table:
@@ -75,6 +96,7 @@ use factory_adapters::reviewer::AgyAuth;
 use factory_core::hook::{Template, Templates};
 use factory_core::quota::WhenBusy;
 use factory_core::steward::Policy;
+use factory_core::tier::Tier;
 use serde::Deserialize;
 
 use crate::output::Failure;
@@ -108,9 +130,43 @@ pub struct Backend {
     pub effort: Option<String>,
     pub timeout: Duration,
     pub concurrency: u32,
-    pub when_busy: WhenBusy,
+    /// What a review does when it is busy; unset, the chain decides: the next pool, or a wait
+    /// on the chain's last.
+    pub when_busy: Option<WhenBusy>,
     /// How agy signs in; the other CLIs take none.
     pub auth: AgyAuth,
+    /// The share of agy's five-hour bucket kept for hard reviews.
+    pub reserve: Option<f64>,
+}
+
+/// One step of a tier's chain: the backend it runs on, by its index, and the model and effort
+/// it runs, else the backend's own.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Step {
+    pub backend: usize,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// The review backends and each tier's chain over them.
+#[derive(Clone, Debug)]
+pub struct ReviewSetup {
+    pub backends: Vec<Backend>,
+    pub hard: Vec<Step>,
+    pub standard: Vec<Step>,
+    pub trivial: Vec<Step>,
+    /// The reviewer skill the prompt carries, as configured.
+    pub skill: Option<PathBuf>,
+}
+
+impl ReviewSetup {
+    pub fn chain(&self, tier: Tier) -> &[Step] {
+        match tier {
+            Tier::Hard => &self.hard,
+            Tier::Standard => &self.standard,
+            Tier::Trivial => &self.trivial,
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -275,6 +331,17 @@ const DEFAULT_DISABLED_PLUGINS: [&str; 2] =
 struct Review {
     #[serde(default)]
     backend: Vec<Entry>,
+    #[serde(default)]
+    chains: Chains,
+    skill: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct Chains {
+    hard: Option<Vec<String>>,
+    standard: Option<Vec<String>>,
+    trivial: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -288,6 +355,7 @@ struct Entry {
     concurrency: Option<u32>,
     when_busy: Option<Busy>,
     auth: Option<AgyAuth>,
+    reserve: Option<f64>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -372,43 +440,127 @@ pub fn claude_hold_at(paths: &Paths) -> Result<f64, Failure> {
     }
 }
 
-/// The review backends in the order they are tried.
-pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
+/// The review backends, each tier's chain over them, and the reviewer skill.
+pub fn review_setup(paths: &Paths) -> Result<ReviewSetup, Failure> {
     let (path, file) = load_config(paths)?;
-    if file.review.backend.is_empty() {
-        return Ok(defaults());
+    let refuse = |what: String| Failure::precondition(format!("{}: {what}", path.display()));
+    let review = file.review;
+    let configured = !review.backend.is_empty();
+    let backends = if configured {
+        let mut names = HashSet::new();
+        review
+            .backend
+            .into_iter()
+            .map(|entry| {
+                let (auth, reserve) = (entry.auth.is_some(), entry.reserve);
+                let backend = backend(entry);
+                if auth && backend.cli != Cli::Agy {
+                    return Err(refuse(format!(
+                        "backend {} sets auth, which only agy takes; remove it",
+                        backend.name
+                    )));
+                }
+                match reserve {
+                    Some(_) if backend.cli != Cli::Agy => {
+                        return Err(refuse(format!(
+                            "backend {} sets reserve, which only agy takes; remove it",
+                            backend.name
+                        )));
+                    }
+                    Some(reserve) if !(0.0..1.0).contains(&reserve) => {
+                        return Err(refuse(format!(
+                            "backend {} has reserve {reserve}; give a share from 0 to below 1",
+                            backend.name
+                        )));
+                    }
+                    _ => {}
+                }
+                if backend.concurrency == 0 {
+                    return Err(refuse(format!(
+                        "backend {} has concurrency 0; give it 1 or more",
+                        backend.name
+                    )));
+                }
+                if !names.insert(backend.name.clone()) {
+                    return Err(refuse(format!(
+                        "two backends are named {}; give each its own name",
+                        backend.name
+                    )));
+                }
+                Ok(backend)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        default_backends()
+    };
+    let chain = |tier: Tier, given: Option<Vec<String>>| -> Result<Vec<Step>, Failure> {
+        let Some(given) = given else {
+            return Ok(if configured {
+                (0..backends.len())
+                    .map(|backend| Step {
+                        backend,
+                        model: None,
+                        effort: None,
+                    })
+                    .collect()
+            } else {
+                default_chain(tier, &backends)
+            });
+        };
+        if given.is_empty() {
+            return Err(refuse(format!(
+                "review.chains.{tier} is empty; name at least one \"pool:model:effort\""
+            )));
+        }
+        given
+            .iter()
+            .map(|step| {
+                parse_step(step, &backends)
+                    .map_err(|why| refuse(format!("review.chains.{tier}: {why}; fix the config")))
+            })
+            .collect()
+    };
+    let chains = review.chains;
+    Ok(ReviewSetup {
+        hard: chain(Tier::Hard, chains.hard)?,
+        standard: chain(Tier::Standard, chains.standard)?,
+        trivial: chain(Tier::Trivial, chains.trivial)?,
+        skill: review.skill.map(|skill| expand_home(&skill)),
+        backends,
+    })
+}
+
+/// The review backends, the pools the chains run on.
+pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
+    review_setup(paths).map(|setup| setup.backends)
+}
+
+/// A chain's step, `pool:model:effort`, with the model and effort optional.
+fn parse_step(step: &str, backends: &[Backend]) -> Result<Step, String> {
+    let mut parts = step.splitn(3, ':');
+    let pool = parts.next().unwrap_or_default();
+    let given = |part: Option<&str>| part.filter(|part| !part.is_empty()).map(str::to_owned);
+    let (model, effort) = (given(parts.next()), given(parts.next()));
+    let backend = backends
+        .iter()
+        .position(|backend| backend.name == pool)
+        .ok_or_else(|| format!("{step:?} names no backend {pool:?}"))?;
+    Ok(Step {
+        backend,
+        model,
+        effort,
+    })
+}
+
+/// A path the config names, with a leading `~/` as the home directory.
+fn expand_home(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME").map_or_else(
+            || PathBuf::from(path),
+            |home| PathBuf::from(home).join(rest),
+        ),
+        None => PathBuf::from(path),
     }
-    let mut names = HashSet::new();
-    file.review
-        .backend
-        .into_iter()
-        .map(|entry| {
-            let auth = entry.auth.is_some();
-            let backend = backend(entry);
-            if auth && backend.cli != Cli::Agy {
-                return Err(Failure::precondition(format!(
-                    "{}: backend {} sets auth, which only agy takes; remove it",
-                    path.display(),
-                    backend.name
-                )));
-            }
-            if backend.concurrency == 0 {
-                return Err(Failure::precondition(format!(
-                    "{}: backend {} has concurrency 0; give it 1 or more",
-                    path.display(),
-                    backend.name
-                )));
-            }
-            if !names.insert(backend.name.clone()) {
-                return Err(Failure::precondition(format!(
-                    "{}: two backends are named {}; give each its own name",
-                    path.display(),
-                    backend.name
-                )));
-            }
-            Ok(backend)
-        })
-        .collect()
 }
 
 /// Reads the config file at `path`; an absent file is an empty config.
@@ -467,32 +619,79 @@ fn backend(entry: Entry) -> Backend {
         effort: entry.effort,
         timeout: Duration::from_secs(entry.timeout.unwrap_or(DEFAULT_TIMEOUT_S)),
         concurrency: entry.concurrency.unwrap_or(DEFAULT_CONCURRENCY),
-        when_busy: match entry.when_busy {
-            Some(Busy::Next) => WhenBusy::Next,
-            Some(Busy::Queue) | None => WhenBusy::Queue,
-        },
+        when_busy: entry.when_busy.map(|busy| match busy {
+            Busy::Next => WhenBusy::Next,
+            Busy::Queue => WhenBusy::Queue,
+        }),
         auth: entry.auth.unwrap_or_default(),
+        reserve: entry.reserve,
     }
 }
 
-fn defaults() -> Vec<Backend> {
-    let entry = |cli, model: Option<&str>, effort: Option<&str>| {
-        backend(Entry {
+/// review.sh's pools: agy's three usage groups, Codex and Claude, two slots each.
+fn default_backends() -> Vec<Backend> {
+    let pool = |name: &str, cli, reserve| Backend {
+        reserve,
+        ..backend(Entry {
             cli,
-            name: None,
-            model: model.map(str::to_owned),
-            effort: effort.map(str::to_owned),
+            name: Some(name.to_owned()),
+            model: None,
+            effort: None,
             timeout: None,
             concurrency: None,
             when_busy: None,
             auth: None,
+            reserve: None,
         })
     };
     vec![
-        entry(Cli::Agy, Some("gemini-4-neon"), Some("high")),
-        entry(Cli::Codex, None, None),
-        entry(Cli::Claude, Some("opus"), Some("high")),
+        pool("agy-gemini", Cli::Agy, Some(DEFAULT_GEMINI_RESERVE)),
+        pool("agy-argon", Cli::Agy, None),
+        pool("agy-claude", Cli::Agy, None),
+        pool("codex", Cli::Codex, None),
+        pool("claude", Cli::Claude, None),
     ]
+}
+
+/// The share of Gemini's five-hour bucket kept for hard reviews.
+const DEFAULT_GEMINI_RESERVE: f64 = 0.2;
+
+/// review.sh's chains, over [`default_backends`].
+const DEFAULT_HARD: [&str; 5] = [
+    "agy-gemini:gemini-4-neon-high:high",
+    "agy-argon:gemini-4-argon-high:high",
+    "agy-claude:claude-opus-5-5-high:high",
+    "codex:gpt-6.2-sol:high",
+    "claude:opus:high",
+];
+/// Standard (owner, 2026-11-23): Codex medium leads, because Neon medium and Argon high missed
+/// known hard findings in replays that Codex caught. agy's Opus comes before Argon high.
+const DEFAULT_STANDARD: [&str; 6] = [
+    "codex:gpt-6.2-sol:medium",
+    "agy-gemini:gemini-4-neon-medium:medium",
+    "agy-claude:claude-opus-5-5-high:high",
+    "agy-argon:gemini-4-argon-high:high",
+    "agy-claude:claude-sonnet-5-5-high:high",
+    "claude:sonnet:high",
+];
+const DEFAULT_TRIVIAL: [&str; 4] = [
+    "agy-gemini:gemini-3.8-flash-high:high",
+    "agy-gemini:gemini-4-neon-low:low",
+    "codex:gpt-6.2-sol:low",
+    "claude:sonnet:medium",
+];
+
+fn default_chain(tier: Tier, backends: &[Backend]) -> Vec<Step> {
+    let steps: &[&str] = match tier {
+        Tier::Hard => &DEFAULT_HARD,
+        Tier::Standard => &DEFAULT_STANDARD,
+        Tier::Trivial => &DEFAULT_TRIVIAL,
+    };
+    // Every step names a default pool; the acceptance tests run each chain.
+    steps
+        .iter()
+        .filter_map(|step| parse_step(step, backends).ok())
+        .collect()
 }
 
 pub fn cli_name(cli: Cli) -> &'static str {

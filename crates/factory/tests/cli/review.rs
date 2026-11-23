@@ -167,12 +167,12 @@ fn a_label_outside_letters_digits_underscore_and_dash_is_refused_with_exit_2() {
 }
 
 #[test]
-fn the_tier_a_caller_names_lands_in_the_review_event_and_none_leaves_it_out() {
+fn the_tier_a_caller_names_lands_in_the_review_event_and_none_is_detected_from_the_diff() {
     let sandbox = Sandbox::new();
     let repo = sandbox.repo();
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
 
-    let tiered = sandbox.factory_in(&repo, &["review", "--tier", "standard", "main", "t1-r1"]);
+    let tiered = sandbox.factory_in(&repo, &["review", "--tier", "hard", "main", "t1-r1"]);
     let untiered = sandbox.factory_in(&repo, &["review", "main", "t2-r1"]);
 
     assert_eq!(
@@ -185,8 +185,11 @@ fn the_tier_a_caller_names_lands_in_the_review_event_and_none_leaves_it_out() {
         .iter()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(events[0]["tier"], "standard", "{}", events[0]);
-    assert_eq!(events[1].get("tier"), None, "{}", events[1]);
+    assert_eq!(events[0]["tier"], "hard", "{}", events[0]);
+    assert_eq!(events[0]["tier_source"], "caller", "{}", events[0]);
+    // The sandbox repo's diff is one line in a.txt, so with no tier it is trivial.
+    assert_eq!(events[1]["tier"], "trivial", "{}", events[1]);
+    assert_eq!(events[1]["tier_source"], "detected", "{}", events[1]);
 }
 
 #[test]
@@ -265,7 +268,7 @@ fn an_issue_ref_as_the_spec_is_fetched_with_gh_and_saved_as_a_file() {
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
     sandbox.fake("gh", "printf '# #12 Add a\\n\\nAdd a.txt, from gh.\\n'");
 
-    for (n, spec) in ["#12", "12", "https://github.com/o/r/issues/12"]
+    for (n, spec) in ["#12", "12", "https://github.com/o/r/issues/12", "o/r#12"]
         .into_iter()
         .enumerate()
     {
@@ -288,22 +291,28 @@ fn an_issue_ref_as_the_spec_is_fetched_with_gh_and_saved_as_a_file() {
             "{spec}: {prompt}"
         );
     }
-    // A URL goes to gh whole, so an issue of another repo is fetched from that repo.
+    // A URL goes to gh whole, and `owner/repo#n` as one, so an issue of another repo is
+    // fetched from that repo.
     let template = r#"# #{{.number}} {{.title}}{{"\n\n"}}{{.body}}{{"\n"}}"#;
-    let expected: Vec<Vec<&str>> = ["12", "12", "https://github.com/o/r/issues/12"]
-        .into_iter()
-        .map(|issue| {
-            vec![
-                "issue",
-                "view",
-                issue,
-                "--json",
-                "number,title,body",
-                "--template",
-                template,
-            ]
-        })
-        .collect();
+    let expected: Vec<Vec<&str>> = [
+        "12",
+        "12",
+        "https://github.com/o/r/issues/12",
+        "https://github.com/o/r/issues/12",
+    ]
+    .into_iter()
+    .map(|issue| {
+        vec![
+            "issue",
+            "view",
+            issue,
+            "--json",
+            "number,title,body",
+            "--template",
+            template,
+        ]
+    })
+    .collect();
     assert_eq!(sandbox.calls("gh"), expected);
 }
 
@@ -389,6 +398,13 @@ fn each_run_logs_one_review_event_with_backend_model_round_outcome_and_counts() 
         "model = \"gpt-test\"\nmodel_reasoning_effort = \"medium\"\n\n[profiles.x]\nmodel = \"other\"\n",
     )
     .unwrap();
+    // Only codex, so its model and effort are what its own config leaves.
+    fs::create_dir_all(sandbox.path("config/factory")).unwrap();
+    fs::write(
+        sandbox.path("config/factory/config.toml"),
+        "[[review.backend]]\ncli = \"codex\"\n",
+    )
+    .unwrap();
     sandbox.fake("codex", &codex_writes(FINDINGS_REPORT));
 
     let out = sandbox.factory_in(&repo, &["review", "main", "t1-r1"]);
@@ -407,7 +423,10 @@ fn each_run_logs_one_review_event_with_backend_model_round_outcome_and_counts() 
         ("outcome", Value::from("ok")),
         ("verdict", Value::from("findings")),
         ("backend", Value::from("codex")),
+        ("pool", Value::from("codex")),
         ("reviewer", Value::from("codex")),
+        ("tier", Value::from("trivial")),
+        ("tier_source", Value::from("detected")),
         ("model", Value::from("gpt-test")),
         ("effort", Value::from("medium")),
         ("blocking", Value::from(2)),
@@ -599,9 +618,9 @@ fn a_run_that_fails_before_the_reviewer_starts_logs_no_report_or_stream() {
             .starts_with("unknown ref: nope"),
         "{event}"
     );
-    assert_eq!(event["backend"], "codex", "{event}");
-    assert_eq!(event["model"], "gpt-test", "{event}");
-    for absent in ["report", "stream", "findings", "verdict"] {
+    for absent in [
+        "backend", "pool", "reviewer", "model", "report", "stream", "findings", "verdict",
+    ] {
         assert_eq!(event.get(absent), None, "{absent} in {event}");
     }
 }
@@ -767,8 +786,14 @@ fn a_fix_rounds_bundle_carries_the_previous_open_findings_as_structured_input() 
     assert_eq!(ids, ["f1", "f2", "f3", "f4"]);
     assert_eq!(carried["findings"][3]["summary"], "nothing tests a");
     assert_eq!(carried["findings"][3]["severity"], "blocking");
-    // The report's prose is not repeated: the findings are the input.
-    assert!(!bundle.contains("Two things."), "{bundle}");
+    // The previous report itself stays above them, under its own heading.
+    let (before, _) = bundle.split_once("## Previous findings").unwrap();
+    assert!(
+        before
+            .split_once("## Previous review")
+            .is_some_and(|(_, report)| report.contains("Two things.")),
+        "{bundle}"
+    );
 }
 
 /// Round 2 of `FINDINGS_REPORT` after a fix that settled all four of its findings.

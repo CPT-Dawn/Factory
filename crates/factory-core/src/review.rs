@@ -48,18 +48,32 @@ pub fn round(label: &str, has_previous: bool) -> u32 {
 }
 
 /// The issue `gh issue view` should fetch when a spec is an issue ref: the number of `#12` or
-/// `12`, or a whole `https://github.com/<owner>/<repo>/issues/12`, which may name another repo.
-pub fn issue_ref(spec: &str) -> Option<&str> {
+/// `12`, a whole `https://github.com/<owner>/<repo>/issues/12`, or `<owner>/<repo>#12` as
+/// that URL. The last two may name another repo.
+pub fn issue_ref(spec: &str) -> Option<String> {
     let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    match spec.strip_prefix("https://github.com/") {
-        Some(rest) => match rest.split('/').collect::<Vec<_>>()[..] {
-            [owner, repo, "issues", n] if !owner.is_empty() && !repo.is_empty() && number(n) => {
-                Some(spec)
+    let name = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    if let Some(rest) = spec.strip_prefix("https://github.com/") {
+        return match rest.split('/').collect::<Vec<_>>()[..] {
+            [owner, repo, "issues", n] if name(owner) && name(repo) && number(n) => {
+                Some(spec.to_owned())
             }
             _ => None,
-        },
-        None => Some(spec.strip_prefix('#').unwrap_or(spec)).filter(|n| number(n)),
+        };
     }
+    if let Some((repo, n)) = spec.split_once('#')
+        && let Some((owner, repo)) = repo.split_once('/')
+    {
+        return (name(owner) && name(repo) && number(n))
+            .then(|| format!("https://github.com/{owner}/{repo}/issues/{n}"));
+    }
+    Some(spec.strip_prefix('#').unwrap_or(spec))
+        .filter(|n| number(n))
+        .map(str::to_owned)
 }
 
 /// The lines a fix touched, read from its diff: the new-side lines it added or changed, and
@@ -174,21 +188,24 @@ impl Previous {
             .get("head")?
             .as_str()
             .filter(|head| !head.is_empty())?;
-        let open = value.get("findings")?.as_array().and_then(|entries| {
-            let findings: Option<Vec<Finding>> = entries.iter().map(finding).collect();
-            Some(
-                findings?
-                    .into_iter()
-                    .filter(|finding| finding.status != Status::Fixed)
-                    .enumerate()
-                    .map(|(i, finding)| Finding {
-                        id: format!("f{}", i + 1),
-                        status: Status::New,
-                        ..finding
-                    })
-                    .collect(),
-            )
-        });
+        let open = value
+            .get("findings")
+            .and_then(Value::as_array)
+            .and_then(|entries| {
+                let findings: Option<Vec<Finding>> = entries.iter().map(finding).collect();
+                Some(
+                    findings?
+                        .into_iter()
+                        .filter(|finding| finding.status != Status::Fixed)
+                        .enumerate()
+                        .map(|(i, finding)| Finding {
+                            id: format!("f{}", i + 1),
+                            status: Status::New,
+                            ..finding
+                        })
+                        .collect(),
+                )
+            });
         Some(Previous {
             head: head.to_owned(),
             open,
@@ -203,11 +220,20 @@ pub struct Part<'a> {
     pub text: &'a str,
 }
 
+/// A Markdown file the diff touches, for the bundle: whole when small, else only named.
+#[derive(Clone, Copy, Debug)]
+pub enum Doc<'a> {
+    Whole(Part<'a>),
+    TooLong(&'a str),
+}
+
 /// Everything a reviewer reads, gathered before it starts, so it re-runs and re-reads nothing.
 #[derive(Clone, Debug)]
 pub struct Bundle<'a> {
     pub label: &'a str,
+    pub repo: &'a str,
     pub round: u32,
+    pub tier: &'a str,
     pub base: &'a str,
     pub base_commit: &'a str,
     pub head: &'a str,
@@ -217,110 +243,122 @@ pub struct Bundle<'a> {
     /// On a fix round, the previous round's open findings, which the reviewer marks fixed or
     /// still present.
     pub open: Option<&'a [Finding]>,
+    /// One line per commit: short sha, author, subject length, subject.
     pub commits: &'a str,
     pub diff_stat: &'a str,
     pub diff: &'a str,
     pub spec: Option<Part<'a>>,
     pub previous: Option<Part<'a>>,
-    /// The repo's standards files, which name what tooling already enforces.
-    pub standards: Vec<Part<'a>>,
+    /// The Markdown files the diff touches: a doc often states the rule its own change must
+    /// follow (docs/flakes.md: waits need a deadline).
+    pub docs: Vec<Doc<'a>>,
+    /// The repo's standards file, which names what tooling already enforces.
+    pub standards: Option<Part<'a>>,
     /// The implementer's record of the gates and checks it ran.
     pub evidence: Option<Part<'a>>,
 }
 
 impl Bundle<'_> {
-    /// The bundle as one Markdown file, each part fenced so nothing inside it reads as
-    /// structure. The diff comes last, being the largest.
+    /// The bundle as one Markdown file, review.sh's sections in its order, each text fenced so
+    /// nothing inside it reads as structure.
     pub fn render(&self) -> String {
-        let mut out = match self.fix_from {
-            Some(from) => format!(
-                "# Review bundle: {}\n\nRound {}, the fix only: the commits from {} (the head round {} reviewed) to {}.\n",
-                self.label,
-                self.round,
-                from,
-                self.round - 1,
-                self.head
-            ),
-            None => format!(
-                "# Review bundle: {}\n\nRound {}: the commits from {} ({}) to {}.\n",
-                self.label, self.round, self.base, self.base_commit, self.head
-            ),
-        };
-        fenced(&mut out, "Commits", self.commits, "");
-        fenced(&mut out, "Diff stat", self.diff_stat, "");
-        named(
-            &mut out,
-            "Spec",
-            self.spec,
-            "None given: skip the spec axis.",
+        let short = |sha: &str| sha[..sha.len().min(8)].to_owned();
+        let mut out = format!(
+            "# Review bundle: {}\n\nRepo {}, round {}, tier {}. Reviewed head {}.\n",
+            self.label, self.repo, self.round, self.tier, self.head
         );
-        match (self.open, self.previous) {
-            (Some(open), previous) => previous_findings(&mut out, open, previous.map(|p| p.name)),
-            (None, previous) => named(
-                &mut out,
-                "Previous review",
-                previous,
-                "None: this is a first round.",
-            ),
+        out.push_str("\n## Commits\n\n");
+        match self.fix_from {
+            Some(from) => out.push_str(&format!(
+                "The fix since the head round {} reviewed, {}..{}:\n\n",
+                self.round.saturating_sub(1),
+                short(from),
+                short(self.head)
+            )),
+            None => out.push_str(&format!(
+                "Since {} ({}):\n\n",
+                self.base,
+                short(self.base_commit)
+            )),
         }
-        if self.standards.is_empty() {
-            absent(
-                &mut out,
-                "Standards",
-                "The repo documents none: apply the smell baseline only.",
-            );
+        out.push_str("sha, author, subject length, subject:\n\n");
+        block(&mut out, self.commits, "");
+        out.push_str("\n## Diff stat\n\n");
+        block(&mut out, self.diff_stat, "");
+        out.push_str("\n## Diff\n\n");
+        block(&mut out, self.diff, "diff");
+        out.push_str("\n## Spec\n\n");
+        match self.spec {
+            Some(spec) => {
+                out.push_str(&format!("From {}:\n\n", spec.name));
+                block(&mut out, spec.text, "");
+            }
+            None => out.push_str("none\n"),
         }
-        for part in &self.standards {
-            named(&mut out, "Standards", Some(*part), "");
+        if let Some(previous) = self.previous {
+            out.push_str(&format!(
+                "\n## Previous review\n\nRound {}, {}. Mark each of its open findings fixed or still present.\n\n",
+                self.round.saturating_sub(1),
+                previous.name
+            ));
+            block(&mut out, previous.text, "");
         }
-        named(
-            &mut out,
-            "Implementer evidence",
-            self.evidence,
-            "None given.",
+        if let Some(open) = self.open {
+            previous_findings(&mut out, open);
+        }
+        out.push_str(
+            "\n## Touched docs\n\nEach Markdown file the diff touches, whole when under 12 KB:\n",
         );
-        fenced(&mut out, "Diff", self.diff, "diff");
+        for doc in &self.docs {
+            match doc {
+                Doc::Whole(doc) => {
+                    out.push_str(&format!("\n### {}\n\n", doc.name));
+                    block(&mut out, doc.text, "markdown");
+                }
+                Doc::TooLong(name) => out.push_str(&format!(
+                    "\n### {name} (too long: open it around the changed lines)\n"
+                )),
+            }
+        }
+        out.push_str("\n## Coding standards\n\n");
+        match self.standards {
+            Some(standards) => {
+                out.push_str(&format!("From {}:\n\n", standards.name));
+                block(&mut out, standards.text, "");
+            }
+            None => out.push_str("none documented: the smell baseline only\n"),
+        }
+        out.push_str("\n## Evidence\n\n");
+        match self.evidence {
+            Some(evidence) => {
+                out.push_str("The builder's record of what it ran:\n\n");
+                block(&mut out, evidence.text, "");
+            }
+            None => out.push_str("none\n"),
+        }
         out
     }
 }
 
 /// Appends the previous round's open findings as JSON, with what a fix round does with them.
-fn previous_findings(out: &mut String, open: &[Finding], report: Option<&str>) {
+fn previous_findings(out: &mut String, open: &[Finding]) {
     let ledger =
         serde_json::json!({"findings": open.iter().map(Finding::to_value).collect::<Vec<_>>()});
-    let mut text = String::from(
-        "The previous round's open findings. Mark each in your ledger by its id as fixed or still_present; report a new finding only on a line this diff touches (a security problem or a hard standards violation anywhere).\n",
+    out.push_str(
+        "\n## Previous findings\n\nThe previous round's open findings. Mark each in your ledger by its id as fixed or still_present; report a new finding only on a line this diff touches (a security problem or a hard standards violation anywhere).\n\n",
     );
-    if let Some(report) = report {
-        text.push_str(&format!(
-            "Its report, to open only to check a claim: {report}\n"
-        ));
-    }
-    out.push_str(&format!("\n## Previous findings\n\n{text}"));
-    fenced(out, "", &format!("{ledger:#}"), "json");
+    block(out, &format!("{ledger:#}"), "json");
 }
 
-/// Appends `## heading: name` and the part, or `## heading` and `note` when there is none.
-fn named(out: &mut String, heading: &str, part: Option<Part<'_>>, note: &str) {
-    match part {
-        Some(part) => fenced(out, &format!("{heading}: {}", part.name), part.text, ""),
-        None => absent(out, heading, note),
-    }
-}
-
-/// Appends `## heading` and `text` in a fence longer than any backtick run inside it, with
-/// `info` as the fence's language.
-fn fenced(out: &mut String, heading: &str, text: &str, info: &str) {
+/// Appends `text` in a fence longer than any backtick run inside it, with `info` as the
+/// fence's language.
+fn block(out: &mut String, text: &str, info: &str) {
     let fence = "`".repeat(longest_backtick_run(text).max(2) + 1);
-    out.push_str(&format!("\n## {heading}\n\n{fence}{info}\n{text}"));
-    if !text.ends_with('\n') {
+    out.push_str(&format!("{fence}{info}\n{text}"));
+    if !text.is_empty() && !text.ends_with('\n') {
         out.push('\n');
     }
     out.push_str(&format!("{fence}\n"));
-}
-
-fn absent(out: &mut String, heading: &str, note: &str) {
-    out.push_str(&format!("\n## {heading}\n\n{note}\n"));
 }
 
 fn longest_backtick_run(text: &str) -> usize {
@@ -341,32 +379,54 @@ One entry per open finding (an empty list when none is open): severity is blocki
 /// What a fix round's reviewer is told on top of the report contract.
 pub const FIX_ROUND: &str = r#"This is a fix round: the bundle's diff is only the fix, and its "Previous findings" are the open findings of the round before. Put each of them in your findings ledger again, whole and with its "id", and add `"status": "fixed"` or `"status": "still_present"`. Report a new finding (no id, `"status": "new"`) only on a line the fix touched, except a hard Standards violation or a security problem, which you report wherever it is. The factory drops any other new finding."#;
 
-/// What a headless Claude reviewer is told beside its prompt: it stands in for the others, so
-/// it reads the reviewer skill they run as a file and follows it.
+/// What a headless Claude reviewer is told beside its prompt: it stands in for the others,
+/// and its prompt carries the reviewer skill they run.
 pub const STANDIN_REVIEWER: &str = "You are the factory's code reviewer, standing in while the \
-     other review backends are out of quota. Your steps are the review skill at \
-     ~/.agents/skills/code-review/SKILL.md (a `code-review` skill in your listing is the \
-     dispatcher, not the reviewer). Read it first and follow it exactly: both axes, the report \
-     format, and the closing FINDINGS and VERDICT lines. The reviewer rules in \
-     ~/.codex/AGENTS.md apply as well.";
+     agy pools and Codex are out of quota. Your prompt carries the review skill and names the \
+     bundle; when it does not carry the skill, read ~/.agents/skills/code-review/SKILL.md first \
+     (a `code-review` skill in your listing is the dispatcher, not the reviewer). Follow the \
+     skill exactly: both axes in this one session, the report format, and the closing FINDINGS \
+     and VERDICT lines. The reviewer rules in ~/.codex/AGENTS.md apply as well.";
 
-/// The prompt a backend gets: the bundle is its whole input. `opening` is the backend's own
-/// first line, which sets it reviewing the changes since the base.
+/// The reviewer skill as a prompt carries it: its text without the front matter.
+pub fn skill_body(skill: &str) -> &str {
+    let Some(rest) = skill.strip_prefix("---\n") else {
+        return skill;
+    };
+    rest.find("\n---\n")
+        .map_or(skill, |end| &rest[end + "\n---\n".len()..])
+}
+
+/// The prompt a backend gets: the bundle is its whole input. With the reviewer `skill`, the
+/// prompt carries it, so every backend reviews in one session without loading it; without,
+/// `opening` is the backend's own first line, which loads it.
 pub fn prompt(
+    skill: Option<&str>,
     opening: &str,
     bundle: &str,
     spec: &str,
     previous: Option<&str>,
     fix_round: bool,
 ) -> String {
-    let mut out = format!(
-        "{opening}\n\
-         The review bundle is your whole input: {bundle}. It holds the commits, the diff stat, \
-         the full diff, the spec, the previous review, the repo's standards (skip what they say \
-         tooling enforces) and the implementer's evidence. Open other files only to check a \
-         specific claim. Do not run tests, builds, gh or devlab: the sandbox cannot.\n\
-         Spec: {spec}\n"
-    );
+    let mut out = match skill {
+        Some(skill) => format!(
+            "{}\n\n---\n\n\
+             Review the bundle at {bundle} with the skill above (it is the code-review skill: no \
+             need to load it again).\n\
+             The bundle is the whole input. Tests, network, gh and devlab are unavailable; open a \
+             repo file only to read the context around a line the diff touches.\n",
+            skill_body(skill).trim_end()
+        ),
+        None => format!(
+            "{opening}\n\
+             The review bundle is your whole input: {bundle}. It holds the commits, the diff stat, \
+             the full diff, the spec, the previous review, the docs the diff touches, the repo's \
+             standards (skip what they say tooling enforces) and the implementer's evidence. Open \
+             other files only to check a specific claim. Do not run tests, builds, gh or devlab: \
+             the sandbox cannot.\n"
+        ),
+    };
+    out.push_str(&format!("Spec: {spec}\n"));
     if let Some(previous) = previous {
         out.push_str(&format!("Previous review: {previous}\n"));
     }
@@ -379,6 +439,50 @@ pub fn prompt(
         out.push('\n');
     }
     out
+}
+
+/// The tokens a reviewer's run record (`.jsonl`, `.agy.json`, `.claude.json`) says it spent,
+/// counted as factory-stats counts a session: input, cached or not, and output. None when the
+/// record names none.
+pub fn tokens(cli: &str, record: &str) -> Option<u64> {
+    let sum = |usage: &Value, keys: &[&str]| -> u64 {
+        keys.iter()
+            .filter_map(|key| usage.get(*key)?.as_u64())
+            .sum()
+    };
+    match cli {
+        "codex" => {
+            let keys = [
+                "input_tokens",
+                "cache_write_input_tokens",
+                "output_tokens",
+                "reasoning_output_tokens",
+            ];
+            let turns: Vec<u64> = record
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|event| event.get("type").and_then(Value::as_str) == Some("turn.completed"))
+                .filter_map(|event| Some(sum(event.get("usage")?, &keys)))
+                .collect();
+            (!turns.is_empty()).then(|| turns.iter().sum())
+        }
+        "agy" => {
+            let record: Value = serde_json::from_str(record).ok()?;
+            let keys = ["input_tokens", "cache_read_tokens", "output_tokens"];
+            Some(sum(record.get("usage")?, &keys))
+        }
+        "claude" => {
+            let record: Value = serde_json::from_str(record).ok()?;
+            let keys = [
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "output_tokens",
+            ];
+            Some(sum(record.get("usage")?, &keys))
+        }
+        _ => None,
+    }
 }
 
 /// How much a finding holds a review back: only blocking findings do.
@@ -701,8 +805,19 @@ pub struct Record<'a> {
     pub base: &'a str,
     pub head: &'a str,
     pub spec: &'a str,
-    /// The backend that ran the review, logged as `reviewer` too, the name factory-stats reads.
+    /// The pool that ran the review, logged as `backend` and `pool`.
     pub backend: &'a str,
+    /// The CLI that ran it (agy, codex or claude), logged as `reviewer`, as factory-stats reads it.
+    pub reviewer: &'a str,
+    pub tier: &'a str,
+    /// Where the tier came from: spec, caller, detected or default.
+    pub tier_source: &'a str,
+    /// What the run that wrote the report spent, by its run record.
+    pub tokens: Option<u64>,
+    pub branch: &'a str,
+    /// The files the whole diff touches, comma-joined.
+    pub files: &'a str,
+    pub bundle_bytes: Option<u64>,
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
     pub duration_s: u64,
@@ -734,21 +849,35 @@ impl Record<'_> {
             format!("label={}", self.label),
             format!("round={}", self.round),
             format!("base={}", self.base),
-            format!("head={}", self.head),
+            format!("from={}", short(self.from)),
+            format!("head={}", short(self.head)),
+            format!("branch={}", self.branch),
             format!("spec={}", self.spec),
             format!("outcome={outcome}"),
             format!("verdict={verdict}"),
             format!("reason={reason}"),
-            format!("reviewer={}", self.backend),
+            format!("reviewer={}", self.reviewer),
+            format!("tier={}", self.tier),
+            format!("tier_source={}", self.tier_source),
+            format!("pool={}", self.backend),
             format!("backend={}", self.backend),
+            format!(
+                "tokens={}",
+                self.tokens.map_or_else(String::new, |n| n.to_string())
+            ),
             format!("duration_s={}", self.duration_s),
+            format!(
+                "bundle_bytes={}",
+                self.bundle_bytes
+                    .map_or_else(String::new, |n| n.to_string())
+            ),
+            format!("files={}", self.files),
             format!("fallback_from={}", self.fallback_from),
             format!("skipped={}", self.skipped),
             format!("model={}", self.model.unwrap_or_default()),
             format!("effort={}", self.effort.unwrap_or_default()),
             format!("report={}", self.report),
             format!("stream={}", self.stream),
-            format!("from={}", self.from),
         ];
         if let Ok(reading) = self.result {
             let Counts {
@@ -782,6 +911,11 @@ impl Record<'_> {
         }
         pairs
     }
+}
+
+/// A commit as the ledger names it: its first 8 characters, as review.sh logged them.
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(8)]
 }
 
 /// The findings in the report's last fenced `json` block, when it reads as a ledger.
@@ -883,8 +1017,21 @@ mod tests {
     }
 
     #[test]
-    fn an_issue_ref_is_a_number_a_hash_number_or_an_issue_url() {
+    fn an_issue_ref_is_a_number_a_hash_number_an_owner_repo_ref_or_an_issue_url() {
         for (spec, issue) in [
+            // gh takes another repo's issue by its URL.
+            (
+                "CPT-Dawn/Factory#1",
+                Some("https://github.com/CPT-Dawn/Factory/issues/1"),
+            ),
+            ("o.r/r_2#34", Some("https://github.com/o.r/r_2/issues/34")),
+            ("o/r#", None),
+            ("o#1", None),
+            ("o/r/x#1", None),
+            ("/r#1", None),
+            ("o/#1", None),
+            ("o/r#1a", None),
+            ("docs/spec.md", None),
             ("12", Some("12")),
             ("#12", Some("12")),
             (
@@ -901,18 +1048,51 @@ mod tests {
             ("https://github.com//r/issues/12", None),
             ("https://example.com/o/r/issues/12", None),
         ] {
-            assert_eq!(issue_ref(spec), issue, "{spec}");
+            assert_eq!(issue_ref(spec).as_deref(), issue, "{spec}");
         }
     }
 
     #[test]
     fn a_bundle_part_is_fenced_longer_than_any_backtick_run_inside_it() {
         let mut out = String::new();
-        fenced(&mut out, "Spec", "a ````rust fence\n", "");
-        assert_eq!(out, "\n## Spec\n\n`````\na ````rust fence\n`````\n");
+        block(&mut out, "a ````rust fence\n", "");
+        assert_eq!(out, "`````\na ````rust fence\n`````\n");
         let mut out = String::new();
-        fenced(&mut out, "Diff", "no newline", "diff");
-        assert_eq!(out, "\n## Diff\n\n```diff\nno newline\n```\n");
+        block(&mut out, "no newline", "diff");
+        assert_eq!(out, "```diff\nno newline\n```\n");
+    }
+
+    #[test]
+    fn a_skills_front_matter_is_left_out_of_the_prompt() {
+        assert_eq!(skill_body("---\nname: x\n---\n# Review\n"), "# Review\n");
+        assert_eq!(skill_body("# No front matter\n"), "# No front matter\n");
+        let prompt = prompt(
+            Some("---\nname: x\n---\n# Review\n"),
+            "/code-review",
+            "/b.md",
+            "none",
+            None,
+            false,
+        );
+        assert!(
+            prompt
+                .starts_with("# Review\n\n---\n\nReview the bundle at /b.md with the skill above"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("/code-review"), "{prompt}");
+    }
+
+    #[test]
+    fn tokens_are_counted_from_each_reviewers_run_record() {
+        let codex = "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1000,\"cached_input_tokens\":900,\"output_tokens\":20}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":5,\"reasoning_output_tokens\":5}}\n";
+        assert_eq!(tokens("codex", codex), Some(1030));
+        assert_eq!(tokens("codex", "{\"type\":\"turn.failed\"}\n"), None);
+        let agy =
+            r#"{"usage": {"input_tokens": 100, "cache_read_tokens": 50, "output_tokens": 10}}"#;
+        assert_eq!(tokens("agy", agy), Some(160));
+        let claude = r#"{"usage": {"input_tokens": 5, "cache_read_input_tokens": 5, "cache_creation_input_tokens": 5, "output_tokens": 5}}"#;
+        assert_eq!(tokens("claude", claude), Some(20));
+        assert_eq!(tokens("agy", "not json"), None);
     }
 
     #[test]
@@ -1200,9 +1380,16 @@ diff --git a/README.md b/README.md
             label: "t1-r1",
             round: 1,
             base: "main",
-            head: "abc",
+            head: "abcdef0123456789",
             spec: "none",
             backend: "codex",
+            reviewer: "codex",
+            tier: "standard",
+            tier_source: "default",
+            tokens: Some(42),
+            branch: "work",
+            files: "a.rs,b.rs",
+            bundle_bytes: Some(900),
             model: Some("m"),
             effort: None,
             duration_s: 7,
@@ -1231,6 +1418,14 @@ diff --git a/README.md b/README.md
             "effort=",
             "duration_s=7",
             "skipped=agy",
+            "head=abcdef01",
+            "tier=standard",
+            "tier_source=default",
+            "pool=codex",
+            "tokens=42",
+            "branch=work",
+            "files=a.rs,b.rs",
+            "bundle_bytes=900",
             "findings=r.findings.json",
             "blocking=1",
             "standards_hard=1",

@@ -135,6 +135,15 @@ fn configure(sandbox: &Sandbox, toml: &str) {
 }
 
 /// The value that follows `flag` in `argv`.
+/// The old default backends, agy then codex, each on its own model: what these tests are about,
+/// whatever pools and chains the defaults hold.
+fn agy_then_codex(sandbox: &Sandbox) {
+    configure(
+        sandbox,
+        "[[review.backend]]\ncli = \"agy\"\n\n[[review.backend]]\ncli = \"codex\"\n",
+    );
+}
+
 fn after<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
     let at = argv.iter().position(|arg| arg == flag)?;
     argv.get(at + 1).map(String::as_str)
@@ -171,6 +180,10 @@ fn settings_of(argv: &[String]) -> Value {
 #[test]
 fn agy_reviews_first_in_plan_mode_in_its_sandbox_with_writes_urls_and_mcp_denied() {
     let sandbox = sandboxed();
+    configure(
+        &sandbox,
+        "[[review.backend]]\ncli = \"agy\"\nmodel = \"gemini-4-neon\"\neffort = \"high\"\n\n[[review.backend]]\ncli = \"codex\"\n",
+    );
     let repo = sandbox.repo();
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
 
@@ -238,6 +251,7 @@ fn agy_reviews_first_in_plan_mode_in_its_sandbox_with_writes_urls_and_mcp_denied
 #[test]
 fn an_empty_usage_bucket_skips_agy_until_it_resets() {
     let sandbox = sandboxed();
+    agy_then_codex(&sandbox);
     let repo = sandbox.repo();
     let reset = in_two_hours();
     sandbox.fake("agy", &agy(&usage(0.0, reset), &agy_writes(CLEAN_REPORT)));
@@ -307,6 +321,7 @@ fn a_model_in_another_group_is_checked_against_that_groups_quota() {
 #[test]
 fn an_inactive_sandbox_is_reported_and_agy_is_skipped() {
     let sandbox = Sandbox::new();
+    agy_then_codex(&sandbox);
     let repo = sandbox.repo();
     sandbox.fake(
         "unshare",
@@ -349,6 +364,7 @@ fn an_inactive_sandbox_is_reported_and_agy_is_skipped() {
 #[test]
 fn agys_individual_quota_error_cools_it_down_until_its_reset_and_codex_reruns_the_review() {
     let sandbox = sandboxed();
+    agy_then_codex(&sandbox);
     let repo = sandbox.repo();
     let failed = agy_fails(
         "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h13m5s.",
@@ -582,6 +598,7 @@ fn a_checkout_left_by_a_review_that_died_is_swept() {
 #[test]
 fn a_review_whose_sandbox_did_not_start_is_reported_and_codex_reruns_it() {
     let sandbox = sandboxed();
+    agy_then_codex(&sandbox);
     let repo = sandbox.repo();
     let unavailable = "W1123 09:37:00.811680 1 session.go:80] Terminal sandbox unavailable: \
                        AppArmor restricts unprivileged user namespaces \
@@ -615,6 +632,7 @@ fn a_review_whose_sandbox_did_not_start_is_reported_and_codex_reruns_it() {
 #[test]
 fn a_review_whose_log_never_says_its_sandbox_started_is_not_trusted() {
     let sandbox = sandboxed();
+    agy_then_codex(&sandbox);
     let repo = sandbox.repo();
     sandbox.fake(
         "agy",
@@ -822,6 +840,7 @@ fn auth_is_refused_on_a_backend_other_than_agy() {
 #[test]
 fn an_inactive_sandbox_stays_reported_when_the_next_backend_fails() {
     let sandbox = Sandbox::new();
+    agy_then_codex(&sandbox);
     let repo = sandbox.repo();
     sandbox.fake("unshare", "exit 1");
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
@@ -863,6 +882,7 @@ fn agy_usage_changes(first: &str, later: &str, review: &str) -> String {
 #[test]
 fn a_cached_usage_whose_empty_bucket_has_reset_is_asked_again() {
     let sandbox = sandboxed();
+    agy_then_codex(&sandbox);
     let repo = sandbox.repo();
     let reset = Timestamp::from_unix_millis(now_millis() + 1500);
     sandbox.fake(

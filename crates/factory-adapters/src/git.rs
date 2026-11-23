@@ -34,14 +34,20 @@ pub trait Repo {
     fn name(&self) -> Result<String, GitError>;
     /// The commit `rev` names; none when it names no commit.
     fn commit(&self, rev: &str) -> Result<Option<String>, GitError>;
-    /// The full diff of `base...HEAD`, with `context` lines around each change.
+    /// The full diff of `base...HEAD`, with `context` lines around each change. Lockfiles are
+    /// left out: they show in the diff stat only.
     fn diff(&self, base: &str, context: u32) -> Result<String, GitError>;
     /// Whether the commit `rev` names is an ancestor of HEAD (or HEAD itself).
     fn is_ancestor(&self, rev: &str) -> Result<bool, GitError>;
     /// The diff stat of `base...HEAD`.
     fn diff_stat(&self, base: &str) -> Result<String, GitError>;
-    /// The commits of `base..HEAD`, newest first: short sha, subject and body.
+    /// The commits of `base..HEAD`, newest first, one line each: short sha, author email, the
+    /// subject's length in characters, and the subject.
     fn commits(&self, base: &str) -> Result<String, GitError>;
+    /// `git diff --numstat` of `base...HEAD`: each file's added and deleted lines.
+    fn numstat(&self, base: &str) -> Result<String, GitError>;
+    /// The branch checked out, empty when HEAD is detached.
+    fn branch(&self) -> Result<String, GitError>;
     /// Whether a local branch called `branch` exists.
     fn branch_exists(&self, branch: &str) -> Result<bool, GitError>;
     /// The top of the working tree.
@@ -234,11 +240,41 @@ impl Repo for GitRepo {
             "--no-ext-diff",
             &format!("-U{context}"),
             &format!("{base}...HEAD"),
+            "--",
+            ":/",
+            ":(exclude,glob)**/bun.lock",
+            ":(exclude,glob)**/bun.lockb",
+            ":(exclude,glob)**/package-lock.json",
+            ":(exclude,glob)**/pnpm-lock.yaml",
+            ":(exclude,glob)**/yarn.lock",
+            ":(exclude,glob)**/Cargo.lock",
         ])
     }
 
     fn diff_stat(&self, base: &str) -> Result<String, GitError> {
-        self.git(&["diff", "--no-color", "--stat", &format!("{base}...HEAD")])
+        self.git(&[
+            "diff",
+            "--no-color",
+            "--stat=160",
+            &format!("{base}...HEAD"),
+        ])
+    }
+
+    fn numstat(&self, base: &str) -> Result<String, GitError> {
+        self.git(&[
+            "diff",
+            "--no-color",
+            "--no-renames",
+            "--numstat",
+            &format!("{base}...HEAD"),
+        ])
+    }
+
+    fn branch(&self) -> Result<String, GitError> {
+        Ok(self
+            .git(&["branch", "--show-current"])?
+            .trim_end()
+            .to_owned())
     }
 
     fn is_ancestor(&self, rev: &str) -> Result<bool, GitError> {
@@ -252,12 +288,23 @@ impl Repo for GitRepo {
     }
 
     fn commits(&self, base: &str) -> Result<String, GitError> {
-        self.git(&[
+        let log = self.git(&[
             "log",
             "--no-color",
-            "--format=%h %s%n%n%b",
+            "--format=%h%x1f%ae%x1f%s",
             &format!("{base}..HEAD"),
-        ])
+        ])?;
+        Ok(log
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.splitn(3, '\x1f');
+                let (sha, email, subject) = (fields.next()?, fields.next()?, fields.next()?);
+                Some(format!(
+                    "{sha} {email} {} {subject}\n",
+                    subject.chars().count()
+                ))
+            })
+            .collect())
     }
 
     fn branch_exists(&self, branch: &str) -> Result<bool, GitError> {
@@ -446,6 +493,9 @@ pub struct FakeRepo {
     /// The revs that are ancestors of HEAD.
     pub ancestors: Vec<String>,
     pub commits: String,
+    pub numstat: String,
+    /// The branch checked out.
+    pub branch: String,
     /// The local branches that exist.
     pub branches: Vec<String>,
     pub toplevel: PathBuf,
@@ -507,6 +557,14 @@ impl Repo for FakeRepo {
 
     fn commits(&self, _base: &str) -> Result<String, GitError> {
         Ok(self.commits.clone())
+    }
+
+    fn numstat(&self, _base: &str) -> Result<String, GitError> {
+        Ok(self.numstat.clone())
+    }
+
+    fn branch(&self) -> Result<String, GitError> {
+        Ok(self.branch.clone())
     }
 
     fn branch_exists(&self, branch: &str) -> Result<bool, GitError> {

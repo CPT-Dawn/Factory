@@ -83,6 +83,18 @@ pub trait Reviewer {
     fn review(&self, job: &Job) -> Result<(), ReviewerError>;
 }
 
+/// The Codex features a review never uses.
+const CODEX_UNUSED: [&str; 8] = [
+    "image_generation",
+    "browser_use",
+    "computer_use",
+    "in_app_browser",
+    "plugins",
+    "goals",
+    "tool_suggest",
+    "multi_agent",
+];
+
 /// Codex, run read-only and ephemeral: `codex exec --json -s read-only`.
 #[derive(Clone, Debug, Default)]
 pub struct Codex {
@@ -143,6 +155,12 @@ impl Reviewer for Codex {
         if let Some(effort) = self.effort.as_ref().filter(|_| self.pinned_effort) {
             cmd.arg("-c")
                 .arg(format!("model_reasoning_effort={}", json!(effort)));
+        }
+        // A review reads one bundle, so the tools it never uses are off: about 3.7k tokens of
+        // tool definitions per request.
+        cmd.args(["-c", "web_search=\"disabled\""]);
+        for feature in CODEX_UNUSED {
+            cmd.args(["--disable", feature]);
         }
         cmd.arg("-C")
             .arg(&job.cwd)
@@ -206,6 +224,9 @@ pub struct Agy {
     repos: Arc<dyn Repos>,
     /// Whether its sandbox can start.
     namespaces: Arc<dyn Namespaces>,
+    /// The share of its group's five-hour bucket this review leaves alone: below it, the
+    /// review is not its to take.
+    reserve: Option<f64>,
 }
 
 impl Agy {
@@ -224,7 +245,14 @@ impl Agy {
             checkouts,
             repos: Arc::new(Git),
             namespaces: Arc::new(Unshare),
+            reserve: None,
         }
+    }
+
+    /// The same backend, keeping `reserve` of its group's five-hour bucket for other reviews.
+    pub fn reserving(mut self, reserve: Option<f64>) -> Agy {
+        self.reserve = reserve;
+        self
     }
 
     /// The same backend, reaching repositories through `repos` and asking `namespaces` whether
@@ -331,15 +359,26 @@ impl Agy {
         Ok((usage, false))
     }
 
-    /// Whether the quota of its model's group has some left, by its usage query.
+    /// Whether the quota of its model's group has some left, by its usage query, and more
+    /// than the reserve this review must leave.
     fn quota_left(&self) -> Result<(), ReviewerError> {
         let model = self.quota_model();
         let group = quota::agy_group(&model);
-        let (usage, cached) = self.usage(false)?;
+        let (mut usage, cached) = self.usage(false)?;
         let mut said = quota::agy_usage(&usage, group);
         // A cached answer may name an empty bucket whose reset has come since: ask again.
         if cached && matches!(said, quota::AgyUsage::Empty { until } if until <= now()) {
-            said = quota::agy_usage(&self.usage(true)?.0, group);
+            usage = self.usage(true)?.0;
+            said = quota::agy_usage(&usage, group);
+        }
+        if let Some(reserve) = self.reserve
+            && matches!(said, quota::AgyUsage::Left)
+            && quota::agy_below(&usage, group, "5h", reserve)
+        {
+            return Err(ReviewerError::Unready(format!(
+                "its {group} 5-hour bucket is under {:.0}%, kept for hard reviews",
+                reserve * 100.0
+            )));
         }
         // Read after the answer, so a reset that came while it was asked counts as come.
         let now = now();
@@ -556,7 +595,16 @@ fn sandbox_active(namespaces: &dyn Namespaces) -> Result<(), ReviewerError> {
 
 /// The tools a headless Claude reviewer may not use: it reads and reports, and runs no skill
 /// of its own (the review skill is a file it reads).
-const CLAUDE_DISALLOWED: [&str; 4] = ["Edit", "Write", "NotebookEdit", "Skill"];
+const CLAUDE_DISALLOWED: [&str; 8] = [
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "Skill",
+    "Agent",
+    "Task",
+    "WebFetch",
+    "WebSearch",
+];
 
 /// Claude Code, headless: `claude -p` with the user's settings only, no plugins and no MCP
 /// servers, and no tool that edits.

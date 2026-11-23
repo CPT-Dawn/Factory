@@ -98,7 +98,7 @@ fn json_gives_every_field_of_every_section() {
         .collect();
     assert_eq!(
         names,
-        ["agy", "codex", "claude"],
+        ["agy-gemini", "agy-argon", "agy-claude", "codex", "claude"],
         "the default backends: {shown}"
     );
     assert_eq!(
@@ -153,12 +153,19 @@ fn a_cooled_backend_shows_when_it_resets_and_the_other_is_available() {
     assert!(claude.contains("available, 0/"), "{out:?}");
     assert!(lines.contains(&"review quota"), "{out:?}");
     let shown = record(&sandbox);
-    assert_eq!(shown["review"][0]["quota"], "unknown", "{shown}");
-    assert_eq!(shown["review"][1]["name"], "codex", "{shown}");
-    assert_eq!(shown["review"][1]["quota"], "cooling", "{shown}");
-    assert_eq!(shown["review"][1]["resets"], until.unix_millis(), "{shown}");
-    assert_eq!(shown["review"][2]["quota"], "available", "{shown}");
-    assert_eq!(shown["review"][2]["resets"], Value::Null, "{shown}");
+    let pool = |name: &str| {
+        shown["review"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|backend| backend["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} in {shown}"))
+    };
+    assert_eq!(pool("agy-gemini")["quota"], "unknown", "{shown}");
+    assert_eq!(pool("codex")["quota"], "cooling", "{shown}");
+    assert_eq!(pool("codex")["resets"], until.unix_millis(), "{shown}");
+    assert_eq!(pool("claude")["quota"], "available", "{shown}");
+    assert_eq!(pool("claude")["resets"], Value::Null, "{shown}");
 }
 
 #[test]

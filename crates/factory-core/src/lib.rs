@@ -18,5 +18,6 @@ pub mod quota;
 pub mod review;
 pub mod status;
 pub mod steward;
+pub mod tier;
 pub mod timestamp;
 pub mod wait;
