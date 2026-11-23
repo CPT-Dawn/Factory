@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::support::herdr::FakeHerdr;
+use crate::support::world::poll_until;
 use crate::support::{DEADLINE, Sandbox, finish, freeze, spawn, stop_daemon, thaw, waited_on};
 
 #[test]
@@ -210,7 +211,9 @@ fn without_herdr_lead_commands_say_where_they_looked() {
 }
 
 /// Starts `factory wait lead <args>` and returns once the daemon watches `pane` in herdr, so an
-/// event the test sends next reaches it.
+/// event the test sends next reaches it, and holds the wait, so a restart the test makes next
+/// finds it in the database. The daemon a wait starts watches its panes before the wait reaches
+/// it: the watch alone does not say the wait is held.
 // cfg(test), as the harness is, so clippy lets it unwrap.
 #[cfg(test)]
 fn waiting(sandbox: &Sandbox, herdr: &FakeHerdr, args: &[&str], pane: &str) -> Child {
@@ -218,6 +221,11 @@ fn waiting(sandbox: &Sandbox, herdr: &FakeHerdr, args: &[&str], pane: &str) -> C
     all.extend(args);
     let child = spawn(sandbox.factory_command(&all));
     herdr.await_watch(pane);
+    let lead = format!("lead-{}", args[0]);
+    assert!(
+        poll_until(|| waited_on(sandbox, "lead", &lead)),
+        "the daemon never held the wait on {lead}"
+    );
     child
 }
 
