@@ -316,24 +316,19 @@ fn a_shell_with_no_agent_above_it_gets_a_lease_and_a_warning() {
     );
 }
 
-/// Fakes `tool` as the world does, after it records whether lab.db's write lock was free.
+/// Fakes `tool` as the world does, after it records whether the lab could write meanwhile: a
+/// `devlab gc`, which writes to the store, that answers within its deadline finds no write
+/// transaction open around `tool`.
 fn probe_lock(sandbox: &Sandbox, tool: &str, probes: &Path) {
-    let db = sandbox.path("state/factory/lab.db");
     let body = fs::read_to_string(fixtures().join(format!("fakes/{tool}.sh")))
         .expect("read a fake")
         .replace("@WORLD@", &sandbox.path("world").display().to_string());
-    let probe = r#"python3 - '@DB@' <<'PY' >> '@PROBES@'
-import sqlite3, sys
-try:
-    c = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)
-    c.execute('BEGIN IMMEDIATE')
-    c.execute('ROLLBACK')
-    print('@TOOL@ free')
-except sqlite3.OperationalError as e:
-    print('@TOOL@ held:', e)
-PY
+    let probe = r#"if timeout 3 devlab gc >/dev/null 2>&1; then
+  echo '@TOOL@ free' >> '@PROBES@'
+else
+  echo "@TOOL@ held: devlab gc exited $?" >> '@PROBES@'
+fi
 "#
-    .replace("@DB@", &db.display().to_string())
     .replace("@PROBES@", &probes.display().to_string())
     .replace("@TOOL@", tool);
     sandbox.fake(tool, &(probe + &body));
@@ -344,8 +339,6 @@ fn docker_runs_while_the_store_is_unlocked() {
     let (sandbox, world) = lab();
     let probes: PathBuf = sandbox.path("probes");
     let wt = world.worktree("demo-lock");
-    // The daemon makes lab.db on its first call; probe once it is there.
-    assert_eq!(owned(&sandbox, &wt, &["status"]).code, 0);
     probe_lock(&sandbox, "docker", &probes);
     let other = world.worktree("demo-other");
     // A second owner, so its lease takes the other slot instead of queueing behind the cap.
