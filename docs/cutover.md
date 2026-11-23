@@ -49,10 +49,11 @@ golden transcripts against what is on PATH.
 `factory cutover --rollback` refuses with exit 75 while factory lab holds a lease, a waiting
 request or a reservation. Otherwise it puts the old link back (the marker names it), checks
 factory lab again, starts `devlab-watch.service` (`enable --now`) and removes the marker.
-When the watcher's unit link is missing (a cutover from before #30 let `disable` take it), the
-rollback links it again from the path the marker records before `enable --now`. A marker that
-records no link (one written before #30) makes the rollback refuse in one line, changing nothing:
-link the unit again with `dots link`, then run `factory cutover --rollback` again.
+When the watcher's unit link went missing after the cutover (by hand, or a `dots unlink`), the
+rollback links it again from the path the marker records before `enable --now`. A marker from
+before #30 records no unit, so a missing unit with such a marker makes the rollback refuse in
+one line, changing nothing, even with `--force`: link the unit again with `dots link`, then run
+`factory cutover --rollback` again.
 `--force` skips the check, for a factory lab that no longer answers. A second rollback says
 `not cut over` and changes nothing.
 

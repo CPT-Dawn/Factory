@@ -519,7 +519,7 @@ fn a_linked_watcher_unit_outlives_the_cutover_so_rollback_starts_it_again() {
 fn rollback_links_a_missing_watcher_unit_again_from_the_marker() {
     let (sandbox, _world) = machine();
     cut_over(&sandbox);
-    // As a cutover from before #30 left it: systemd's disable took the link.
+    // The unit link went missing after the cutover (by hand, or a dots unlink).
     fs::remove_file(watcher_unit(&sandbox)).unwrap();
     assert_eq!(watcher_state(&sandbox).0, "not-found");
 

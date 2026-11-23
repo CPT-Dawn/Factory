@@ -332,6 +332,8 @@ fn retire_watcher(place: &Place, systemd: &impl UserManager, unit: &Unit) -> Res
         .map_err(systemd_failed("cutover"))?;
     if let Unit::Link(text) = unit {
         link_watcher(place, text, "cutover")?;
+        // disable reloaded systemd while the link was gone: let it see the unit again.
+        systemd.reload().map_err(systemd_failed("cutover"))?;
     }
     systemd.stop(&[WATCHER]).map_err(systemd_failed("cutover"))
 }
