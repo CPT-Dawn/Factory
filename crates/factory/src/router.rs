@@ -19,9 +19,7 @@ use tokio::sync::Notify;
 
 use crate::clock;
 use crate::output::Failure;
-use crate::protocol::{
-    AcquireParams, AcquireResult, BackendSlots, MISMATCH, Outcome, QuotaParams,
-};
+use crate::protocol::{AcquireParams, AcquireResult, BackendSlots, MISMATCH, Outcome, QuotaParams};
 use crate::store::Store;
 
 pub struct Router {

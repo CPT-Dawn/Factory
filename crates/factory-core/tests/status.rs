@@ -2,16 +2,14 @@
 //! ticket names (three slots, three backends, five leads) fits one terminal screen.
 
 use factory_core::status::{
-    Backend, COLUMNS, Lab, Lead, Leads, Lease, QuotaState, ROWS, Queued, Slot, Status, Subagent,
+    Backend, COLUMNS, Lab, Lead, Leads, Lease, Queued, QuotaState, ROWS, Slot, Status, Subagent,
     Wait, screen,
 };
 use factory_core::timestamp::Timestamp;
 
 /// 2026-11-23 04:13:00 UTC, in seconds.
 fn now() -> i64 {
-    Timestamp::parse("2026-11-23T04:13:00Z")
-        .map_or(0, Timestamp::unix_millis)
-        / 1000
+    Timestamp::parse("2026-11-23T04:13:00Z").map_or(0, Timestamp::unix_millis) / 1000
 }
 
 fn idle() -> Status {
@@ -57,7 +55,9 @@ fn backend(name: &str, quota: QuotaState, resets: Option<&str>, running: u32, of
     Backend {
         name: name.to_owned(),
         quota,
-        resets: resets.and_then(Timestamp::parse).map(Timestamp::unix_millis),
+        resets: resets
+            .and_then(Timestamp::parse)
+            .map(Timestamp::unix_millis),
         running,
         concurrency: of,
         when_busy: "queue".to_owned(),
@@ -153,7 +153,10 @@ fn a_slot_whose_stack_is_being_stopped_says_so_instead_of_free() {
 
     assert_eq!(
         &rows(&status)[1..3],
-        ["lab: 0 leased, 0 free, 0 queued", "  demo/1 stopping, last demo-c"]
+        [
+            "lab: 0 leased, 0 free, 0 queued",
+            "  demo/1 stopping, last demo-c"
+        ]
     );
 }
 
@@ -161,10 +164,22 @@ fn a_slot_whose_stack_is_being_stopped_says_so_instead_of_free() {
 fn a_backend_shows_its_quota_its_reset_and_its_load() {
     let mut status = idle();
     status.review = vec![
-        backend("codex", QuotaState::Cooling, Some("2026-11-23T06:13:00Z"), 0, 2),
+        backend(
+            "codex",
+            QuotaState::Cooling,
+            Some("2026-11-23T06:13:00Z"),
+            0,
+            2,
+        ),
         backend("claude", QuotaState::Available, None, 1, 2),
         backend("agy", QuotaState::Unknown, None, 0, 1),
-        backend("old", QuotaState::Cooling, Some("2026-11-24T01:00:00Z"), 0, 1),
+        backend(
+            "old",
+            QuotaState::Cooling,
+            Some("2026-11-24T01:00:00Z"),
+            0,
+            1,
+        ),
     ];
 
     assert_eq!(
@@ -273,9 +288,19 @@ fn five_leads_three_slots_and_three_backends_fit_one_terminal_screen() {
     let mut status = idle();
     status.lab = Lab {
         leases: (0..3)
-            .map(|n| lease(n + 1, Some(u32::try_from(n).unwrap_or(0)), "demo-a-long-worktree", "claude:1234567", 125))
+            .map(|n| {
+                lease(
+                    n + 1,
+                    Some(u32::try_from(n).unwrap_or(0)),
+                    "demo-a-long-worktree",
+                    "claude:1234567",
+                    125,
+                )
+            })
             .collect(),
-        slots: (0..3).map(|n| slot(n, Some(i64::from(n) + 1), None)).collect(),
+        slots: (0..3)
+            .map(|n| slot(n, Some(i64::from(n) + 1), None))
+            .collect(),
         queue: (0..2)
             .map(|n| Queued {
                 id: n,
@@ -287,7 +312,13 @@ fn five_leads_three_slots_and_three_backends_fit_one_terminal_screen() {
             .collect(),
     };
     status.review = vec![
-        backend("codex", QuotaState::Cooling, Some("2026-11-23T06:13:00Z"), 0, 2),
+        backend(
+            "codex",
+            QuotaState::Cooling,
+            Some("2026-11-23T06:13:00Z"),
+            0,
+            2,
+        ),
         backend("claude", QuotaState::Available, None, 1, 2),
         backend("agy", QuotaState::Unknown, None, 0, 1),
     ];
@@ -302,7 +333,11 @@ fn five_leads_three_slots_and_three_backends_fit_one_terminal_screen() {
     status.leads.monitor = true;
     status.leads.leads = (0..5)
         .map(|n| {
-            let mut lead = lead(&format!("lead-slug-number-{n}"), "waiting: lead-slug-number-9", Some(300_000));
+            let mut lead = lead(
+                &format!("lead-slug-number-{n}"),
+                "waiting: lead-slug-number-9",
+                Some(300_000),
+            );
             lead.subagents = vec![Subagent {
                 agent: "agent-a".to_owned(),
                 description: None,
@@ -315,16 +350,31 @@ fn five_leads_three_slots_and_three_backends_fit_one_terminal_screen() {
 
     let shown = rows(&status);
 
-    assert!(shown.len() <= ROWS, "{} rows:\n{}", shown.len(), shown.join("\n"));
+    assert!(
+        shown.len() <= ROWS,
+        "{} rows:\n{}",
+        shown.len(),
+        shown.join("\n")
+    );
     assert!(
         shown.iter().all(|row| row.chars().count() <= COLUMNS),
         "{}",
         shown.join("\n")
     );
     for name in ["codex", "claude", "agy", "lead-slug-number-4"] {
-        assert!(shown.iter().any(|row| row.contains(name)), "{name}: {}", shown.join("\n"));
+        assert!(
+            shown.iter().any(|row| row.contains(name)),
+            "{name}: {}",
+            shown.join("\n")
+        );
     }
-    assert_eq!(shown.iter().filter(|row| row.starts_with("  lease ")).count(), 3);
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|row| row.starts_with("  lease "))
+            .count(),
+        3
+    );
 }
 
 #[test]
@@ -346,13 +396,24 @@ fn a_section_with_more_rows_than_its_cap_says_how_many_it_left_out() {
     let shown = rows(&status);
 
     assert_eq!(
-        shown.iter().filter(|row| row.starts_with("  queued ")).count(),
+        shown
+            .iter()
+            .filter(|row| row.starts_with("  queued "))
+            .count(),
         2,
         "{}",
         shown.join("\n")
     );
-    assert!(shown.contains(&"  +5 more queued".to_owned()), "{}", shown.join("\n"));
-    assert!(shown.contains(&"  +4 more leads".to_owned()), "{}", shown.join("\n"));
+    assert!(
+        shown.contains(&"  +5 more queued".to_owned()),
+        "{}",
+        shown.join("\n")
+    );
+    assert!(
+        shown.contains(&"  +4 more leads".to_owned()),
+        "{}",
+        shown.join("\n")
+    );
 }
 
 #[test]

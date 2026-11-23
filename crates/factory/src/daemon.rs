@@ -393,8 +393,14 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
         MONITOR_STATUS => answered(Ok::<_, Failure>(daemon.steward.status())),
         STATUS => match params::<StatusParams>(STATUS, request.params) {
             Ok(params) => answered(
-                status::gather(&params, &daemon.router, &daemon.lab, &daemon.leads, &daemon.steward)
-                    .await,
+                status::gather(
+                    &params,
+                    &daemon.router,
+                    &daemon.lab,
+                    &daemon.leads,
+                    &daemon.steward,
+                )
+                .await,
             ),
             Err(refused) => refused,
         },

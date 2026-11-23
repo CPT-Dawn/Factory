@@ -297,8 +297,16 @@ fn leads(status: &Status, rows: &mut Vec<String>) {
     }
     rows.push(format!("leads: {}, monitor {monitor}", leads.leads.len()));
     let shown = &leads.leads[..leads.leads.len().min(LEAD_ROWS)];
-    let name_width = shown.iter().map(|l| l.name.chars().count()).max().unwrap_or(0);
-    let status_width = shown.iter().map(|l| l.status.chars().count()).max().unwrap_or(0);
+    let name_width = shown
+        .iter()
+        .map(|l| l.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let status_width = shown
+        .iter()
+        .map(|l| l.status.chars().count())
+        .max()
+        .unwrap_or(0);
     let each = leads
         .leads
         .iter()
@@ -317,7 +325,8 @@ fn leads(status: &Status, rows: &mut Vec<String>) {
             };
             if !lead.subagents.is_empty() {
                 let most = lead.subagents.iter().filter_map(|sub| sub.tokens).max();
-                let most = most.map_or_else(String::new, |tokens| format!(", most {}", kilo(tokens)));
+                let most =
+                    most.map_or_else(String::new, |tokens| format!(", most {}", kilo(tokens)));
                 let n = lead.subagents.len();
                 let noun = if n == 1 { "sub" } else { "subs" };
                 context.push_str(&format!("  {n} {noun}{most}"));

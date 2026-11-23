@@ -96,4 +96,3 @@ fn lead(report: crate::protocol::LeadReport, context: Option<&LeadContext>) -> s
         }),
     }
 }
-

@@ -16,7 +16,7 @@ use crate::support::world::{World, fixtures, poll_until};
 use crate::support::{Run, Sandbox, finish, kill_group, run, spawn};
 
 /// The sandbox with the golden world installed and the built binary on PATH as `devlab`.
-fn lab() -> (Sandbox, World) {
+pub(crate) fn lab() -> (Sandbox, World) {
     let sandbox = Sandbox::new();
     let world = World::install(&sandbox);
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_factory"), sandbox.path("bin/devlab"))
@@ -554,17 +554,17 @@ fn a_phone_unplugged_while_its_pair_boots_gives_the_acquire_exit_76() {
 }
 
 /// `devlab` run in `dir` for the owner process `pid`.
-fn for_owner(sandbox: &Sandbox, dir: &Path, pid: u32, args: &[&str]) -> Command {
+pub(crate) fn for_owner(sandbox: &Sandbox, dir: &Path, pid: u32, args: &[&str]) -> Command {
     let mut cmd = devlab(sandbox, dir, args);
     cmd.env("DEVLAB_OWNER_PID", pid.to_string());
     cmd
 }
 
 /// A stand-in agent: a live process to own leases, killed when dropped.
-struct Agent(std::process::Child);
+pub(crate) struct Agent(std::process::Child);
 
 impl Agent {
-    fn start() -> Agent {
+    pub(crate) fn start() -> Agent {
         Agent(
             Command::new("sleep")
                 .arg("60")
@@ -573,7 +573,7 @@ impl Agent {
         )
     }
 
-    fn pid(&self) -> u32 {
+    pub(crate) fn pid(&self) -> u32 {
         self.0.id()
     }
 
@@ -718,7 +718,7 @@ fn a_second_stop_that_ends_first_leaves_the_slot_held_for_the_first() {
 }
 
 /// The worktrees `devlab status` shows waiting, oldest first.
-fn waiting(sandbox: &Sandbox, dir: &Path) -> Vec<String> {
+pub(crate) fn waiting(sandbox: &Sandbox, dir: &Path) -> Vec<String> {
     let out = run(devlab(sandbox, dir, &["status", "--json"]));
     let report: serde_json::Value = serde_json::from_str(&out.stdout).unwrap_or_default();
     report["waiting"]
