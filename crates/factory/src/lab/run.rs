@@ -13,7 +13,7 @@ use super::lease::lease_env;
 use super::wire::Lease;
 use crate::output::Failure;
 
-/// Exit code when the command can't be run, as a shell says it.
+/// Exit code when the command can't be run or waited for, as a shell says it.
 const CANNOT_RUN: u8 = 127;
 
 /// Runs `argv` in the lease and returns its exit code (128 + the signal that ended it);
@@ -28,7 +28,13 @@ pub fn exec_in(ctx: &Ctx, lease: &Lease, argv: &[String]) -> Result<u8, Failure>
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .spawn();
     match spawned {
-        Ok(child) => Ok(exit_code(&wait_for(child))),
+        Ok(child) => match wait_for(child) {
+            Ok(status) => Ok(exit_code(&status)),
+            Err(e) => {
+                note(&format!("cannot wait for {program}: {e}"));
+                Ok(CANNOT_RUN)
+            }
+        },
         Err(e) => {
             note(&format!("cannot run {program}: {e}"));
             Ok(CANNOT_RUN)
@@ -37,12 +43,11 @@ pub fn exec_in(ctx: &Ctx, lease: &Lease, argv: &[String]) -> Result<u8, Failure>
 }
 
 /// Waits until the child has ended. The one place this process idles while the command runs.
-fn wait_for(mut child: Child) -> ExitStatus {
+fn wait_for(mut child: Child) -> std::io::Result<ExitStatus> {
     loop {
         match child.wait() {
-            Ok(status) => return status,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return ExitStatus::from_raw(1 << 8),
+            done => return done,
         }
     }
 }

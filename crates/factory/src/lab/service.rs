@@ -368,8 +368,13 @@ where
         }
     };
     lab.notify();
-    let deadline = Instant::now()
-        + Duration::try_from_secs_f64(p.wait_sec).unwrap_or(Duration::from_secs(365 * 86400));
+    let year = Duration::from_secs(365 * 86400);
+    let wait = Duration::try_from_secs_f64(p.wait_sec).unwrap_or(year);
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(wait)
+        .or_else(|| now.checked_add(year))
+        .unwrap_or(now);
     let mut said = String::new();
     loop {
         let mut changed = lab.changed.subscribe();

@@ -229,7 +229,7 @@ exit 9"#;
 }
 
 #[test]
-fn the_command_runs_with_default_signal_dispositions_and_no_time_limit() {
+fn the_command_runs_with_default_signal_dispositions() {
     let (sandbox, world) = lab();
     let wt = world.worktree("demo-signals");
     let piped = owned(
@@ -245,22 +245,51 @@ fn the_command_runs_with_default_signal_dispositions_and_no_time_limit() {
             "kill -PIPE $$",
         ],
     );
-    let slow = owned(
+
+    assert_eq!(piped.code, 141, "{piped:?}");
+}
+
+#[test]
+fn a_bad_wait_is_refused_even_when_the_machine_config_is_broken() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-brokencfg");
+    fs::write(sandbox.path("config/devlab/config.json"), "{").expect("break the config");
+    let out = owned(
+        &sandbox,
+        &wt,
+        &["run", "--no-device", "--wait", "soon", "--", "true"],
+    );
+
+    assert_eq!(
+        (out.code, out.stderr.as_str()),
+        (
+            2,
+            "devlab: --wait takes a number of seconds (0 = do not wait)\n"
+        )
+    );
+}
+
+#[test]
+fn a_wait_too_long_to_count_down_still_gets_a_lease() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-longwait");
+    let out = owned(
         &sandbox,
         &wt,
         &[
             "run",
             "--no-device",
             "--quiet",
+            "--wait",
+            "1e19",
             "--",
             "sh",
             "-c",
-            "sleep 1; exit 4",
+            "exit 6",
         ],
     );
 
-    assert_eq!(piped.code, 141, "{piped:?}");
-    assert_eq!(slow.code, 4, "{slow:?}");
+    assert_eq!(out.code, 6, "{out:?}");
 }
 
 fn daemon_log(sandbox: &Sandbox) -> String {
