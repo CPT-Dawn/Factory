@@ -27,7 +27,12 @@ factory cutover --rollback [--force] [--json] # devlab is today's devlab again; 
    `this devlab was cut over to factory lab; …`. A call already under way meets the marker at
    its next transaction, so the two never write one database.
 3. It checks that today's devlab now refuses and that factory lab answers.
-4. It disables and stops `devlab-watch.service`, when its unit is in `~/.config/systemd/user`.
+4. It disables and stops `devlab-watch.service`, when its unit is in `~/.config/systemd/user`,
+   and keeps the unit file. Stow links that file into the devlab package, and systemd's
+   `disable` deletes a unit file that is a link along with its `[Install]` link (`is-enabled`
+   then says `not-found`). So the cutover records the link in the marker first and puts it back
+   straight after `disable`: only the `[Install]` link stays gone, so the watcher does not start
+   at login, and `is-enabled` says `disabled`.
 5. It points `~/.local/bin/devlab` at `factory`, through a rename, so the name is never missing.
 
 A step that fails undoes the ones before it: the watcher starts again, the marker goes, and the
@@ -44,6 +49,11 @@ golden transcripts against what is on PATH.
 `factory cutover --rollback` refuses with exit 75 while factory lab holds a lease, a waiting
 request or a reservation. Otherwise it puts the old link back (the marker names it), checks
 factory lab again, starts `devlab-watch.service` (`enable --now`) and removes the marker.
+When the watcher's unit link went missing after the cutover (by hand, or a `dots unlink`), the
+rollback links it again from the path the marker records before `enable --now`. A marker from
+before #30 records no unit, so a missing unit with such a marker makes the rollback refuse in
+one line, changing nothing, even with `--force`: link the unit again with `dots link`, then run
+`factory cutover --rollback` again.
 `--force` skips the check, for a factory lab that no longer answers. A second rollback says
 `not cut over` and changes nothing.
 
