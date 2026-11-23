@@ -19,9 +19,7 @@ use std::time::{Duration, Instant};
 
 use factory_adapters::gh::{Gh, Issues};
 use factory_adapters::git::{GitError, GitRepo, Repo};
-use factory_adapters::reviewer::{
-    Agy, AgyAuth, Claude, Codex, Job, Reviewer, ReviewerError, home_of,
-};
+use factory_adapters::reviewer::{Agy, Claude, Codex, Job, Reviewer, ReviewerError, home_of};
 use factory_core::exit::Exit;
 use factory_core::quota::Reset;
 use factory_core::review::{self, Bundle, Finding, Part, Reading, Record, Verdict};
@@ -30,7 +28,7 @@ use serde_json::{Value, json};
 
 use crate::client;
 use crate::clock;
-use crate::config::{self, Auth, Backend, Cli};
+use crate::config::{self, Backend, Cli};
 use crate::log;
 use crate::output::{Done, Failure};
 use crate::paths::Paths;
@@ -74,6 +72,14 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         Ok(routes) => review(args, &paths, routes, &mut run),
         Err(failure) => Err(Failure::new(failure.exit, failure.message.clone())),
     };
+    // A skip the spec has reported (an inactive sandbox) stays in the line of a run that fails.
+    let result = result.map_err(|failure| match run.notes.is_empty() {
+        true => failure,
+        false => Failure::new(
+            failure.exit,
+            format!("{}; {}", failure.message, run.notes.join("; ")),
+        ),
+    });
     let failed = result.as_ref().err().map(|failure| failure.message.clone());
     let chosen = routes
         .as_ref()
@@ -137,10 +143,7 @@ fn reviewer(backend: &Backend, paths: &Paths) -> Box<dyn Reviewer> {
         Cli::Agy => Box::new(Agy::new(
             model,
             effort,
-            match backend.auth {
-                Auth::Subscription => AgyAuth::Subscription,
-                Auth::ApiKey => AgyAuth::ApiKey,
-            },
+            backend.auth,
             paths.state.join("agy-usage.json"),
         )),
         Cli::Codex => Box::new(Codex::new(model, effort, &home_of("CODEX_HOME", ".codex"))),
@@ -245,10 +248,7 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
                 continue;
             }
             Err(ReviewerError::NoSandbox(why)) => {
-                run.notes.push(format!(
-                    "{} skipped: {why}; the next backend reviews",
-                    backend.name
-                ));
+                run.notes.push(format!("{} skipped: {why}", backend.name));
                 run.skipped.push((backend.name.clone(), why));
                 continue;
             }

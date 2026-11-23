@@ -14,6 +14,10 @@
 //! timeout = 1800           # seconds before its process group is killed
 //! concurrency = 2          # reviews it runs at once
 //! when_busy = "queue"      # at its limit: "queue" for it, or take the "next" backend
+//!
+//! [[review.backend]]
+//! cli = "agy"
+//! model = "gemini-4-neon"
 //! auth = "subscription"    # agy only: its "subscription" login, or an "api-key" in
 //!                          # GEMINI_API_KEY (default: subscription)
 //! ```
@@ -24,6 +28,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
+use factory_adapters::reviewer::AgyAuth;
 use factory_core::quota::WhenBusy;
 use serde::Deserialize;
 
@@ -42,16 +47,6 @@ pub enum Cli {
     Claude,
 }
 
-/// How agy signs in: the subscription login it keeps, whose quota its usage query shows, or a
-/// Gemini API key from `GEMINI_API_KEY`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum Auth {
-    #[default]
-    Subscription,
-    ApiKey,
-}
-
 /// One review backend, as configured.
 #[derive(Clone, Debug)]
 pub struct Backend {
@@ -63,7 +58,8 @@ pub struct Backend {
     pub timeout: Duration,
     pub concurrency: u32,
     pub when_busy: WhenBusy,
-    pub auth: Auth,
+    /// How agy signs in; the other CLIs take none.
+    pub auth: AgyAuth,
 }
 
 #[derive(Deserialize, Default)]
@@ -89,7 +85,7 @@ struct Entry {
     timeout: Option<u64>,
     concurrency: Option<u32>,
     when_busy: Option<Busy>,
-    auth: Option<Auth>,
+    auth: Option<AgyAuth>,
 }
 
 #[derive(Clone, Copy, Deserialize)]

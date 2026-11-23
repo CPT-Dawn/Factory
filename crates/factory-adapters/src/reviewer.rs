@@ -14,6 +14,8 @@ use std::time::{Duration, SystemTime};
 
 use factory_core::quota::{self, Reset};
 use factory_core::review;
+use factory_core::timestamp::Timestamp;
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::git::{GitRepo, Repo};
@@ -164,8 +166,9 @@ const AGY_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long after its own print timeout agy is killed with its process group.
 const AGY_KILL_GRACE: Duration = Duration::from_secs(30);
 
-/// How agy signs in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// How agy signs in, as the factory's config names it: `subscription` or `api-key`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum AgyAuth {
     /// The subscription login agy keeps, whose quota its usage query shows.
     #[default]
@@ -225,15 +228,19 @@ impl Agy {
         cmd
     }
 
-    /// What its usage query says, from the cache while it is fresh.
-    fn usage(&self) -> Result<String, ReviewerError> {
+    /// What its usage query says, and whether that came from the cache: from the cache while
+    /// it is fresh, unless `ask` says to ask again.
+    fn usage(&self, ask: bool) -> Result<(String, bool), ReviewerError> {
         let fresh = fs::metadata(&self.usage_cache)
             .and_then(|meta| meta.modified())
             .ok()
             .and_then(|modified| SystemTime::now().duration_since(modified).ok())
             .is_some_and(|age| age < AGY_USAGE_FRESH);
-        if fresh && let Ok(usage) = fs::read_to_string(&self.usage_cache) {
-            return Ok(usage);
+        if fresh
+            && !ask
+            && let Ok(usage) = fs::read_to_string(&self.usage_cache)
+        {
+            return Ok((usage, true));
         }
         let mut cmd = self.command();
         cmd.args(["-p", "/usage", "--output-format", "json"])
@@ -251,8 +258,38 @@ impl Agy {
         let usage = String::from_utf8_lossy(&output.stdout).into_owned();
         // A cache that can't be written only costs the next review another query.
         let _ = fs::write(&self.usage_cache, &usage);
-        Ok(usage)
+        Ok((usage, false))
     }
+
+    /// Whether the quota of its model's group has some left, by its usage query.
+    fn quota_left(&self) -> Result<(), ReviewerError> {
+        let group = quota::agy_group(self.model.as_deref().unwrap_or_default());
+        let now = now();
+        let (usage, cached) = self.usage(false)?;
+        let mut said = quota::agy_usage(&usage, group);
+        // A cached answer may name an empty bucket whose reset has come since: ask again.
+        if cached && matches!(said, quota::AgyUsage::Empty { until } if until <= now) {
+            said = quota::agy_usage(&self.usage(true)?.0, group);
+        }
+        match said {
+            quota::AgyUsage::Empty { until } if until > now => {
+                Err(ReviewerError::OutOfQuota(Reset::On(until)))
+            }
+            // An empty bucket whose reset has passed has its quota back.
+            quota::AgyUsage::Left | quota::AgyUsage::Empty { .. } => Ok(()),
+            quota::AgyUsage::Unreadable(why) => Err(ReviewerError::Unready(format!(
+                "its usage query is unreadable: {why}"
+            ))),
+        }
+    }
+}
+
+/// The moment it is, by the system clock.
+fn now() -> Timestamp {
+    let since = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    Timestamp::from_unix_millis(i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
 }
 
 impl Reviewer for Agy {
@@ -278,21 +315,7 @@ impl Reviewer for Agy {
 
     fn preflight(&self) -> Result<(), ReviewerError> {
         match self.auth {
-            AgyAuth::Subscription => {
-                let usage = self.usage()?;
-                let group = quota::agy_group(self.model.as_deref().unwrap_or_default());
-                match quota::agy_usage(&usage, group) {
-                    quota::AgyUsage::Left => {}
-                    quota::AgyUsage::Empty { until } => {
-                        return Err(ReviewerError::OutOfQuota(Reset::On(until)));
-                    }
-                    quota::AgyUsage::Unreadable(why) => {
-                        return Err(ReviewerError::Unready(format!(
-                            "its usage query is unreadable: {why}"
-                        )));
-                    }
-                }
-            }
+            AgyAuth::Subscription => self.quota_left()?,
             AgyAuth::ApiKey => {
                 if env::var_os("GEMINI_API_KEY").is_none_or(|key| key.is_empty()) {
                     return Err(ReviewerError::Unready(
@@ -330,7 +353,10 @@ impl Reviewer for Agy {
             .current_dir(&job.cwd)
             .stdout(Stdio::from(stream))
             .stderr(Stdio::from(log));
-        let failed = run(cmd, job.timeout + AGY_KILL_GRACE)?;
+        // agy stops itself at its print timeout; the grace is for an agy that doesn't. Either
+        // way, nothing it started outlives it.
+        let kill_at = job.timeout.saturating_add(AGY_KILL_GRACE);
+        let failed = exit_of(process::run_swept(cmd, kill_at))?;
         let result = fs::read_to_string(&job.stream).unwrap_or_default();
         let parsed = serde_json::from_str::<Value>(&result).ok();
         let Some(code) = failed else {
@@ -486,7 +512,14 @@ impl Reviewer for Claude {
 
 /// Runs a backend's command: none when it succeeded, else the code it exited with.
 fn run(cmd: Command, timeout: Duration) -> Result<Option<Option<i32>>, ReviewerError> {
-    match process::run(cmd, timeout) {
+    exit_of(process::run(cmd, timeout))
+}
+
+/// How a backend's command ended: none when it succeeded, else the code it exited with.
+fn exit_of(
+    ran: Result<std::process::Output, RunError>,
+) -> Result<Option<Option<i32>>, ReviewerError> {
+    match ran {
         Ok(output) if output.status.success() => Ok(None),
         Ok(output) => Ok(Some(output.status.code())),
         Err(RunError::Spawn(e) | RunError::Wait(e)) => Err(ReviewerError::Start(e)),

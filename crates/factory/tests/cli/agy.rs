@@ -2,7 +2,8 @@
 //! read-only and offline invocation, its sandbox check, its quota error and its auth modes.
 
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
@@ -518,4 +519,120 @@ fn auth_is_refused_on_a_backend_other_than_agy() {
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
     assert!(out.stderr.contains("auth"), "{out:?}");
     assert!(sandbox.calls("codex").is_empty());
+}
+
+#[test]
+fn an_inactive_sandbox_stays_reported_when_the_next_backend_fails() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake("unshare", "exit 1");
+    sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
+    sandbox.fake("codex", "cat > /dev/null\nexit 1");
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let json = sandbox.factory_in(&repo, &["review", "--json", "main", "t2"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
+    assert!(
+        out.stderr.starts_with("factory: codex exited 1; "),
+        "{out:?}"
+    );
+    assert!(
+        out.stderr
+            .contains("agy skipped: its sandbox is not active"),
+        "{out:?}"
+    );
+    assert!(
+        shown(&json.stdout)["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("agy skipped: its sandbox is not active")),
+        "{json:?}"
+    );
+}
+
+/// A fake agy whose usage query answers `first` once, then `later`.
+fn agy_usage_changes(first: &str, later: &str, review: &str) -> String {
+    format!(
+        "if [ \"$2\" = /usage ]; then\n\
+         if [ -e \"$0.asked\" ]; then cat <<'USAGE'\n{later}\nUSAGE\n\
+         else : > \"$0.asked\"; cat <<'USAGE'\n{first}\nUSAGE\nfi\nexit 0\nfi\n{review}"
+    )
+}
+
+#[test]
+fn a_cached_usage_whose_empty_bucket_has_reset_is_asked_again() {
+    let sandbox = sandboxed();
+    let repo = sandbox.repo();
+    let reset = Timestamp::from_unix_millis(now_millis() + 1500);
+    sandbox.fake(
+        "agy",
+        &agy_usage_changes(&usage(0.0, reset), &usage_left(), &agy_writes(CLEAN_REPORT)),
+    );
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+    let first = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+    assert_eq!(shown(&first.stdout)["backend"], "codex", "{first:?}");
+    // Wait, on the clock, for the reset the cached answer names to pass.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while now_millis() <= reset.unix_millis() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let later = sandbox.factory_in(&repo, &["review", "--json", "main", "t2"]);
+
+    assert_eq!(later.code, 0, "{later:?}");
+    assert_eq!(shown(&later.stdout)["backend"], "agy", "{later:?}");
+    assert_eq!(usage_queries(&sandbox), 2, "{:?}", sandbox.calls("agy"));
+}
+
+/// Whether the process `pid` has died (a zombie has), within a deadline.
+fn died(pid: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let state = stat.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
+        if stat.is_empty() || state == Some(Some('Z')) {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn what_agy_leaves_running_at_its_print_timeout_is_killed() {
+    let sandbox = sandboxed();
+    let repo = sandbox.repo();
+    let straggler = "sleep 300 </dev/null >/dev/null 2>&1 &\necho $! > \"$0.straggler\"\n";
+    let timed_out = agy_fails("print timeout after 1800s", "print_timeout");
+    sandbox.fake(
+        "agy",
+        &agy(&usage_left(), &format!("{straggler}{timed_out}")),
+    );
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 124, "{out:?}");
+    let pid = fs::read_to_string(sandbox.path("bin/agy.straggler")).unwrap();
+    assert!(died(pid.trim()), "sleep {} still runs", pid.trim());
+}
+
+#[test]
+fn a_timeout_too_long_to_add_a_grace_to_still_runs_the_review() {
+    let sandbox = sandboxed();
+    let repo = sandbox.repo();
+    sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
+
+    let out = sandbox.factory_in(
+        &repo,
+        &["review", "--timeout", "18446744073709551615", "main", "t1"],
+    );
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(
+        after(&reviews_run(&sandbox)[0], "--print-timeout"),
+        Some("18446744073709551615s")
+    );
 }

@@ -42,21 +42,42 @@ impl std::error::Error for RunError {}
 
 /// Runs `cmd` to its end in a process group of its own, with the stdio its caller set. When
 /// it outlives `timeout`, the whole group is killed, so nothing it started lives on.
-pub fn run(mut cmd: Command, timeout: Duration) -> Result<Output, RunError> {
+pub fn run(cmd: Command, timeout: Duration) -> Result<Output, RunError> {
+    run_in_group(cmd, timeout).1
+}
+
+/// Runs `cmd` as [`run`] does, then kills what its process group still holds once it has
+/// exited: a program that stops on a timeout of its own can leave its children running.
+pub fn run_swept(cmd: Command, timeout: Duration) -> Result<Output, RunError> {
+    let (group, result) = run_in_group(cmd, timeout);
+    if let Some(group) = group {
+        // An empty group has nothing to signal; that is the usual case.
+        let _ = kill_process_group(group, Signal::KILL);
+    }
+    result
+}
+
+/// Runs `cmd` in a group of its own, killing the group on timeout: the group, once started,
+/// and how the run ended.
+fn run_in_group(mut cmd: Command, timeout: Duration) -> (Option<Pid>, Result<Output, RunError>) {
     cmd.process_group(0);
-    let child = cmd.spawn().map_err(RunError::Spawn)?;
-    let leader = child.id();
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return (None, Err(RunError::Spawn(e))),
+    };
+    let group = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || tx.send(child.wait_with_output()));
-    match rx.recv_timeout(timeout) {
+    let result = match rx.recv_timeout(timeout) {
         Ok(output) => output.map_err(RunError::Wait),
         Err(_) => {
-            if let Some(group) = i32::try_from(leader).ok().and_then(Pid::from_raw) {
+            if let Some(group) = group {
                 let _ = kill_process_group(group, Signal::KILL);
             }
             // The waiting thread reaps the leader once the group is dead.
             let _ = rx.recv_timeout(REAP_TIMEOUT);
             Err(RunError::TimedOut(timeout))
         }
-    }
+    };
+    (group, result)
 }
