@@ -48,18 +48,32 @@ pub fn round(label: &str, has_previous: bool) -> u32 {
 }
 
 /// The issue `gh issue view` should fetch when a spec is an issue ref: the number of `#12` or
-/// `12`, or a whole `https://github.com/<owner>/<repo>/issues/12`, which may name another repo.
-pub fn issue_ref(spec: &str) -> Option<&str> {
+/// `12`, a whole `https://github.com/<owner>/<repo>/issues/12`, or `<owner>/<repo>#12` as
+/// that URL. The last two may name another repo.
+pub fn issue_ref(spec: &str) -> Option<String> {
     let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    match spec.strip_prefix("https://github.com/") {
-        Some(rest) => match rest.split('/').collect::<Vec<_>>()[..] {
-            [owner, repo, "issues", n] if !owner.is_empty() && !repo.is_empty() && number(n) => {
-                Some(spec)
+    let name = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    if let Some(rest) = spec.strip_prefix("https://github.com/") {
+        return match rest.split('/').collect::<Vec<_>>()[..] {
+            [owner, repo, "issues", n] if name(owner) && name(repo) && number(n) => {
+                Some(spec.to_owned())
             }
             _ => None,
-        },
-        None => Some(spec.strip_prefix('#').unwrap_or(spec)).filter(|n| number(n)),
+        };
     }
+    if let Some((repo, n)) = spec.split_once('#')
+        && let Some((owner, repo)) = repo.split_once('/')
+    {
+        return (name(owner) && name(repo) && number(n))
+            .then(|| format!("https://github.com/{owner}/{repo}/issues/{n}"));
+    }
+    Some(spec.strip_prefix('#').unwrap_or(spec))
+        .filter(|n| number(n))
+        .map(str::to_owned)
 }
 
 /// The lines a fix touched, read from its diff: the new-side lines it added or changed, and
@@ -883,8 +897,18 @@ mod tests {
     }
 
     #[test]
-    fn an_issue_ref_is_a_number_a_hash_number_or_an_issue_url() {
+    fn an_issue_ref_is_a_number_a_hash_number_an_owner_repo_ref_or_an_issue_url() {
         for (spec, issue) in [
+            // gh takes another repo's issue by its URL.
+            ("CPT-Dawn/Factory#1", Some("https://github.com/CPT-Dawn/Factory/issues/1")),
+            ("o.r/r_2#34", Some("https://github.com/o.r/r_2/issues/34")),
+            ("o/r#", None),
+            ("o#1", None),
+            ("o/r/x#1", None),
+            ("/r#1", None),
+            ("o/#1", None),
+            ("o/r#1a", None),
+            ("docs/spec.md", None),
             ("12", Some("12")),
             ("#12", Some("12")),
             (
@@ -901,7 +925,7 @@ mod tests {
             ("https://github.com//r/issues/12", None),
             ("https://example.com/o/r/issues/12", None),
         ] {
-            assert_eq!(issue_ref(spec), issue, "{spec}");
+            assert_eq!(issue_ref(spec).as_deref(), issue, "{spec}");
         }
     }
 

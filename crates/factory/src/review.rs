@@ -682,7 +682,7 @@ fn fetch_spec(spec: &str, saved: &Path) -> Result<(String, String), Failure> {
     let Some(issue) = review::issue_ref(spec) else {
         return Ok((spec.to_owned(), read_given("spec", Path::new(spec))?));
     };
-    let text = Gh.issue(issue).map_err(|e| {
+    let text = Gh.issue(&issue).map_err(|e| {
         Failure::usage(format!(
             "could not fetch spec {spec} with gh: {e}; check gh auth status, or pass the spec as a file"
         ))

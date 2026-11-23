@@ -265,7 +265,7 @@ fn an_issue_ref_as_the_spec_is_fetched_with_gh_and_saved_as_a_file() {
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
     sandbox.fake("gh", "printf '# #12 Add a\\n\\nAdd a.txt, from gh.\\n'");
 
-    for (n, spec) in ["#12", "12", "https://github.com/o/r/issues/12"]
+    for (n, spec) in ["#12", "12", "https://github.com/o/r/issues/12", "o/r#12"]
         .into_iter()
         .enumerate()
     {
@@ -288,9 +288,15 @@ fn an_issue_ref_as_the_spec_is_fetched_with_gh_and_saved_as_a_file() {
             "{spec}: {prompt}"
         );
     }
-    // A URL goes to gh whole, so an issue of another repo is fetched from that repo.
+    // A URL goes to gh whole, and `owner/repo#n` as one, so an issue of another repo is
+    // fetched from that repo.
     let template = r#"# #{{.number}} {{.title}}{{"\n\n"}}{{.body}}{{"\n"}}"#;
-    let expected: Vec<Vec<&str>> = ["12", "12", "https://github.com/o/r/issues/12"]
+    let expected: Vec<Vec<&str>> = [
+        "12",
+        "12",
+        "https://github.com/o/r/issues/12",
+        "https://github.com/o/r/issues/12",
+    ]
         .into_iter()
         .map(|issue| {
             vec![
