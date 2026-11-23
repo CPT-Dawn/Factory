@@ -43,7 +43,7 @@ $ d@demo-d devlab status
 1>   demo 1   down                         lease 2 demo-b
 1>   demo per owner (cap 1 of 2): claude:<a> 1/1 at cap, claude:<b> 1/1 at cap
 1> waiting: claude:<c> @ demo-c for 0m
-1> memory <mem> GB free; watcher inactive (systemctl --user enable --now devlab-watch)
+1> memory <mem> GB free; watcher active
 ? 0
 $ a@demo-a devlab release
 2> devlab: released lease 1
@@ -71,5 +71,5 @@ $ d@demo-d devlab status
 1>   demo 0   down                         lease 3 demo-c
 1>   demo 1   down                         lease 2 demo-b
 1>   demo per owner (cap 1 of 2): claude:<b> 1/1 at cap, claude:<c> 1/1 at cap
-1> memory <mem> GB free; watcher inactive (systemctl --user enable --now devlab-watch)
+1> memory <mem> GB free; watcher active
 ? 0

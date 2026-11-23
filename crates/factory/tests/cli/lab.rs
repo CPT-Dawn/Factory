@@ -330,15 +330,13 @@ PY
 }
 
 #[test]
-fn docker_and_systemctl_run_while_the_store_is_unlocked() {
+fn docker_runs_while_the_store_is_unlocked() {
     let (sandbox, world) = lab();
     let probes: PathBuf = sandbox.path("probes");
     let wt = world.worktree("demo-lock");
     // The daemon makes lab.db on its first call; probe once it is there.
     assert_eq!(owned(&sandbox, &wt, &["status"]).code, 0);
-    for tool in ["docker", "systemctl"] {
-        probe_lock(&sandbox, tool, &probes);
-    }
+    probe_lock(&sandbox, "docker", &probes);
     let other = world.worktree("demo-other");
     // A second owner, so its lease takes the other slot instead of queueing behind the cap.
     let mut second = Command::new("sleep")
@@ -366,12 +364,7 @@ fn docker_and_systemctl_run_while_the_store_is_unlocked() {
     let _ = second.wait();
 
     let seen = fs::read_to_string(&probes).unwrap_or_default();
-    for tool in ["docker", "systemctl"] {
-        assert!(
-            seen.contains(&format!("{tool} free")),
-            "{tool} never ran: {seen}"
-        );
-    }
+    assert!(seen.contains("docker free"), "docker never ran: {seen}");
     assert!(!seen.contains("held"), "{seen}");
 }
 
@@ -1001,16 +994,49 @@ fn a_stack_devlab_started_is_stopped_once_idle_and_one_started_outside_devlab_ne
     );
     assert_eq!(owned(&sandbox, &ours, &["release"]).code, 0);
 
-    let stopped = poll_until(|| stack_stops(&sandbox, "demo") == 1);
+    // The fake records the stop before it takes the container down.
+    let stopped = poll_until(|| {
+        stack_stops(&sandbox, "demo") == 1
+            && !fs::read_to_string(&containers)
+                .unwrap_or_default()
+                .lines()
+                .any(|c| c == "supabase_db_demo")
+    });
     kill_owner(other);
     assert!(stopped, "{:?}", sandbox.calls("supabase"));
     let up = fs::read_to_string(&containers).unwrap_or_default();
-    assert!(!up.lines().any(|c| c == "supabase_db_demo"), "{up}");
     assert!(up.lines().any(|c| c == "supabase_db_demo_s1"), "{up}");
     assert_eq!(
         stack_stops(&sandbox, "demo_s1"),
         0,
         "{:?}",
         sandbox.calls("supabase")
+    );
+}
+
+#[test]
+fn status_names_the_daemon_as_the_watcher_and_devlab_watch_starts_no_poller() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-watch");
+    let text = status(&sandbox, &wt);
+    assert!(
+        text.lines()
+            .last()
+            .is_some_and(|l| l.ends_with("; watcher active")),
+        "{text}"
+    );
+    let json = sandbox.factory_in(&wt, &["--json", "lab", "status"]);
+    let json: serde_json::Value =
+        serde_json::from_str(&json.stdout).unwrap_or_else(|e| panic!("{e}: {json:?}"));
+    assert_eq!(json["watcher"], "active", "{json}");
+
+    let watch = owned(&sandbox, &wt, &["watch"]);
+    assert_eq!(
+        (watch.code, watch.stdout.as_str()),
+        (
+            0,
+            "devlab watch: the factory daemon frees leases and stops idle emulators and stacks now; nothing to start\n"
+        ),
+        "{watch:?}"
     );
 }

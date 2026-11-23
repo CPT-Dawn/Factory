@@ -13,7 +13,7 @@ mod keeper;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, MutexGuard, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use factory_adapters::adb::{Adb, AdbCli, AdbTrack};
@@ -77,6 +77,11 @@ pub struct Lab {
 
 /// How many dropped leases wait for `devlab gc` to tell them.
 const UNREPORTED: usize = 64;
+
+/// The lock, whether or not a thread panicked while it held it.
+fn lock_ignoring_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 type Answer<T> = Result<T, ErrorBody>;
 
@@ -179,7 +184,7 @@ impl Lab {
             })?;
         drop(store);
         if !freed.is_empty() {
-            let mut unreported = keeper::held(&self.unreported);
+            let mut unreported = lock_ignoring_poison(&self.unreported);
             for lease in &freed {
                 if unreported.len() == UNREPORTED {
                     unreported.pop_front();
@@ -191,7 +196,7 @@ impl Lab {
             }
             drop(unreported);
             self.notify();
-            keeper::take_back_reverses_beside(self.attached.borrow().clone(), freed);
+            keeper::take_back_reverses_on_thread(self.attached.borrow().clone(), freed);
         }
         Ok(out)
     }
@@ -222,10 +227,11 @@ pub async fn respond(lab: &Arc<Lab>, method: &str, params: Value) -> Option<Outc
         LEASE => |lab, p, seen| reply(lab_lease(lab, parse(p)?, seen)),
         RELEASE => |lab, p, _| reply(release(lab, parse(p)?)),
         GC => |lab, _, _| {
-            reply(
-                lab.write(|_, _| Ok(()))
-                    .map(|()| keeper::held(&lab.unreported).drain(..).collect::<Vec<_>>()),
-            )
+            reply(lab.write(|_, _| Ok(())).map(|()| {
+                lock_ignoring_poison(&lab.unreported)
+                    .drain(..)
+                    .collect::<Vec<_>>()
+            }))
         },
         STATUS => |lab, _, seen| reply(status(lab, seen)),
         SLOT => |lab, p, _| reply(slot(lab, parse(p)?)),
@@ -544,7 +550,7 @@ fn try_grant(
 ) -> Answer<Result<Taken, String>> {
     lab.write(|c, now| {
         let lease = store::find_lease(c, &p.worktree, &p.owner, p.lease)?;
-        let stopping = keeper::held(&lab.stopping).clone();
+        let stopping = lock_ignoring_poison(&lab.stopping).clone();
         let planned = match &p.devices {
             Some(ask) => plan(
                 c,

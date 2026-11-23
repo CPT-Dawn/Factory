@@ -219,9 +219,6 @@ pub fn stack_ours(project: &str, slot: u32, ours: bool) -> Result<(), Failure> {
     )
 }
 
-/// The lease's exports: its slot's ports and stack, then `DEVLAB_LEASE`, then its devices:
-/// `ANDROID_SERIAL` (the first) and the space-separated `DEVLAB_SERIALS`, `DEVLAB_KINDS` and
-/// `DEVLAB_ABIS`.
 /// The project's reverses as (device port, host port), a port named by a variable read from
 /// `env`, a lease's; 0 for a port that names nothing.
 pub fn reverse_ports(p: &ProjectConfig, env: &Env) -> Vec<(u32, u32)> {
@@ -243,6 +240,9 @@ pub fn reverse_ports(p: &ProjectConfig, env: &Env) -> Vec<(u32, u32)> {
         .collect()
 }
 
+/// The lease's exports: its slot's ports and stack, then `DEVLAB_LEASE`, then its devices:
+/// `ANDROID_SERIAL` (the first) and the space-separated `DEVLAB_SERIALS`, `DEVLAB_KINDS` and
+/// `DEVLAB_ABIS`.
 pub fn lease_env(lease: &Lease, project: Option<&ProjectConfig>) -> Result<Env, Failure> {
     let mut env = Env::new();
     if let (Some(p), Some(slot)) = (project, lease.slot) {

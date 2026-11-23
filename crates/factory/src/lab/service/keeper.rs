@@ -5,7 +5,7 @@
 //! again on each look, so a changed timer counts from the next one.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use factory_adapters::adb::{Adb, AdbCli};
@@ -20,7 +20,7 @@ use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags, pidfd_open};
 
 use super::super::{context, host, lease, stack};
-use super::{Lab, Lease, store};
+use super::{Lab, Lease, lock_ignoring_poison, store};
 use crate::lab::wire::SlotRow;
 
 /// The longest the keeper goes without a look: a changed config is read by then.
@@ -33,11 +33,6 @@ pub struct Stopping {
     pub emulators: BTreeSet<u32>,
     /// Slots whose stack is stopping, by project and slot.
     pub slots: BTreeSet<(String, u32)>,
-}
-
-/// The lock, whether or not a thread panicked while it held it.
-pub fn held<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Lab {
@@ -54,14 +49,14 @@ impl Lab {
     /// Watches the owner of `lease`, once per owner: when it exits, its leases are dropped.
     pub(super) fn watch_owner(self: &Arc<Self>, lease: &Lease) {
         let key = lease.owner_key();
-        if !held(&self.watched).insert(key.clone()) {
+        if !lock_ignoring_poison(&self.watched).insert(key.clone()) {
             return;
         }
         let lab = Arc::clone(self);
         let (pid, start) = (lease.owner_pid, lease.owner_start.clone());
-        beside("lab-owner", move || {
+        on_thread("lab-owner", move || {
             let exited = owner_exit(pid, &start);
-            held(&lab.watched).remove(&key);
+            lock_ignoring_poison(&lab.watched).remove(&key);
             if exited {
                 let _ = lab.write(|_, _| Ok(()));
             }
@@ -78,7 +73,7 @@ impl Lab {
             .write(|c, _| {
                 let taken = store::taken(c)?;
                 let leases = store::leases(c)?;
-                let mut stopping = held(&self.stopping);
+                let mut stopping = lock_ignoring_poison(&self.stopping);
                 let emulators: Vec<store::EmulatorRow> = store::emulators(c)?
                     .into_iter()
                     .filter(|e| !stopping.emulators.contains(&e.idx))
@@ -130,14 +125,14 @@ impl Lab {
         for row in emulators {
             let lab = Arc::clone(self);
             let minutes = js_number(cfg.emulator_idle_min);
-            beside("lab-idle-emulator", move || {
+            on_thread("lab-idle-emulator", move || {
                 lab.stop_emulator(&row, &minutes)
             });
         }
         for row in slots {
             let lab = Arc::clone(self);
             let minutes = js_number(cfg.stack_idle_min);
-            beside("lab-idle-stack", move || lab.stop_stack(&row, &minutes));
+            on_thread("lab-idle-stack", move || lab.stop_stack(&row, &minutes));
         }
         Ok(next)
     }
@@ -146,7 +141,9 @@ impl Lab {
     fn stop_emulator(&self, row: &store::EmulatorRow, minutes: &str) {
         SystemdEmulators.stop(&unit_name(row.idx), &row.serial, &AdbCli);
         let _ = self.write(|c, _| store::delete_emulator(c, row.idx, "ready"));
-        held(&self.stopping).emulators.remove(&row.idx);
+        lock_ignoring_poison(&self.stopping)
+            .emulators
+            .remove(&row.idx);
         self.notify();
         eprintln!(
             "factory: lab: stopped emulator {}, idle for {minutes} min",
@@ -170,7 +167,7 @@ impl Lab {
             Err(f) => Err(f.message),
         };
         let _ = self.write(|c, _| store::set_stack_ours(c, &row.project, row.slot, false));
-        held(&self.stopping)
+        lock_ignoring_poison(&self.stopping)
             .slots
             .remove(&(row.project.clone(), row.slot));
         self.notify();
@@ -247,11 +244,11 @@ fn owner_exit(pid: i64, start: &str) -> bool {
 }
 
 /// Takes back the reverses dropped leases' devices were given, beside the caller.
-pub fn take_back_reverses_beside(attached: Option<Vec<Attached>>, leases: Vec<Lease>) {
+pub fn take_back_reverses_on_thread(attached: Option<Vec<Attached>>, leases: Vec<Lease>) {
     if leases.iter().all(|l| l.devices.is_empty()) {
         return;
     }
-    beside("lab-unreverse", move || {
+    on_thread("lab-unreverse", move || {
         take_back_reverses(attached.as_deref(), &leases);
     });
 }
@@ -287,7 +284,7 @@ pub fn take_back_reverses(attached: Option<&[Attached]>, leases: &[Lease]) {
 }
 
 /// Runs `work` on a thread of its own, named `name`.
-fn beside(name: &str, work: impl FnOnce() + Send + 'static) {
+fn on_thread(name: &str, work: impl FnOnce() + Send + 'static) {
     let _ = std::thread::Builder::new()
         .name(name.to_owned())
         .spawn(work);
