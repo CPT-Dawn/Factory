@@ -30,7 +30,7 @@ factory review [--tier <tier>] --skill <its checkout's codex/code-review/SKILL.m
   the caller's tier, or standard. The chains and pools are factory's config (`[review.chains]`, `config.rs`),
   review.sh's by default. Each pool has 2 slots: a busy pool passes the review to the chain's next, and the
   chain's last waits. A pool out of quota (agy's free `/usage`, or a quota error mid-run) cools down until its
-  reset; a mid-run hit tries the same pool's next model first when it is next in the chain. Standard and
+  reset. A failed `claude -p` counts as out of quota when its `result` or stderr says a plan limit (`You've hit your session limit · resets 3:45pm`, `usage limit reached|<epoch>`) or a rate limit (`rate_limit_error`, HTTP 429): the pool cools until the reset named, else for an hour, and any other failure is exit 3; a mid-run hit tries the same pool's next model first when it is next in the chain. Standard and
   trivial reviews leave the Gemini pool alone while its 5-hour bucket is under 20%.
 
 ## What `factory review` prints
