@@ -2,7 +2,8 @@
 //!
 //! Its `[[review.backend]]` entries are the review backends, tried in the order they are
 //! written (spec #1, "Reviewer router"). Without the file, or without entries, the backends are
-//! Codex on its own config, then Claude Opus at high effort.
+//! Antigravity's Gemini 4 Neon at high effort, then Codex on its own config, then Claude Opus at
+//! high effort.
 //!
 //! Its `[ci]` table sets how often a wait on CI polls GitHub when it can't listen for events.
 //!
@@ -11,13 +12,19 @@
 //! poll = "30s"             # a duration: 90s, 9m, 2h
 //!
 //! [[review.backend]]
-//! cli = "codex"            # which adapter runs it: codex or claude
+//! cli = "codex"            # which adapter runs it: agy, codex or claude
 //! name = "codex"           # its quota's name in the ledger and the daemon (default: cli)
 //! model = "gpt-6.2-sol"    # default: the CLI's own
 //! effort = "high"          # default: the CLI's own
 //! timeout = 1800           # seconds before its process group is killed
 //! concurrency = 2          # reviews it runs at once
 //! when_busy = "queue"      # at its limit: "queue" for it, or take the "next" backend
+//!
+//! [[review.backend]]
+//! cli = "agy"
+//! model = "gemini-4-neon"
+//! auth = "subscription"    # agy only: its "subscription" login, or an "api-key" in
+//!                          # GEMINI_API_KEY (default: subscription)
 //! ```
 
 use std::collections::HashSet;
@@ -26,6 +33,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use factory_adapters::reviewer::AgyAuth;
 use factory_core::quota::WhenBusy;
 use serde::Deserialize;
 
@@ -40,6 +48,7 @@ const DEFAULT_POLL: Duration = Duration::from_secs(30);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Cli {
+    Agy,
     Codex,
     Claude,
 }
@@ -55,6 +64,8 @@ pub struct Backend {
     pub timeout: Duration,
     pub concurrency: u32,
     pub when_busy: WhenBusy,
+    /// How agy signs in; the other CLIs take none.
+    pub auth: AgyAuth,
 }
 
 #[derive(Deserialize, Default)]
@@ -88,6 +99,7 @@ struct Entry {
     timeout: Option<u64>,
     concurrency: Option<u32>,
     when_busy: Option<Busy>,
+    auth: Option<AgyAuth>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -144,7 +156,15 @@ pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
         .backend
         .into_iter()
         .map(|entry| {
+            let auth = entry.auth.is_some();
             let backend = backend(entry);
+            if auth && backend.cli != Cli::Agy {
+                return Err(Failure::precondition(format!(
+                    "{}: backend {} sets auth, which only agy takes; remove it",
+                    path.display(),
+                    backend.name
+                )));
+            }
             if backend.concurrency == 0 {
                 return Err(Failure::precondition(format!(
                     "{}: backend {} has concurrency 0; give it 1 or more",
@@ -176,6 +196,7 @@ fn backend(entry: Entry) -> Backend {
             Some(Busy::Next) => WhenBusy::Next,
             Some(Busy::Queue) | None => WhenBusy::Queue,
         },
+        auth: entry.auth.unwrap_or_default(),
     }
 }
 
@@ -189,9 +210,11 @@ fn defaults() -> Vec<Backend> {
             timeout: None,
             concurrency: None,
             when_busy: None,
+            auth: None,
         })
     };
     vec![
+        entry(Cli::Agy, Some("gemini-4-neon"), Some("high")),
         entry(Cli::Codex, None, None),
         entry(Cli::Claude, Some("opus"), Some("high")),
     ]
@@ -199,6 +222,7 @@ fn defaults() -> Vec<Backend> {
 
 pub fn cli_name(cli: Cli) -> &'static str {
     match cli {
+        Cli::Agy => "agy",
         Cli::Codex => "codex",
         Cli::Claude => "claude",
     }
