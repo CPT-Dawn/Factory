@@ -22,7 +22,8 @@ pub const RUN_END: &str = "lab.run.end";
 pub const LEASE: &str = "lab.lease";
 /// Drops the caller's lease: [`FindParams`] in, the lease it dropped (`Option<Lease>`) out.
 pub const RELEASE: &str = "lab.release";
-/// Drops the leases of owners that exited: no params, a line per lease out.
+/// Drops the leases of owners that exited: no params, out a line per lease dropped since the last
+/// gc, by it or by the daemon, which drops them as their owners exit.
 pub const GC: &str = "lab.gc";
 /// The whole board: no params, [`Board`] out.
 pub const STATUS: &str = "lab.status";

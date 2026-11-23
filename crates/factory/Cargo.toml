@@ -14,7 +14,7 @@ factory-adapters.workspace = true
 clap.workspace = true
 listenfd.workspace = true
 rusqlite.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["event"] }
 serde.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
@@ -23,7 +23,6 @@ toml.workspace = true
 jiff.workspace = true
 
 [dev-dependencies]
-rustix = { workspace = true, features = ["event"] }
 tempfile.workspace = true
 
 [lints]

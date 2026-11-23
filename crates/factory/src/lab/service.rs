@@ -4,8 +4,13 @@
 //! runs) first, then decides and writes in one short transaction. It waits on a change to the
 //! board (a grant, a release, a waiter leaving) or the re-check tick, never in a sleep loop of
 //! the CLI's.
+//!
+//! The keeper ([`keeper`]) does what devlab's watcher did: it frees an owner's leases the moment
+//! the owner exits, and stops idle emulators and the idle stacks devlab started.
 
-use std::collections::BTreeSet;
+mod keeper;
+
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once};
@@ -44,8 +49,8 @@ use super::{android, host};
 use crate::ledger::Ledger;
 use crate::protocol::{ErrorBody, Outcome, Request, Response};
 
-/// How often a waiting acquire looks again without a change to the board: an owner that exited
-/// or a port that freed tells no one (the daemon watches owners itself from #18).
+/// How often a waiting acquire looks again without a change to the board: a port that freed
+/// tells no one. An owner that exits does: the keeper watches each one.
 const RECHECK: Duration = Duration::from_secs(3);
 /// How long a call that needs the device list waits for adb's first one.
 const FIRST_LIST: Duration = Duration::from_secs(15);
@@ -61,7 +66,17 @@ pub struct Lab {
     attached: watch::Sender<Option<Vec<Attached>>>,
     /// Starts the one device tracker, on the first call that needs the device list.
     tracking: Once,
+    /// The owners the keeper watches, by [`Lease::owner_key`].
+    watched: Mutex<HashSet<String>>,
+    /// What the keeper is stopping because it idled; no grant hands it out meanwhile.
+    stopping: Mutex<keeper::Stopping>,
+    /// A line for each lease dropped because its owner exited, until `devlab gc` tells it: the
+    /// keeper usually drops it first. The newest [`UNREPORTED`].
+    unreported: Mutex<VecDeque<String>>,
 }
+
+/// How many dropped leases wait for `devlab gc` to tell them.
+const UNREPORTED: usize = 64;
 
 type Answer<T> = Result<T, ErrorBody>;
 
@@ -75,6 +90,9 @@ impl Lab {
             changed: watch::Sender::new(0),
             attached: watch::Sender::new(None),
             tracking: Once::new(),
+            watched: Mutex::new(HashSet::new()),
+            stopping: Mutex::new(keeper::Stopping::default()),
+            unreported: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -141,16 +159,10 @@ impl Lab {
         });
     }
 
-    /// One write transaction; dead owners' leases are dropped first, telling waiters.
+    /// One write transaction; dead owners' leases are dropped first, telling waiters and
+    /// `devlab gc`. The reverses their devices were given are taken back beside it, after the
+    /// transaction.
     fn write<T>(&self, work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>) -> Answer<T> {
-        self.write_gc(work).map(|(_, out)| out)
-    }
-
-    /// [`Lab::write`], with a line for each lease of an owner that exited.
-    fn write_gc<T>(
-        &self,
-        work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>,
-    ) -> Answer<(Vec<String>, T)> {
         let mut store = self
             .store
             .lock()
@@ -165,10 +177,23 @@ impl Lab {
                 code: Exit::Precondition.code(),
                 message: format!("lab store {}: {e}; retry", self.path.display()),
             })?;
+        drop(store);
         if !freed.is_empty() {
+            let mut unreported = keeper::held(&self.unreported);
+            for lease in &freed {
+                if unreported.len() == UNREPORTED {
+                    unreported.pop_front();
+                }
+                unreported.push_back(format!(
+                    "lease {} ({}, owner exited)",
+                    lease.id, lease.owner_label
+                ));
+            }
+            drop(unreported);
             self.notify();
+            keeper::take_back_reverses_beside(self.attached.borrow().clone(), freed);
         }
-        Ok((freed, out))
+        Ok(out)
     }
 
     fn notify(&self) {
@@ -196,7 +221,12 @@ pub async fn respond(lab: &Arc<Lab>, method: &str, params: Value) -> Option<Outc
     let work: fn(&Lab, Value, &[Attached]) -> Answer<Value> = match method {
         LEASE => |lab, p, seen| reply(lab_lease(lab, parse(p)?, seen)),
         RELEASE => |lab, p, _| reply(release(lab, parse(p)?)),
-        GC => |lab, _, _| reply(lab.write_gc(|_, _| Ok(())).map(|(freed, ())| freed)),
+        GC => |lab, _, _| {
+            reply(
+                lab.write(|_, _| Ok(()))
+                    .map(|()| keeper::held(&lab.unreported).drain(..).collect::<Vec<_>>()),
+            )
+        },
         STATUS => |lab, _, seen| reply(status(lab, seen)),
         SLOT => |lab, p, _| reply(slot(lab, parse(p)?)),
         _ => return None,
@@ -270,8 +300,12 @@ fn release(lab: &Lab, p: FindParams) -> Answer<Option<Lease>> {
         }
         Ok(lease)
     })?;
-    if dropped.is_some() {
+    if let Some(lease) = &dropped {
         lab.notify();
+        keeper::take_back_reverses(
+            lab.attached.borrow().clone().as_deref(),
+            std::slice::from_ref(lease),
+        );
     }
     Ok(dropped)
 }
@@ -403,6 +437,7 @@ fn plan(
     lease: Option<&Lease>,
     seen: &[Attached],
     mem_available_mb: i64,
+    stopping: &keeper::Stopping,
 ) -> rusqlite::Result<Result<Option<Planned>, String>> {
     let mut have = 0u32;
     for held in lease.map_or(&[][..], |l| l.devices.as_slice()) {
@@ -438,6 +473,7 @@ fn plan(
             .filter(|e| {
                 State::from_word(&e.state) == State::Ready
                     && !is_taken(&e.serial)
+                    && !stopping.emulators.contains(&e.idx)
                     && state_of(seen, &e.serial) == Some("device")
             })
             .map(|e| e.serial.clone())
@@ -508,6 +544,7 @@ fn try_grant(
 ) -> Answer<Result<Taken, String>> {
     lab.write(|c, now| {
         let lease = store::find_lease(c, &p.worktree, &p.owner, p.lease)?;
+        let stopping = keeper::held(&lab.stopping).clone();
         let planned = match &p.devices {
             Some(ask) => plan(
                 c,
@@ -515,6 +552,7 @@ fn try_grant(
                 lease.as_ref(),
                 &facts.attached,
                 facts.mem_available_mb,
+                &stopping,
             )?,
             None => Ok(None),
         };
@@ -550,6 +588,7 @@ fn try_grant(
                                 .unwrap_or(false),
                             own_ports,
                             stack_ports,
+                            stopping: stopping.slots.contains(&(project.name.clone(), slot)),
                         }
                     })
                     .collect()
@@ -976,6 +1015,7 @@ pub async fn acquire<W, R, S>(
         let why = match tried {
             Ok(Ok(taken)) => {
                 lab.notify();
+                lab.watch_owner(&taken.granted.lease);
                 let (fresh, previous) = (taken.fresh, taken.granted.previous.clone());
                 let lease = taken.granted.lease.clone();
                 let outcome = match settle(&lab, &p, taken, writer, id).await {

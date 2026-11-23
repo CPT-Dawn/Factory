@@ -8,6 +8,7 @@
 //! - [`devices`] reads adb's device lists and plans which phones and emulators a request gets.
 //! - [`emulator`] is the life of an emulator the daemon boots.
 //! - [`run`] says how a `devlab run` ended.
+//! - [`idle`] says which idle emulators and stacks to stop, and when to look again.
 //!
 //! Reservations (#17) get a module of their own beside these.
 
@@ -16,6 +17,7 @@ pub mod config;
 pub mod devices;
 pub mod emulator;
 pub mod grant;
+pub mod idle;
 pub mod queue;
 pub mod run;
 pub mod slots;

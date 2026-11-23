@@ -316,20 +316,17 @@ pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<(
     Ok(())
 }
 
-/// Drops every lease whose owner exited; a line per lease dropped.
+/// Drops every lease whose owner exited, and returns them as they were, with their devices.
 pub fn gc(
     c: &Connection,
     now: i64,
     alive: &dyn Fn(i64, &str) -> bool,
-) -> rusqlite::Result<Vec<String>> {
+) -> rusqlite::Result<Vec<Lease>> {
     let mut freed = Vec::new();
     for lease in leases(c)? {
         if !alive(lease.owner_pid, &lease.owner_start) {
             drop_lease(c, &lease, now)?;
-            freed.push(format!(
-                "lease {} ({}, owner exited)",
-                lease.id, lease.owner_label
-            ));
+            freed.push(lease);
         }
     }
     Ok(freed)

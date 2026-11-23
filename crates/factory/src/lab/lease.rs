@@ -138,22 +138,9 @@ pub fn apply_reverses(lease: &Lease, project: Option<&ProjectConfig>) -> Result<
     let Some(p) = project.filter(|p| !p.reverse.is_empty() && !lease.devices.is_empty()) else {
         return Ok(());
     };
-    let env = lease_env(lease, Some(p))?;
-    let port = |x: &str| -> u32 {
-        let named = env
-            .iter()
-            .find(|(k, _)| k == x)
-            .map_or("", |(_, v)| v.as_str());
-        let text = if !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()) {
-            x
-        } else {
-            named
-        };
-        text.parse().unwrap_or(0)
-    };
+    let ports = reverse_ports(p, &lease_env(lease, Some(p))?);
     for d in &lease.devices {
-        for (device_port, host_port) in &p.reverse {
-            let (on_device, on_host) = (port(device_port), port(host_port));
+        for &(on_device, on_host) in &ports {
             if on_device > 0 && on_host > 0 && !AdbCli.reverse(&d.serial, on_device, on_host) {
                 note(&format!(
                     "adb reverse tcp:{on_device} -> {on_host} failed on {}",
@@ -235,6 +222,27 @@ pub fn stack_ours(project: &str, slot: u32, ours: bool) -> Result<(), Failure> {
 /// The lease's exports: its slot's ports and stack, then `DEVLAB_LEASE`, then its devices:
 /// `ANDROID_SERIAL` (the first) and the space-separated `DEVLAB_SERIALS`, `DEVLAB_KINDS` and
 /// `DEVLAB_ABIS`.
+/// The project's reverses as (device port, host port), a port named by a variable read from
+/// `env`, a lease's; 0 for a port that names nothing.
+pub fn reverse_ports(p: &ProjectConfig, env: &Env) -> Vec<(u32, u32)> {
+    let port = |x: &str| -> u32 {
+        let named = env
+            .iter()
+            .find(|(k, _)| k == x)
+            .map_or("", |(_, v)| v.as_str());
+        let text = if !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()) {
+            x
+        } else {
+            named
+        };
+        text.parse().unwrap_or(0)
+    };
+    p.reverse
+        .iter()
+        .map(|(on_device, on_host)| (port(on_device), port(on_host)))
+        .collect()
+}
+
 pub fn lease_env(lease: &Lease, project: Option<&ProjectConfig>) -> Result<Env, Failure> {
     let mut env = Env::new();
     if let (Some(p), Some(slot)) = (project, lease.slot) {

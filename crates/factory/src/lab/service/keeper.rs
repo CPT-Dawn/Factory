@@ -1,0 +1,301 @@
+//! What devlab's watcher did, inside the daemon (#18): an owner's leases are freed the moment
+//! the owner exits, watched through a pidfd rather than polled; a ready emulator no lease holds
+//! is stopped after `emulatorIdleMin`, and a stack devlab started on a slot no lease holds after
+//! `stackIdleMin`. A stack started outside devlab is never stopped. The machine config is read
+//! again on each look, so a changed timer counts from the next one.
+
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use factory_adapters::adb::{Adb, AdbCli};
+use factory_adapters::emulator::{Emulators, SystemdEmulators};
+use factory_core::lab::devices::Attached;
+use factory_core::lab::emulator::{State, unit_name};
+use factory_core::lab::idle::{self, IdleEmulator, IdleSlot, Timers};
+use factory_core::lab::js_number;
+use factory_core::lab::slots::slot_project_id;
+use rustix::event::{PollFd, PollFlags, poll};
+use rustix::io::Errno;
+use rustix::process::{Pid, PidfdFlags, pidfd_open};
+
+use super::super::{context, host, lease, stack};
+use super::{Lab, Lease, store};
+use crate::lab::wire::SlotRow;
+
+/// The longest the keeper goes without a look: a changed config is read by then.
+const LOOK: Duration = Duration::from_secs(60);
+
+/// What the keeper has claimed to stop, so no grant hands it out until it is stopped.
+#[derive(Debug, Default, Clone)]
+pub struct Stopping {
+    /// Emulators, by index.
+    pub emulators: BTreeSet<u32>,
+    /// Slots whose stack is stopping, by project and slot.
+    pub slots: BTreeSet<(String, u32)>,
+}
+
+/// The lock, whether or not a thread panicked while it held it.
+pub fn held<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Lab {
+    /// Starts the keeper: a watch on the owner of each lease in the store, and the idle loop.
+    pub fn keep(self: &Arc<Self>) {
+        if let Ok(leases) = self.write(|c, _| store::leases(c)) {
+            for lease in &leases {
+                self.watch_owner(lease);
+            }
+        }
+        tokio::spawn(idle_loop(Arc::clone(self)));
+    }
+
+    /// Watches the owner of `lease`, once per owner: when it exits, its leases are dropped.
+    pub(super) fn watch_owner(self: &Arc<Self>, lease: &Lease) {
+        let key = lease.owner_key();
+        if !held(&self.watched).insert(key.clone()) {
+            return;
+        }
+        let lab = Arc::clone(self);
+        let (pid, start) = (lease.owner_pid, lease.owner_start.clone());
+        beside("lab-owner", move || {
+            let exited = owner_exit(pid, &start);
+            held(&lab.watched).remove(&key);
+            if exited {
+                let _ = lab.write(|_, _| Ok(()));
+            }
+        });
+    }
+
+    /// One look: claims and starts stopping what idled long enough, and says when the next thing
+    /// falls due.
+    fn look(self: &Arc<Self>) -> Result<Option<f64>, String> {
+        let cfg = context::machine_config().map_err(|f| f.message)?;
+        let timers = Timers::from_minutes(cfg.emulator_idle_min, cfg.stack_idle_min);
+        let now = now_f64();
+        let claimed = self
+            .write(|c, _| {
+                let taken = store::taken(c)?;
+                let leases = store::leases(c)?;
+                let mut stopping = held(&self.stopping);
+                let emulators: Vec<store::EmulatorRow> = store::emulators(c)?
+                    .into_iter()
+                    .filter(|e| !stopping.emulators.contains(&e.idx))
+                    .collect();
+                let slots: Vec<SlotRow> = store::slots(c)?
+                    .into_iter()
+                    .filter(|s| !stopping.slots.contains(&(s.project.clone(), s.slot)))
+                    .collect();
+                let emulator_views: Vec<IdleEmulator> = emulators
+                    .iter()
+                    .map(|e| IdleEmulator {
+                        idx: e.idx,
+                        ready: State::from_word(&e.state) == State::Ready,
+                        held: taken.contains(&e.serial),
+                        idle_since: e.idle_since,
+                    })
+                    .collect();
+                let slot_views: Vec<IdleSlot> = slots
+                    .iter()
+                    .map(|s| IdleSlot {
+                        project: s.project.clone(),
+                        slot: s.slot,
+                        stack_ours: s.stack_ours,
+                        held: leases.iter().any(|l| {
+                            l.project.as_deref() == Some(s.project.as_str())
+                                && l.slot == Some(s.slot)
+                        }),
+                        last_worktree: s.last_worktree.clone(),
+                        idle_since: s.idle_since,
+                    })
+                    .collect();
+                let due = idle::sweep(&emulator_views, &slot_views, timers, now);
+                let emulators: Vec<store::EmulatorRow> = emulators
+                    .into_iter()
+                    .filter(|e| due.emulators.contains(&e.idx))
+                    .collect();
+                let slots: Vec<SlotRow> = slots
+                    .into_iter()
+                    .filter(|s| due.stacks.contains(&(s.project.clone(), s.slot)))
+                    .collect();
+                stopping.emulators.extend(emulators.iter().map(|e| e.idx));
+                stopping
+                    .slots
+                    .extend(slots.iter().map(|s| (s.project.clone(), s.slot)));
+                Ok((emulators, slots, due.next))
+            })
+            .map_err(|e| e.message)?;
+        let (emulators, slots, next) = claimed;
+        for row in emulators {
+            let lab = Arc::clone(self);
+            let minutes = js_number(cfg.emulator_idle_min);
+            beside("lab-idle-emulator", move || {
+                lab.stop_emulator(&row, &minutes)
+            });
+        }
+        for row in slots {
+            let lab = Arc::clone(self);
+            let minutes = js_number(cfg.stack_idle_min);
+            beside("lab-idle-stack", move || lab.stop_stack(&row, &minutes));
+        }
+        Ok(next)
+    }
+
+    /// Stops a claimed emulator and forgets it.
+    fn stop_emulator(&self, row: &store::EmulatorRow, minutes: &str) {
+        SystemdEmulators.stop(&unit_name(row.idx), &row.serial, &AdbCli);
+        let _ = self.write(|c, _| store::delete_emulator(c, row.idx, "ready"));
+        held(&self.stopping).emulators.remove(&row.idx);
+        self.notify();
+        eprintln!(
+            "factory: lab: stopped emulator {}, idle for {minutes} min",
+            row.serial
+        );
+    }
+
+    /// Stops a claimed slot's stack with the config of the worktree it last ran, and stops
+    /// counting it as devlab's whether or not that worked, as the watcher did.
+    fn stop_stack(&self, row: &SlotRow, minutes: &str) {
+        let worktree = row.last_worktree.clone().unwrap_or_default();
+        let stopped = match context::project_config(&worktree) {
+            Ok(Some(p)) => {
+                let project_id = match stack::info(&p, &worktree, row.slot) {
+                    Ok(Some(info)) => info.project_id,
+                    _ => slot_project_id(&row.project, row.slot),
+                };
+                stack::down(&p, &project_id, &worktree).map_err(|f| f.message)
+            }
+            Ok(None) => Err(format!("{worktree}/devlab.json is gone")),
+            Err(f) => Err(f.message),
+        };
+        let _ = self.write(|c, _| store::set_stack_ours(c, &row.project, row.slot, false));
+        held(&self.stopping)
+            .slots
+            .remove(&(row.project.clone(), row.slot));
+        self.notify();
+        match stopped {
+            Ok(()) => eprintln!(
+                "factory: lab: stopped the stack of {} slot {}, idle for {minutes} min",
+                row.project, row.slot
+            ),
+            Err(why) => eprintln!(
+                "factory: lab: cannot stop the idle stack of {} slot {}: {why}",
+                row.project, row.slot
+            ),
+        }
+    }
+}
+
+/// Looks, then waits for the next thing to fall due, a change to the board, or [`LOOK`].
+async fn idle_loop(lab: Arc<Lab>) {
+    let mut said = String::new();
+    loop {
+        let mut changed = lab.changed.subscribe();
+        let looker = Arc::clone(&lab);
+        let looked = tokio::task::spawn_blocking(move || looker.look())
+            .await
+            .unwrap_or_else(|e| Err(format!("the idle look failed: {e}")));
+        let next = match looked {
+            Ok(next) => {
+                said.clear();
+                next
+            }
+            Err(why) => {
+                if why != said {
+                    eprintln!("factory: lab: idle emulators and stacks are left running: {why}");
+                    said = why;
+                }
+                None
+            }
+        };
+        let wait = next.map_or(LOOK, |at| {
+            Duration::try_from_secs_f64(at - now_f64())
+                .unwrap_or(Duration::ZERO)
+                .min(LOOK)
+        });
+        tokio::select! {
+            _ = changed.changed() => {}
+            () = tokio::time::sleep(wait) => {}
+        }
+    }
+}
+
+/// Waits until the process (pid, start) exits, on a pidfd: true then, false when it can't be
+/// watched, and the gc of every write is left to free its leases.
+fn owner_exit(pid: i64, start: &str) -> bool {
+    let Some(raw) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
+        return true;
+    };
+    let fd = match pidfd_open(raw, PidfdFlags::empty()) {
+        Ok(fd) => fd,
+        Err(e) => return e == Errno::SRCH,
+    };
+    // Opened after the lease was granted: by now the pid may name another process.
+    if !host::alive(pid, start) {
+        return true;
+    }
+    // A pidfd reads as ready once the process exits, before its parent reaps it.
+    let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+    loop {
+        match poll(&mut fds, None) {
+            Ok(_) => return true,
+            Err(Errno::INTR) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Takes back the reverses dropped leases' devices were given, beside the caller.
+pub fn take_back_reverses_beside(attached: Option<Vec<Attached>>, leases: Vec<Lease>) {
+    if leases.iter().all(|l| l.devices.is_empty()) {
+        return;
+    }
+    beside("lab-unreverse", move || {
+        take_back_reverses(attached.as_deref(), &leases);
+    });
+}
+
+/// Takes back the reverses of each lease's project on its devices that adb lists as usable
+/// (all of them before adb's first list), as devlab's release did.
+pub fn take_back_reverses(attached: Option<&[Attached]>, leases: &[Lease]) {
+    for lease in leases.iter().filter(|l| !l.devices.is_empty()) {
+        let Ok(Some(p)) = context::project_config(&lease.worktree) else {
+            continue;
+        };
+        if p.reverse.is_empty() {
+            continue;
+        }
+        let env = lease::lease_env(lease, Some(&p)).unwrap_or_default();
+        let ports: Vec<u32> = lease::reverse_ports(&p, &env)
+            .into_iter()
+            .map(|(on_device, _)| on_device)
+            .filter(|port| *port > 0)
+            .collect();
+        for d in &lease.devices {
+            let usable = attached.is_none_or(|list| {
+                list.iter()
+                    .any(|a| a.serial == d.serial && a.state == "device")
+            });
+            if usable {
+                for port in &ports {
+                    AdbCli.unreverse(&d.serial, *port);
+                }
+            }
+        }
+    }
+}
+
+/// Runs `work` on a thread of its own, named `name`.
+fn beside(name: &str, work: impl FnOnce() + Send + 'static) {
+    let _ = std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(work);
+}
+
+/// Seconds since the epoch, with their fraction.
+fn now_f64() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}

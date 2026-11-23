@@ -13,6 +13,8 @@ pub struct Proc {
     pub session: i64,
     /// Field 22, the start time in clock ticks since boot: with the pid, it names one process.
     pub start: String,
+    /// It exited and waits for its parent to reap it (state `Z`, or `X` on its way out).
+    pub exited: bool,
 }
 
 pub fn proc(pid: i64) -> Option<Proc> {
@@ -31,12 +33,14 @@ pub fn proc(pid: i64) -> Option<Proc> {
         ppid: rest.get(1)?.parse().ok()?,
         session: rest.get(3)?.parse().ok()?,
         start: (*rest.get(19)?).to_owned(),
+        exited: matches!(*rest.first()?, "Z" | "X"),
     })
 }
 
-/// The process recorded as (pid, start) still runs: its pid wasn't reused.
+/// The process recorded as (pid, start) still runs: its pid wasn't reused, and it isn't a
+/// zombie its parent has yet to reap.
 pub fn alive(pid: i64, start: &str) -> bool {
-    proc(pid).is_some_and(|p| p.start == start)
+    proc(pid).is_some_and(|p| p.start == start && !p.exited)
 }
 
 /// `MemAvailable` in MB; 0 when it can't be read.

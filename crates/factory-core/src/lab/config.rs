@@ -41,6 +41,10 @@ pub struct MachineConfig {
     pub prep_stay_awake: bool,
     /// Turn animations off, for steadier UI tests.
     pub prep_animations_off: bool,
+    /// Minutes a ready emulator no lease holds runs before it is stopped.
+    pub emulator_idle_min: f64,
+    /// Minutes a stack devlab started runs with no lease on its slot before it is stopped.
+    pub stack_idle_min: f64,
 }
 
 impl Default for MachineConfig {
@@ -59,6 +63,8 @@ impl Default for MachineConfig {
             emulator_ram_mb: 3072,
             prep_stay_awake: true,
             prep_animations_off: true,
+            emulator_idle_min: 10.0,
+            stack_idle_min: 45.0,
         }
     }
 }
@@ -111,6 +117,16 @@ pub fn machine_config(file: &str, text: &str) -> Result<MachineConfig, ConfigErr
         cfg.wait_sec = v.as_f64().filter(|n| *n >= 0.0).ok_or_else(|| {
             ConfigError(format!("{file}: \"waitSec\" must be a number of seconds"))
         })?;
+    }
+    for (key, at) in [
+        ("emulatorIdleMin", &mut cfg.emulator_idle_min),
+        ("stackIdleMin", &mut cfg.stack_idle_min),
+    ] {
+        if let Some(v) = raw.get(key) {
+            *at = v.as_f64().filter(|n| *n >= 0.0).ok_or_else(|| {
+                ConfigError(format!("{file}: \"{key}\" must be a number of minutes"))
+            })?;
+        }
     }
     for (key, at) in [
         ("stackRamMB", &mut cfg.stack_ram_mb),
@@ -450,6 +466,20 @@ mod tests {
             machine_config("m", r#"{"maxEmulators":"two"}"#),
             Err(ConfigError(
                 "m: \"maxEmulators\" must be a whole number".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn the_idle_timers_are_minutes_from_the_config_defaulting_to_ten_and_forty_five() {
+        let cfg = machine_config("m", "{}").unwrap();
+        assert_eq!((cfg.emulator_idle_min, cfg.stack_idle_min), (10.0, 45.0));
+        let cfg = machine_config("m", r#"{"emulatorIdleMin":0.5,"stackIdleMin":90}"#).unwrap();
+        assert_eq!((cfg.emulator_idle_min, cfg.stack_idle_min), (0.5, 90.0));
+        assert_eq!(
+            machine_config("m", r#"{"stackIdleMin":-1}"#),
+            Err(ConfigError(
+                "m: \"stackIdleMin\" must be a number of minutes".to_owned()
             ))
         );
     }

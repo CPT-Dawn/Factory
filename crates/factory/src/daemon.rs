@@ -131,6 +131,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
         tokio::spawn(Arc::clone(&leads).start());
         let lab = Arc::new(lab);
         lab.recover();
+        lab.keep();
         let daemon = Daemon {
             ledger,
             leads,
