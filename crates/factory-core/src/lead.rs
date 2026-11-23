@@ -5,11 +5,41 @@
 //! lead answers.
 
 use std::fmt;
+use std::time::Duration;
 
 use crate::exit::Exit;
 
 /// The prefix of every lead's herdr agent name.
 pub const PREFIX: &str = "lead-";
+
+/// How long herdr waits for Claude to come up in a lead's pane.
+pub const START_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long Claude has to settle once the folder-trust dialog is answered.
+pub const TRUST_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long Claude has to start working once the prompt is typed.
+pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long Claude has to start working once an enter submits a prompt that was left typed.
+pub const SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the trust dialog's selection takes to move before enter confirms it.
+pub const KEY_PAUSE: Duration = Duration::from_millis(300);
+/// How many times a stalled prompt is pressed or typed again.
+pub const TRIES: u32 = 5;
+/// What herdr's adapter adds to each call's own wait: 5 s to connect and 5 s to answer.
+const CALL_SLACK: Duration = Duration::from_secs(10);
+
+/// The longest a spawn can take with `pause` between its tries at a stalled prompt: every
+/// herdr call at its limit, down the slowest path (the trust dialog, then every try typed
+/// again), so a caller that waits this long always hears how the spawn ended.
+pub fn spawn_longest(pause: Duration) -> Duration {
+    let worktree = CALL_SLACK;
+    let start = START_TIMEOUT + CALL_SLACK;
+    // The screen read, down, enter and the wait for Claude to settle.
+    let trust = CALL_SLACK * 4 + KEY_PAUSE + TRUST_TIMEOUT;
+    let prompt = PROMPT_TIMEOUT + CALL_SLACK;
+    // The screen read, then the prompt typed again: slower than an enter and its short wait.
+    let try_again = pause + CALL_SLACK * 2 + PROMPT_TIMEOUT;
+    worktree + start + trust + prompt + try_again * TRIES
+}
 
 /// What herdr reports about an agent: herdr's `AgentStatus`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +168,43 @@ pub fn lead_name(arg: &str) -> Result<String, BadLeadName> {
     } else {
         Err(BadLeadName(arg.to_owned()))
     }
+}
+
+/// The integration branch a lead's worktree is cut on.
+pub fn branch(slug: &str) -> String {
+    format!("factory/{slug}")
+}
+
+/// What a freshly started lead is told: run `skill` on `spec`, unattended, and leave the final
+/// report at `report`.
+pub fn prompt(skill: &str, spec: &str, branch: &str, report: &str) -> String {
+    format!(
+        "/{skill} {spec}. Integration branch: {branch}, already checked out here. \
+         You run unattended: wherever a skill says to ask or confirm with the user, decide from \
+         the spec and tickets yourself and list each such decision in your report. When everything \
+         is finished, run devlab release (a finished lead must not hold a stack slot or a phone), \
+         then write your final report to {report}."
+    )
+}
+
+/// The arguments Claude starts with: its model and effort, and a settings override that turns
+/// each of `disabled_plugins` (`name@marketplace`) off, so their skills stay out of every request.
+pub fn claude_args(model: &str, effort: &str, disabled_plugins: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "--model".to_owned(),
+        model.to_owned(),
+        "--effort".to_owned(),
+        effort.to_owned(),
+    ];
+    if !disabled_plugins.is_empty() {
+        let enabled: serde_json::Map<String, serde_json::Value> = disabled_plugins
+            .iter()
+            .map(|plugin| (plugin.clone(), serde_json::Value::Bool(false)))
+            .collect();
+        args.push("--settings".to_owned());
+        args.push(serde_json::json!({ "enabledPlugins": enabled }).to_string());
+    }
+    args
 }
 
 /// The slug of a lead's agent name.

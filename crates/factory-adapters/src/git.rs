@@ -38,6 +38,8 @@ pub trait Repo {
     fn diff_stat(&self, base: &str) -> Result<String, GitError>;
     /// The commits of `base..HEAD`, newest first: short sha, subject and body.
     fn commits(&self, base: &str) -> Result<String, GitError>;
+    /// Whether a local branch called `branch` exists.
+    fn branch_exists(&self, branch: &str) -> Result<bool, GitError>;
     /// The top of the working tree.
     fn toplevel(&self) -> Result<PathBuf, GitError>;
     /// The git dir of this worktree, where the implementer leaves its evidence.
@@ -156,6 +158,22 @@ impl Repo for GitRepo {
             "--format=%h %s%n%n%b",
             &format!("{base}..HEAD"),
         ])
+    }
+
+    fn branch_exists(&self, branch: &str) -> Result<bool, GitError> {
+        let args = [
+            "rev-parse",
+            "-q",
+            "--verify",
+            &format!("refs/heads/{branch}"),
+        ];
+        let output = self.output(&args)?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            // `--verify -q` exits 1, silently, for a ref that doesn't exist.
+            Some(1) => Ok(false),
+            _ => Err(failed(&args, &output)),
+        }
     }
 
     fn toplevel(&self) -> Result<PathBuf, GitError> {
@@ -326,6 +344,8 @@ pub struct FakeRepo {
     pub diff: String,
     pub diff_stat: String,
     pub commits: String,
+    /// The local branches that exist.
+    pub branches: Vec<String>,
     pub toplevel: PathBuf,
     pub git_dir: PathBuf,
     pub staged_diff: String,
@@ -355,6 +375,10 @@ impl Repo for FakeRepo {
 
     fn commits(&self, _base: &str) -> Result<String, GitError> {
         Ok(self.commits.clone())
+    }
+
+    fn branch_exists(&self, branch: &str) -> Result<bool, GitError> {
+        Ok(self.branches.iter().any(|known| known == branch))
     }
 
     fn toplevel(&self) -> Result<PathBuf, GitError> {

@@ -35,7 +35,7 @@ use super::wire::{
     RUN_START, ReleaseParams, RunAsk, RunEnd, SLOT, STATUS, STOPPING, SlotParams, StopParams,
     Waiter,
 };
-use crate::daemon::Ledger;
+use crate::ledger::Ledger;
 use crate::protocol::{ErrorBody, Outcome, Request, Response};
 
 /// How often a waiting acquire looks again without a change to the board: an owner that exited

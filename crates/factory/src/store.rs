@@ -1,5 +1,6 @@
 //! The daemon's SQLite database, `<state>/factory.db`, in WAL mode: what a daemon restart must
-//! not lose. Today that is each review backend's quota.
+//! not lose: each review backend's quota, and the leads spawned whose end is not yet in the
+//! ledger.
 
 use std::path::Path;
 
@@ -42,10 +43,43 @@ impl Store {
                  state TEXT NOT NULL CHECK (state IN ('available', 'cooling')),
                  until_ms INTEGER
              );
+             CREATE TABLE IF NOT EXISTS lead (
+                 name TEXT PRIMARY KEY,
+                 repo TEXT NOT NULL,
+                 report TEXT NOT NULL,
+                 ended INTEGER NOT NULL DEFAULT 0
+             );
              PRAGMA user_version = 1;",
         )
         .map_err(cannot)?;
         Ok(Store { db })
+    }
+
+    /// Records that the lead `name` was spawned in `repo` and will leave its final report at
+    /// `report`; its end is not in the ledger yet.
+    pub fn lead_started(&self, name: &str, repo: &str, report: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO lead (name, repo, report, ended) VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT (name) DO UPDATE SET repo = ?2, report = ?3, ended = 0",
+            params![name, repo, report],
+        )?;
+        Ok(())
+    }
+
+    /// Records that the end of the lead `name` is in the ledger.
+    pub fn lead_ended(&self, name: &str) -> rusqlite::Result<()> {
+        self.db
+            .execute("UPDATE lead SET ended = 1 WHERE name = ?1", params![name])?;
+        Ok(())
+    }
+
+    /// The leads spawned whose end is not in the ledger yet, as (name, repo, report).
+    pub fn leads_running(&self) -> rusqlite::Result<Vec<(String, String, String)>> {
+        let mut rows = self
+            .db
+            .prepare("SELECT name, repo, report FROM lead WHERE ended = 0 ORDER BY name")?;
+        rows.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect()
     }
 
     /// Every backend's recorded quota; one never recorded is unknown.
