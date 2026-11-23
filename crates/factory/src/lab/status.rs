@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use factory_adapters::systemd::{Systemctl, Units};
 use factory_core::lab::ago;
 use factory_core::lab::config::MachineConfig;
+use factory_core::lab::devices::{DeviceRow, device_line};
 use factory_core::lab::queue::{Holding, held_by, owner_slot_counts, waiter_capped};
 use factory_core::lab::slots::slot_project_id;
 use serde::Serialize;
@@ -13,7 +14,7 @@ use super::context::{self, project_config};
 use super::host::mem_available_mb;
 use super::lease::base_name;
 use super::stack;
-use super::wire::{Board, Lease, STATUS};
+use super::wire::{Board, DeviceLine, Lease, STATUS};
 use crate::client;
 use crate::output::Failure;
 use crate::paths::Paths;
@@ -21,8 +22,7 @@ use crate::paths::Paths;
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Report {
-    /// Phones and emulators come with #16.
-    devices: Vec<()>,
+    devices: Vec<DeviceLine>,
     slots: Vec<SlotLine>,
     owners: Vec<OwnerLine>,
     waiting: Vec<String>,
@@ -50,6 +50,17 @@ struct OwnerLine {
     max_slots: Option<u32>,
 }
 
+/// The devices adb lists as `device`, in the status table's order.
+pub fn ready_serials() -> Result<Vec<String>, Failure> {
+    let board: Board = client::call(&Paths::from_env()?, STATUS, &())?;
+    Ok(board
+        .devices
+        .into_iter()
+        .filter(|d| d.state == "ready")
+        .map(|d| d.serial)
+        .collect())
+}
+
 pub fn render(json: bool) -> Result<String, Failure> {
     let board: Board = client::call(&Paths::from_env()?, STATUS, &())?;
     let cfg = context::machine_config()?;
@@ -58,7 +69,21 @@ pub fn render(json: bool) -> Result<String, Failure> {
         return serde_json::to_string_pretty(&report)
             .map_err(|e| Failure::precondition(format!("cannot write the status: {e}")));
     }
-    let mut out = vec!["devices: none attached".to_owned()];
+    let mut out = Vec::new();
+    if report.devices.is_empty() {
+        out.push("devices: none attached".to_owned());
+    } else {
+        out.push("devices".to_owned());
+        for d in &report.devices {
+            out.push(device_line(&DeviceRow {
+                serial: d.serial.clone(),
+                kind: d.kind.clone(),
+                model: d.model.clone(),
+                state: d.state.clone(),
+                holder: d.holder.clone(),
+            }));
+        }
+    }
     if !report.slots.is_empty() {
         out.push("stack slots".to_owned());
         for s in &report.slots {
@@ -199,7 +224,7 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
         })
         .collect();
     Report {
-        devices: Vec::new(),
+        devices: board.devices.clone(),
         slots,
         owners,
         waiting,
