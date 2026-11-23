@@ -7,7 +7,7 @@
 //! with conditional requests: each read sends back the ETag of the last answer, and GitHub
 //! answers an unchanged pull request or check list with `304 Not Modified`. A read is the pull
 //! request (for its head), then the head's check runs and its commit statuses. While a
-//! listener is attached, a poller still reads every ten minutes, in case the stream stalled.
+//! listener is attached, a poller still reads every two minutes, in case the stream stalled.
 //!
 //! Waits hold the poller; when the last one ends, the poller stops and its listener is killed.
 //!
@@ -37,7 +37,7 @@ use crate::protocol::WaitCiResult;
 /// How many lines of a failed job's log the file keeps.
 const TAIL_LINES: usize = 40;
 /// How often a poller with an attached listener reads anyway.
-const ATTACHED_CHECK: Duration = Duration::from_secs(600);
+const ATTACHED_CHECK: Duration = Duration::from_secs(120);
 /// How many reads in a row may fail before the waits on a pull request fail with them.
 const READ_FAILURES: u32 = 3;
 
@@ -425,10 +425,11 @@ impl<G: PullRequests> Reader<G> {
         })
     }
 
-    /// Writes each failed run's URL and log tail to `<state>/ci/<owner>/<repo>/<number>.md`,
+    /// Writes each failed run's URL and log tail to
+    /// `<state>/ci/<host>/<owner>/<repo>/<number>-<head>.md`,
     /// readable by its owner only: the logs can be a private repo's.
     fn write_failures(&self, head: &str, failed: &[CheckRun]) -> Result<PathBuf, String> {
-        let path = self.paths.ci_failures(&self.pr);
+        let path = self.paths.ci_failures(&self.pr, head);
         let mut text = format!(
             "# {} at {}: {} failed\n",
             self.pr,
@@ -484,11 +485,15 @@ mod private {
         if let Some(dir) = path.parent() {
             DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         }
-        let tmp = path.with_extension("md.tmp");
+        // A fresh staging file, so no mode an old one had carries over.
+        let tmp = path.with_extension(format!("md.{}.tmp", std::process::id()));
+        match fs::remove_file(&tmp) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
         let mut file = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
         file.write_all(text.as_bytes())?;

@@ -62,7 +62,7 @@ fn failed_checks_exit_10_naming_them_and_a_file_with_each_url_and_log_tail() {
 
     let out = sandbox.factory(&["wait", "ci", "12"]);
 
-    let file = sandbox.path("state/factory/ci/acme/shop/12.md");
+    let file = sandbox.path("state/factory/ci/github.com/acme/shop/12-c0ffee123456.md");
     assert_eq!(
         (out.code, out.stdout.as_str(), out.stderr.as_str()),
         (
@@ -454,7 +454,7 @@ fn json_carries_the_whole_answer() {
     assert!(
         answer["file"]
             .as_str()
-            .is_some_and(|f| f.ends_with("ci/acme/shop/12.md")),
+            .is_some_and(|f| f.ends_with("ci/github.com/acme/shop/12-c0ffee123456.md")),
         "{answer}"
     );
 }
@@ -476,8 +476,10 @@ fn commit_statuses_count_as_checks() {
 
     assert_eq!(out.code, 10, "{out:?}");
     assert!(out.stdout.ends_with("; failed: ci/circleci\n"), "{out:?}");
-    let text = fs::read_to_string(sandbox.path("state/factory/ci/acme/shop/12.md"))
-        .expect("read the failures file");
+    let text = fs::read_to_string(
+        sandbox.path("state/factory/ci/github.com/acme/shop/12-c0ffee123456.md"),
+    )
+    .expect("read the failures file");
     assert!(
         text.contains("https://ci.example.com/acme/shop/ci/circleci\n\nNo log here: a commit status keeps it at the URL."),
         "{text}"
@@ -528,8 +530,10 @@ fn a_check_from_another_app_points_at_its_url_for_the_log() {
     let out = sandbox.factory(&["wait", "ci", "12"]);
 
     assert_eq!(out.code, 10, "{out:?}");
-    let text = fs::read_to_string(sandbox.path("state/factory/ci/acme/shop/12.md"))
-        .expect("read the failures file");
+    let text = fs::read_to_string(
+        sandbox.path("state/factory/ci/github.com/acme/shop/12-c0ffee123456.md"),
+    )
+    .expect("read the failures file");
     assert!(
         text.contains("No log here: snyk keeps it at the URL."),
         "{text}"
@@ -564,7 +568,7 @@ fn many_failures_name_as_many_as_fit_and_count_the_rest() {
     assert_eq!(out.code, 10, "{out:?}");
     let line = out.stdout.trim_end();
     assert!(line.chars().count() <= 200, "{line:?}");
-    let file = sandbox.path("state/factory/ci/acme/shop/12.md");
+    let file = sandbox.path("state/factory/ci/github.com/acme/shop/12-c0ffee123456.md");
     assert!(
         line.contains(&format!(
             "; logs in {}; failed: integration-shard-01, ",
@@ -623,5 +627,9 @@ fn a_failures_file_that_cannot_be_written_is_retried_on_the_next_read() {
 
     assert_eq!(out.code, 10, "{out:?}");
     assert!(out.stdout.ends_with("; failed: test\n"), "{out:?}");
-    assert!(sandbox.path("state/factory/ci/acme/shop/12.md").exists());
+    assert!(
+        sandbox
+            .path("state/factory/ci/github.com/acme/shop/12-c0ffee123456.md")
+            .exists()
+    );
 }

@@ -69,13 +69,19 @@ impl Paths {
         self.state.join("factory.db")
     }
 
-    /// The failed checks of a pull request, with their URLs and log tails.
-    pub fn ci_failures(&self, pr: &PullRequest) -> PathBuf {
+    /// The failed checks of a pull request's head, with their URLs and log tails: one file per
+    /// head, so a late read of an old head never overwrites a newer one's.
+    pub fn ci_failures(&self, pr: &PullRequest, head: &str) -> PathBuf {
         self.state
             .join("ci")
+            .join(&pr.host)
             .join(&pr.owner)
             .join(&pr.repo)
-            .join(format!("{}.md", pr.number))
+            .join(format!(
+                "{}-{}.md",
+                pr.number,
+                head.get(..12).unwrap_or(head)
+            ))
     }
 
     pub fn config_file(&self) -> PathBuf {

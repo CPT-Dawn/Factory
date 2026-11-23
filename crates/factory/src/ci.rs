@@ -40,7 +40,8 @@ pub fn wait(pr: &str, timeout: Duration) -> Result<Done, Failure> {
 }
 
 /// `<pr>: <n> passed, <n> failed[, <n> skipped][; logs in <file>; failed: <names>]`, with as
-/// many names as fit the line and a count of the rest, which the file and `--json` list.
+/// many names as fit the line and a count of the rest, which the file and `--json` list. Only a
+/// state dir so deep that its path alone fills the line gets cut.
 fn line(answer: &WaitCiResult) -> String {
     let mut line = format!(
         "{}: {} passed, {} failed",
@@ -63,9 +64,10 @@ fn line(answer: &WaitCiResult) -> String {
             String::new()
         };
         let candidate = format!("{line}; failed: {}{more}", names[..shown].join(", "));
-        if candidate.chars().count() <= LINE_LIMIT || shown == 1 {
+        if candidate.chars().count() <= LINE_LIMIT {
             return candidate;
         }
     }
+    // Not one name fits beside the file, which the line keeps.
     line
 }
