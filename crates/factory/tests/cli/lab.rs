@@ -448,12 +448,9 @@ fn an_emulator_whose_unit_ends_while_it_boots_is_never_ready_and_is_forgotten() 
     // Status shows what adb lists, which drops the emulator once its stream says so.
     let gone = poll_until(|| status(&sandbox, &wt).starts_with("devices: none attached\n"));
     assert!(gone, "{}", status(&sandbox, &wt));
-    // The lease stays, with no device in it.
+    // The lease went with it: nothing is held here.
     let env = owned(&sandbox, &wt, &["env"]);
-    assert_eq!(
-        (env.code, env.stdout.as_str()),
-        (0, "export DEVLAB_LEASE=1\n")
-    );
+    assert_eq!(env.code, 4, "{env:?}");
 }
 
 #[test]
@@ -505,9 +502,62 @@ fn a_pair_whose_emulator_fails_to_boot_gives_back_its_phone_too() {
         status(&sandbox, &wt)
     );
     let env = owned(&sandbox, &wt, &["env"]);
-    assert_eq!(
-        (env.code, env.stdout.as_str()),
-        (0, "export DEVLAB_LEASE=1\n")
+    assert_eq!(env.code, 4, "{env:?}");
+}
+
+#[test]
+fn a_failed_emulator_boot_frees_the_slot_for_the_next_owner() {
+    let (sandbox, world) = lab();
+    let (a, b) = (Agent::start(), Agent::start());
+    let [wa, wb] = ["demo-a", "demo-b"].map(|n| world.worktree(n));
+    world.apply("break systemd-run").unwrap();
+
+    let failed = run(for_owner(
+        &sandbox,
+        &wa,
+        a.pid(),
+        &["acquire", "--emulator"],
+    ));
+    assert_eq!(failed.code, 77, "{failed:?}");
+    world.apply("mend systemd-run").unwrap();
+    let again = run(for_owner(
+        &sandbox,
+        &wb,
+        b.pid(),
+        &["acquire", "--no-device"],
+    ));
+
+    // Both slots of demo are free again: the failed lease took neither.
+    assert!(again.stdout.contains("DEVLAB_SLOT=0"), "{again:?}");
+    let env = run(for_owner(&sandbox, &wa, a.pid(), &["env"]));
+    assert_eq!(env.code, 4, "{env:?}");
+}
+
+#[test]
+fn a_top_up_whose_emulator_fails_to_boot_gives_the_whole_lease_back() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("plain-a");
+    world
+        .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
+        .unwrap();
+    let held = owned(&sandbox, &wt, &["acquire", "--phone", "--quiet"]);
+    assert_eq!(held.code, 0, "{held:?}");
+    world.apply("break systemd-run").unwrap();
+
+    let more = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--devices", "2", "--emulator", "--quiet"],
+    );
+
+    assert_eq!(more.code, 77, "{more:?}");
+    // The phone it already held is free again too.
+    let env = owned(&sandbox, &wt, &["env"]);
+    assert_eq!(env.code, 4, "{env:?}");
+    assert!(
+        status(&sandbox, &wt).contains("Pixel 8        ready        free"),
+        "{}",
+        status(&sandbox, &wt)
     );
 }
 
@@ -676,8 +726,13 @@ fn a_plain_release_mid_stop_leaves_the_slot_held_until_the_stack_is_down() {
 fn an_owner_that_exits_mid_stop_leaves_the_slot_held_until_the_stack_is_down() {
     a_slot_stays_held_while_its_stack_stops(|sandbox, wa, a, _| {
         a.exit();
+        // The daemon frees it the moment a exits, or this gc does: either way it is gone.
         let gc = run(devlab(sandbox, wa, &["gc"]));
-        assert!(gc.stdout.starts_with("released lease 1 "), "{gc:?}");
+        assert_eq!(gc.code, 0, "{gc:?}");
+        assert!(
+            gc.stdout.is_empty() || gc.stdout.starts_with("released lease 1 "),
+            "{gc:?}"
+        );
     });
 }
 
@@ -1094,6 +1149,56 @@ fn factory_lab_is_silent_while_it_waits() {
 }
 
 #[test]
+fn a_wait_of_minus_one_queues_for_the_configured_default_and_other_negatives_are_refused() {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""waitSec": 1"#);
+    let (a, b, c) = (Agent::start(), Agent::start(), Agent::start());
+    let [wa, wb, wc] = ["demo-a", "demo-b", "demo-c"].map(|n| world.worktree(n));
+    for (agent, wt) in [(&a, &wa), (&b, &wb)] {
+        let held = run(for_owner(
+            &sandbox,
+            wt,
+            agent.pid(),
+            &["acquire", "--no-device"],
+        ));
+        assert_eq!(held.code, 0, "{held:?}");
+    }
+
+    let queued = run(for_owner(
+        &sandbox,
+        &wc,
+        c.pid(),
+        &["acquire", "--no-device", "--wait", "-1"],
+    ));
+    let ran = run(for_owner(
+        &sandbox,
+        &wc,
+        c.pid(),
+        &["run", "--no-device", "--wait", "-1", "--", "true"],
+    ));
+    let refused = run(for_owner(
+        &sandbox,
+        &wc,
+        c.pid(),
+        &["acquire", "--no-device", "--wait", "-2"],
+    ));
+
+    for out in [&queued, &ran] {
+        assert_eq!(out.code, 75, "{out:?}");
+        assert!(
+            out.stderr
+                .ends_with("devlab: gave up after 1 s: all 2 stack slots of demo are held\n"),
+            "{out:?}"
+        );
+    }
+    assert_eq!(refused.code, 2, "{refused:?}");
+    assert_eq!(
+        refused.stderr,
+        "devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)\n"
+    );
+}
+
+#[test]
 fn a_queued_request_keeps_its_deadline_across_a_daemon_restart() {
     let (sandbox, world) = lab();
     let (a, b, c) = (Agent::start(), Agent::start(), Agent::start());
@@ -1271,7 +1376,7 @@ fn a_request_its_caller_sends_again_keeps_the_place_it_never_heard_of() {
 }
 
 #[test]
-fn factory_lab_gc_names_a_file_with_the_leases_it_released() {
+fn gc_has_nothing_to_say_of_leases_the_daemon_already_freed() {
     let (sandbox, world) = lab();
     let (mut a, mut b) = (Agent::start(), Agent::start());
     let [wa, wb] = ["demo-a", "demo-b"].map(|n| world.worktree(n));
@@ -1284,9 +1389,44 @@ fn factory_lab_gc_names_a_file_with_the_leases_it_released() {
         ));
         assert_eq!(held.code, 0, "{held:?}");
     }
-    let (pa, pb) = (a.pid(), b.pid());
     a.exit();
     b.exit();
+    let gone = poll_until(|| {
+        [(&wa, &a), (&wb, &b)]
+            .iter()
+            .all(|(wt, agent)| run(for_owner(&sandbox, wt, agent.pid(), &["env"])).code == 4)
+    });
+    assert!(
+        gone,
+        "the daemon never freed the leases of the owners that exited"
+    );
+
+    // The daemon freed them: gc has nothing of its own to say.
+    let gc = native(&sandbox, &wa, std::process::id(), &["lab", "gc"]);
+    assert_eq!(one_line(&gc), "no lease of an exited owner");
+    let plain = run(devlab(&sandbox, &wa, &["gc"]));
+    assert_eq!((plain.code, plain.stdout.as_str()), (0, ""), "{plain:?}");
+}
+
+/// A lead that reserved a slot and exited: the keeper watches leases' owners, not reservations',
+/// so only a write that finds the reservation frees it, and a `gc` that is the next call does.
+fn orphaned_reservations(sandbox: &Sandbox, world: &World) -> (PathBuf, Vec<u32>) {
+    let (mut a, mut b) = (Agent::start(), Agent::start());
+    let [wa, wb] = ["demo-a", "demo-b"].map(|n| world.worktree(n));
+    for (agent, wt) in [(&a, &wa), (&b, &wb)] {
+        let reserved = run(for_owner(sandbox, wt, agent.pid(), &["reserve"]));
+        assert_eq!(reserved.code, 0, "{reserved:?}");
+    }
+    let pids = vec![a.pid(), b.pid()];
+    a.exit();
+    b.exit();
+    (wa, pids)
+}
+
+#[test]
+fn gc_names_a_file_with_the_reservations_it_freed_itself() {
+    let (sandbox, world) = lab();
+    let (wa, pids) = orphaned_reservations(&sandbox, &world);
 
     let gc = native(&sandbox, &wa, std::process::id(), &["lab", "gc"]);
 
@@ -1295,12 +1435,36 @@ fn factory_lab_gc_names_a_file_with_the_leases_it_released() {
         line.starts_with("released 2 leases of exited owners; list in "),
         "{line}"
     );
-    assert_eq!(
-        named_file(line),
-        format!(
-            "released lease 1 (sleep:{pa}, owner exited)\nreleased lease 2 (sleep:{pb}, owner exited)\n"
-        )
-    );
+    let freed = named_file(line);
+    for pid in pids {
+        assert!(
+            freed.contains(&format!("(sleep:{pid}, owner exited)")),
+            "{freed}"
+        );
+    }
+    // Said once: the next gc finds nothing.
+    let again = run(devlab(&sandbox, &wa, &["gc"]));
+    assert_eq!((again.code, again.stdout.as_str()), (0, ""), "{again:?}");
+}
+
+#[test]
+fn devlab_gc_says_a_freed_reservation_once() {
+    let (sandbox, world) = lab();
+    let (wa, pids) = orphaned_reservations(&sandbox, &world);
+
+    let gc = run(devlab(&sandbox, &wa, &["gc"]));
+    let again = run(devlab(&sandbox, &wa, &["gc"]));
+
+    assert_eq!(gc.code, 0, "{gc:?}");
+    assert_eq!(gc.stdout.lines().count(), 2, "{gc:?}");
+    for (line, pid) in gc.stdout.lines().zip(&pids) {
+        assert!(
+            line.starts_with("released reservation ")
+                && line.ends_with(&format!("(sleep:{pid}, owner exited)")),
+            "{line}"
+        );
+    }
+    assert_eq!((again.code, again.stdout.as_str()), (0, ""), "{again:?}");
 }
 
 /// Tells the daemon the grant on `stream` reached its caller; its confirmation.
