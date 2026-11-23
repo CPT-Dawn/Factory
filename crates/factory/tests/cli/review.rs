@@ -2,6 +2,8 @@
 
 use std::fs;
 
+use serde_json::Value;
+
 use crate::support::Sandbox;
 
 const CLEAN_REPORT: &str = r#"## Standards
@@ -247,4 +249,239 @@ fn a_spec_gh_cannot_fetch_fails_with_exit_2_before_codex_starts() {
         "{out:?}"
     );
     assert!(sandbox.calls("codex").is_empty());
+}
+
+#[test]
+fn a_timeout_kills_the_reviewers_whole_process_group_and_exits_124() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    let child_pid = sandbox.path("child.pid");
+    sandbox.fake(
+        "codex",
+        &format!("sleep 300 &\necho $! > '{}'\nwait", child_pid.display()),
+    );
+
+    let out = sandbox.factory_in(&repo, &["review", "--timeout", "1", "main", "t1-r1"]);
+
+    assert_eq!(out.code, 124, "{out:?}");
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
+    assert!(
+        out.stderr.starts_with("factory: codex timed out after 1s"),
+        "{out:?}"
+    );
+    let pid = fs::read_to_string(&child_pid).unwrap();
+    let proc = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
+    assert!(
+        eventually(|| !is_alive(&proc)),
+        "the fake reviewer's child {} outlived the timeout",
+        pid.trim()
+    );
+}
+
+/// A process is alive while its /proc entry exists and it isn't a zombie waiting to be reaped.
+fn is_alive(proc: &std::path::Path) -> bool {
+    fs::read_to_string(proc.join("stat")).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+    })
+}
+
+/// Whether `done` holds within a few seconds, checked as it changes.
+fn eventually(done: impl Fn() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::yield_now();
+    }
+    done()
+}
+
+#[test]
+fn each_run_logs_one_review_event_with_backend_model_round_outcome_and_counts() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    fs::create_dir(sandbox.path("home/.codex")).unwrap();
+    fs::write(
+        sandbox.path("home/.codex/config.toml"),
+        "model = \"gpt-test\"\nmodel_reasoning_effort = \"medium\"\n\n[profiles.x]\nmodel = \"other\"\n",
+    )
+    .unwrap();
+    sandbox.fake("codex", &codex_writes(FINDINGS_REPORT));
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1-r1"]);
+
+    assert_eq!(out.code, 10, "{out:?}");
+    let lines = sandbox.ledger_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let event: Value = serde_json::from_str(&lines[0]).unwrap();
+    let reviews = sandbox.reviews();
+    for (key, expected) in [
+        ("type", Value::from("review")),
+        ("repo", Value::from("repo")),
+        ("label", Value::from("t1-r1")),
+        ("round", Value::from(1)),
+        ("base", Value::from("main")),
+        ("outcome", Value::from("ok")),
+        ("verdict", Value::from("findings")),
+        ("backend", Value::from("codex")),
+        ("reviewer", Value::from("codex")),
+        ("model", Value::from("gpt-test")),
+        ("effort", Value::from("medium")),
+        ("blocking", Value::from(2)),
+        ("advisory", Value::from(1)),
+        ("question", Value::from(1)),
+        ("standards_hard", Value::from(1)),
+        (
+            "tags",
+            Value::from("partial-requirement,mysterious-name,spec-conflict,missing-test"),
+        ),
+        (
+            "report",
+            Value::from(reviews.join("t1-r1.md").to_str().unwrap()),
+        ),
+        (
+            "stream",
+            Value::from(reviews.join("t1-r1.jsonl").to_str().unwrap()),
+        ),
+    ] {
+        assert_eq!(event[key], expected, "{key} in {event}");
+    }
+    assert!(event["duration_s"].is_u64(), "{event}");
+}
+
+#[test]
+fn a_failed_run_logs_its_event_with_outcome_error_and_the_reason() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake("codex", "echo 'stream so far'; exit 1");
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1-r2", "none"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
+    assert!(
+        out.stderr.starts_with("factory: codex exited 1; see "),
+        "{out:?}"
+    );
+    let lines = sandbox.ledger_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let event: Value = serde_json::from_str(&lines[0]).unwrap();
+    assert_eq!(event["outcome"], "error", "{event}");
+    assert_eq!(event["round"], 2, "{event}");
+    assert!(
+        event["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("codex exited 1"),
+        "{event}"
+    );
+    assert_eq!(event.get("verdict"), None, "{event}");
+    let stream = fs::read_to_string(sandbox.reviews().join("t1-r2.jsonl")).unwrap();
+    assert_eq!(stream, "stream so far\n");
+}
+
+#[test]
+fn the_findings_ledger_is_kept_as_json_beside_the_report_and_json_output_names_it() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake("codex", &codex_writes(FINDINGS_REPORT));
+
+    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1-r1"]);
+
+    assert_eq!(out.code, 10, "{out:?}");
+    let reviews = sandbox.reviews();
+    let shown: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(out.stdout.lines().count(), 1, "{out:?}");
+    assert_eq!(shown["verdict"], "findings");
+    assert_eq!(shown["blocking"], 2);
+    assert_eq!(shown["report"], reviews.join("t1-r1.md").to_str().unwrap());
+    let ledger_path = reviews.join("t1-r1.findings.json");
+    assert_eq!(shown["findings"], ledger_path.to_str().unwrap());
+    let ledger: Value = serde_json::from_str(&fs::read_to_string(&ledger_path).unwrap()).unwrap();
+    assert_eq!(ledger["label"], "t1-r1");
+    assert_eq!(ledger["round"], 1);
+    assert_eq!(ledger["backend"], "codex");
+    assert_eq!(ledger["verdict"], "findings");
+    let findings = ledger["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 4, "{ledger}");
+    assert_eq!(
+        findings[3],
+        serde_json::json!({"severity": "blocking", "axis": "standards", "tag": "missing-test",
+            "location": "a.txt:1", "summary": "nothing tests a"})
+    );
+    let report = fs::read_to_string(reviews.join("t1-r1.md")).unwrap();
+    assert!(report.contains("FINDINGS: standards_hard=1"), "{report}");
+    assert!(report.ends_with("VERDICT: findings\n"), "{report}");
+    for kept in ["bundle.md", "prompt", "jsonl"] {
+        assert!(reviews.join(format!("t1-r1.{kept}")).is_file(), "{kept}");
+    }
+}
+
+#[test]
+fn a_report_without_a_ledger_is_read_by_its_findings_and_verdict_lines() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake(
+        "codex",
+        &codex_writes(
+            "Prose only.\n\nFINDINGS: standards_hard=1 standards_judgement=2 spec_findings=1 spec_advisory=0 questions=1 tags=missing-test\nVERDICT: findings\n",
+        ),
+    );
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 10, "{out:?}");
+    let report = sandbox.reviews().join("t1.md");
+    assert_eq!(
+        out.stdout_lines(),
+        [
+            format!(
+                "review t1: findings (2 blocking, 2 advisory, 1 question) → {}",
+                report.display()
+            ),
+            format!(
+                "the report has no findings ledger: read its blocking findings in {}",
+                report.display()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_report_with_neither_ledger_nor_verdict_fails_with_exit_3_naming_it() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake("codex", &codex_writes("I looked around.\n"));
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
+    assert!(
+        out.stderr
+            .starts_with("factory: the report has no findings ledger and no VERDICT line: "),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_rerun_under_the_same_label_does_not_read_the_last_runs_report() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+    assert_eq!(sandbox.factory_in(&repo, &["review", "main", "t1"]).code, 0);
+    sandbox.fake("codex", "exit 0");
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(
+        out.stderr
+            .starts_with("factory: codex finished without a report ("),
+        "{out:?}"
+    );
+    assert!(!sandbox.reviews().join("t1.findings.json").exists());
 }

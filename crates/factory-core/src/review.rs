@@ -198,6 +198,14 @@ pub enum Severity {
 }
 
 impl Severity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Blocking => "blocking",
+            Severity::Advisory => "advisory",
+            Severity::Question => "question",
+        }
+    }
+
     fn parse(word: &str) -> Option<Severity> {
         match word {
             "blocking" => Some(Severity::Blocking),
@@ -227,6 +235,17 @@ impl Finding {
             "- [{}/{}] {}: {}",
             self.axis, self.tag, self.location, self.summary
         )
+    }
+
+    /// The finding as its findings-ledger entry.
+    pub fn to_value(&self) -> Value {
+        serde_json::json!({
+            "severity": self.severity.as_str(),
+            "axis": self.axis,
+            "tag": self.tag,
+            "location": self.location,
+            "summary": self.summary,
+        })
     }
 }
 
@@ -261,6 +280,8 @@ pub struct Reading {
     pub counts: Counts,
     /// The report's findings ledger; none when it holds no readable one.
     pub findings: Option<Vec<Finding>>,
+    /// The `key=value` words of its FINDINGS line, which the review event carries on.
+    pub tallies: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,26 +304,51 @@ impl std::error::Error for ReportError {}
 
 impl Reading {
     /// Reads a report. Its findings ledger, the last fenced `json` block, decides the verdict
-    /// and the counts.
+    /// and the counts; without one, its VERDICT and FINDINGS lines do.
     pub fn of(report: &str) -> Result<Reading, ReportError> {
-        let findings = ledger(report).ok_or(ReportError::NoVerdict)?;
-        let mut counts = Counts::default();
-        for finding in &findings {
-            match finding.severity {
-                Severity::Blocking => counts.blocking += 1,
-                Severity::Advisory => counts.advisory += 1,
-                Severity::Question => counts.question += 1,
+        let tallies = findings_line(report);
+        if let Some(findings) = ledger(report) {
+            let mut counts = Counts::default();
+            for finding in &findings {
+                match finding.severity {
+                    Severity::Blocking => counts.blocking += 1,
+                    Severity::Advisory => counts.advisory += 1,
+                    Severity::Question => counts.question += 1,
+                }
             }
+            let verdict = if counts.blocking == 0 {
+                Verdict::Clean
+            } else {
+                Verdict::Findings
+            };
+            return Ok(Reading {
+                verdict,
+                counts,
+                findings: Some(findings),
+                tallies,
+            });
         }
-        let verdict = if counts.blocking == 0 {
-            Verdict::Clean
-        } else {
-            Verdict::Findings
+        let verdict = verdict_line(report).ok_or(ReportError::NoVerdict)?;
+        let tally = |keys: &[&str]| {
+            keys.iter()
+                .filter_map(|key| {
+                    tallies
+                        .iter()
+                        .find_map(|word| word.strip_prefix(key)?.strip_prefix('='))
+                        .and_then(|n| n.parse::<u64>().ok())
+                })
+                .sum()
+        };
+        let counts = Counts {
+            blocking: tally(&["standards_hard", "spec_findings"]),
+            advisory: tally(&["standards_judgement", "spec_advisory"]),
+            question: tally(&["questions"]),
         };
         Ok(Reading {
             verdict,
             counts,
-            findings: Some(findings),
+            findings: None,
+            tallies,
         })
     }
 
@@ -327,6 +373,101 @@ impl Reading {
             "review {label}: {} ({blocking} blocking, {advisory} advisory, {question} question) → {report}",
             self.verdict
         )
+    }
+}
+
+/// The words after the report's first `FINDINGS:`.
+fn findings_line(report: &str) -> Vec<String> {
+    report
+        .lines()
+        .find_map(|line| line.strip_prefix("FINDINGS:"))
+        .map(|rest| rest.split_whitespace().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// The verdict of the report's last `VERDICT:` line.
+fn verdict_line(report: &str) -> Option<Verdict> {
+    let rest = report
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("VERDICT:"))?;
+    match rest
+        .trim_start()
+        .split(|c: char| !c.is_ascii_lowercase())
+        .next()?
+    {
+        "clean" => Some(Verdict::Clean),
+        "findings" => Some(Verdict::Findings),
+        _ => None,
+    }
+}
+/// One run of a review, as its `review` event in the ledger records it.
+#[derive(Clone, Debug)]
+pub struct Record<'a> {
+    pub repo: &'a str,
+    pub label: &'a str,
+    pub round: u32,
+    pub base: &'a str,
+    pub head: &'a str,
+    pub spec: &'a str,
+    /// The backend that ran the review, logged as `reviewer` too, the name factory-stats reads.
+    pub backend: &'a str,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub duration_s: u64,
+    pub report: &'a str,
+    pub stream: &'a str,
+    /// The run's findings ledger file.
+    pub findings: &'a str,
+    /// What the report says, or why the run failed.
+    pub result: Result<&'a Reading, &'a str>,
+}
+
+impl Record<'_> {
+    /// The event's `key=value` pairs, as `factory log review` takes them: the run, then its
+    /// counts, then the report's FINDINGS words. Empty values are dropped when they are parsed.
+    pub fn pairs(&self) -> Vec<String> {
+        let (outcome, verdict, reason) = match self.result {
+            Ok(reading) => ("ok", reading.verdict.to_string(), ""),
+            Err(reason) => ("error", String::new(), reason),
+        };
+        let mut pairs = vec![
+            format!("repo={}", self.repo),
+            format!("label={}", self.label),
+            format!("round={}", self.round),
+            format!("base={}", self.base),
+            format!("head={}", self.head),
+            format!("spec={}", self.spec),
+            format!("outcome={outcome}"),
+            format!("verdict={verdict}"),
+            format!("reason={reason}"),
+            format!("reviewer={}", self.backend),
+            format!("backend={}", self.backend),
+            format!("duration_s={}", self.duration_s),
+            format!("model={}", self.model.unwrap_or_default()),
+            format!("effort={}", self.effort.unwrap_or_default()),
+            format!("report={}", self.report),
+            format!("stream={}", self.stream),
+        ];
+        if let Ok(reading) = self.result {
+            let Counts {
+                blocking,
+                advisory,
+                question,
+            } = reading.counts;
+            pairs.push(format!("findings={}", self.findings));
+            pairs.push(format!("blocking={blocking}"));
+            pairs.push(format!("advisory={advisory}"));
+            pairs.push(format!("question={question}"));
+            pairs.extend(
+                reading
+                    .tallies
+                    .iter()
+                    .filter(|word| word.contains('='))
+                    .cloned(),
+            );
+        }
+        pairs
     }
 }
 
@@ -359,4 +500,196 @@ fn finding(value: &Value) -> Option<Finding> {
         location: text("location"),
         summary: text("summary"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_is_the_label_suffix_else_1_and_2_for_a_first_label_with_a_previous_report() {
+        for (label, has_previous, round) in [
+            ("t1", false, 1),
+            ("t1", true, 2),
+            ("t1-r1", false, 1),
+            ("t1-r1", true, 2),
+            ("t1-r3", true, 3),
+            ("t1-r12", false, 12),
+            ("t1-r", false, 1),
+            ("t1-rx", false, 1),
+            ("t1-r2b", false, 1),
+        ] {
+            assert_eq!(
+                super::round(label, has_previous),
+                round,
+                "{label} {has_previous}"
+            );
+        }
+    }
+
+    #[test]
+    fn labels_are_letters_digits_underscore_and_dash() {
+        for good in ["t1", "t1-r2", "A_b-9"] {
+            assert_eq!(check_label(good), Ok(()), "{good}");
+        }
+        for bad in ["", "t1/r1", "../x", "t 1", "t1.r1", "é"] {
+            assert_eq!(check_label(bad), Err(BadLabel(bad.to_owned())), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_issue_ref_is_a_number_a_hash_number_or_an_issue_url() {
+        for (spec, number) in [
+            ("12", Some(12)),
+            ("#12", Some(12)),
+            ("https://github.com/o/r/issues/12", Some(12)),
+            ("spec.md", None),
+            ("#", None),
+            ("", None),
+            ("12a", None),
+            ("-12", None),
+            ("https://github.com/o/r/pull/12", None),
+            ("https://github.com/o/r/issues/12/x", None),
+            ("https://github.com//r/issues/12", None),
+            ("https://example.com/o/r/issues/12", None),
+        ] {
+            assert_eq!(issue_number(spec), number, "{spec}");
+        }
+    }
+
+    #[test]
+    fn a_bundle_part_is_fenced_longer_than_any_backtick_run_inside_it() {
+        let mut out = String::new();
+        fenced(&mut out, "Spec", "a ````rust fence\n", "");
+        assert_eq!(out, "\n## Spec\n\n`````\na ````rust fence\n`````\n");
+        let mut out = String::new();
+        fenced(&mut out, "Diff", "no newline", "diff");
+        assert_eq!(out, "\n## Diff\n\n```diff\nno newline\n```\n");
+    }
+
+    #[test]
+    fn the_ledger_decides_the_counts_and_the_verdict() {
+        let report = "x\n```json\n{\"findings\": [\n\
+            {\"severity\": \"advisory\", \"axis\": \"spec\", \"tag\": \"t\", \"location\": \"a:1\", \"summary\": \"s\"},\n\
+            {\"severity\": \"blocking\", \"axis\": \"standards\", \"tag\": \"u\", \"location\": \"b:2\", \"summary\": \"v\"}\n\
+            ]}\n```\nFINDINGS: standards_hard=0 tags=t,u\nVERDICT: clean\n";
+        let reading = Reading::of(report).unwrap();
+        assert_eq!(reading.verdict, Verdict::Findings);
+        assert_eq!(
+            reading.counts,
+            Counts {
+                blocking: 1,
+                advisory: 1,
+                question: 0
+            }
+        );
+        assert_eq!(reading.blocking_lines(), ["- [standards/u] b:2: v"]);
+        assert_eq!(reading.tallies, ["standards_hard=0", "tags=t,u"]);
+        assert_eq!(
+            reading.summary("t1", "r.md"),
+            "review t1: findings (1 blocking, 1 advisory, 0 question) → r.md"
+        );
+    }
+
+    #[test]
+    fn an_empty_ledger_is_clean() {
+        let reading = Reading::of("```json\n{\"findings\": []}\n```\n").unwrap();
+        assert_eq!(reading.verdict, Verdict::Clean);
+        assert_eq!(reading.findings, Some(vec![]));
+    }
+
+    #[test]
+    fn without_a_readable_ledger_the_findings_and_verdict_lines_decide() {
+        for (report, verdict, blocking, advisory, question) in [
+            (
+                "FINDINGS: standards_hard=1 standards_judgement=2 spec_findings=3 spec_advisory=4 questions=5\nVERDICT: findings\n",
+                Verdict::Findings,
+                4,
+                6,
+                5,
+            ),
+            ("VERDICT: clean.\n", Verdict::Clean, 0, 0, 0),
+            (
+                "```json\nnot json\n```\nVERDICT: findings\nVERDICT: clean\n",
+                Verdict::Clean,
+                0,
+                0,
+                0,
+            ),
+        ] {
+            let reading = Reading::of(report).unwrap();
+            assert_eq!(reading.verdict, verdict, "{report}");
+            assert_eq!(
+                reading.counts,
+                Counts {
+                    blocking,
+                    advisory,
+                    question
+                },
+                "{report}"
+            );
+            assert_eq!(reading.findings, None, "{report}");
+        }
+        for report in ["", "prose\n", "VERDICT: maybe\n"] {
+            assert_eq!(Reading::of(report), Err(ReportError::NoVerdict), "{report}");
+        }
+    }
+
+    fn record<'a>(result: Result<&'a Reading, &'a str>) -> Record<'a> {
+        Record {
+            repo: "repo",
+            label: "t1-r1",
+            round: 1,
+            base: "main",
+            head: "abc",
+            spec: "none",
+            backend: "codex",
+            model: Some("m"),
+            effort: None,
+            duration_s: 7,
+            report: "r.md",
+            stream: "r.jsonl",
+            findings: "r.findings.json",
+            result,
+        }
+    }
+
+    #[test]
+    fn an_ok_record_carries_its_counts_and_the_findings_words() {
+        let reading =
+            Reading::of("FINDINGS: standards_hard=1 junk tags=x\nVERDICT: findings\n").unwrap();
+        let pairs = record(Ok(&reading)).pairs();
+        for pair in [
+            "outcome=ok",
+            "verdict=findings",
+            "reason=",
+            "reviewer=codex",
+            "backend=codex",
+            "model=m",
+            "effort=",
+            "duration_s=7",
+            "findings=r.findings.json",
+            "blocking=1",
+            "standards_hard=1",
+            "tags=x",
+        ] {
+            assert!(pairs.iter().any(|p| p == pair), "{pair} in {pairs:?}");
+        }
+        assert!(!pairs.iter().any(|p| p == "junk"), "{pairs:?}");
+    }
+
+    #[test]
+    fn a_failed_record_carries_its_reason_and_no_verdict() {
+        let pairs = record(Err("codex exited 1")).pairs();
+        assert!(pairs.iter().any(|p| p == "outcome=error"), "{pairs:?}");
+        assert!(pairs.iter().any(|p| p == "verdict="), "{pairs:?}");
+        assert!(
+            pairs.iter().any(|p| p == "reason=codex exited 1"),
+            "{pairs:?}"
+        );
+        assert!(
+            !pairs.iter().any(|p| p.starts_with("blocking=")),
+            "{pairs:?}"
+        );
+    }
 }
