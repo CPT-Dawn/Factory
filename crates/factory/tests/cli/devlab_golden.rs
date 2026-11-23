@@ -251,11 +251,11 @@ fn the_replay_reports_a_different_exit_code_and_a_missing_newline() {
 }
 
 #[test]
-fn the_replay_hides_the_sandbox_path_owner_pids_and_free_memory() {
+fn the_replay_hides_the_sandbox_path_owner_pids_free_memory_and_signal_seconds() {
     let dir = tempfile::tempdir().unwrap();
     let devlab = stand_in(
         dir.path(),
-        "pwd; echo \"lease 1 (claude:$DEVLAB_OWNER_PID)\"; echo 'memory 12.3 GB free'; echo '  \"memAvailableMB\": 12617'",
+        "pwd; echo \"lease 1 (claude:$DEVLAB_OWNER_PID)\"; echo 'memory 12.3 GB free'; echo '  \"memAvailableMB\": 12617'; echo 'devlab: sh killed by SIGKILL after 12 s'; echo 'gave up after 3 s'",
     );
     let scenario = fixture(
         dir.path(),
@@ -264,6 +264,8 @@ fn the_replay_hides_the_sandbox_path_owner_pids_and_free_memory() {
          1> lease 1 (claude:<b>)\n\
          1> memory <mem> GB free\n\
          1>   \"memAvailableMB\": <mem>\n\
+         1> devlab: sh killed by SIGKILL after <n> s\n\
+         1> gave up after 3 s\n\
          ? 0\n",
     );
 
@@ -416,6 +418,10 @@ mod transcript {
         slots_owner_cap => "slots-owner-cap.golden",
         slots_queue => "slots-queue.golden",
         slots_release => "slots-release.golden",
+        slots_run_exit => "slots-run-exit.golden",
+        slots_run_killed => "slots-run-killed.golden",
+        slots_run_stopped_queued => "slots-run-stopped-queued.golden",
+        slots_run_stopped_running => "slots-run-stopped-running.golden",
         slots_stack_failure => "slots-stack-failure.golden",
     }
 
