@@ -5,5 +5,6 @@
 
 pub mod event;
 pub mod exit;
+pub mod lab;
 pub mod review;
 pub mod timestamp;
