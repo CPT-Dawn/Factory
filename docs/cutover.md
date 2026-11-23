@@ -53,10 +53,13 @@ When the watcher's unit link went missing after the cutover (by hand, or a `dots
 rollback links it again from the path the marker records before `enable --now`. A marker from
 before #30 records no unit, so a missing unit with such a marker makes the rollback refuse in
 one line, changing nothing: link the unit again with `dots link`, then run
-`factory cutover --rollback` again, or add `--force` to roll back without the unit: devlab and the
-marker are put right, one line names the unit it skipped, and the watcher stays off until you link
-it and enable it.
-`--force` also skips the check that factory lab holds nothing, for a lab that no longer answers. A second rollback says
-`not cut over` and changes nothing.
+`factory cutover --rollback` again.
+`--force` goes on instead when the unit is missing and cannot be linked again (the marker records
+no link, or the link cannot be made, or it dangles so the watcher will not start): devlab and the
+marker are put right, one line names the unit it skipped (`"watcher": "skipped"` and `"skipped"`
+in `--json`), and the watcher stays off until you link the unit and enable it. Where the unit can
+be linked again, `--force` does that as above.
+`--force` also skips the check that factory lab holds nothing, for a factory lab that no longer
+answers. A second rollback says `not cut over` and changes nothing.
 
 Leases held in factory lab's `lab.db` don't carry back: roll back when nothing is leased.

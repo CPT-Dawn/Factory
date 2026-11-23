@@ -612,7 +612,7 @@ fn rollback_force_goes_on_without_the_unit_and_says_it_skipped_it() {
         (
             0,
             format!(
-                "rolled back: {} runs today's devlab again; skipped {}, which is gone\n",
+                "rolled back: {} runs today's devlab again; skipped {}, which is gone or did not start\n",
                 link(&sandbox).display(),
                 watcher_unit(&sandbox).display()
             )
@@ -658,6 +658,25 @@ fn rollback_force_skips_a_recorded_unit_it_cannot_link_again() {
     );
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
     assert_rolled_back_without_watcher(&sandbox);
+}
+
+#[test]
+fn rollback_force_skips_a_unit_that_is_a_dangling_link() {
+    let (sandbox, _world) = machine();
+    cut_over(&sandbox);
+    let unit = watcher_unit(&sandbox);
+    fs::remove_file(&unit).unwrap();
+    symlink(sandbox.path("gone/devlab-watch.service"), &unit).unwrap();
+
+    let out = sandbox.factory(&["cutover", "--rollback", "--force"]);
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    assert!(
+        out.stdout.contains(&format!("skipped {}", unit.display())),
+        "{out:?}"
+    );
+    let answers = old_devlab(&sandbox, &["gc"]);
+    assert_eq!(answers.code, 0, "{answers:?}");
 }
 
 #[test]

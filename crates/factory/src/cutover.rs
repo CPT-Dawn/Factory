@@ -272,14 +272,10 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
         lab_holds_nothing()?;
     }
     let unit_gone = !unit_present(&place)?;
-    // --force goes on without a unit it cannot link again, and says it did.
-    let mut skip_unit = false;
     let link_unit = match &marker.watcher {
         Unit::Link(text) if unit_gone => Some(text),
-        Unit::Unrecorded | Unit::File if unit_gone && force => {
-            skip_unit = true;
-            None
-        }
+        // --force goes on without a unit it cannot link again, and says so.
+        Unit::Unrecorded | Unit::File if unit_gone && force => None,
         Unit::Unrecorded | Unit::File if unit_gone => {
             return Err(Failure::precondition(format!(
                 "{} is gone and {} names no link to put back; link it again (dots link), then run factory cutover --rollback again",
@@ -301,23 +297,26 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
     }
     if let Some(text) = link_unit {
         match link_watcher(&place, text, "cutover --rollback") {
-            Err(_) if force => skip_unit = true,
+            Err(_) if force => {}
             linked => linked?,
         }
     }
     let retire = unit_present(&place)?;
-    // What was done decides what is said: a unit that came back meanwhile is enabled, not skipped.
-    let skipped = skip_unit && !retire;
+    // What is said follows what happened, not what was found first: a unit that came back
+    // meanwhile is enabled, one that went again is skipped.
+    let mut skipped = force && !retire && marker.watcher != Unit::Absent;
     if retire {
-        Systemctl
-            .enable_now(WATCHER)
-            .map_err(systemd_failed("cutover --rollback"))?;
+        match Systemctl.enable_now(WATCHER) {
+            // A unit that is only a dangling link will not start.
+            Err(_) if force => skipped = true,
+            started => started.map_err(systemd_failed("cutover --rollback"))?,
+        }
     }
     remove(&place.marker(), "cutover --rollback")?;
     Ok(Done::new(
         if skipped {
             format!(
-                "rolled back: {} runs today's devlab again; skipped {}, which is gone",
+                "rolled back: {} runs today's devlab again; skipped {}, which is gone or did not start",
                 place.link.display(),
                 place.watcher.display()
             )
@@ -335,7 +334,7 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
         json!({
             "devlab": place.link,
             "restored": marker.devlab,
-            "watcher": if retire { "enabled" } else { "skipped" },
+            "watcher": if skipped { "skipped" } else if retire { "enabled" } else { "not installed" },
             "skipped": skipped.then_some(&place.watcher),
         }),
     ))
