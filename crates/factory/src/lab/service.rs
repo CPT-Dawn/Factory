@@ -16,7 +16,7 @@ use factory_adapters::docker::{Containers, Docker};
 use factory_adapters::emulator::{EmulatorSpec, Emulators, SystemdEmulators};
 use factory_core::exit::Exit;
 use factory_core::lab::devices::{
-    Attached, EmulatorView, HeldBy, Mode, Plan, PlanInput, device_rows, plan_devices,
+    Attached, EmulatorView, Held, HeldBy, Mode, Plan, PlanInput, device_rows, lost, plan_devices,
 };
 use factory_core::lab::emulator::{
     Boot, Settle, State, after_restart, boot_step, booting_note, free_indexes, serial_of, unit_name,
@@ -94,7 +94,7 @@ impl Lab {
             .spawn(move || {
                 for row in orphans {
                     SystemdEmulators.stop(&unit_name(row.idx), &row.serial, &AdbCli);
-                    let _ = lab.write(|c, _| store::delete_emulator(c, row.idx));
+                    let _ = lab.write(|c, _| store::delete_emulator(c, row.idx, "booting"));
                 }
                 lab.notify();
             });
@@ -374,7 +374,7 @@ fn forget_dead_emulators(lab: &Lab, attached: &[Attached]) {
             && state_of(attached, &row.serial) != Some("device")
             && !SystemdEmulators.unit_active(&unit_name(row.idx))
         {
-            let _ = lab.write(|c, _| store::delete_emulator(c, row.idx));
+            let _ = lab.write(|c, _| store::delete_emulator(c, row.idx, "ready"));
         }
     }
 }
@@ -388,6 +388,8 @@ struct Taken {
     boots: Vec<u32>,
     /// The phones just granted, whose ABI is still to be read.
     phones: Vec<String>,
+    /// The idle emulators just granted.
+    reused: Vec<String>,
 }
 
 /// What the request's device ask plans, or why it waits: the held devices adb no longer lists
@@ -438,6 +440,11 @@ fn plan(
             .map(|e| e.serial.clone())
             .collect(),
         emulators_running: count(emus.len()),
+        emulators_booting: count(
+            emus.iter()
+                .filter(|e| State::from_word(&e.state) == State::Booting)
+                .count(),
+        ),
         max_emulators: ask.max_emulators,
         mem_available_mb,
         host_floor_mb: ask.host_floor_mb,
@@ -572,7 +579,7 @@ fn try_grant(
             (Some(project), Some(slot)) => store::claim_slot(c, &project.name, slot, &p.worktree)?,
             _ => None,
         };
-        let (mut boots, mut phones) = (Vec::new(), Vec::new());
+        let (mut boots, mut phones, mut reused) = (Vec::new(), Vec::new(), Vec::new());
         if let (Some(Planned { plan, used }), Some(ask)) = (planned, &p.devices) {
             for serial in &plan.phones {
                 let model = facts
@@ -596,6 +603,7 @@ fn try_grant(
             for serial in &plan.reuse {
                 store::insert_lease_device(c, lease.id, &emulator_device(serial))?;
                 store::emulator_held(c, serial)?;
+                reused.push(serial.clone());
             }
             for idx in free_indexes(&used, plan.boot) {
                 store::insert_emulator(c, idx, &serial_of(idx, ask.port_base))?;
@@ -610,6 +618,7 @@ fn try_grant(
             fresh,
             boots,
             phones,
+            reused,
         }))
     })
 }
@@ -625,9 +634,10 @@ fn emulator_device(serial: &str) -> LeaseDevice {
 }
 
 /// The device work after a grant, none of it in a transaction: the new phones' ABIs, the
-/// emulators to boot (an emulator that won't boot is exit 77, and the lease keeps what it was
-/// granted), then each device readied. Notes go to the caller as it goes. The lease as it is
-/// then, with its devices' states.
+/// emulators to boot, then each device readied. Notes go to the caller as it goes. An emulator
+/// that won't boot is exit 77, and the request gets none of its devices: the lease keeps only
+/// what it held before. A device the lease holds that is gone by the end is exit 76. Else the
+/// lease as it is then, with its devices' states.
 async fn settle<W: AsyncWrite + Unpin>(
     lab: &Arc<Lab>,
     p: &AcquireParams,
@@ -640,7 +650,7 @@ async fn settle<W: AsyncWrite + Unpin>(
         return Ok(taken.granted.lease);
     };
     if !taken.phones.is_empty() {
-        let (lab, phones) = (Arc::clone(lab), taken.phones);
+        let (lab, phones) = (Arc::clone(lab), taken.phones.clone());
         blocking(move || {
             for serial in &phones {
                 let abi = android::abi(&AdbCli, serial);
@@ -653,12 +663,28 @@ async fn settle<W: AsyncWrite + Unpin>(
     if !taken.boots.is_empty() {
         let note = Outcome::Note(booting_note(taken.boots.len()));
         send(writer, Response { id, outcome: note }).await;
-        boot(lab, &ask, lease_id, &taken.boots)
-            .await
-            .map_err(|why| ErrorBody {
+        if let Err(why) = boot(lab, &ask, lease_id, &taken.boots).await {
+            let lab = Arc::clone(lab);
+            let (phones, reused) = (taken.phones.clone(), taken.reused.clone());
+            blocking(move || {
+                lab.write(|c, now| {
+                    for serial in phones.iter().chain(&reused) {
+                        store::delete_lease_device(c, serial)?;
+                    }
+                    for serial in &reused {
+                        store::emulator_idle(c, serial, now)?;
+                    }
+                    Ok(())
+                })?;
+                lab.notify();
+                Ok(())
+            })
+            .await?;
+            return Err(ErrorBody {
                 code: Exit::Emulator.code(),
                 message: why,
-            })?;
+            });
+        }
     }
     let warnings = {
         let lab = Arc::clone(lab);
@@ -686,12 +712,30 @@ async fn settle<W: AsyncWrite + Unpin>(
     }
     let seen = lab.attached().await;
     let lease = lab.write(|c, _| store::lease(c, lease_id))?;
-    Ok(with_states(lease.unwrap_or(taken.granted.lease), &seen))
+    let lease = with_states(lease.unwrap_or(taken.granted.lease), &seen);
+    let held: Vec<Held> = lease
+        .devices
+        .iter()
+        .map(|d| Held {
+            serial: d.serial.clone(),
+            kind: d.kind.clone(),
+            model: d.model.clone(),
+            state: d.state.clone(),
+        })
+        .collect();
+    match lost(&held) {
+        Some(why) => Err(ErrorBody {
+            code: Exit::DeviceLost.code(),
+            message: why,
+        }),
+        None => Ok(lease),
+    }
 }
 
-/// Boots the emulators at `idxs` for lease `lease`: each joins the lease once adb says it
-/// finished booting. One whose unit won't start or ends, or that doesn't boot in time, fails
-/// them all: those still booting are stopped and forgotten, never marked ready.
+/// Boots the emulators at `idxs` for lease `lease`. They stay booting until every one has
+/// finished, then join the lease together. One whose unit won't start or ends, or that doesn't
+/// boot in time, fails them all: those still booting are stopped and forgotten, never marked
+/// ready, and those that finished idle.
 async fn boot(lab: &Arc<Lab>, ask: &DeviceAsk, lease: i64, idxs: &[u32]) -> Result<(), String> {
     let specs: Vec<EmulatorSpec> = idxs.iter().map(|idx| android::spec(*idx, ask)).collect();
     let started = {
@@ -703,14 +747,14 @@ async fn boot(lab: &Arc<Lab>, ask: &DeviceAsk, lease: i64, idxs: &[u32]) -> Resu
             })
         })
         .await
-        .unwrap_or_else(|e| Err(format!("the emulator boot failed in the daemon: {e}")))
+        .unwrap_or_else(|e| Err(daemon_failed(&e)))
     };
     if let Err(why) = started {
         lab.forget(specs).await;
         return Err(why);
     }
     let begun = Instant::now();
-    let mut pending = specs;
+    let (mut pending, mut finished) = (specs, Vec::new());
     loop {
         let mut changed = lab.attached.subscribe();
         let seen = lab.attached().await;
@@ -727,38 +771,35 @@ async fn boot(lab: &Arc<Lab>, ask: &DeviceAsk, lease: i64, idxs: &[u32]) -> Resu
                     .collect::<Vec<Boot>>()
             })
             .await
-            .map_err(|e| format!("the emulator boot failed in the daemon: {e}"))
+            .map_err(|e| daemon_failed(&e))
         };
         let steps = match steps {
             Ok(steps) => steps,
             Err(why) => {
                 lab.forget(pending).await;
+                let _ = lab.hand_over(finished, None).await;
                 return Err(why);
             }
         };
-        if let Some(why) = steps.iter().find_map(|step| match step {
+        let failed = steps.iter().find_map(|step| match step {
             Boot::Failed(why) => Some(why.clone()),
             _ => None,
-        }) {
-            let unready = pending
-                .into_iter()
-                .zip(&steps)
-                .filter(|(_, step)| **step != Boot::Ready)
-                .map(|(spec, _)| spec)
-                .collect();
-            lab.forget(unready).await;
-            return Err(why);
-        }
+        });
         let mut waiting = Vec::new();
         for (spec, step) in pending.into_iter().zip(steps) {
             if step == Boot::Ready {
-                lab.booted(lease, spec).await;
+                finished.push(spec);
             } else {
                 waiting.push(spec);
             }
         }
+        if let Some(why) = failed {
+            lab.forget(waiting).await;
+            let _ = lab.hand_over(finished, None).await;
+            return Err(why);
+        }
         if waiting.is_empty() {
-            return Ok(());
+            return lab.hand_over(finished, Some(lease)).await;
         }
         pending = waiting;
         tokio::select! {
@@ -768,38 +809,75 @@ async fn boot(lab: &Arc<Lab>, ask: &DeviceAsk, lease: i64, idxs: &[u32]) -> Resu
     }
 }
 
+fn daemon_failed(e: &dyn std::fmt::Display) -> String {
+    format!("the emulator boot failed in the daemon ({e}); run devlab acquire again")
+}
+
 impl Lab {
-    /// Marks a booted emulator ready and hands it to the lease, or lets it idle when the lease
-    /// ended while it booted; then unlocks its screen.
-    async fn booted(self: &Arc<Self>, lease: i64, spec: EmulatorSpec) {
+    /// Marks emulators that finished booting ready, all or none, and hands them to lease
+    /// `lease`; with no lease, or when the lease ended while they booted, they idle. Then their
+    /// screens are unlocked. An error when one of them is no longer booting in the store.
+    async fn hand_over(
+        self: &Arc<Self>,
+        specs: Vec<EmulatorSpec>,
+        lease: Option<i64>,
+    ) -> Result<(), String> {
+        if specs.is_empty() {
+            return Ok(());
+        }
         let lab = Arc::clone(self);
-        let _ = blocking(move || {
-            lab.write(|c, now| {
-                store::set_emulator_ready(c, spec.idx)?;
-                if store::lease(c, lease)?.is_some() {
-                    store::insert_lease_device(c, lease, &emulator_device(&spec.serial))?;
-                } else {
-                    c.execute(
-                        "UPDATE emulators SET idle_since = ?1 WHERE idx = ?2",
-                        rusqlite::params![now, spec.idx],
-                    )?;
+        let done = blocking(move || {
+            let handed = lab.write(|c, now| {
+                let rows = store::emulators(c)?;
+                if let Some(gone) = specs.iter().find(|spec| {
+                    !rows.iter().any(|r| {
+                        r.idx == spec.idx
+                            && r.serial == spec.serial
+                            && State::from_word(&r.state) == State::Booting
+                    })
+                }) {
+                    return Ok(Err(format!(
+                        "{} was forgotten while it booted; run devlab acquire again",
+                        gone.serial
+                    )));
                 }
-                Ok(())
+                let holder = match lease {
+                    Some(id) => store::lease(c, id)?.map(|l| l.id),
+                    None => None,
+                };
+                for spec in &specs {
+                    store::set_emulator_ready(c, spec.idx, holder.is_none().then_some(now))?;
+                    if let Some(id) = holder {
+                        store::insert_lease_device(c, id, &emulator_device(&spec.serial))?;
+                    }
+                }
+                Ok(Ok(()))
             })?;
-            let _ = AdbCli.shell(&spec.serial, "input keyevent 82");
+            if handed.is_ok() {
+                for spec in &specs {
+                    let _ = AdbCli.shell(&spec.serial, "input keyevent 82");
+                }
+            }
             lab.notify();
-            Ok(())
+            Ok(handed)
         })
         .await;
+        match done {
+            Ok(handed) => handed,
+            Err(body) => Err(body.message),
+        }
     }
 
     /// Stops emulators that won't boot and forgets them.
     async fn forget(self: &Arc<Self>, specs: Vec<EmulatorSpec>) {
+        if specs.is_empty() {
+            return;
+        }
         let lab = Arc::clone(self);
         let _ = blocking(move || {
             for spec in &specs {
                 SystemdEmulators.stop(&spec.unit, &spec.serial, &AdbCli);
-                lab.write(|c, _| store::delete_emulator(c, spec.idx))?;
+                lab.write(|c, _| store::delete_emulator(c, spec.idx, "booting"))?;
             }
             lab.notify();
             Ok(())

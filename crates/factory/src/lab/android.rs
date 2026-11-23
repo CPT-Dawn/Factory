@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use factory_adapters::adb::{Adb, TrackDevices};
 use factory_adapters::emulator::{EmulatorSpec, Emulators};
-use factory_core::lab::devices::{Attached, LOCK_PROBE, lock_warning, parse_track, prep_command};
+use factory_core::lab::devices::{Attached, LOCK_PROBE, parse_track, prep_command, prep_warning};
 use factory_core::lab::emulator::{Look, avd_name, port_of, serial_of, unit_name};
 
 use super::wire::DeviceAsk;
@@ -48,15 +48,18 @@ pub fn track_forever(
     }
 }
 
-/// Readies a device for unattended runs; a warning when its lock screen stays up.
+/// Readies a device for unattended runs; a warning when its lock screen stays up or adb can't
+/// reach it.
 pub fn prep(
     adb: &dyn Adb,
     serial: &str,
     stay_awake: bool,
     animations_off: bool,
 ) -> Option<&'static str> {
-    let _ = adb.shell(serial, &prep_command(stay_awake, animations_off));
-    lock_warning(&adb.shell(serial, LOCK_PROBE).unwrap_or_default())
+    let prepped = adb
+        .shell(serial, &prep_command(stay_awake, animations_off))
+        .is_some();
+    prep_warning(prepped, adb.shell(serial, LOCK_PROBE).as_deref())
 }
 
 /// The device's ABI, as `DEVLAB_ABIS` shows it; none when adb can't tell.

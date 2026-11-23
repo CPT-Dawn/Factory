@@ -196,8 +196,25 @@ pub fn insert_emulator(c: &Connection, idx: u32, serial: &str) -> rusqlite::Resu
     Ok(())
 }
 
-pub fn set_emulator_ready(c: &Connection, idx: u32) -> rusqlite::Result<()> {
-    c.execute("UPDATE emulators SET state = 'ready' WHERE idx = ?1", [idx])?;
+/// Marks a booting emulator ready, idle since `idle_since` (none: a lease holds it).
+pub fn set_emulator_ready(
+    c: &Connection,
+    idx: u32,
+    idle_since: Option<i64>,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE emulators SET state = 'ready', idle_since = ?2 WHERE idx = ?1 AND state = 'booting'",
+        params![idx, idle_since],
+    )?;
+    Ok(())
+}
+
+/// No lease holds the emulator any more: it idles from `now`.
+pub fn emulator_idle(c: &Connection, serial: &str, now: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE emulators SET idle_since = ?2 WHERE serial = ?1",
+        params![serial, now],
+    )?;
     Ok(())
 }
 
@@ -210,8 +227,13 @@ pub fn emulator_held(c: &Connection, serial: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn delete_emulator(c: &Connection, idx: u32) -> rusqlite::Result<()> {
-    c.execute("DELETE FROM emulators WHERE idx = ?1", [idx])?;
+/// Forgets emulator `idx` if it is still in `state`: a row in another state is a newer
+/// emulator at the same index.
+pub fn delete_emulator(c: &Connection, idx: u32, state: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "DELETE FROM emulators WHERE idx = ?1 AND state = ?2",
+        params![idx, state],
+    )?;
     Ok(())
 }
 

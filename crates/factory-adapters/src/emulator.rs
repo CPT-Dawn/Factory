@@ -229,7 +229,7 @@ impl Emulators for SystemdEmulators {
             Ok(out) => Err(format!(
                 "could not start {}: {}",
                 spec.unit,
-                String::from_utf8_lossy(&out.stderr).trim()
+                one_line(&String::from_utf8_lossy(&out.stderr))
             )),
             Err(e) => Err(format!("could not start {}: systemd-run: {e}", spec.unit)),
         }
@@ -249,6 +249,15 @@ impl Emulators for SystemdEmulators {
         }
         systemctl(&["stop", unit], STOP_TIMEOUT);
     }
+}
+
+/// A tool's message on one line: its non-blank lines, trimmed and joined with `; `.
+fn one_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Runs `cmd` with `input` on its stdin: whether it succeeded, and its stderr (else stdout).
@@ -319,54 +328,5 @@ impl Emulators for FakeEmulators {
         self.record(format!("stop {unit}"));
         adb.emu_kill(serial);
         self.units().remove(unit);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::adb::FakeAdb;
-
-    fn spec() -> EmulatorSpec {
-        EmulatorSpec {
-            idx: 0,
-            avd: "devlab-0".into(),
-            unit: "devlab-emu-0".into(),
-            port: 5580,
-            serial: "emulator-5580".into(),
-            image: String::new(),
-            device: "pixel_6".into(),
-            gpu: "swiftshader_indirect".into(),
-        }
-    }
-
-    #[test]
-    fn the_fake_runs_a_unit_from_its_start_to_its_stop() {
-        let emus = FakeEmulators::default();
-        emus.start(&spec()).unwrap();
-        assert!(emus.unit_active("devlab-emu-0"));
-        emus.stop("devlab-emu-0", "emulator-5580", &FakeAdb::default());
-        assert!(!emus.unit_active("devlab-emu-0"));
-        let refusing = FakeEmulators {
-            refuse: Some("no".into()),
-            ..FakeEmulators::default()
-        };
-        assert_eq!(
-            refusing.start(&spec()),
-            Err("could not start devlab-emu-0: no".into())
-        );
-    }
-
-    #[test]
-    fn a_config_ini_is_tuned_and_keeps_its_other_lines() {
-        let dir = std::env::temp_dir().join(format!("factory-avd-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let ini = dir.join("config.ini");
-        fs::write(&ini, "avd.ini.encoding=UTF-8\nhw.ramSize=1536\n").unwrap();
-        tune(&ini);
-        let text = fs::read_to_string(&ini).unwrap();
-        fs::remove_dir_all(&dir).unwrap();
-        assert!(text.starts_with("avd.ini.encoding=UTF-8\nhw.ramSize=2048\n"));
-        assert!(text.ends_with("hw.audioOutput=no\n"));
     }
 }

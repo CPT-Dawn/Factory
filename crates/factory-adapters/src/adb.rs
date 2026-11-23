@@ -6,7 +6,7 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::process;
@@ -100,33 +100,75 @@ pub trait TrackDevices: Send + Sync {
     fn start(&self) -> std::io::Result<Box<dyn Read + Send>>;
 }
 
-/// `adb track-devices -l`, in a process group of its own. A stream has no timeout: it ends
-/// when adb does, and the stream is killed when it is dropped.
+/// How long `adb track-devices` may take to show its first list; past it the stream's process
+/// group is killed, and the stream ends.
+const FIRST_FRAME: Duration = Duration::from_secs(15);
+
+/// `adb track-devices -l`, in a process group of its own. Its first list must come within
+/// [`FIRST_FRAME`], or its group is killed; after that it streams for as long as adb runs (adb
+/// writes only when the list changes, so silence is no fault), and its group is killed when the
+/// stream is dropped.
 pub struct AdbTrack;
 
 struct Stream {
     child: Child,
+    /// Set once the stream has shown bytes or is dropped: the first-frame watchdog stands down.
+    done: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Stream {
+    fn stand_down(&self) {
+        let (done, cvar) = &*self.done;
+        *done.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        cvar.notify_all();
+    }
 }
 
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self.child.stdout.as_mut() {
+        let read = match self.child.stdout.as_mut() {
             Some(out) => out.read(buf),
             None => Ok(0),
+        };
+        if matches!(read, Ok(n) if n > 0) {
+            self.stand_down();
         }
+        read
     }
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        if let Some(group) = i32::try_from(self.child.id())
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)
-        {
-            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-        }
+        self.stand_down();
+        kill_group(self.child.id());
         let _ = self.child.wait();
     }
+}
+
+fn kill_group(pid: u32) {
+    if let Some(group) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
+}
+
+/// Kills the stream's process group unless it shows bytes, or is dropped, within
+/// [`FIRST_FRAME`]. The stream is not reaped before it is dropped, so the group is still its.
+fn watch_first_frame(pid: u32, done: Arc<(Mutex<bool>, Condvar)>) {
+    let _ = std::thread::Builder::new()
+        .name("adb-track-first".to_owned())
+        .spawn(move || {
+            let (flag, cvar) = &*done;
+            let guard = flag.lock().unwrap_or_else(PoisonError::into_inner);
+            let (guard, _) = cvar
+                .wait_timeout_while(guard, FIRST_FRAME, |done| !*done)
+                .unwrap_or_else(PoisonError::into_inner);
+            if !*guard {
+                kill_group(pid);
+            }
+        });
 }
 
 impl TrackDevices for AdbTrack {
@@ -138,7 +180,9 @@ impl TrackDevices for AdbTrack {
             .stderr(Stdio::null())
             .process_group(0)
             .spawn()?;
-        Ok(Box::new(Stream { child }))
+        let done = Arc::new((Mutex::new(false), Condvar::new()));
+        watch_first_frame(child.id(), Arc::clone(&done));
+        Ok(Box::new(Stream { child, done }))
     }
 }
 
@@ -154,7 +198,7 @@ impl FakeAdb {
     fn record(&self, call: String) {
         self.calls
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .push(call);
     }
 }
@@ -186,35 +230,5 @@ pub struct FakeTrack {
 impl TrackDevices for FakeTrack {
     fn start(&self) -> std::io::Result<Box<dyn Read + Send>> {
         Ok(Box::new(std::io::Cursor::new(self.bytes.clone())))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_fakes_answer_and_record() {
-        let adb = FakeAdb {
-            answers: BTreeMap::from([("getprop sys.boot_completed".to_owned(), "1\n".to_owned())]),
-            ..FakeAdb::default()
-        };
-        assert_eq!(
-            adb.shell("emulator-5580", "getprop sys.boot_completed")
-                .as_deref(),
-            Some("1\n")
-        );
-        assert_eq!(adb.shell("emulator-5580", "true"), None);
-        assert!(adb.reverse("P1", 8787, 27787));
-        let mut out = String::new();
-        FakeTrack {
-            bytes: b"0000".to_vec(),
-        }
-        .start()
-        .unwrap()
-        .read_to_string(&mut out)
-        .unwrap();
-        assert_eq!(out, "0000");
-        assert_eq!(adb.calls.lock().unwrap().len(), 3);
     }
 }

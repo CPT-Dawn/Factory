@@ -107,6 +107,8 @@ pub struct PlanInput {
     pub idle_emulators: Vec<String>,
     /// Every devlab emulator: booting, idle or held.
     pub emulators_running: u32,
+    /// The emulators still booting: their RAM is not taken yet, but it will be.
+    pub emulators_booting: u32,
     pub max_emulators: u32,
     pub mem_available_mb: i64,
     pub host_floor_mb: i64,
@@ -160,7 +162,7 @@ pub fn plan_devices(p: &PlanInput) -> Result<Plan, String> {
                 p.max_emulators
             ));
         }
-        let ram = i64::from(need) * p.emulator_ram_mb;
+        let ram = i64::from(need + p.emulators_booting) * p.emulator_ram_mb;
         if p.mem_available_mb - ram < p.host_floor_mb {
             return Err(format!(
                 "no free phone ({}) and too little memory for an emulator ({} MB free, need {})",
@@ -239,6 +241,17 @@ pub const LOCK_PROBE: &str = "dumpsys window | grep -E 'mDreamingLockscreen=true
 pub fn lock_warning(probe: &str) -> Option<&'static str> {
     (!probe.trim().is_empty())
         .then_some("lock screen still showing: set the phone's screen lock to None or Swipe")
+}
+
+/// The warning after a prep: whether adb ran its [prep_command], and what its [LOCK_PROBE]
+/// printed (none: adb failed). A device adb reached for neither is not ready.
+pub fn prep_warning(prepped: bool, probe: Option<&str>) -> Option<&'static str> {
+    match probe {
+        None if !prepped => {
+            Some("adb could not reach it: plug it in and allow USB debugging, then devlab prep")
+        }
+        probe => lock_warning(probe.unwrap_or_default()),
+    }
 }
 
 /// One line of status's device table.
@@ -453,6 +466,36 @@ mod tests {
                 ..base()
             }),
             Err("no free phone (0 phone(s) busy) and too little memory for an emulator (7000 MB free, need 8192)".into())
+        );
+    }
+
+    #[test]
+    fn a_device_adb_reaches_for_nothing_is_not_called_ready() {
+        let locked = "isKeyguardShowing=true";
+        assert_eq!(prep_warning(true, Some("")), None);
+        assert_eq!(prep_warning(false, Some("")), None);
+        assert_eq!(prep_warning(true, None), None);
+        assert_eq!(prep_warning(true, Some(locked)), lock_warning(locked));
+        assert_eq!(
+            prep_warning(false, None),
+            Some("adb could not reach it: plug it in and allow USB debugging, then devlab prep")
+        );
+    }
+
+    #[test]
+    fn the_memory_floor_counts_the_emulators_still_booting() {
+        let ask = |emulators_booting| PlanInput {
+            want: 1,
+            mem_available_mb: 12000,
+            emulators_running: emulators_booting,
+            max_emulators: 4,
+            emulators_booting,
+            ..base()
+        };
+        assert_eq!(plan_devices(&ask(0)).map(|p| p.boot), Ok(1));
+        assert_eq!(
+            plan_devices(&ask(2)),
+            Err("no free phone (0 phone(s) busy) and too little memory for an emulator (12000 MB free, need 14336)".into())
         );
     }
 

@@ -7,7 +7,8 @@ use factory_adapters::adb::{Adb, AdbCli};
 use factory_core::exit::Exit;
 use factory_core::lab::args::Opts;
 use factory_core::lab::config::{MachineConfig, ProjectConfig, owner_cap};
-use factory_core::lab::devices::{Held, lost};
+use factory_core::lab::devices::{Held, Mode, lost};
+use factory_core::lab::emulator::BOOT_TIMEOUT_SEC;
 use factory_core::lab::slots::{Env, slot_env};
 
 use super::cli::note;
@@ -23,6 +24,9 @@ use crate::paths::Paths;
 
 /// How much longer than its wait the CLI listens for the daemon's answer.
 const ANSWER_GRACE: Duration = Duration::from_secs(60);
+/// How much longer an answer may take when the daemon may boot emulators for it: making their
+/// AVDs, starting their units and booting them, then stopping them when that fails.
+const BOOT_GRACE: Duration = Duration::from_secs(BOOT_TIMEOUT_SEC + 300);
 
 fn paths() -> Result<Paths, Failure> {
     Paths::from_env()
@@ -61,7 +65,14 @@ pub fn acquire(ctx: &Ctx, opts: &Opts) -> Result<Lease, Failure> {
     };
     let listen = Duration::try_from_secs_f64(wait_sec)
         .ok()
-        .and_then(|wait| wait.checked_add(ANSWER_GRACE));
+        .and_then(|wait| wait.checked_add(ANSWER_GRACE))
+        .and_then(|wait| {
+            if opts.want > 0 && opts.mode != Mode::Phone {
+                wait.checked_add(BOOT_GRACE)
+            } else {
+                Some(wait)
+            }
+        });
     let granted: Granted = client::call_streaming(&paths()?, ACQUIRE, &params, listen, note)?;
     let lease = granted.lease;
     if let (Some(p), Some(slot)) = (&ctx.project, lease.slot) {
