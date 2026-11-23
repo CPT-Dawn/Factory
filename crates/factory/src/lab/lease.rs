@@ -11,12 +11,12 @@ use factory_core::lab::devices::Mode;
 use factory_core::lab::emulator::BOOT_TIMEOUT_SEC;
 use factory_core::lab::slots::{Env, slot_env};
 
-use super::cli::note;
 use super::context::Ctx;
+use super::host::proc;
 use super::stack;
 use super::wire::{
-    ACQUIRE, AcquireParams, DeviceAsk, GC, Granted, LEASE, Lease, ProjectAsk, RELEASE, RunAsk,
-    SLOT, SlotParams, StackAsk,
+    ACQUIRE, AcquireParams, DeviceAsk, GC, Granted, LEASE, Lease, Process, ProjectAsk, RECEIVED,
+    RELEASE, ReleaseParams, RunAsk, SLOT, STOPPING, SlotParams, StackAsk, StopParams,
 };
 use crate::client;
 use crate::output::Failure;
@@ -42,11 +42,29 @@ pub fn base_name(path: &str) -> &str {
 /// Queues for a lease and takes it: the daemon grants its devices (booting emulators as needed)
 /// and readies them, then the slot's workdir is prepared and, with `--stack`, its stack
 /// started, and the project's ports reversed onto each device. A stack that fails to start, or
-/// an emulator that fails to boot (exit 77), keeps the lease.
-pub fn acquire(ctx: &Ctx, opts: &Opts) -> Result<Lease, Failure> {
+/// an emulator that fails to boot (exit 77), keeps the lease. Each new reason it waits goes
+/// to `waiting`, a warning about the slot to `warn`.
+pub fn acquire(
+    ctx: &Ctx,
+    opts: &Opts,
+    waiting: &mut dyn FnMut(&str),
+    warn: &mut dyn FnMut(&str),
+) -> Result<Lease, Failure> {
     let (params, listen) = ask(ctx, opts, None)?;
-    let granted: Granted = client::call_streaming(&paths()?, ACQUIRE, &params, listen, note)?;
-    take(ctx, opts, granted)
+    let ask_at = |resume| AcquireParams {
+        resume,
+        ..params.clone()
+    };
+    // A daemon that comes back says why it waits again: say it once.
+    let mut said = String::new();
+    let granted: Granted =
+        client::call_queued(&paths()?, ACQUIRE, RECEIVED, ask_at, listen, |why| {
+            if why != said {
+                waiting(why);
+                said = why.to_owned();
+            }
+        })?;
+    take(ctx, opts, granted, warn)
 }
 
 /// The acquire to send for `opts` (for `run`, if any) and how long to listen for its answer;
@@ -71,9 +89,11 @@ pub fn ask(
         worktree: ctx.worktree.clone(),
         owner: ctx.owner.clone(),
         lease: super::context::forced_lease(),
-        project,
+        project: project.clone(),
         wait_sec,
         devices: (opts.want > 0).then(|| device_ask(&ctx.cfg, opts)),
+        resume: None,
+        client: Some(me()),
         run,
     };
     let listen = Duration::try_from_secs_f64(wait_sec)
@@ -90,8 +110,13 @@ pub fn ask(
 }
 
 /// Takes a granted lease: prepares the slot's workdir, with `--stack` starts its stack, and
-/// reverses the project's ports onto each device.
-pub fn take(ctx: &Ctx, opts: &Opts, granted: Granted) -> Result<Lease, Failure> {
+/// reverses the project's ports onto each device. A warning about the slot goes to `warn`.
+pub fn take(
+    ctx: &Ctx,
+    opts: &Opts,
+    granted: Granted,
+    warn: &mut dyn FnMut(&str),
+) -> Result<Lease, Failure> {
     let lease = granted.lease;
     if let (Some(p), Some(slot)) = (&ctx.project, lease.slot) {
         stack::prepare_workdir(p, &ctx.worktree, slot)?;
@@ -100,7 +125,7 @@ pub fn take(ctx: &Ctx, opts: &Opts, granted: Granted) -> Result<Lease, Failure> 
             && *previous != ctx.worktree
             && stack::running(&info.project_id)
         {
-            note(&format!(
+            warn(&format!(
                 "slot {slot}'s stack last ran {}'s schema: reset it if your migrations differ",
                 base_name(previous)
             ));
@@ -112,7 +137,7 @@ pub fn take(ctx: &Ctx, opts: &Opts, granted: Granted) -> Result<Lease, Failure> 
             }
         }
     }
-    apply_reverses(&lease, ctx.project.as_ref())?;
+    apply_reverses(&lease, ctx.project.as_ref(), warn)?;
     Ok(lease)
 }
 
@@ -134,7 +159,11 @@ fn device_ask(cfg: &MachineConfig, opts: &Opts) -> DeviceAsk {
 
 /// Maps the project's `reverse` ports onto each device the lease holds: a device port to a
 /// port, or to the port an export names.
-pub fn apply_reverses(lease: &Lease, project: Option<&ProjectConfig>) -> Result<(), Failure> {
+pub fn apply_reverses(
+    lease: &Lease,
+    project: Option<&ProjectConfig>,
+    warn: &mut dyn FnMut(&str),
+) -> Result<(), Failure> {
     let Some(p) = project.filter(|p| !p.reverse.is_empty() && !lease.devices.is_empty()) else {
         return Ok(());
     };
@@ -155,7 +184,7 @@ pub fn apply_reverses(lease: &Lease, project: Option<&ProjectConfig>) -> Result<
         for (device_port, host_port) in &p.reverse {
             let (on_device, on_host) = (port(device_port), port(host_port));
             if on_device > 0 && on_host > 0 && !AdbCli.reverse(&d.serial, on_device, on_host) {
-                note(&format!(
+                warn(&format!(
                     "adb reverse tcp:{on_device} -> {on_host} failed on {}",
                     d.serial
                 ));
@@ -211,8 +240,38 @@ pub fn live(ctx: &Ctx) -> Result<Lease, Failure> {
     }
 }
 
+/// Drops the caller's lease, and lets go of any slot this call held while stopping its stack.
 pub fn release(ctx: &Ctx) -> Result<Option<Lease>, Failure> {
-    client::call(&paths()?, RELEASE, &ctx.find())
+    client::call(
+        &paths()?,
+        RELEASE,
+        &ReleaseParams {
+            find: ctx.find(),
+            stopper: Some(me()),
+        },
+    )
+}
+
+/// The caller's lease, its slot held for this call until its [`release`] while it stops
+/// the slot's stack.
+pub fn stopping(ctx: &Ctx) -> Result<Option<Lease>, Failure> {
+    client::call(
+        &paths()?,
+        STOPPING,
+        &StopParams {
+            find: ctx.find(),
+            stopper: me(),
+        },
+    )
+}
+
+/// This devlab call, as a stopper or a waiter.
+fn me() -> Process {
+    let pid = i64::from(std::process::id());
+    Process {
+        pid,
+        start: proc(pid).map(|p| p.start).unwrap_or_default(),
+    }
 }
 
 /// Drops the leases of owners that exited; a line for each.
