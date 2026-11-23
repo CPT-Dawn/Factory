@@ -11,12 +11,15 @@ use std::fmt;
 pub enum WaitOn {
     /// A lead, by its herdr agent name.
     Lead(String),
+    /// A pull request's checks, by `<owner>/<repo>#<number>`.
+    Ci(String),
 }
 
 impl fmt::Display for WaitOn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WaitOn::Lead(name) => f.write_str(name),
+            WaitOn::Ci(pr) => write!(f, "ci {pr}"),
         }
     }
 }
