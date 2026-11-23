@@ -4,6 +4,7 @@
 //! Add a module per command here.
 
 mod agy;
+mod ci;
 mod devlab_golden;
 mod harness;
 mod help;
