@@ -387,7 +387,7 @@ fn any_other_agy_exit_3_is_a_failed_review() {
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
     assert!(
-        out.stderr.starts_with("factory: agy exited 3; see "),
+        out.stderr.starts_with("factory: code-review: agy exited 3; see "),
         "{out:?}"
     );
     assert!(sandbox.calls("codex").is_empty(), "no fallback");
@@ -411,7 +411,7 @@ fn a_print_timeout_ends_the_review_as_a_timeout() {
 
     assert_eq!(out.code, 124, "{out:?}");
     assert!(
-        out.stderr.starts_with("factory: agy timed out after 5s"),
+        out.stderr.starts_with("factory: code-review: agy timed out after 5s"),
         "{out:?}"
     );
     assert_eq!(
@@ -535,7 +535,7 @@ fn an_inactive_sandbox_stays_reported_when_the_next_backend_fails() {
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
     assert!(
-        out.stderr.starts_with("factory: codex exited 1; "),
+        out.stderr.starts_with("factory: code-review: codex exited 1; "),
         "{out:?}"
     );
     assert!(
@@ -638,12 +638,12 @@ fn a_timeout_longer_than_a_week_is_refused_before_any_backend_runs() {
     assert_eq!(out.code, 2, "{out:?}");
     assert_eq!(
         out.stderr,
-        "factory: --timeout 18446744073709551615 is longer than a week; give at most 604800\n"
+        "factory: code-review: --timeout 18446744073709551615 is longer than a week; give at most 604800\n"
     );
     assert_eq!(configured.code, 3, "{configured:?}");
     assert_eq!(
         configured.stderr,
-        "factory: backend agy has a timeout of 604801s, longer than a week; set at most 604800 in the factory config\n"
+        "factory: code-review: backend agy has a timeout of 604801s, longer than a week; set at most 604800 in the factory config\n"
     );
     assert!(
         sandbox.calls("agy").is_empty(),

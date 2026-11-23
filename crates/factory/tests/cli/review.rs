@@ -103,8 +103,8 @@ fn an_unknown_base_or_an_empty_diff_fails_with_exit_2_before_codex_starts() {
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
 
     for (base, says) in [
-        ("nope", "factory: unknown ref: nope"),
-        ("work", "factory: no committed changes since work"),
+        ("nope", "factory: code-review: unknown ref: nope"),
+        ("work", "factory: code-review: no committed changes since work"),
     ] {
         let out = sandbox.factory_in(&repo, &["review", base, "t1-r1"]);
 
@@ -126,7 +126,7 @@ fn a_label_outside_letters_digits_underscore_and_dash_is_refused_with_exit_2() {
     assert_eq!(out.code, 2, "{out:?}");
     assert_eq!(
         out.stderr,
-        "factory: label may only use letters, digits, _ and -, got: \"t1/r1\"\n"
+        "factory: code-review: label may only use letters, digits, _ and -, got: \"t1/r1\"\n"
     );
     assert!(sandbox.calls("codex").is_empty());
 }
@@ -251,7 +251,7 @@ fn a_spec_gh_cannot_fetch_fails_with_exit_2_before_codex_starts() {
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
     assert!(
         out.stderr
-            .starts_with("factory: could not fetch spec #99 with gh: GraphQL: Could not resolve"),
+            .starts_with("factory: code-review: could not fetch spec #99 with gh: GraphQL: Could not resolve"),
         "{out:?}"
     );
     assert!(sandbox.calls("codex").is_empty());
@@ -273,7 +273,7 @@ fn a_timeout_kills_the_reviewers_whole_process_group_and_exits_124() {
     assert_eq!(out.stdout, "");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
     assert!(
-        out.stderr.starts_with("factory: codex timed out after 1s"),
+        out.stderr.starts_with("factory: code-review: codex timed out after 1s"),
         "{out:?}"
     );
     let pid = fs::read_to_string(&child_pid).unwrap();
@@ -369,7 +369,7 @@ fn a_failed_run_logs_its_event_with_outcome_error_and_the_reason() {
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
     assert!(
-        out.stderr.starts_with("factory: codex exited 1; see "),
+        out.stderr.starts_with("factory: code-review: codex exited 1; see "),
         "{out:?}"
     );
     let lines = sandbox.ledger_lines();
@@ -468,7 +468,7 @@ fn a_report_with_neither_ledger_nor_verdict_fails_with_exit_3_naming_it() {
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
     assert!(
         out.stderr
-            .starts_with("factory: the report has no findings ledger and no VERDICT line: "),
+            .starts_with("factory: code-review: the report has no findings ledger and no VERDICT line: "),
         "{out:?}"
     );
 }
@@ -486,7 +486,7 @@ fn a_rerun_under_the_same_label_does_not_read_the_last_runs_report() {
     assert_eq!(out.code, 3, "{out:?}");
     assert!(
         out.stderr
-            .starts_with("factory: codex finished without a report ("),
+            .starts_with("factory: code-review: codex finished without a report ("),
         "{out:?}"
     );
     assert!(!sandbox.reviews().join("t1.findings.json").exists());
@@ -547,7 +547,7 @@ fn an_event_that_cannot_be_logged_fails_the_run_in_one_line_naming_the_report() 
     let report = sandbox.reviews().join("t1.md");
     assert!(
         out.stderr.starts_with(&format!(
-            "factory: review t1: clean (0 blocking, 1 advisory, 0 question) → {}; but its event was not logged: ",
+            "factory: code-review: review t1: clean (0 blocking, 1 advisory, 0 question) → {}; but its event was not logged: ",
             report.display()
         )),
         "{out:?}"

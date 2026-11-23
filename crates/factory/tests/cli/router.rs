@@ -224,7 +224,7 @@ fn the_config_file_sets_codexs_model_effort_and_timeout() {
 
     assert_eq!(out.code, 124, "{out:?}");
     assert!(
-        out.stderr.starts_with("factory: codex timed out after 1s"),
+        out.stderr.starts_with("factory: code-review: codex timed out after 1s"),
         "{out:?}"
     );
     let argv = &sandbox.calls("codex")[0];
@@ -449,7 +449,7 @@ fn every_backend_out_of_quota_exits_75_naming_when_to_retry() {
     assert_eq!(
         out.stderr,
         format!(
-            "factory: every review backend is out of quota (codex until {until}); retry after {until}\n"
+            "factory: code-review: every review backend is out of quota (codex until {until}); retry after {until}\n"
         )
     );
     let logged = event(&sandbox, 0);
@@ -536,7 +536,7 @@ fn a_review_queued_when_the_daemon_stops_says_to_run_it_again() {
     assert_eq!(second.code, 3, "{second:?}");
     assert_eq!(
         second.stderr,
-        "factory: the daemon stopped (a restart or an upgrade); run the review again\n"
+        "factory: code-review: the daemon stopped (a restart or an upgrade); run the review again\n"
     );
     open(&gate);
     support::finish(first);

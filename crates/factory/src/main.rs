@@ -106,7 +106,9 @@ fn run(command: Command, json: bool) -> ExitCode {
             spec,
             previous,
             timeout: timeout.map(std::time::Duration::from_secs),
-        }),
+        })
+        // review.sh's failures said so, and factory-stats' classifier still matches the text.
+        .map_err(|failure| Failure::new(failure.exit, format!("code-review: {}", failure.message))),
         // Answered in `main`: a hook prints its own protocol, not the output contract's line.
         Command::Hook { .. } => unreachable!("main answers hooks before it gets here"),
         Command::Install { units } => install::install(units.as_deref()),
