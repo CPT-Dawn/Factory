@@ -5,7 +5,7 @@ in one command, and `factory cutover --rollback` gives it back.
 
 ```
 factory cutover [--json]                     # devlab becomes factory lab; the TS watcher stops
-factory cutover --rollback [--force] [--json] # devlab is today's devlab again; its watcher starts
+factory cutover --rollback [--force] [--json] # devlab is today's devlab again; its watcher starts (not with --force and no unit)
 ```
 
 ## Before you cut over
@@ -52,9 +52,16 @@ factory lab again, starts `devlab-watch.service` (`enable --now`) and removes th
 When the watcher's unit link went missing after the cutover (by hand, or a `dots unlink`), the
 rollback links it again from the path the marker records before `enable --now`. A marker from
 before #30 records no unit, so a missing unit with such a marker makes the rollback refuse in
-one line, changing nothing, even with `--force`: link the unit again with `dots link`, then run
+one line, changing nothing: link the unit again with `dots link`, then run
 `factory cutover --rollback` again.
-`--force` skips the check, for a factory lab that no longer answers. A second rollback says
-`not cut over` and changes nothing.
+`--force` goes on instead when the unit is missing and cannot be linked again (the marker records
+no link, or the link cannot be made), or when it is a link to nothing: devlab and the marker are
+put right, `enable --now` is not called, one line names the unit it skipped (`"watcher": "skipped"`
+and `"skipped"` in `--json`), and the watcher stays off until you link the unit and enable it.
+Where the unit can be linked again, `--force` does that as above. A unit that is there and
+that systemd will not start stops the rollback, `--force` or not, with the marker kept: fix
+systemd, then run the rollback again.
+`--force` also skips the check that factory lab holds nothing, for a factory lab that no longer
+answers. A second rollback says `not cut over` and changes nothing.
 
 Leases held in factory lab's `lab.db` don't carry back: roll back when nothing is leased.

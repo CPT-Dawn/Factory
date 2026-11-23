@@ -23,6 +23,9 @@ pub enum Part {
     Sequence,
 }
 
+/// What a word holds in place of a command substitution's output, which the line does not say.
+const SUBSTITUTION: &str = "$(…)";
+
 /// The simple commands of `text`, in order, with where the children they run in start and end.
 /// A command substitution and a subshell hold commands of their own, and a here-document's body
 /// is text, not commands.
@@ -132,19 +135,22 @@ pub fn parts(text: &str) -> Vec<Part> {
                 out.mark(Part::Pipe);
                 out.joined = true;
             }
-            '(' => out.mark(Part::Enter),
-            ')' => out.mark(Part::Leave),
+            '(' => {
+                out.open.push(None);
+                out.mark(Part::Enter);
+            }
+            ')' => out.close(),
             '`' => {
                 in_backticks = !in_backticks;
-                out.mark(if in_backticks {
-                    Part::Enter
+                if in_backticks {
+                    out.substitute();
                 } else {
-                    Part::Leave
-                });
+                    out.close();
+                }
             }
             '$' if chars.get(at) == Some(&'(') => {
                 at += 1;
-                out.mark(Part::Enter);
+                out.substitute();
             }
             c => out.push(c),
         }
@@ -184,6 +190,9 @@ struct Lexer {
     in_word: bool,
     /// The last thing read was `&&`, `||` or `|`, which the next command continues.
     joined: bool,
+    /// What each open `(`, `$(` or backquote interrupted: for a command substitution, the
+    /// command it is part of, which goes on once it closes; none for a subshell.
+    open: Vec<Option<(Words, String, bool)>>,
 }
 
 impl Lexer {
@@ -214,6 +223,31 @@ impl Lexer {
             self.parts
                 .push(Part::Command(std::mem::take(&mut self.words)));
         }
+    }
+
+    /// Starts a command substitution: its commands run in a child, before the command it is
+    /// part of, which goes on after it.
+    fn substitute(&mut self) {
+        let words = std::mem::take(&mut self.words);
+        let word = std::mem::take(&mut self.word);
+        let in_word = std::mem::take(&mut self.in_word);
+        self.open.push(Some((words, word, in_word)));
+        self.mark(Part::Enter);
+    }
+
+    /// Ends the innermost subshell or command substitution. The substitution's output is part
+    /// of a word, which stands for it as [`SUBSTITUTION`].
+    fn close(&mut self) {
+        self.mark(Part::Leave);
+        if let Some(Some((words, word, _))) = self.open.pop() {
+            (self.words, self.word) = (words, word);
+            self.push_str(SUBSTITUTION);
+        }
+    }
+
+    fn push_str(&mut self, text: &str) {
+        self.open_word();
+        self.word.push_str(text);
     }
 
     /// Ends the command, then records `part` after it.

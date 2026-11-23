@@ -583,3 +583,164 @@ fn rollback_says_how_to_link_a_missing_unit_the_marker_does_not_name() {
     let old = old_devlab(&sandbox, &["status"]);
     assert_eq!((old.code, old.stderr.as_str()), (3, REFUSAL));
 }
+
+/// Today's devlab answers, the marker is gone, and nothing started the watcher again.
+fn assert_rolled_back_without_watcher(sandbox: &Sandbox) {
+    let answers = old_devlab(sandbox, &["gc"]);
+    assert_eq!(answers.code, 0, "{answers:?}");
+    assert_eq!(watcher_state(sandbox).0, "not-found");
+    assert!(
+        !watcher_calls(sandbox)
+            .iter()
+            .any(|call| call.starts_with("--user enable ")),
+        "{:?}",
+        watcher_calls(sandbox)
+    );
+}
+
+#[test]
+fn rollback_force_goes_on_without_the_unit_and_says_it_skipped_it() {
+    let (sandbox, _world) = machine();
+    cut_over(&sandbox);
+    marker_without_watcher(&sandbox);
+    fs::remove_file(watcher_unit(&sandbox)).unwrap();
+
+    let out = sandbox.factory(&["cutover", "--rollback", "--force"]);
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (
+            0,
+            format!(
+                "rolled back: {} runs today's devlab again; skipped {}, which is gone or links to nothing\n",
+                link(&sandbox).display(),
+                watcher_unit(&sandbox).display()
+            )
+            .as_str(),
+            ""
+        )
+    );
+    // Today's devlab answers again, the marker is gone, and the watcher was left alone.
+    assert_rolled_back_without_watcher(&sandbox);
+    let again = sandbox.factory(&["cutover", "--rollback"]);
+    assert_eq!(
+        (again.code, again.stdout.as_str()),
+        (
+            0,
+            format!(
+                "not cut over: {} is today's devlab; nothing to roll back\n",
+                link(&sandbox).display()
+            )
+            .as_str()
+        )
+    );
+}
+
+#[test]
+fn rollback_force_skips_a_recorded_unit_it_cannot_link_again() {
+    let (sandbox, _world) = machine();
+    cut_over(&sandbox);
+    // The unit went missing, and its directory no longer lets the link be made again.
+    let unit = watcher_unit(&sandbox);
+    fs::remove_file(&unit).unwrap();
+    let dir = sandbox.path("config/systemd/user");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let refused = sandbox.factory(&["cutover", "--rollback"]);
+    assert_eq!(refused.code, 3, "{refused:?}");
+
+    let out = sandbox.factory(&["cutover", "--rollback", "--force"]);
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    assert!(
+        out.stdout.contains(&format!("skipped {}", unit.display())),
+        "{out:?}"
+    );
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_rolled_back_without_watcher(&sandbox);
+}
+
+#[test]
+fn rollback_force_skips_a_unit_that_is_a_dangling_link() {
+    let (sandbox, _world) = machine();
+    cut_over(&sandbox);
+    let unit = watcher_unit(&sandbox);
+    fs::remove_file(&unit).unwrap();
+    symlink(sandbox.path("gone/devlab-watch.service"), &unit).unwrap();
+
+    let out = sandbox.factory(&["cutover", "--rollback", "--force"]);
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    assert!(
+        out.stdout.contains(&format!("skipped {}", unit.display())),
+        "{out:?}"
+    );
+    // A link to nothing is not started: the watcher stays off and the marker is gone.
+    assert_rolled_back_without_watcher(&sandbox);
+    let again = sandbox.factory(&["cutover", "--rollback"]);
+    assert!(again.stdout.starts_with("not cut over"), "{again:?}");
+}
+
+#[test]
+fn rollback_force_skips_a_unit_linked_through_a_file() {
+    let (sandbox, _world) = machine();
+    cut_over(&sandbox);
+    let unit = watcher_unit(&sandbox);
+    fs::remove_file(&unit).unwrap();
+    // The link's target runs through a plain file, so it resolves to nothing.
+    fs::write(sandbox.path("plain"), "").unwrap();
+    symlink(sandbox.path("plain/devlab-watch.service"), &unit).unwrap();
+
+    let out = sandbox.factory(&["cutover", "--rollback", "--force"]);
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    assert!(
+        out.stdout.contains(&format!("skipped {}", unit.display())),
+        "{out:?}"
+    );
+    assert_rolled_back_without_watcher(&sandbox);
+}
+
+#[test]
+fn rollback_force_keeps_the_marker_when_systemd_will_not_start_a_unit_that_is_there() {
+    let (sandbox, _world) = machine();
+    cut_over(&sandbox);
+    fs::write(sandbox.path("systemctl-fails"), "enable").unwrap();
+
+    let out = sandbox.factory(&["cutover", "--rollback", "--force"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(out.stdout, "", "{out:?}");
+    assert!(
+        out.stderr
+            .contains("enable --now devlab-watch.service failed"),
+        "{out:?}"
+    );
+    // The marker stays, so the rollback can run again once systemd starts the watcher.
+    fs::remove_file(sandbox.path("systemctl-fails")).unwrap();
+    let again = sandbox.factory(&["cutover", "--rollback", "--force"]);
+    assert_eq!(again.code, 0, "{again:?}");
+    assert!(
+        again.stdout.contains("devlab-watch.service is enabled"),
+        "{again:?}"
+    );
+    assert_eq!(watcher_state(&sandbox).0, "enabled");
+}
+
+#[test]
+fn rollback_force_says_in_json_which_unit_it_skipped() {
+    let (sandbox, _world) = machine();
+    cut_over(&sandbox);
+    marker_without_watcher(&sandbox);
+    fs::remove_file(watcher_unit(&sandbox)).unwrap();
+
+    let out = sandbox.factory(&["cutover", "--rollback", "--force", "--json"]);
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    let json: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(json["watcher"], "skipped");
+    assert_eq!(
+        json["skipped"],
+        watcher_unit(&sandbox).display().to_string()
+    );
+}
