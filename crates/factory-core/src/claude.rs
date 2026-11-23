@@ -239,6 +239,7 @@ fn is_status(text: &str, code: &str) -> bool {
         http_version
             || [
                 "http",
+                "http error",
                 "status",
                 "status code",
                 "status_code",
@@ -256,12 +257,17 @@ fn ends_with_word(text: &str, word: &str) -> bool {
         .is_some_and(|head| !head.ends_with(|c: char| c.is_ascii_alphanumeric()))
 }
 
-/// Where `lower` says `resets ` as a word (not inside `presets `), the last first.
+/// Where `lower` says `resets` as a whole word (not inside `presets` or `resetsHourly`), the
+/// last first.
 fn resets_at(lower: &str) -> impl Iterator<Item = usize> + '_ {
     lower
         .rmatch_indices("resets")
         .map(|(at, _)| at)
-        .filter(|at| ends_with_word(&lower[..at + "resets".len()], "resets"))
+        .filter(|at| {
+            let end = at + "resets".len();
+            ends_with_word(&lower[..end], "resets")
+                && !lower[end..].starts_with(|c: char| c.is_ascii_alphanumeric())
+        })
 }
 
 /// The reset `lower` names after its last `resets `: a time of day or a weekday and time.
