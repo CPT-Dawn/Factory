@@ -8,7 +8,6 @@ use factory_core::lab::args::Opts;
 use factory_core::lab::config::{ProjectConfig, owner_cap};
 use factory_core::lab::slots::{Env, slot_env};
 
-use super::cli::note;
 use super::context::Ctx;
 use super::host::proc;
 use super::stack;
@@ -35,8 +34,14 @@ pub fn base_name(path: &str) -> &str {
 }
 
 /// Queues for a lease and takes it: the slot's workdir is prepared and, with `--stack`, its
-/// stack started. A stack that fails to start keeps the lease.
-pub fn acquire(ctx: &Ctx, opts: &Opts) -> Result<Lease, Failure> {
+/// stack started. A stack that fails to start keeps the lease. Each new reason it waits goes
+/// to `waiting`, a warning about the slot to `warn`.
+pub fn acquire(
+    ctx: &Ctx,
+    opts: &Opts,
+    waiting: &mut dyn FnMut(&str),
+    warn: &mut dyn FnMut(&str),
+) -> Result<Lease, Failure> {
     if opts.want == 0 && ctx.project.is_none() {
         return Err(Failure::usage(format!(
             "no devlab.json in {}: nothing to lease without a device",
@@ -69,7 +74,7 @@ pub fn acquire(ctx: &Ctx, opts: &Opts) -> Result<Lease, Failure> {
     let mut said = String::new();
     let granted: Granted = client::call_queued(&paths()?, ACQUIRE, params, listen, |why| {
         if why != said {
-            note(why);
+            waiting(why);
             said = why.to_owned();
         }
     })?;
@@ -81,7 +86,7 @@ pub fn acquire(ctx: &Ctx, opts: &Opts) -> Result<Lease, Failure> {
             && *previous != ctx.worktree
             && stack::running(&info.project_id)
         {
-            note(&format!(
+            warn(&format!(
                 "slot {slot}'s stack last ran {}'s schema: reset it if your migrations differ",
                 base_name(previous)
             ));

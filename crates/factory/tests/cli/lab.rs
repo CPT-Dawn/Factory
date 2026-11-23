@@ -1,5 +1,6 @@
-//! `factory lab` under the `devlab` name, beyond what the golden transcripts show: lease ids,
-//! owners, and the store's write lock while the fakes of docker and systemctl run.
+//! `factory lab` beyond what the golden transcripts show: lease ids, owners, the store's write
+//! lock while the fakes of docker and systemctl run, the queue across daemon restarts, stacks
+//! being stopped, and the output contract under the `factory lab` name.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -137,7 +138,7 @@ fn the_owner_is_the_nearest_agent_above_the_shell() {
 }
 
 #[test]
-fn factory_lab_is_devlab_and_takes_the_global_json_flag() {
+fn factory_lab_shows_devlabs_help_and_takes_the_global_json_flag() {
     let (sandbox, world) = lab();
     let wt = world.worktree("demo-name");
     let as_devlab = owned(&sandbox, &wt, &["help"]);
@@ -513,4 +514,191 @@ fn a_lease_granted_after_its_caller_left_is_given_back() {
     });
     assert!(given_back, "the lease outlived its caller");
     assert_eq!(waiting(&sandbox, &wt), Vec::<String>::new());
+}
+
+/// `factory <args>` in `dir` for the owner process `pid`: the lab under its own name.
+fn native(sandbox: &Sandbox, dir: &Path, pid: u32, args: &[&str]) -> Run {
+    let mut cmd = sandbox.factory_command(args);
+    cmd.current_dir(dir)
+        .env("DEVLAB_OWNER_PID", pid.to_string());
+    run(cmd)
+}
+
+/// One line on stdout and nothing on stderr: the line.
+fn one_line(out: &Run) -> &str {
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    assert_eq!(out.stdout.lines().count(), 1, "{out:?}");
+    assert!(out.stdout.chars().count() <= 201, "{out:?}");
+    out.stdout.trim_end()
+}
+
+/// One JSON object on stdout and nothing on stderr.
+fn one_json(out: &Run) -> serde_json::Value {
+    assert_eq!(out.stderr, "", "{out:?}");
+    assert_eq!(out.stdout.lines().count(), 1, "{out:?}");
+    serde_json::from_str(&out.stdout).unwrap_or_else(|e| panic!("{e}: {out:?}"))
+}
+
+/// The file a line names last, as `… in <file>`.
+fn named_file(line: &str) -> String {
+    let path = line.rsplit(" in ").next().unwrap_or_default();
+    fs::read_to_string(path).unwrap_or_else(|e| panic!("{e}: {line}"))
+}
+
+#[test]
+fn factory_lab_says_one_line_per_verb_and_json_with_the_flag() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-native");
+    let me = std::process::id();
+    let lab = |args: &[&str]| native(&sandbox, &wt, me, &[&["lab"], args].concat());
+
+    let acquired = lab(&["acquire", "--no-device"]);
+    let line = one_line(&acquired);
+    assert!(
+        line.starts_with("lease 1, slot 0 (stack http://127.0.0.1:27321, down); env in "),
+        "{line}"
+    );
+    assert!(
+        named_file(line).contains("export DEVLAB_LEASE=1\n"),
+        "{line}"
+    );
+    let env = one_line(&lab(&["env"])).to_owned();
+    assert!(
+        named_file(&env).contains("export API_PORT=27787\n"),
+        "{env}"
+    );
+    let env = one_json(&lab(&["--json", "env"]));
+    assert_eq!(env["lease"]["id"], 1, "{env}");
+    assert_eq!(env["env"]["DEVLAB_SLOT"], "0", "{env}");
+    assert!(env["envFile"].is_string(), "{env}");
+
+    let status = one_line(&lab(&["status"])).to_owned();
+    assert!(named_file(&status).contains("stack slots"), "{status}");
+    let board = one_json(&lab(&["status", "--json"]));
+    assert_eq!(board["leases"][0]["id"], 1, "{board}");
+    assert!(board["waiters"].is_array(), "{board}");
+    let globally = sandbox.factory_in(&wt, &["--json", "lab", "status"]);
+    assert!(one_json(&globally)["slots"].is_array(), "{globally:?}");
+
+    assert_eq!(one_line(&lab(&["stack"])), "stack demo on slot 0 is down");
+    assert_eq!(
+        one_json(&lab(&["--json", "stack", "status"]))["state"],
+        "down"
+    );
+    assert_eq!(one_line(&lab(&["gc"])), "no lease of an exited owner");
+    assert_eq!(
+        one_json(&lab(&["gc", "--json"]))["released"],
+        serde_json::json!([])
+    );
+    let help = one_json(&lab(&["help", "--json"]));
+    assert!(
+        help["help"].as_str().is_some_and(|h| h.contains("devlab")),
+        "{help}"
+    );
+
+    assert_eq!(one_line(&lab(&["release"])), "released lease 1");
+    assert_eq!(
+        one_json(&lab(&["--json", "release"]))["released"],
+        serde_json::Value::Null
+    );
+    assert_eq!(one_line(&lab(&["release"])), "nothing held here");
+
+    let refused = lab(&["frobnicate"]);
+    assert_eq!(
+        (
+            refused.code,
+            refused.stdout.as_str(),
+            refused.stderr.as_str()
+        ),
+        (
+            2,
+            "",
+            "factory: unknown command frobnicate; factory lab help\n"
+        )
+    );
+}
+
+#[test]
+fn factory_lab_is_silent_while_it_waits() {
+    let (sandbox, world) = lab();
+    let (a, b) = (Agent::start(), Agent::start());
+    let [wa, wb, wc] = ["demo-a", "demo-b", "demo-c"].map(|n| world.worktree(n));
+    for (agent, wt) in [(&a, &wa), (&b, &wb)] {
+        let held = run(for_owner(
+            &sandbox,
+            wt,
+            agent.pid(),
+            &["acquire", "--no-device"],
+        ));
+        assert_eq!(held.code, 0, "{held:?}");
+    }
+    let me = std::process::id();
+    let waited = native(
+        &sandbox,
+        &wc,
+        me,
+        &["lab", "acquire", "--no-device", "--wait", "1"],
+    );
+    let as_json = native(
+        &sandbox,
+        &wc,
+        me,
+        &["lab", "acquire", "--no-device", "--wait", "0", "--json"],
+    );
+
+    assert_eq!(
+        (waited.code, waited.stdout.as_str(), waited.stderr.as_str()),
+        (
+            75,
+            "",
+            "factory: gave up after 1 s: all 2 stack slots of demo are held\n"
+        )
+    );
+    assert_eq!(as_json.code, 75, "{as_json:?}");
+    assert_eq!(
+        one_json(&as_json),
+        serde_json::json!({"exit": 75, "error": "gave up after 0 s: all 2 stack slots of demo are held"})
+    );
+}
+
+#[test]
+fn a_queued_request_keeps_its_deadline_across_a_daemon_restart() {
+    let (sandbox, world) = lab();
+    let (a, b, c) = (Agent::start(), Agent::start(), Agent::start());
+    let [wa, wb, wc] = ["demo-a", "demo-b", "demo-c"].map(|n| world.worktree(n));
+    for (agent, wt) in [(&a, &wa), (&b, &wb)] {
+        let held = run(for_owner(
+            &sandbox,
+            wt,
+            agent.pid(),
+            &["acquire", "--no-device"],
+        ));
+        assert_eq!(held.code, 0, "{held:?}");
+    }
+    let queued = spawn(for_owner(
+        &sandbox,
+        &wc,
+        c.pid(),
+        &["acquire", "--no-device", "--wait", "30"],
+    ));
+    let me = std::process::id();
+    let waiter = || {
+        let board = one_json(&native(&sandbox, &wa, me, &["lab", "status", "--json"]));
+        board["waiters"][0].clone()
+    };
+    let mut before = serde_json::Value::Null;
+    assert!(poll_until(|| {
+        before = waiter();
+        !before.is_null()
+    }));
+    stop_daemon(&sandbox);
+    let after = waiter();
+    kill_group(queued.id(), Signal::TERM);
+    let _ = finish(queued);
+
+    assert!(before["deadline_ms"].is_i64(), "{before}");
+    assert_eq!(
+        (&after["id"], &after["deadline_ms"]),
+        (&before["id"], &before["deadline_ms"])
+    );
 }

@@ -1,6 +1,7 @@
 //! `factory lab`, which also answers to the name `devlab`: leases of this PC's local stack
-//! slots (#14), in devlab's own dialect: its commands, its text and its exit codes, byte for byte
-//! with the golden transcripts (#13).
+//! slots (#14). As `devlab` it speaks devlab's own dialect: its commands, its text and its exit
+//! codes, byte for byte with the golden transcripts (#13) ([`cli`]). As `factory lab` the same
+//! verbs keep the output contract ([`native`]).
 //!
 //! The CLI reads the configs, finds the owner, runs stacks and commands; the daemon keeps the
 //! lease store and decides who is granted what ([`service`]). Devices (#16), reservations
@@ -10,6 +11,7 @@ mod cli;
 mod context;
 mod host;
 mod lease;
+mod native;
 mod owner;
 mod run;
 pub mod service;
@@ -19,3 +21,4 @@ mod store;
 pub mod wire;
 
 pub use cli::main;
+pub use native::main as native;

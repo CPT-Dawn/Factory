@@ -50,14 +50,25 @@ struct OwnerLine {
     max_slots: Option<u32>,
 }
 
+/// devlab's status: its screen, or with `json` the screen's JSON.
 pub fn render(json: bool) -> Result<String, Failure> {
-    let board: Board = client::call(&Paths::from_env()?, STATUS, &())?;
-    let cfg = context::machine_config()?;
-    let report = report(&board, &cfg);
+    let board = board()?;
     if json {
+        let report = report(&board, &context::machine_config()?);
         return serde_json::to_string_pretty(&report)
             .map_err(|e| Failure::precondition(format!("cannot write the status: {e}")));
     }
+    screen(&board)
+}
+
+/// The daemon's board.
+pub fn board() -> Result<Board, Failure> {
+    client::call(&Paths::from_env()?, STATUS, &())
+}
+
+/// The board as devlab's status screen shows it.
+pub fn screen(board: &Board) -> Result<String, Failure> {
+    let report = report(board, &context::machine_config()?);
     let mut out = vec!["devices: none attached".to_owned()];
     if !report.slots.is_empty() {
         out.push("stack slots".to_owned());
