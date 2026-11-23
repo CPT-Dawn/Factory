@@ -273,10 +273,13 @@ impl Lab {
 
 /// Answers once lease `p.lease` is held no more: released, its owner exited (each look frees
 /// a dead owner's leases first), or expired. Fails with exit 4 for an id never granted, and
-/// with exit 124 when it is still held at the params' timeout.
-pub async fn wait_lease(lab: &Arc<Lab>, p: &WaitLeaseParams) -> Result<WaitLeaseResult, Failure> {
-    let limit = Duration::from_secs(p.timeout_secs);
-    let deadline = Instant::now() + limit;
+/// with exit 124 when it is still held at `deadline`, `limit` after the wait began.
+pub async fn wait_lease(
+    lab: &Arc<Lab>,
+    p: &WaitLeaseParams,
+    deadline: Instant,
+    limit: Duration,
+) -> Result<WaitLeaseResult, Failure> {
     let id = p.lease;
     loop {
         // Subscribed before the look, so a release during it is not missed.

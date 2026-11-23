@@ -17,14 +17,16 @@ use crate::protocol::{NotifyOn, WAIT_CI, WaitCiParams, WaitCiResult};
 pub fn wait(pr: &str, timeout: Duration) -> Result<Done, Failure> {
     let paths = Paths::from_env()?;
     let poll = config::ci_poll(&paths)?;
-    let params = WaitCiParams {
+    let (cwd, waiter) = (cwd()?, client::waiter());
+    let params = |resume, timeout_secs| WaitCiParams {
         pr: pr.to_owned(),
-        cwd: cwd()?,
-        waiter: client::waiter(),
-        timeout_secs: timeout.as_secs(),
+        cwd: cwd.clone(),
+        waiter: waiter.clone(),
+        timeout_secs,
         poll_secs: poll.as_secs(),
+        resume,
     };
-    let answer: WaitCiResult = client::wait(&paths, WAIT_CI, &params, timeout)?;
+    let answer: WaitCiResult = client::hold(&paths, WAIT_CI, params, timeout)?;
     let mut done = Done::new(
         line(&answer),
         serde_json::to_value(&answer).unwrap_or(Value::Null),

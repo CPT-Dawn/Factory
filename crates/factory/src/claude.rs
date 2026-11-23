@@ -91,10 +91,14 @@ impl Claude {
         lock(&self.quota).verdict(clock::now(), hold_at).record()
     }
 
-    /// Answers once a lead may dispatch, or with exit 124 once `timeout_secs` pass.
-    pub async fn wait(&self, params: &WaitClaudeParams) -> Result<ClaudeVerdict, Failure> {
-        let limit = Duration::from_secs(params.timeout_secs);
-        let deadline = Instant::now() + limit;
+    /// Answers once a lead may dispatch, or with exit 124 at `deadline`, `limit` after the wait
+    /// began.
+    pub async fn wait(
+        &self,
+        params: &WaitClaudeParams,
+        deadline: Instant,
+        limit: Duration,
+    ) -> Result<ClaudeVerdict, Failure> {
         loop {
             let mut changed = std::pin::pin!(self.changed.notified());
             changed.as_mut().enable();
@@ -156,12 +160,14 @@ pub fn quota() -> Result<Done, Failure> {
 /// `factory wait claude`: blocks, silent, until a lead may dispatch.
 pub fn wait(timeout: Duration) -> Result<Done, Failure> {
     let paths = Paths::from_env()?;
-    let params = WaitClaudeParams {
-        hold_at: config::claude_hold_at(&paths)?,
-        waiter: client::waiter(),
-        timeout_secs: timeout.as_secs(),
+    let (hold_at, waiter) = (config::claude_hold_at(&paths)?, client::waiter());
+    let params = |resume, timeout_secs| WaitClaudeParams {
+        hold_at,
+        waiter: waiter.clone(),
+        timeout_secs,
+        resume,
     };
-    let verdict: ClaudeVerdict = client::wait(&paths, WAIT_CLAUDE, &params, timeout)?;
+    let verdict: ClaudeVerdict = client::hold(&paths, WAIT_CLAUDE, params, timeout)?;
     let json = serde_json::to_value(&verdict).unwrap_or(Value::Null);
     Ok(Done::new("claude: the window has room; dispatch", json))
 }

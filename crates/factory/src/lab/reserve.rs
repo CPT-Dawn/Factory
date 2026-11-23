@@ -16,7 +16,7 @@ use super::wire::{RESERVE, ReserveParams, Reserved, UNRESERVE, UnreserveParams};
 use crate::client;
 use crate::output::Failure;
 
-pub(super) const USAGE: &str = "usage: factory lab reserve [--slots N] [--wait SEC] [--json]\n       factory lab reserve --release [--json]\n\nreserve sets N stack slots of this project aside for implementers (up to your per-owner cap)\nand prints their ids; give each implementer one as DEVLAB_RESERVATION=<id> and its devlab\nacquire takes the slot at once. An owner with no room under its cap exits 75 with an ETA.\n--release gives every reservation of yours back.\n";
+pub(super) const USAGE: &str = "usage: factory lab reserve [--slots N] [--wait SEC] [--json]\n       factory lab reserve --release [--json]\n\nreserve sets N stack slots of this project aside for implementers (up to your per-owner cap)\nand prints their ids; give each implementer one as DEVLAB_RESERVATION=<id> and its devlab\nacquire takes the slot at once. An owner with no room under its cap exits 75 with an ETA.\n--release gives every reservation of yours back. --wait takes seconds, or 90s, 9m or 1h.\n";
 
 pub fn main(args: &[String]) -> Result<u8, Failure> {
     if args.iter().any(|a| a == "-h" || a == "--help") {

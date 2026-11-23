@@ -16,7 +16,8 @@ $ a@plain-a devlab
 1>   --phone        real phones only (wait for one); --emulator emulators only. Default: phones first,
 1>                  then an emulator when none is free and the cap and memory allow
 1>   --stack        start the slot's local stack too (quiet; log path on failure)
-1>   --wait SEC     how long to queue for a free device or slot (default 480); 0 = do not wait
+1>   --wait SEC     how long to queue for a free device or slot (default 480); 0 = do not wait;
+1>                  seconds, or 90s, 9m or 1h
 1>
 1> A lease belongs to the calling agent (or your terminal) and this worktree; every command from the
 1> same agent in the same worktree finds it again. Subagents count as their lead: one owner may hold at
@@ -49,7 +50,8 @@ $ a@plain-a devlab help
 1>   --phone        real phones only (wait for one); --emulator emulators only. Default: phones first,
 1>                  then an emulator when none is free and the cap and memory allow
 1>   --stack        start the slot's local stack too (quiet; log path on failure)
-1>   --wait SEC     how long to queue for a free device or slot (default 480); 0 = do not wait
+1>   --wait SEC     how long to queue for a free device or slot (default 480); 0 = do not wait;
+1>                  seconds, or 90s, 9m or 1h
 1>
 1> A lease belongs to the calling agent (or your terminal) and this worktree; every command from the
 1> same agent in the same worktree finds it again. Subagents count as their lead: one owner may hold at

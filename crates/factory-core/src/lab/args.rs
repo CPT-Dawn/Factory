@@ -8,6 +8,27 @@ use super::devices::Mode;
 /// year keeps that meaning without overflowing a deadline.
 pub const LONGEST_WAIT: Duration = Duration::from_secs(365 * 86400);
 
+/// What a `--wait` that is no duration is refused with.
+pub const WAIT_REFUSAL: &str =
+    "--wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)";
+
+/// Reads a `--wait`: seconds as devlab read them (see [`number_arg`]), or a whole number and
+/// a unit as [`crate::duration::parse`] reads it, such as `90s` or `9m`. Refuses what is
+/// neither, and a negative or endless number.
+pub fn wait_arg(text: Option<&String>) -> Result<f64, String> {
+    let refused = || WAIT_REFUSAL.to_owned();
+    let sec = match text.map(|text| text.trim()) {
+        Some(text) if text.ends_with(['s', 'm', 'h']) => crate::duration::parse(text)
+            .map_err(|_| refused())?
+            .as_secs_f64(),
+        _ => number_arg(text),
+    };
+    if !sec.is_finite() || sec < 0.0 {
+        return Err(refused());
+    }
+    Ok(sec)
+}
+
 /// What `acquire` and `run` ask for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Opts {
@@ -55,11 +76,7 @@ pub fn parse_opts(args: &[String]) -> Result<(Opts, &[String], Vec<String>), Str
             "--stack" => opts.stack = true,
             "--wait" => {
                 i += 1;
-                let sec = number_arg(args.get(i));
-                if !sec.is_finite() || sec < 0.0 {
-                    return Err("--wait takes a number of seconds (0 = do not wait)".to_owned());
-                }
-                opts.wait_sec = Some(sec);
+                opts.wait_sec = Some(wait_arg(args.get(i))?);
             }
             flag if flag.starts_with("--") => flags.push(flag.to_owned()),
             _ => break,
@@ -150,14 +167,32 @@ mod tests {
             "--devices takes a whole number"
         );
         for bad in ["soon", "-1", "nan", "Infinity", "1e999"] {
-            assert!(
-                opts(&["--wait", bad])
-                    .unwrap_err()
-                    .starts_with("--wait takes"),
-                "{bad}"
-            );
+            assert!(opts(&["--wait", bad]).unwrap_err() == WAIT_REFUSAL, "{bad}");
         }
         assert_eq!(opts(&["--wait", " 7 "]).unwrap().0.wait_sec, Some(7.0));
+    }
+
+    #[test]
+    fn a_wait_takes_the_duration_grammar_and_bare_numbers_as_devlab_read_them() {
+        for (text, sec) in [
+            ("9m", 540.0),
+            ("90s", 90.0),
+            ("1h", 3600.0),
+            ("0s", 0.0),
+            ("2.5", 2.5),
+            (" 7 ", 7.0),
+            ("1e3", 1000.0),
+            ("", 0.0),
+        ] {
+            assert_eq!(
+                opts(&["--wait", text]).unwrap().0.wait_sec,
+                Some(sec),
+                "{text:?}"
+            );
+        }
+        for bad in ["9x", "1.5m", "m", "-1m", "9 m"] {
+            assert_eq!(opts(&["--wait", bad]).unwrap_err(), WAIT_REFUSAL, "{bad:?}");
+        }
     }
 
     #[test]

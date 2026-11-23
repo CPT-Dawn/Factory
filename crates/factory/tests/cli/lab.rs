@@ -12,8 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustix::process::Signal;
 
+pub(super) use crate::support::stop_daemon;
 use crate::support::world::{World, fixtures, poll_until};
-use crate::support::{Run, Sandbox, finish, kill_group, run, spawn};
+use crate::support::{Run, Sandbox, finish, freeze, kill_group, run, spawn, thaw};
 
 /// The sandbox with the golden world installed and the built binary on PATH as `devlab`.
 pub(super) fn lab() -> (Sandbox, World) {
@@ -45,29 +46,6 @@ fn lease_id(out: &Run) -> String {
         .unwrap_or_else(|| panic!("no DEVLAB_LEASE in {out:?}"))
         .trim_matches('\'')
         .to_owned()
-}
-
-/// Stops the sandbox's daemon and waits until it is gone.
-pub(super) fn stop_daemon(sandbox: &Sandbox) {
-    let pid: u32 = fs::read_to_string(sandbox.path("run/factory/daemon.pid"))
-        .expect("a daemon runs")
-        .trim()
-        .parse()
-        .expect("a pid");
-    kill_group(pid, Signal::TERM);
-    // A zombie leader can outlast its other threads, which still hold the socket and the lock:
-    // the daemon is gone once the leader is all that is left of it.
-    let gone = poll_until(|| {
-        let threads = fs::read_dir(format!("/proc/{pid}/task")).map_or(0, Iterator::count);
-        fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-            threads <= 1
-                && stat
-                    .rsplit(')')
-                    .next()
-                    .is_some_and(|s| s.trim_start().starts_with('Z'))
-        })
-    });
-    assert!(gone, "daemon {pid} outlived its TERM");
 }
 
 pub(super) fn write_machine_config(sandbox: &Sandbox, extra: &str) {
@@ -171,7 +149,26 @@ fn a_wait_that_is_no_number_of_seconds_is_refused() {
         (
             2,
             "",
-            "devlab: --wait takes a number of seconds (0 = do not wait)\n"
+            "devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)\n"
+        )
+    );
+}
+
+#[test]
+fn a_wait_takes_a_unit_too() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-unit");
+
+    let unit = owned(&sandbox, &wt, &["acquire", "--no-device", "--wait", "1m"]);
+    let bad = owned(&sandbox, &wt, &["acquire", "--no-device", "--wait", "1.5m"]);
+
+    assert_eq!(unit.code, 0, "{unit:?}");
+    assert!(unit.stdout.contains("DEVLAB_SLOT="), "{unit:?}");
+    assert_eq!(
+        (bad.code, bad.stderr.as_str()),
+        (
+            2,
+            "devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)\n"
         )
     );
 }
@@ -201,7 +198,7 @@ fn a_wait_that_is_no_number_of_seconds_stops_run_before_it_runs_anything() {
         (
             2,
             "",
-            "devlab: --wait takes a number of seconds (0 = do not wait)\n"
+            "devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)\n"
         )
     );
     assert!(!marker.exists(), "the command ran");
@@ -268,7 +265,7 @@ fn a_bad_wait_is_refused_even_when_the_machine_config_is_broken() {
         (out.code, out.stderr.as_str()),
         (
             2,
-            "devlab: --wait takes a number of seconds (0 = do not wait)\n"
+            "devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)\n"
         )
     );
 }
@@ -1904,6 +1901,42 @@ fn factory_wait_lease_returns_once_the_lease_is_released() {
     let again = one_json(&sandbox.factory(&["wait", "lease", "1", "--json"]));
     assert_eq!(again, serde_json::json!({"lease": 1, "held": false}));
     assert!(!lease_waited_on(&sandbox, "1"));
+}
+
+#[test]
+fn factory_wait_lease_carries_on_across_a_daemon_restart_and_hears_what_happened_meanwhile() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-wait-restart");
+    let mut owner = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn the owner");
+    let acquired = native(
+        &sandbox,
+        &wt,
+        owner.id(),
+        &["lab", "acquire", "--no-device"],
+    );
+    assert!(one_line(&acquired).starts_with("lease 1,"), "{acquired:?}");
+    let waiter = spawn(sandbox.factory_command(&["wait", "lease", "1"]));
+    assert!(
+        poll_until(|| lease_waited_on(&sandbox, "1")),
+        "the daemon never held the wait"
+    );
+
+    // The CLI sleeps through the restart; the owner exits while no daemon runs.
+    freeze(&waiter);
+    stop_daemon(&sandbox);
+    owner.kill().expect("kill the owner");
+    owner.wait().expect("reap the owner");
+    thaw(&waiter);
+    let out = finish(waiter);
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "lease 1 ended\n", ""),
+        "{out:?}"
+    );
 }
 
 #[test]
