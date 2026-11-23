@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
 
-use crate::support::Sandbox;
+use crate::support::{Sandbox, finish, spawn};
 
 const CLEAN_REPORT: &str = r#"## Standards
 
@@ -620,7 +620,7 @@ fn what_agy_leaves_running_at_its_print_timeout_is_killed() {
 }
 
 #[test]
-fn a_timeout_too_long_to_add_a_grace_to_still_runs_the_review() {
+fn a_timeout_longer_than_a_week_is_refused_before_any_backend_runs() {
     let sandbox = sandboxed();
     let repo = sandbox.repo();
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
@@ -629,10 +629,86 @@ fn a_timeout_too_long_to_add_a_grace_to_still_runs_the_review() {
         &repo,
         &["review", "--timeout", "18446744073709551615", "main", "t1"],
     );
+    configure(
+        &sandbox,
+        "[[review.backend]]\ncli = \"agy\"\ntimeout = 604801\n",
+    );
+    let configured = sandbox.factory_in(&repo, &["review", "main", "t2"]);
 
-    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(out.code, 2, "{out:?}");
     assert_eq!(
-        after(&reviews_run(&sandbox)[0], "--print-timeout"),
-        Some("18446744073709551615s")
+        out.stderr,
+        "factory: --timeout 18446744073709551615 is longer than a week; give at most 604800\n"
+    );
+    assert_eq!(configured.code, 3, "{configured:?}");
+    assert_eq!(
+        configured.stderr,
+        "factory: backend agy has a timeout of 604801s, longer than a week; set at most 604800 in the factory config\n"
+    );
+    assert!(
+        sandbox.calls("agy").is_empty(),
+        "{:?}",
+        sandbox.calls("agy")
+    );
+}
+
+/// Waits, within a deadline, for `done` to hold.
+fn until_it(done: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !done() {
+        if Instant::now() > deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+#[test]
+fn agy_out_of_quota_is_not_granted_again_while_the_review_waits_for_codex() {
+    let sandbox = sandboxed();
+    let repo = sandbox.repo();
+    configure(
+        &sandbox,
+        "[[review.backend]]\ncli = \"agy\"\n\n[[review.backend]]\ncli = \"codex\"\nconcurrency = 1\nwhen_busy = \"queue\"\n",
+    );
+    let failed = agy_fails(
+        "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 1s.",
+        "error",
+    );
+    sandbox.fake("agy", &agy(&usage_left(), &failed));
+    // codex holds its one slot until the test opens the gate.
+    let gate =
+        "i=0\nwhile [ ! -e \"$0.gate\" ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done\n";
+    sandbox.fake("codex", &format!("{gate}{}", codex_writes(CLEAN_REPORT)));
+    let review = |label: &str| {
+        let mut cmd = sandbox.factory_command(&["review", "--json", "main", label]);
+        cmd.current_dir(&repo);
+        spawn(cmd)
+    };
+    let holder = review("t1");
+    assert!(
+        until_it(|| sandbox.calls("codex").len() == 1),
+        "t1 reaches codex"
+    );
+    let waiter = review("t2");
+    assert!(
+        until_it(|| reviews_run(&sandbox).len() == 2),
+        "t2 tries agy"
+    );
+    // Past the second cooldown: a router that still offered agy would have granted it.
+    let resumed = Instant::now() + Duration::from_millis(2500);
+    assert!(until_it(|| Instant::now() > resumed));
+    fs::write(sandbox.path("bin/codex.gate"), "").unwrap();
+
+    let (holder, waiter) = (finish(holder), finish(waiter));
+
+    assert_eq!(holder.code, 0, "{holder:?}");
+    assert_eq!(waiter.code, 0, "{waiter:?}");
+    assert_eq!(shown(&waiter.stdout)["backend"], "codex", "{waiter:?}");
+    assert_eq!(
+        reviews_run(&sandbox).len(),
+        2,
+        "agy is not granted to t2 again"
     );
 }

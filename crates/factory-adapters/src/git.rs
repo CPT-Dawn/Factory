@@ -87,8 +87,7 @@ fn failed(args: &[&str], output: &Output) -> GitError {
 
 impl Repo for GitRepo {
     fn name(&self) -> Result<String, GitError> {
-        let common = self.git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
-        let common = Path::new(common.trim_end());
+        let common = self.common_dir()?;
         common
             .parent()
             .and_then(Path::file_name)

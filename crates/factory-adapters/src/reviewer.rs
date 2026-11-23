@@ -256,21 +256,27 @@ impl Agy {
             return Err(unready(format!("exited {code}")));
         }
         let usage = String::from_utf8_lossy(&output.stdout).into_owned();
-        // A cache that can't be written only costs the next review another query.
-        let _ = fs::write(&self.usage_cache, &usage);
+        // A cache that can't be written only costs the next review another query. It is
+        // replaced whole, so a review reading it alongside never sees half an answer.
+        let mut fresh = self.usage_cache.clone().into_os_string();
+        fresh.push(format!(".{}", std::process::id()));
+        if fs::write(&fresh, &usage).is_ok() && fs::rename(&fresh, &self.usage_cache).is_err() {
+            let _ = fs::remove_file(&fresh);
+        }
         Ok((usage, false))
     }
 
     /// Whether the quota of its model's group has some left, by its usage query.
     fn quota_left(&self) -> Result<(), ReviewerError> {
         let group = quota::agy_group(self.model.as_deref().unwrap_or_default());
-        let now = now();
         let (usage, cached) = self.usage(false)?;
         let mut said = quota::agy_usage(&usage, group);
         // A cached answer may name an empty bucket whose reset has come since: ask again.
-        if cached && matches!(said, quota::AgyUsage::Empty { until } if until <= now) {
+        if cached && matches!(said, quota::AgyUsage::Empty { until } if until <= now()) {
             said = quota::agy_usage(&self.usage(true)?.0, group);
         }
+        // Read after the answer, so a reset that came while it was asked counts as come.
+        let now = now();
         match said {
             quota::AgyUsage::Empty { until } if until > now => {
                 Err(ReviewerError::OutOfQuota(Reset::On(until)))

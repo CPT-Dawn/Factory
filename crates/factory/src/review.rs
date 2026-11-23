@@ -44,6 +44,8 @@ const DIFF_CONTEXT: u32 = 15;
 const STANDARDS: [&str; 2] = ["CODING_STANDARDS.md", "CONTRIBUTING.md"];
 /// Where the implementer leaves its evidence, in the git dir so it is never committed.
 const EVIDENCE: &str = "factory-evidence.md";
+/// The longest a review may run, in seconds: a week.
+const MAX_TIMEOUT_S: u64 = 7 * 24 * 60 * 60;
 
 pub struct Args {
     pub base: String,
@@ -177,6 +179,7 @@ struct Run {
 }
 
 fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result<Done, Failure> {
+    bounded(args.timeout, routes)?;
     let cwd = env::current_dir().map_err(|e| {
         Failure::precondition(format!(
             "cannot read the working directory: {e}; cd into the repo under review"
@@ -198,13 +201,8 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
     let mut daemon = client::Session::open(paths)?;
     let text = loop {
         let slots = AcquireParams {
-            backends: routes
-                .iter()
-                .filter(|route| {
-                    !run.skipped
-                        .iter()
-                        .any(|(name, _)| *name == route.backend.name)
-                })
+            backends: candidates(routes, run)
+                .into_iter()
                 .map(|Route { backend, .. }| BackendSlots {
                     name: backend.name.clone(),
                     concurrency: backend.concurrency,
@@ -234,9 +232,17 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
                 ))
             })?;
         let Route { backend, reviewer } = &routes[index];
-        if run.cooled.iter().any(|(name, _)| *name == backend.name) {
+        // Granted again only once its reset has come and no other backend is left; a backend
+        // that runs out twice in one review is not tried a third time.
+        if run
+            .cooled
+            .iter()
+            .filter(|(name, _)| *name == backend.name)
+            .count()
+            > 1
+        {
             return Err(Failure::precondition(format!(
-                "the daemon granted {} again although it ran out of quota; restart the daemon",
+                "{} ran out of quota twice in this review; retry after its reset",
                 backend.name
             )));
         }
@@ -365,6 +371,45 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
 }
 
 /// Cools `backend` down until its `reset`, in the daemon and in the run's record.
+/// The routes a run may still be granted: none it skipped, and none it cooled down while
+/// another is left. The daemon decides whether a cooled one's reset has come.
+fn candidates<'a>(routes: &'a [Route], run: &Run) -> Vec<&'a Route> {
+    let skipped = |route: &Route| {
+        run.skipped
+            .iter()
+            .any(|(name, _)| *name == route.backend.name)
+    };
+    let cooled = |route: &Route| {
+        run.cooled
+            .iter()
+            .any(|(name, _)| *name == route.backend.name)
+    };
+    let open: Vec<&Route> = routes.iter().filter(|route| !skipped(route)).collect();
+    if open.iter().all(|route| cooled(route)) {
+        return open;
+    }
+    open.into_iter().filter(|route| !cooled(route)).collect()
+}
+
+/// Refuses a timeout too long to wait on: the wait would have no deadline.
+fn bounded(timeout: Option<Duration>, routes: &[Route]) -> Result<(), Failure> {
+    let limit = Duration::from_secs(MAX_TIMEOUT_S);
+    if let Some(timeout) = timeout.filter(|timeout| *timeout > limit) {
+        return Err(Failure::usage(format!(
+            "--timeout {} is longer than a week; give at most {MAX_TIMEOUT_S}",
+            timeout.as_secs()
+        )));
+    }
+    match routes.iter().find(|route| route.backend.timeout > limit) {
+        Some(route) if timeout.is_none() => Err(Failure::precondition(format!(
+            "backend {} has a timeout of {}s, longer than a week; set at most {MAX_TIMEOUT_S} in the factory config",
+            route.backend.name,
+            route.backend.timeout.as_secs()
+        ))),
+        _ => Ok(()),
+    }
+}
+
 fn cool(
     daemon: &mut client::Session,
     run: &mut Run,
