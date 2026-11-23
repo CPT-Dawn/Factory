@@ -13,11 +13,10 @@ use std::io::{self, Write};
 use std::os::unix::net::UnixListener as StdListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use factory_core::event::{Event, Fields};
 use factory_core::exit::Exit;
-use factory_core::timestamp::Timestamp;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -30,22 +29,24 @@ use tokio::task::JoinSet;
 use factory_adapters::herdr::Herdr;
 use listenfd::ListenFd;
 
+use crate::clock;
 use crate::leads::Leads;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{
-    ErrorBody, LEAD_LIST, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, Outcome, Request,
-    Response, WAIT_LEAD, WaitLeadParams,
+    ErrorBody, LEAD_LIST, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH, Outcome,
+    REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, WAIT_LEAD, WaitLeadParams,
 };
+use crate::router::Router;
+use crate::store::Store;
 
-/// What every connection answers from: the ledger and the picture of the leads.
+/// What every connection answers from: the ledger, the picture of the leads, and the reviewer
+/// router.
 struct Daemon {
     ledger: Arc<Ledger>,
     leads: Arc<Leads>,
+    router: Arc<Router>,
 }
-
-/// What to do when the CLI and the daemon don't speak the same protocol.
-const MISMATCH: &str = "the daemon may be older than this factory: restart it";
 
 /// How long a stopping daemon gives the connections it holds to finish their requests.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -69,6 +70,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
     let ledger = Arc::new(Ledger::open(paths.ledger())?);
     let leads = Leads::new(paths.clone(), Herdr::new(paths.herdr.clone()));
     let _lock = take_daemon_lock(&paths)?;
+    let router = Arc::new(Router::open(Store::open(&paths.database())?)?);
     let listener = match activated {
         Some(listener) => listener,
         None => bind(&paths)?,
@@ -108,7 +110,12 @@ pub fn run(json: bool) -> Result<(), Failure> {
             json,
         );
         tokio::spawn(Arc::clone(&leads).start());
-        serve(listener, Arc::new(Daemon { ledger, leads }), stop).await;
+        let daemon = Daemon {
+            ledger,
+            leads,
+            router,
+        };
+        serve(listener, Arc::new(daemon), stop).await;
         Ok(())
     })?;
     // Nothing is left to answer; the herdr watcher and any stray task may go.
@@ -192,6 +199,10 @@ fn bind(paths: &Paths) -> Result<StdListener, Failure> {
 /// Answers connections until the daemon is stopping, then lets the ones it took finish, for
 /// up to [`DRAIN_TIMEOUT`]. Connections it never took stay queued in the socket.
 async fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Stop) {
+    // The connections hear of the stop only once the listener is gone, so a call made after
+    // a cut-short answer queues for the next daemon instead of in this one's closing backlog.
+    let (hang_up, hung_up) = watch::channel(false);
+    let hung_up = Stop(hung_up);
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
@@ -199,7 +210,7 @@ async fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Stop) {
             () = stop.clone().stopping() => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    connections.spawn(answer(stream, Arc::clone(&daemon), stop.clone()));
+                    connections.spawn(answer(stream, Arc::clone(&daemon), hung_up.clone()));
                 }
                 Err(e) => {
                     let _ = writeln!(io::stderr(), "factory: accept failed: {e}");
@@ -209,6 +220,7 @@ async fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Stop) {
         }
     }
     drop(listener);
+    let _ = hang_up.send(true);
     let drained = async { while connections.join_next().await.is_some() {} };
     if tokio::time::timeout(DRAIN_TIMEOUT, drained).await.is_err() {
         let _ = writeln!(
@@ -225,6 +237,13 @@ async fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Stop) {
 /// so a wait whose CLI is gone stops waiting. A stopping daemon still answers the first request
 /// of a connection it took, then hangs up.
 async fn answer(stream: UnixStream, daemon: Arc<Daemon>, stop: Stop) {
+    let mut held = None;
+    converse(stream, &daemon, &stop, &mut held).await;
+    daemon.router.release(&mut held);
+}
+
+/// The requests and answers of one connection; `held` names the review slot it holds.
+async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut Option<String>) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     let mut first = true;
@@ -242,7 +261,7 @@ async fn answer(stream: UnixStream, daemon: Arc<Daemon>, stop: Stop) {
         };
         first = false;
         let response = tokio::select! {
-            response = respond(&line, &daemon, &stop) => response,
+            response = respond(&line, daemon, stop, held) => response,
             _ = lines.next_line() => return,
         };
         let Ok(mut out) = serde_json::to_string(&response) else {
@@ -255,7 +274,7 @@ async fn answer(stream: UnixStream, daemon: Arc<Daemon>, stop: Stop) {
     }
 }
 
-async fn respond(line: &str, daemon: &Daemon, stop: &Stop) -> Response {
+async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<String>) -> Response {
     let request: Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(e) => {
@@ -281,12 +300,11 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop) -> Response {
                     params.waiter,
                     Duration::from_secs(params.timeout_secs),
                 );
+                // Biased: a stopping daemon answers no wait, even one that ends as it stops.
                 tokio::select! {
+                    biased;
+                    () = stop.clone().stopping() => stopped("wait"),
                     waited = wait => answered(waited),
-                    () = stop.clone().stopping() => Outcome::Error(refusal(
-                        Exit::Precondition,
-                        "the daemon stopped (a restart or an upgrade); run the wait again".to_owned(),
-                    )),
                 }
             }
             Err(refused) => refused,
@@ -299,6 +317,23 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop) -> Response {
                 Err(e) => Outcome::Error(refusal(
                     Exit::Precondition,
                     format!("log failed in the daemon: {e}; retry"),
+                )),
+            }
+        }
+        // Biased: a stopping daemon grants no slot, even one a stopped connection just freed.
+        REVIEW_ACQUIRE => tokio::select! {
+            biased;
+            () = stop.clone().stopping() => stopped("review"),
+            granted = daemon.router.acquire(request.params, held) => granted,
+        },
+        REVIEW_QUOTA => {
+            let router = Arc::clone(&daemon.router);
+            let params = request.params;
+            match tokio::task::spawn_blocking(move || router.record(params)).await {
+                Ok(outcome) => outcome,
+                Err(e) => Outcome::Error(refusal(
+                    Exit::Precondition,
+                    format!("recording a quota failed in the daemon: {e}; retry"),
                 )),
             }
         }
@@ -341,6 +376,14 @@ fn log(params: Value, ledger: &Ledger) -> Outcome {
 }
 
 /// The params of a `method` request, or the refusal of params that don't fit it.
+/// The answer to a request the daemon stopped under: `factory <command>` again.
+fn stopped(command: &str) -> Outcome {
+    Outcome::Error(refusal(
+        Exit::Precondition,
+        format!("the daemon stopped (a restart or an upgrade); run the {command} again"),
+    ))
+}
+
 fn params<P: DeserializeOwned>(method: &str, params: Value) -> Result<P, Outcome> {
     serde_json::from_value(params).map_err(|e| {
         Outcome::Error(refusal(
@@ -394,17 +437,10 @@ impl Ledger {
             .file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let landed = event.stamped(now());
+        let landed = event.stamped(clock::now());
         let mut line = Value::Object(landed.clone()).to_string();
         line.push('\n');
         file.write_all(line.as_bytes())?;
         Ok(landed)
     }
-}
-
-fn now() -> Timestamp {
-    let since_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    Timestamp::from_unix_millis(i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX))
 }

@@ -7,10 +7,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+use rustix::process::Signal;
 use serde_json::Value;
 
 use crate::support::socket_unit::SocketUnit;
-use crate::support::{Sandbox, run};
+use crate::support::{Sandbox, kill_group, run, world};
 
 /// The units as DotFiles keeps them, in a stow package under the sandbox.
 // cfg(test), as the harness is, so clippy lets it unwrap.
@@ -401,4 +402,25 @@ fn install_and_uninstall_answer_in_json() {
         done["state"],
         sandbox.path("state/factory").to_str().unwrap()
     );
+}
+
+#[test]
+fn a_call_while_a_daemon_the_cli_started_stops_waits_and_starts_the_next() {
+    let sandbox = Sandbox::new();
+    assert_eq!(sandbox.factory(&["log", "review", "n=1"]).code, 0);
+    // A caller that connected and has not asked yet keeps the stopping daemon draining.
+    let socket = sandbox.path("run/factory/factory.sock");
+    let quiet = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let pid = fs::read_to_string(sandbox.path("run/factory/daemon.pid")).unwrap();
+    kill_group(pid.trim().parse().unwrap(), Signal::TERM);
+    assert!(
+        world::poll_until(|| std::os::unix::net::UnixStream::connect(&socket).is_err()),
+        "the daemon never stopped listening"
+    );
+
+    let out = sandbox.factory(&["log", "review", "n=2"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(sandbox.ledger_lines().len(), 2);
+    drop(quiet);
 }

@@ -2,8 +2,9 @@
 //!
 //! State resolves as factory-stats resolves it (`$FACTORY_STATE`, else
 //! `${XDG_STATE_HOME:-$HOME/.local/state}/factory`), so both read and write one ledger. The
-//! daemon's socket, locks and pid live in `$XDG_RUNTIME_DIR/factory`. `factory install` puts the
-//! binary in `~/.local/bin` and links the units into systemd's user unit dir.
+//! daemon's socket, locks and pid live in `$XDG_RUNTIME_DIR/factory`, and the config in
+//! `${XDG_CONFIG_HOME:-$HOME/.config}/factory`. `factory install` puts the binary in
+//! `~/.local/bin` and links the units into systemd's user unit dir.
 
 use std::env;
 use std::ffi::OsString;
@@ -17,6 +18,7 @@ use crate::output::Failure;
 pub struct Paths {
     pub state: PathBuf,
     pub runtime: PathBuf,
+    pub config: PathBuf,
     /// herdr's socket: `$HERDR_SOCKET_PATH`, as herdr sets it in its panes, else herdr's
     /// default `${XDG_CONFIG_HOME:-$HOME/.config}/herdr/herdr.sock`.
     pub herdr: PathBuf,
@@ -37,25 +39,36 @@ impl Paths {
             (None, Some(dir)) => Path::new(&dir).join("factory"),
             (None, None) => Path::new(&home()).join(".local/state/factory"),
         };
-        let config = var("XDG_CONFIG_HOME")
+        let config_home = var("XDG_CONFIG_HOME")
             .map_or_else(|| Path::new(&home()).join(".config"), PathBuf::from);
-        let herdr =
-            var("HERDR_SOCKET_PATH").map_or_else(|| config.join("herdr/herdr.sock"), PathBuf::from);
+        let herdr = var("HERDR_SOCKET_PATH")
+            .map_or_else(|| config_home.join("herdr/herdr.sock"), PathBuf::from);
+        let config = config_home.join("factory");
         let runtime = var("XDG_RUNTIME_DIR").ok_or_else(|| {
             Failure::precondition("XDG_RUNTIME_DIR is not set; run factory inside a user session")
         })?;
         Ok(Paths {
             state,
             runtime: Path::new(&runtime).join("factory"),
+            config,
             herdr,
             bin: Path::new(&home()).join(".local/bin"),
-            units: config.join("systemd/user"),
+            units: config_home.join("systemd/user"),
         })
     }
 
     /// The event ledger factory-stats reads.
     pub fn ledger(&self) -> PathBuf {
         self.state.join("events.jsonl")
+    }
+
+    /// The daemon's database: reviewer quotas, and later leases and waits.
+    pub fn database(&self) -> PathBuf {
+        self.state.join("factory.db")
+    }
+
+    pub fn config_file(&self) -> PathBuf {
+        self.config.join("config.toml")
     }
 
     /// The final report of the lead `slug` working in `repo`, as lead.sh names it.

@@ -7,6 +7,7 @@ pub mod duration;
 pub mod event;
 pub mod exit;
 pub mod lead;
+pub mod quota;
 pub mod review;
 pub mod timestamp;
 pub mod wait;

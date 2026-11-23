@@ -15,6 +15,10 @@ impl Timestamp {
     pub const fn from_unix_millis(millis: i64) -> Timestamp {
         Timestamp(millis)
     }
+
+    pub const fn unix_millis(self) -> i64 {
+        self.0
+    }
 }
 
 impl fmt::Display for Timestamp {
