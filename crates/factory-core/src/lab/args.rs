@@ -53,7 +53,8 @@ impl Default for Opts {
     }
 }
 
-/// Options for run and acquire, the command after them, and the other `--flags` seen.
+/// Options for run and acquire, the command after them, and the other `--flags` seen. A
+/// `--wait -1` leaves `wait_sec` unset: the machine's default wait.
 pub fn parse_opts(args: &[String]) -> Result<(Opts, &[String], Vec<String>), String> {
     let mut want = 1.0;
     let mut opts = Opts::default();
@@ -76,7 +77,13 @@ pub fn parse_opts(args: &[String]) -> Result<(Opts, &[String], Vec<String>), Str
             "--stack" => opts.stack = true,
             "--wait" => {
                 i += 1;
-                opts.wait_sec = Some(wait_arg(args.get(i))?);
+                // -1 is the configured default, as it was for the old devlab; any other
+                // negative is refused.
+                opts.wait_sec = if number_arg(args.get(i)) == -1.0 {
+                    None
+                } else {
+                    Some(wait_arg(args.get(i))?)
+                };
             }
             flag if flag.starts_with("--") => flags.push(flag.to_owned()),
             _ => break,
@@ -166,10 +173,33 @@ mod tests {
             opts(&["--devices"]).unwrap_err(),
             "--devices takes a whole number"
         );
-        for bad in ["soon", "-1", "nan", "Infinity", "1e999"] {
+        for bad in [
+            "soon", "-2", "-0.5", "-1.5", "-1s", "-1m", "nan", "Infinity", "1e999",
+        ] {
             assert!(opts(&["--wait", bad]).unwrap_err() == WAIT_REFUSAL, "{bad}");
         }
         assert_eq!(opts(&["--wait", " 7 "]).unwrap().0.wait_sec, Some(7.0));
+    }
+
+    #[test]
+    fn a_wait_of_minus_one_asks_for_the_configured_default() {
+        for text in ["-1", " -1 ", "-1.0", "-1e0"] {
+            let (o, rest, _) = opts(&["--wait", text, "--no-device", "true"]).unwrap();
+            assert_eq!(
+                (o.wait_sec, rest),
+                (None, vec!["true".to_owned()]),
+                "{text:?}"
+            );
+        }
+        // A later --wait still wins, and an earlier -1 does not stick.
+        assert_eq!(
+            opts(&["--wait", "-1", "--wait", "5"]).unwrap().0.wait_sec,
+            Some(5.0)
+        );
+        assert_eq!(
+            opts(&["--wait", "5", "--wait", "-1"]).unwrap().0.wait_sec,
+            None
+        );
     }
 
     #[test]
