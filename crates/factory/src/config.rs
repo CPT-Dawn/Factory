@@ -14,13 +14,28 @@
 //! concurrency = 2          # reviews it runs at once
 //! when_busy = "queue"      # at its limit: "queue" for it, or take the "next" backend
 //! ```
+//!
+//! The hooks (`factory hook`, spec #1, "Hooks") read the `[hook]` table:
+//!
+//! ```toml
+//! [hook]
+//! private_addresses = ["me@example.invalid"]  # a commit or push adding one is refused
+//!
+//! [hook.report]                # the template of a subagent's final report; no limit when absent
+//! max_lines = 40
+//! max_chars = 4000
+//!
+//! [hook.report.agent.implementer]  # an agent type's own limits, over the ones above
+//! max_lines = 5
+//! ```
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
 
+use factory_core::hook::{Template, Templates};
 use factory_core::quota::WhenBusy;
 use serde::Deserialize;
 
@@ -55,6 +70,75 @@ pub struct Backend {
 struct ConfigFile {
     #[serde(default)]
     review: Review,
+    #[serde(default)]
+    hook: HookFile,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct HookFile {
+    #[serde(default)]
+    private_addresses: Vec<String>,
+    #[serde(default)]
+    report: ReportFile,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ReportFile {
+    max_lines: Option<usize>,
+    max_chars: Option<usize>,
+    #[serde(default)]
+    agent: BTreeMap<String, TemplateFile>,
+}
+
+#[derive(Clone, Copy, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct TemplateFile {
+    max_lines: Option<usize>,
+    max_chars: Option<usize>,
+}
+
+impl From<TemplateFile> for Template {
+    fn from(file: TemplateFile) -> Template {
+        Template {
+            max_lines: file.max_lines,
+            max_chars: file.max_chars,
+        }
+    }
+}
+
+/// What the hooks read from the config.
+#[derive(Debug, Default)]
+pub struct HookSettings {
+    /// Addresses a commit or push must not add; lower-cased, none empty.
+    pub private_addresses: Vec<String>,
+    pub templates: Templates,
+}
+
+/// The hooks' settings from the config file in `config_dir`; defaults without the file.
+pub fn hook_settings(config_dir: &Path) -> Result<HookSettings, Failure> {
+    let hook = load(&config_dir.join("config.toml"))?.hook;
+    Ok(HookSettings {
+        private_addresses: hook
+            .private_addresses
+            .iter()
+            .map(|address| address.trim().to_lowercase())
+            .filter(|address| !address.is_empty())
+            .collect(),
+        templates: Templates {
+            default: Template {
+                max_lines: hook.report.max_lines,
+                max_chars: hook.report.max_chars,
+            },
+            agents: hook
+                .report
+                .agent
+                .into_iter()
+                .map(|(agent, template)| (agent, template.into()))
+                .collect(),
+        },
+    })
 }
 
 #[derive(Deserialize, Default)]
@@ -86,17 +170,7 @@ enum Busy {
 /// The review backends in the order they are tried.
 pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
     let path = paths.config_file();
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(Failure::precondition(format!(
-                "cannot read {}: {e}; check its permissions",
-                path.display()
-            )));
-        }
-    };
-    let file: ConfigFile = toml::from_str(&text).map_err(|e| bad(&path, &text, &e))?;
+    let file = load(&path)?;
     if file.review.backend.is_empty() {
         return Ok(defaults());
     }
@@ -123,6 +197,21 @@ pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
             Ok(backend)
         })
         .collect()
+}
+
+/// Reads the config file at `path`; an absent file is an empty config.
+fn load(path: &Path) -> Result<ConfigFile, Failure> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(Failure::precondition(format!(
+                "cannot read {}: {e}; check its permissions",
+                path.display()
+            )));
+        }
+    };
+    toml::from_str(&text).map_err(|e| bad(path, &text, &e))
 }
 
 fn backend(entry: Entry) -> Backend {

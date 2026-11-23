@@ -1,0 +1,512 @@
+//! The hook rules, as tables: each row is one tool call and what the hook says to it.
+
+use factory_core::hook::{
+    GitAction, GitKind, PreTool, RESULT_LIMIT, Template, Templates, post_tool, pre_tool,
+    private_address, subagent_stop,
+};
+use serde_json::{Value, json};
+
+fn bash(command: &str) -> Value {
+    json!({"tool_name": "Bash", "tool_input": {"command": command}})
+}
+
+fn blocked(call: &Value, escape: bool) -> Option<String> {
+    match pre_tool(call, escape) {
+        PreTool::Block(reason) => Some(reason),
+        _ => None,
+    }
+}
+
+#[test]
+fn pre_tool_blocks_a_js_package_manager_as_the_command_word() {
+    for command in [
+        "npm install",
+        "npx tsc --noEmit",
+        "yarn add left-pad",
+        "pnpm i",
+        "cd app && npm test",
+        "echo hi; yarn",
+        "ls | pnpm run x",
+        "FOO=1 npm run build",
+        "sudo npm i -g x",
+        "env npm i",
+        "time npm test",
+        "/usr/bin/npm ci",
+        "(npm test)",
+        "echo $(npm bin)",
+        "echo `npm bin`",
+        "bash -c 'npm test'",
+        "sh -c \"cd x && yarn\"",
+        "npm\ninstall",
+        "true && \\\n  npm test",
+    ] {
+        let reason = blocked(&bash(command), false);
+        assert!(reason.is_some(), "{command:?} should be blocked");
+    }
+}
+
+#[test]
+fn pre_tool_lets_everything_else_through() {
+    for command in [
+        "bun install",
+        "bunx tsc",
+        "bun run build",
+        "git commit -m 'drop npm for bun'",
+        "rg npm src",
+        "echo npm",
+        "man npm",
+        "cat package.json",
+        "ls npm-stuff",
+        "cd npm && ls",
+        "git log --grep=yarn",
+        "npm_config_x=1 bun x",
+        "echo 'a; npm b'",
+        "",
+    ] {
+        assert!(
+            matches!(
+                pre_tool(&bash(command), false),
+                PreTool::Allow | PreTool::CheckStaged(_)
+            ),
+            "{command:?} should pass"
+        );
+    }
+}
+
+#[test]
+fn the_escape_lets_a_package_manager_through_once_set() {
+    for command in ["npm install", "cd a && npx tsc"] {
+        assert!(matches!(pre_tool(&bash(command), true), PreTool::Allow));
+    }
+    // Set in the command itself, for the one call.
+    for command in [
+        "FACTORY_ALLOW_NPM=1 npm install",
+        "cd a && FACTORY_ALLOW_NPM=1 pnpm i",
+    ] {
+        assert!(matches!(pre_tool(&bash(command), false), PreTool::Allow));
+    }
+    // Only for the command it prefixes.
+    assert!(blocked(&bash("FACTORY_ALLOW_NPM=1 bun i; npm i"), false).is_some());
+}
+
+#[test]
+fn the_package_manager_block_is_one_line_with_the_fix() {
+    let reason = blocked(&bash("npm install"), false).unwrap();
+    assert!(!reason.contains('\n'), "{reason}");
+    assert!(reason.chars().count() <= 200, "{reason}");
+    assert!(reason.contains("bun install"), "{reason}");
+    assert!(reason.contains("FACTORY_ALLOW_NPM=1"), "{reason}");
+    let reason = blocked(&bash("npx tsc"), false).unwrap();
+    assert!(reason.contains("bunx"), "{reason}");
+}
+
+#[test]
+fn other_tools_and_shapes_pass_untouched() {
+    for call in [
+        json!({}),
+        json!({"tool_name": "Read", "tool_input": {"file_path": "npm"}}),
+        json!({"tool_name": "Bash"}),
+        json!({"tool_name": "Bash", "tool_input": {"command": 7}}),
+    ] {
+        assert!(matches!(pre_tool(&call, false), PreTool::Allow), "{call}");
+    }
+}
+
+fn repl(code: &str) -> Value {
+    json!({"tool_name": "REPL", "tool_input": {"code": code}})
+}
+
+#[test]
+fn pre_tool_stops_a_repl_script_that_uses_what_the_repl_lacks() {
+    // (script, the word the line must name)
+    for (code, word) in [
+        ("const home = process.env.HOME;", "process"),
+        ("process.exit(1)", "process"),
+        ("await $`ls`;\nconst fs = require('fs');", "require"),
+        ("const m = BASH_REMATCH[1];", "BASH_REMATCH"),
+        ("$`echo ${process.env.HOME}`", "process"),
+        ("`a ${`b ${process.pid}`}`", "process"),
+        ("const x = a / process.pid / 2;", "process"),
+        ("if (ok) { require('x') }", "require"),
+        ("const p = (typeof x) + process;", "process"),
+    ] {
+        let reason =
+            blocked(&repl(code), false).unwrap_or_else(|| panic!("{code:?} should be stopped"));
+        assert!(reason.contains(word), "{code:?}: {reason}");
+        assert!(!reason.contains('\n'), "{reason}");
+        assert!(reason.chars().count() <= 200, "{reason}");
+    }
+}
+
+#[test]
+fn pre_tool_lets_a_repl_script_through_that_only_mentions_those_words() {
+    for code in [
+        "const x = 'process';",
+        "const x = \"it's a require\";",
+        "// require it\nconst a = 1;",
+        "/* process\n require */ const a = 1;",
+        "obj.process = 1; x.require(); y?.process;",
+        "const processed = 1, myprocess = 2, requireAll = 3, BASH_REMATCHES = 4;",
+        "$`echo process; require`",
+        "$`[[ a =~ b ]] && echo \\${BASH_REMATCH[1]}`",
+        "const hit = text.match(/require|process/);",
+        "const hit = text.split(/[/]process/);",
+        "const m = text.match(/(\\d+)/); m[1]",
+        "const o = {process: 1}.process;",
+        "",
+    ] {
+        assert!(
+            matches!(pre_tool(&repl(code), false), PreTool::Allow),
+            "{code:?} should pass"
+        );
+    }
+}
+
+#[test]
+fn the_repl_rule_reads_only_the_repl_and_its_code() {
+    for call in [
+        json!({"tool_name": "Bash", "tool_input": {"command": "echo", "code": "process"}}),
+        json!({"tool_name": "REPL", "tool_input": {"command": "process"}}),
+        json!({"tool_name": "REPL", "tool_input": {"code": 4}}),
+        json!({"tool_name": "REPL"}),
+    ] {
+        assert!(matches!(pre_tool(&call, false), PreTool::Allow), "{call}");
+    }
+}
+
+#[test]
+fn the_repl_block_names_the_line_it_found_the_word_on() {
+    let reason = blocked(&repl("const a = 1;\n\nconst b = require('x');"), false).unwrap();
+    assert!(reason.contains("line 3"), "{reason}");
+}
+
+fn result(response: Value) -> Value {
+    json!({"tool_name": "Bash", "tool_input": {}, "tool_response": response})
+}
+
+#[test]
+fn post_tool_answers_a_result_over_the_limit_with_one_line() {
+    assert_eq!(RESULT_LIMIT, 12_000);
+    let over = "x".repeat(12_001);
+    // (response, the characters in all its strings)
+    for (response, chars) in [
+        (
+            json!({"stdout": over, "stderr": "", "interrupted": false}),
+            12_001,
+        ),
+        // The parts add up.
+        (
+            json!({"stdout": "x".repeat(6_000), "stderr": "y".repeat(6_001)}),
+            12_001,
+        ),
+        (
+            json!({"type": "text", "file": {"filePath": "/a", "content": over}}),
+            12_007,
+        ),
+        (json!(over), 12_001),
+        (
+            json!([{"type": "text", "text": "x".repeat(7_000)}, {"type": "text", "text": "x".repeat(5_001)}]),
+            12_009,
+        ),
+    ] {
+        let line = post_tool(&result(response.clone()))
+            .unwrap_or_else(|| panic!("{} should be answered", preview(&response)));
+        assert!(!line.contains('\n'), "{line}");
+        assert!(line.chars().count() <= 200, "{line}");
+        assert!(line.contains("rg -n"), "{line}");
+        assert!(line.contains(&chars.to_string()), "{line}");
+    }
+}
+
+fn preview(value: &Value) -> String {
+    value.to_string().chars().take(60).collect()
+}
+
+#[test]
+fn post_tool_says_nothing_to_a_result_within_the_limit() {
+    for response in [
+        json!({"stdout": "x".repeat(12_000), "stderr": ""}),
+        // Characters count, not bytes.
+        json!({"stdout": "é".repeat(7_000)}),
+        json!({"stdout": "", "interrupted": true, "isImage": false}),
+        // Keys and numbers are not output.
+        json!({"a".repeat(13_000): 1}),
+        json!(null),
+        json!("short"),
+    ] {
+        assert_eq!(
+            post_tool(&result(response.clone())),
+            None,
+            "{}",
+            preview(&response)
+        );
+    }
+    assert_eq!(post_tool(&json!({"tool_name": "Bash"})), None);
+    assert_eq!(post_tool(&json!({})), None);
+}
+
+fn stop(agent: &str, report: &str, active: bool) -> Value {
+    json!({
+        "hook_event_name": "SubagentStop",
+        "agent_type": agent,
+        "stop_hook_active": active,
+        "last_assistant_message": report,
+    })
+}
+
+fn lines(n: usize) -> String {
+    vec!["a line"; n].join("\n")
+}
+
+fn five_lines() -> Templates {
+    Templates {
+        default: Template {
+            max_lines: Some(5),
+            max_chars: None,
+        },
+        agents: Default::default(),
+    }
+}
+
+#[test]
+fn subagent_stop_sends_back_a_report_longer_than_the_template() {
+    let reason = subagent_stop(&stop("implementer", &lines(6), false), &five_lines())
+        .expect("6 lines is over 5");
+    assert!(!reason.contains('\n'), "{reason}");
+    assert!(reason.contains('6') && reason.contains('5'), "{reason}");
+}
+
+#[test]
+fn subagent_stop_lets_a_report_that_fits_stop() {
+    let templates = five_lines();
+    for report in [
+        lines(5),
+        lines(1),
+        String::new(),
+        format!("{}\n\n", lines(5)),
+    ] {
+        assert_eq!(
+            subagent_stop(&stop("x", &report, false), &templates),
+            None,
+            "{report:?}"
+        );
+    }
+}
+
+#[test]
+fn subagent_stop_counts_characters_when_the_template_limits_them() {
+    let templates = Templates {
+        default: Template {
+            max_lines: None,
+            max_chars: Some(100),
+        },
+        agents: Default::default(),
+    };
+    assert_eq!(
+        subagent_stop(&stop("x", &"é".repeat(100), false), &templates),
+        None
+    );
+    let reason = subagent_stop(&stop("x", &"é".repeat(101), false), &templates).unwrap();
+    assert!(reason.contains("101") && reason.contains("100"), "{reason}");
+}
+
+#[test]
+fn subagent_stop_lets_a_report_stop_the_second_time() {
+    // The agent was already sent back once: sending it back again would never end.
+    assert_eq!(
+        subagent_stop(&stop("x", &lines(50), true), &five_lines()),
+        None
+    );
+}
+
+#[test]
+fn subagent_stop_without_a_template_or_a_report_says_nothing() {
+    assert_eq!(
+        subagent_stop(&stop("x", &lines(500), false), &Templates::default()),
+        None
+    );
+    assert_eq!(
+        subagent_stop(&json!({"agent_type": "x"}), &five_lines()),
+        None
+    );
+    assert_eq!(subagent_stop(&json!({}), &five_lines()), None);
+}
+
+#[test]
+fn a_template_for_an_agent_type_overrides_the_default_field_by_field() {
+    let mut templates = Templates {
+        default: Template {
+            max_lines: Some(40),
+            max_chars: Some(5000),
+        },
+        agents: Default::default(),
+    };
+    templates.agents.insert(
+        "implementer".to_owned(),
+        Template {
+            max_lines: Some(5),
+            max_chars: None,
+        },
+    );
+
+    // The implementer gets its own line limit and the default character limit.
+    assert!(subagent_stop(&stop("implementer", &lines(6), false), &templates).is_some());
+    assert!(subagent_stop(&stop("implementer", &"x".repeat(5001), false), &templates).is_some());
+    assert_eq!(
+        subagent_stop(&stop("implementer", &lines(5), false), &templates),
+        None
+    );
+    // Any other agent gets the default.
+    assert_eq!(
+        subagent_stop(&stop("merger", &lines(6), false), &templates),
+        None
+    );
+    assert!(subagent_stop(&stop("merger", &lines(41), false), &templates).is_some());
+}
+
+fn git(command: &str) -> Option<GitAction> {
+    match pre_tool(&bash(command), false) {
+        PreTool::CheckStaged(action) => Some(action),
+        _ => None,
+    }
+}
+
+fn action(kind: GitKind, all: bool, dir: Option<&str>) -> Option<GitAction> {
+    Some(GitAction {
+        kind,
+        all,
+        dir: dir.map(str::to_owned),
+    })
+}
+
+#[test]
+fn pre_tool_asks_for_the_staged_diff_of_a_commit_or_push() {
+    use GitKind::{Commit, Push};
+    for (command, expected) in [
+        ("git commit -m x", action(Commit, false, None)),
+        ("git commit --amend --no-edit", action(Commit, false, None)),
+        ("git commit -am x", action(Commit, true, None)),
+        ("git commit -a", action(Commit, true, None)),
+        ("git commit --all -m x", action(Commit, true, None)),
+        ("git commit -m 'add -a flag'", action(Commit, false, None)),
+        ("git push", action(Push, false, None)),
+        ("git push origin main", action(Push, false, None)),
+        ("git -C /r commit -m x", action(Commit, false, Some("/r"))),
+        (
+            "git -c user.name=x -C r push",
+            action(Push, false, Some("r")),
+        ),
+        ("git --no-pager commit -m x", action(Commit, false, None)),
+        ("cd r && git commit -m x", action(Commit, false, None)),
+        ("FOO=1 git commit -m x", action(Commit, false, None)),
+        ("sudo git push", action(Push, false, None)),
+        // What an earlier `git add` in the same command stages is not staged yet.
+        ("git add -A && git commit -m x", action(Commit, true, None)),
+        ("git stage a; git commit -m x", action(Commit, true, None)),
+        (
+            "git add . && git commit -m x && git push",
+            action(Commit, true, None),
+        ),
+        ("git commit -m x && git add y", action(Commit, false, None)),
+        ("git commit -m x && git push", action(Commit, false, None)),
+        ("git add . && git push", action(Push, true, None)),
+        ("git status", None),
+        ("git log --grep=commit", None),
+        ("git diff --cached", None),
+        ("git stash push", None),
+        ("git commit-tree abc", None),
+        ("git pushall", None),
+        ("echo git push", None),
+        ("gh pr create", None),
+        ("git", None),
+    ] {
+        assert_eq!(git(command), expected, "{command:?}");
+    }
+}
+
+#[test]
+fn a_package_manager_is_refused_before_the_diff_is_asked_for() {
+    assert!(blocked(&bash("npm i && git commit -m x"), false).is_some());
+}
+
+#[test]
+fn a_heredoc_body_is_text_not_commands() {
+    assert!(matches!(
+        pre_tool(&bash("cat <<EOF > notes\nnpm install\nEOF\nls"), false),
+        PreTool::Allow
+    ));
+    assert!(matches!(
+        pre_tool(&bash("cat <<-'EOF'\n\tnpm install\n\tEOF\nls"), false),
+        PreTool::Allow
+    ));
+    assert!(blocked(&bash("cat <<'EOF'\nnpm i\nEOF\nnpm i"), false).is_some());
+    assert!(git("cat <<EOF\ngit push\nEOF").is_none());
+}
+
+const DIFF: &str = "diff --git a/src/a.txt b/src/a.txt
+index 111..222 100644
+--- a/src/a.txt
++++ b/src/a.txt
+@@ -1,3 +1,4 @@
+ context
+-old line
++new line by Me@Example.Invalid today
++++ not a header
+diff --git a/b.txt b/b.txt
+--- a/b.txt
++++ b/b.txt
+@@ -1 +1 @@
+-me@example.invalid removed
++clean
+";
+
+fn addresses(list: &[&str]) -> Vec<String> {
+    list.iter().map(|a| (*a).to_owned()).collect()
+}
+
+#[test]
+fn a_staged_diff_adding_a_private_address_is_refused_naming_the_file() {
+    let reason = private_address(DIFF, &addresses(&["me@example.invalid"])).unwrap();
+    assert!(reason.contains("src/a.txt"), "{reason}");
+    assert!(
+        !reason.contains("example.invalid"),
+        "the address stays out of the line: {reason}"
+    );
+    assert!(
+        !reason.contains('\n') && reason.chars().count() <= 200,
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_private_address_that_is_only_removed_or_in_context_passes() {
+    let removed = "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-me@example.invalid\n+clean\n";
+    let context = "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1,2 +1,2 @@\n me@example.invalid\n-a\n+b\n";
+    let header = "diff --git a/me@example.invalid b/me@example.invalid\n--- a/me@example.invalid\n+++ b/me@example.invalid\n@@ -1 +1 @@\n-a\n+b\n";
+    for diff in [removed, context, header, ""] {
+        assert_eq!(
+            private_address(diff, &addresses(&["me@example.invalid"])),
+            None,
+            "{diff}"
+        );
+    }
+}
+
+#[test]
+fn with_no_address_configured_nothing_is_private() {
+    assert_eq!(private_address(DIFF, &[]), None);
+    // An empty entry would match every line.
+    assert_eq!(private_address(DIFF, &addresses(&[""])), None);
+    assert!(private_address(DIFF, &addresses(&["", "ME@EXAMPLE.INVALID"])).is_some());
+}
+
+#[test]
+fn any_of_several_addresses_is_private() {
+    let diff =
+        "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+reach me at other@example.invalid\n";
+    let reason = private_address(
+        diff,
+        &addresses(&["me@example.invalid", "other@example.invalid"]),
+    );
+    assert!(reason.unwrap().contains(" x"));
+}

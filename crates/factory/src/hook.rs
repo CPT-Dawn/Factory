@@ -1,0 +1,106 @@
+//! `factory hook pre-tool|post-tool|subagent-stop`: Claude Code's hook JSON on stdin,
+//! answered in its hook protocol on stdout.
+//!
+//! A hook runs on every tool call, so it never talks to the daemon and reads no more than it
+//! must. It prints nothing and exits 0 to let a call through, and one JSON line to refuse it.
+//! A hook that cannot read its input exits 3: Claude Code shows that line and carries on, where
+//! exit 2 would block the call.
+
+use std::env;
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use factory_adapters::git::{GitRepo, Repo};
+use factory_core::hook::{self, GitAction, PreTool};
+use serde_json::{Value, json};
+
+use crate::cli::HookCommand;
+use crate::config;
+use crate::output::{self, Failure};
+use crate::paths;
+
+pub fn run(command: &HookCommand, json: bool) -> ExitCode {
+    match answer(command) {
+        Ok(Some(line)) => {
+            let _ = writeln!(io::stdout().lock(), "{line}");
+            ExitCode::SUCCESS
+        }
+        Ok(None) => ExitCode::SUCCESS,
+        Err(failure) => output::finish(Err(failure), json),
+    }
+}
+
+/// The JSON line the hook prints, or none to let the call through.
+fn answer(command: &HookCommand) -> Result<Option<Value>, Failure> {
+    let input = read_input()?;
+    Ok(match command {
+        HookCommand::PreTool => match hook::pre_tool(&input, escape_set()) {
+            PreTool::Allow => None,
+            PreTool::Block(reason) => Some(deny(&reason)),
+            PreTool::CheckStaged(action) => {
+                // A config that can't be read refuses the call: a leak must not slip by on a typo.
+                match leak(&input, &action) {
+                    Ok(None) => None,
+                    Ok(Some(reason)) => Some(deny(&reason)),
+                    Err(failure) => Some(deny(&failure.message)),
+                }
+            }
+        },
+        HookCommand::PostTool => {
+            hook::post_tool(&input).map(|line| json!({"decision": "block", "reason": line}))
+        }
+        HookCommand::SubagentStop => {
+            let settings = config::hook_settings(&paths::config_dir())?;
+            hook::subagent_stop(&input, &settings.templates)
+                .map(|line| json!({"decision": "block", "reason": line}))
+        }
+    })
+}
+
+fn deny(reason: &str) -> Value {
+    json!({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }})
+}
+
+/// The refusal for a commit or push whose diff adds a private address from the config.
+fn leak(input: &Value, action: &GitAction) -> Result<Option<String>, Failure> {
+    let addresses = config::hook_settings(&paths::config_dir())?.private_addresses;
+    if addresses.is_empty() {
+        return Ok(None);
+    }
+    let cwd = match input.get("cwd").and_then(Value::as_str) {
+        Some(cwd) => PathBuf::from(cwd),
+        None => env::current_dir().unwrap_or_default(),
+    };
+    let dir = action.dir.as_ref().map_or(cwd.clone(), |dir| cwd.join(dir));
+    // Where git can't say what would be committed, git itself will refuse the commit.
+    Ok(GitRepo::at(&dir)
+        .staged_diff(action.all)
+        .ok()
+        .and_then(|diff| hook::private_address(&diff, &addresses)))
+}
+
+fn read_input() -> Result<Value, Failure> {
+    let bad = |why: &str| {
+        Failure::precondition(format!(
+            "hook input is not a JSON object ({why}); Claude Code sends the call on stdin"
+        ))
+    };
+    let mut text = String::new();
+    io::stdin()
+        .read_to_string(&mut text)
+        .map_err(|e| bad(&e.to_string()))?;
+    match serde_json::from_str::<Value>(&text) {
+        Ok(input @ Value::Object(_)) => Ok(input),
+        Ok(_) => Err(bad("another JSON value")),
+        Err(e) => Err(bad(&e.to_string())),
+    }
+}
+
+fn escape_set() -> bool {
+    env::var_os(hook::ESCAPE).is_some_and(|value| !value.is_empty() && value != "0")
+}

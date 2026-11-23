@@ -10,6 +10,9 @@ use crate::process;
 /// How long one git command may take.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The most untracked files a staged-diff check reads.
+const UNTRACKED_LIMIT: usize = 200;
+
 /// A git command that failed: which one, and what it said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitError(pub String);
@@ -38,6 +41,9 @@ pub trait Repo {
     fn toplevel(&self) -> Result<PathBuf, GitError>;
     /// The git dir of this worktree, where the implementer leaves its evidence.
     fn git_dir(&self) -> Result<PathBuf, GitError>;
+    /// What a commit made now would add: the staged diff, or with `all` the whole working tree
+    /// against HEAD, untracked files included, for a command that stages as it commits.
+    fn staged_diff(&self, all: bool) -> Result<String, GitError>;
 }
 
 /// The repository at a directory, through the `git` on PATH.
@@ -57,6 +63,8 @@ impl GitRepo {
         let mut cmd = Command::new("git");
         cmd.args(args)
             .current_dir(&self.dir)
+            // A hook runs on every tool call; it must not take the index lock to refresh stat info.
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -141,6 +149,30 @@ impl Repo for GitRepo {
         let dir = self.git(&["rev-parse", "--absolute-git-dir"])?;
         Ok(PathBuf::from(dir.trim_end()))
     }
+
+    fn staged_diff(&self, all: bool) -> Result<String, GitError> {
+        let diff = ["diff", "--no-color", "--no-ext-diff"];
+        let cached = [&diff[..], &["--cached"]].concat();
+        if !all {
+            return self.git(&cached);
+        }
+        // Before the first commit there is no HEAD to compare with.
+        let mut text = self
+            .git(&[&diff[..], &["HEAD"]].concat())
+            .or_else(|_| self.git(&cached))?;
+        let untracked = self.git(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        for file in untracked
+            .split('\0')
+            .filter(|file| !file.is_empty())
+            .take(UNTRACKED_LIMIT)
+        {
+            // Exit 1 is how `--no-index` says the files differ.
+            let output =
+                self.output(&[&diff[..], &["--no-index", "--", "/dev/null", file]].concat())?;
+            text.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+        Ok(text)
+    }
 }
 
 /// A repository held in memory, for tests of code that reads one.
@@ -154,6 +186,7 @@ pub struct FakeRepo {
     pub commits: String,
     pub toplevel: PathBuf,
     pub git_dir: PathBuf,
+    pub staged_diff: String,
 }
 
 impl Repo for FakeRepo {
@@ -187,5 +220,9 @@ impl Repo for FakeRepo {
 
     fn git_dir(&self) -> Result<PathBuf, GitError> {
         Ok(self.git_dir.clone())
+    }
+
+    fn staged_diff(&self, _all: bool) -> Result<String, GitError> {
+        Ok(self.staged_diff.clone())
     }
 }

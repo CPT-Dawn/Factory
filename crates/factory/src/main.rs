@@ -5,6 +5,7 @@ mod client;
 mod clock;
 mod config;
 mod daemon;
+mod hook;
 mod lead;
 mod leads;
 mod log;
@@ -18,13 +19,17 @@ mod store;
 use std::ffi::OsString;
 use std::process::ExitCode;
 
-use cli::{Command, LeadCommand, WaitCommand};
+use cli::{Cli, Command, LeadCommand, WaitCommand};
 use output::{Done, Failure};
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
     let json = args.iter().skip(1).any(|arg| arg == "--json");
     match cli::parse(args) {
+        Ok(Cli {
+            command: Command::Hook { command },
+            json,
+        }) => hook::run(&command, json),
         Ok(cli) => output::finish(run(cli.command, cli.json), cli.json),
         Err(refusal) => cli::refuse(refusal, json),
     }
@@ -55,6 +60,8 @@ fn run(command: Command, json: bool) -> Result<Done, Failure> {
             previous,
             timeout: timeout.map(std::time::Duration::from_secs),
         }),
+        // Answered in `main`: a hook prints its own protocol, not the output contract's line.
+        Command::Hook { .. } => unreachable!("main answers hooks before it gets here"),
         Command::Daemon => daemon::run(json),
     }
 }

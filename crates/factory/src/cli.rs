@@ -58,8 +58,23 @@ pub enum Command {
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
     },
+    /// Answer a Claude Code hook: its JSON on stdin, its hook protocol on stdout
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
     /// Run the daemon; other commands start it when it isn't running
     Daemon,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HookCommand {
+    /// Before a tool runs: refuse npm, a leaking commit or push, a REPL script that can't run
+    PreTool,
+    /// After a tool ran: one line when its result is over 12k characters
+    PostTool,
+    /// When a subagent stops: send back a report longer than its template
+    SubagentStop,
 }
 
 #[derive(Subcommand, Debug)]
