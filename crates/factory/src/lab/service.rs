@@ -5,7 +5,7 @@
 //! board (a grant, a release, a waiter leaving) or the re-check tick, never in a sleep loop of
 //! the CLI's.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -36,12 +36,20 @@ use crate::protocol::{ErrorBody, Outcome, Request, Response};
 /// How often a waiting acquire looks again without a change to the board: an owner that exited
 /// or a port that freed tells no one (the daemon watches owners itself from #18).
 const RECHECK: Duration = Duration::from_secs(3);
+/// How long past its deadline a waiter whose caller is away keeps its place, so a caller that
+/// lost the daemon as its wait ran out still hears that it gave up.
+const AWAY_GRACE_MS: i64 = 30_000;
+/// How long a wait with no end of its own lasts.
+const FOREVER: Duration = Duration::from_secs(365 * 86400);
 
 pub struct Lab {
     path: PathBuf,
     store: Mutex<Store>,
     /// Bumped on every change a waiter could be waiting for.
     changed: watch::Sender<u64>,
+    /// The waiters whose callers are connected to this daemon; the rest are kept for callers
+    /// that come back after a restart, until they can't.
+    attached: Mutex<HashSet<i64>>,
 }
 
 type Answer<T> = Result<T, ErrorBody>;
@@ -54,10 +62,12 @@ impl Lab {
             path: path.to_owned(),
             store: Mutex::new(store),
             changed: watch::Sender::new(0),
+            attached: Mutex::new(HashSet::new()),
         })
     }
 
-    /// One write transaction; dead owners' leases are dropped first, telling waiters.
+    /// One write transaction; dead owners' leases, dead stoppers' holds and waiters that can't
+    /// come back are dropped first, telling waiters.
     fn write<T>(&self, work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>) -> Answer<T> {
         self.write_gc(work).map(|(_, out)| out)
     }
@@ -76,7 +86,15 @@ impl Lab {
             .write(|c| {
                 let freed = store::gc(c, now, &host::alive)?;
                 let unstopped = store::clear_dead_stoppers(c, &host::alive)?;
-                Ok((freed, unstopped, work(c, now)?))
+                let attached = self.attached().clone();
+                let pruned = store::prune_waiters(
+                    c,
+                    now_ms(),
+                    AWAY_GRACE_MS,
+                    &|id| attached.contains(&id),
+                    &host::alive,
+                )?;
+                Ok((freed, unstopped + pruned, work(c, now)?))
             })
             .map_err(|e| ErrorBody {
                 code: Exit::Precondition.code(),
@@ -86,6 +104,12 @@ impl Lab {
             self.notify();
         }
         Ok((freed, out))
+    }
+
+    fn attached(&self) -> std::sync::MutexGuard<'_, HashSet<i64>> {
+        self.attached
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn notify(&self) {
@@ -238,25 +262,59 @@ fn gather(p: &AcquireParams) -> Facts {
     }
 }
 
-fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<i64> {
+/// Leaves the waiter to callers that come back, once its caller's connection ends.
+struct Attached(Arc<Lab>, i64);
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        self.0.attached().remove(&self.1);
+    }
+}
+
+/// Queues the request, or takes back the place it named if it is still its own; the place and
+/// when it gives up. The caller counts as attached from here.
+fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<(i64, Option<i64>)> {
     lab.write(|c, now| {
-        let name = base_name(&p.worktree);
-        store::insert_waiter(
-            c,
-            &Waiter {
-                id: 0,
-                created: now,
-                label: format!("{} @ {name}", p.owner.label),
-                owner: p.owner.key(),
-                owner_label: p.owner.label.clone(),
-                worktree: p.worktree.clone(),
-                lease: p.lease,
-                project: p.project.as_ref().map(|project| project.name.clone()),
-                slot_cap: p.project.as_ref().map(|project| project.cap),
-                max_slots: p.project.as_ref().map_or(0, |project| project.max_slots),
-            },
-        )
+        let kept = match p.resume {
+            Some(id) => store::waiter(c, id)?
+                .filter(|w| w.owner == p.owner.key() && w.worktree == p.worktree)
+                .map(|w| (w.id, w.deadline_ms)),
+            None => None,
+        };
+        let queued = match kept {
+            Some(kept) => kept,
+            None => insert(c, p, now)?,
+        };
+        lab.attached().insert(queued.0);
+        Ok(queued)
     })
+}
+
+fn insert(c: &Connection, p: &AcquireParams, now: i64) -> rusqlite::Result<(i64, Option<i64>)> {
+    let deadline_ms = Duration::try_from_secs_f64(p.wait_sec)
+        .ok()
+        .and_then(|wait| i64::try_from(wait.as_millis()).ok())
+        .and_then(|wait| now_ms().checked_add(wait));
+    let name = base_name(&p.worktree);
+    let id = store::insert_waiter(
+        c,
+        &Waiter {
+            id: 0,
+            created: now,
+            label: format!("{} @ {name}", p.owner.label),
+            owner: p.owner.key(),
+            owner_label: p.owner.label.clone(),
+            worktree: p.worktree.clone(),
+            lease: p.lease,
+            project: p.project.as_ref().map(|project| project.name.clone()),
+            slot_cap: p.project.as_ref().map(|project| project.cap),
+            max_slots: p.project.as_ref().map_or(0, |project| project.max_slots),
+            deadline_ms,
+            client_pid: p.client.as_ref().map(|client| client.pid),
+            client_start: p.client.as_ref().map(|client| client.start.clone()),
+        },
+    )?;
+    Ok((id, deadline_ms))
 }
 
 fn project_ask(p: &AcquireParams) -> Option<grant::ProjectAsk> {
@@ -379,8 +437,8 @@ where
         let (lab, p) = (Arc::clone(&lab), Arc::clone(&p));
         blocking(move || enqueue(&lab, &p)).await
     };
-    let waiter = match queued {
-        Ok(waiter) => waiter,
+    let (waiter, deadline_ms) = match queued {
+        Ok(queued) => queued,
         Err(body) => {
             send(
                 writer,
@@ -393,9 +451,20 @@ where
             return;
         }
     };
+    let _attached = Attached(Arc::clone(&lab), waiter);
     lab.notify();
+    let place = Response {
+        id,
+        outcome: Outcome::Queued(waiter),
+    };
+    if !send(writer, place).await {
+        lab.remove_waiter(waiter);
+        return;
+    }
     let deadline = Instant::now()
-        + Duration::try_from_secs_f64(p.wait_sec).unwrap_or(Duration::from_secs(365 * 86400));
+        + deadline_ms.map_or(FOREVER, |ms| {
+            Duration::from_millis(u64::try_from(ms.saturating_sub(now_ms())).unwrap_or(0))
+        });
     let mut said = String::new();
     loop {
         let mut changed = lab.changed.subscribe();
@@ -496,6 +565,13 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, response: Response) -> bool
     };
     line.push('\n');
     writer.write_all(line.as_bytes()).await.is_ok()
+}
+
+/// Milliseconds since the epoch.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Seconds since the epoch.

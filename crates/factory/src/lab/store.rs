@@ -41,7 +41,10 @@ CREATE TABLE IF NOT EXISTS waiters (
   lease INTEGER,
   project TEXT,
   slot_cap INTEGER,
-  max_slots INTEGER NOT NULL
+  max_slots INTEGER NOT NULL,
+  deadline_ms INTEGER,
+  client_pid INTEGER,
+  client_start TEXT
 );
 ";
 
@@ -54,8 +57,7 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens (or creates) the store. Waiters are forgotten: their connections ended with the
-    /// daemon that queued them.
+    /// Opens (or creates) the store. Waiters keep their places: their callers come back to them.
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(15))?;
@@ -72,7 +74,6 @@ impl Store {
         if version < VERSION {
             conn.pragma_update(None, "user_version", VERSION)?;
         }
-        conn.execute("DELETE FROM waiters", [])?;
         Ok(Store { conn })
     }
 
@@ -155,9 +156,16 @@ pub fn waiters(c: &Connection) -> rusqlite::Result<Vec<Waiter>> {
             project: row.get("project")?,
             slot_cap: row.get("slot_cap")?,
             max_slots: row.get("max_slots")?,
+            deadline_ms: row.get("deadline_ms")?,
+            client_pid: row.get("client_pid")?,
+            client_start: row.get("client_start")?,
         })
     })?
     .collect()
+}
+
+pub fn waiter(c: &Connection, id: i64) -> rusqlite::Result<Option<Waiter>> {
+    Ok(waiters(c)?.into_iter().find(|w| w.id == id))
 }
 
 /// The lease `forced` names when set; else this worktree's for this owner.
@@ -219,8 +227,9 @@ pub fn touch(c: &Connection, id: i64, now: i64) -> rusqlite::Result<()> {
 
 pub fn insert_waiter(c: &Connection, w: &Waiter) -> rusqlite::Result<i64> {
     c.execute(
-        "INSERT INTO waiters (created, label, owner, owner_label, worktree, lease, project, slot_cap, max_slots)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO waiters (created, label, owner, owner_label, worktree, lease, project, slot_cap,
+           max_slots, deadline_ms, client_pid, client_start)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             w.created,
             w.label,
@@ -230,10 +239,37 @@ pub fn insert_waiter(c: &Connection, w: &Waiter) -> rusqlite::Result<i64> {
             w.lease,
             w.project,
             w.slot_cap,
-            w.max_slots
+            w.max_slots,
+            w.deadline_ms,
+            w.client_pid,
+            w.client_start
         ],
     )?;
     Ok(c.last_insert_rowid())
+}
+
+/// Drops the waiters no caller is attached to that can't come back: their devlab call exited
+/// (or never said which it was), or their wait ran out `grace_ms` ago; how many it dropped.
+pub fn prune_waiters(
+    c: &Connection,
+    now_ms: i64,
+    grace_ms: i64,
+    attached: &dyn Fn(i64) -> bool,
+    alive: &dyn Fn(i64, &str) -> bool,
+) -> rusqlite::Result<usize> {
+    let mut pruned = 0;
+    for w in waiters(c)?.iter().filter(|w| !attached(w.id)) {
+        let gone = w
+            .client_pid
+            .is_none_or(|pid| !alive(pid, w.client_start.as_deref().unwrap_or_default()));
+        let lapsed = w
+            .deadline_ms
+            .is_some_and(|deadline| deadline.saturating_add(grace_ms) < now_ms);
+        if (gone || lapsed) && delete_waiter(c, w.id)? {
+            pruned += 1;
+        }
+    }
+    Ok(pruned)
 }
 
 /// Whether there was such a waiter.

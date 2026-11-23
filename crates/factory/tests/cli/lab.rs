@@ -388,3 +388,92 @@ fn an_owner_that_exits_mid_stop_leaves_the_slot_held_until_the_stack_is_down() {
         assert!(gc.stdout.starts_with("released lease 1 "), "{gc:?}");
     });
 }
+
+/// The worktrees `devlab status` shows waiting, oldest first.
+fn waiting(sandbox: &Sandbox, dir: &Path) -> Vec<String> {
+    let out = run(devlab(sandbox, dir, &["status", "--json"]));
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).unwrap_or_default();
+    report["waiting"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|line| {
+            let after = line.as_str()?.split(" @ ").nth(1)?;
+            after.split(" for ").next().map(str::to_owned)
+        })
+        .collect()
+}
+
+#[test]
+fn queued_requests_keep_their_places_across_a_daemon_restart() {
+    let (sandbox, world) = lab();
+    let (a, b, c, d) = (
+        Agent::start(),
+        Agent::start(),
+        Agent::start(),
+        Agent::start(),
+    );
+    let [wa, wb, wc, wd] = ["demo-a", "demo-b", "demo-c", "demo-d"].map(|n| world.worktree(n));
+    for (agent, wt) in [(&a, &wa), (&b, &wb)] {
+        let held = run(for_owner(
+            &sandbox,
+            wt,
+            agent.pid(),
+            &["acquire", "--no-device"],
+        ));
+        assert_eq!(held.code, 0, "{held:?}");
+    }
+    let queue = ["acquire", "--no-device", "--wait", "30"];
+    let first = spawn(for_owner(&sandbox, &wc, c.pid(), &queue));
+    assert!(poll_until(|| waiting(&sandbox, &wa) == ["demo-c"]));
+    let second = spawn(for_owner(&sandbox, &wd, d.pid(), &queue));
+    assert!(poll_until(|| waiting(&sandbox, &wa) == ["demo-c", "demo-d"]));
+
+    // The first in line can't speak up while the daemon restarts.
+    kill_group(first.id(), Signal::STOP);
+    stop_daemon(&sandbox);
+    let freed = run(for_owner(&sandbox, &wa, a.pid(), &["release"]));
+    let after_restart = waiting(&sandbox, &wa);
+    kill_group(first.id(), Signal::CONT);
+    let first = finish(first);
+    let freed_too = run(for_owner(&sandbox, &wb, b.pid(), &["release"]));
+    let second = finish(second);
+
+    assert_eq!(
+        (freed.code, freed_too.code),
+        (0, 0),
+        "{freed:?} {freed_too:?}"
+    );
+    assert_eq!(after_restart, ["demo-c", "demo-d"]);
+    assert!(first.stdout.contains("DEVLAB_SLOT=0"), "{first:?}");
+    assert!(second.stdout.contains("DEVLAB_SLOT=1"), "{second:?}");
+}
+
+#[test]
+fn a_queued_request_whose_caller_died_while_the_daemon_was_down_is_pruned() {
+    let (sandbox, world) = lab();
+    let (a, b, c) = (Agent::start(), Agent::start(), Agent::start());
+    let [wa, wb, wc] = ["demo-a", "demo-b", "demo-c"].map(|n| world.worktree(n));
+    for (agent, wt) in [(&a, &wa), (&b, &wb)] {
+        let held = run(for_owner(
+            &sandbox,
+            wt,
+            agent.pid(),
+            &["acquire", "--no-device"],
+        ));
+        assert_eq!(held.code, 0, "{held:?}");
+    }
+    let queued = spawn(for_owner(
+        &sandbox,
+        &wc,
+        c.pid(),
+        &["acquire", "--no-device", "--wait", "30"],
+    ));
+    assert!(poll_until(|| waiting(&sandbox, &wa) == ["demo-c"]));
+    kill_group(queued.id(), Signal::STOP);
+    stop_daemon(&sandbox);
+    kill_group(queued.id(), Signal::KILL);
+    let _ = finish(queued);
+
+    assert_eq!(waiting(&sandbox, &wa), Vec::<String>::new());
+}

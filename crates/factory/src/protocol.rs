@@ -3,7 +3,7 @@
 //! A client writes one request per line, `{"id", "method", "params"}`, and reads one response
 //! line per request, `{"id", "result"}` or `{"id", "error": {"code", "message"}}`, where
 //! `code` is an exit code from [`factory_core::exit`]. A request that waits (`lab.acquire`) may
-//! send `{"id", "note"}` lines before its answer.
+//! send `{"id", "note"}` and `{"id", "queued"}` lines before its answer.
 
 use factory_core::event::Fields;
 use factory_core::exit::Exit;
@@ -54,6 +54,9 @@ pub enum Outcome {
     Error(ErrorBody),
     /// Progress before the result, `{"id", "note"}`: a request that waits may send any number.
     Note(String),
+    /// `{"id", "queued": n}`: a request that waits in a queue the daemon keeps across restarts
+    /// (`lab.acquire`) holds place `n`, which it names to keep it when it asks again.
+    Queued(i64),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

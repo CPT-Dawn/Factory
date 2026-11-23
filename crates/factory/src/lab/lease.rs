@@ -53,17 +53,26 @@ pub fn acquire(ctx: &Ctx, opts: &Opts) -> Result<Lease, Failure> {
         None => None,
     };
     let wait_sec = opts.wait_sec.unwrap_or(ctx.cfg.wait_sec);
-    let params = AcquireParams {
+    let params = |resume| AcquireParams {
         worktree: ctx.worktree.clone(),
         owner: ctx.owner.clone(),
         lease: super::context::forced_lease(),
-        project,
+        project: project.clone(),
         wait_sec,
+        resume,
+        client: Some(me()),
     };
     let listen = Duration::try_from_secs_f64(wait_sec)
         .ok()
         .and_then(|wait| wait.checked_add(ANSWER_GRACE));
-    let granted: Granted = client::call_streaming(&paths()?, ACQUIRE, &params, listen, note)?;
+    // A daemon that comes back says why it waits again: say it once.
+    let mut said = String::new();
+    let granted: Granted = client::call_queued(&paths()?, ACQUIRE, params, listen, |why| {
+        if why != said {
+            note(why);
+            said = why.to_owned();
+        }
+    })?;
     let lease = granted.lease;
     if let (Some(p), Some(slot)) = (&ctx.project, lease.slot) {
         stack::prepare_workdir(p, &ctx.worktree, slot)?;
@@ -146,7 +155,7 @@ pub fn stopping(ctx: &Ctx) -> Result<Option<Lease>, Failure> {
     )
 }
 
-/// This devlab call, as a stopper.
+/// This devlab call, as a stopper or a waiter.
 fn me() -> Process {
     let pid = i64::from(std::process::id());
     Process {

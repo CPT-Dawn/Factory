@@ -4,8 +4,9 @@
 use factory_core::lab::queue::{Holding, QueueEntry};
 use serde::{Deserialize, Serialize};
 
-/// Waits in the queue until a lease can be granted: [`AcquireParams`] in, notes while it waits
-/// (`{"id", "note"}`), then [`Granted`] or an error.
+/// Waits in the queue until a lease can be granted: [`AcquireParams`] in, its place in the
+/// queue (`{"id", "queued"}`), notes while it waits (`{"id", "note"}`), then [`Granted`] or an
+/// error. The queue outlives the daemon: a caller that lost it asks again with `resume`.
 pub const ACQUIRE: &str = "lab.acquire";
 /// The caller's lease, touched: [`FindParams`] in, `Option<Lease>` out.
 pub const LEASE: &str = "lab.lease";
@@ -68,6 +69,12 @@ pub struct AcquireParams {
     pub project: Option<ProjectAsk>,
     /// How long to queue; 0 gives up at once.
     pub wait_sec: f64,
+    /// The place in the queue the daemon gave this request before the caller lost it.
+    #[serde(default)]
+    pub resume: Option<i64>,
+    /// The devlab call that asks: its place goes once it exits.
+    #[serde(default)]
+    pub client: Option<Process>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +175,11 @@ pub struct Waiter {
     /// The owner's cap in its project; the planner sets it aside while a lease serves it.
     pub slot_cap: Option<u32>,
     pub max_slots: u32,
+    /// When the request gives up, in milliseconds since the epoch; none waits as long as it takes.
+    pub deadline_ms: Option<i64>,
+    /// The devlab call that waits, by pid and start time.
+    pub client_pid: Option<i64>,
+    pub client_start: Option<String>,
 }
 
 impl Waiter {
