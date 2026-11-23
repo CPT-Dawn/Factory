@@ -1,7 +1,9 @@
 //! The command line: what each command takes, and `--help` kept short.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -32,8 +34,59 @@ pub enum Command {
         #[arg(value_name = "KEY=VALUE")]
         pairs: Vec<String>,
     },
+    /// Say what the leads in herdr are doing
+    Lead {
+        #[command(subcommand)]
+        command: LeadCommand,
+    },
+    /// Block, silent, until something happens
+    Wait {
+        #[command(subcommand)]
+        command: WaitCommand,
+    },
+    /// Review the commits since BASE on a second vendor's model
+    Review {
+        /// The fixed point the work started from
+        base: String,
+        /// Names the report: letters, digits, _ and -; a -rN suffix is the round
+        label: String,
+        /// The spec: a file, an issue ref (#12, 12, an issue URL) or none
+        spec: Option<String>,
+        /// The previous round's report
+        previous: Option<PathBuf>,
+        /// Seconds a reviewer may take before its process group is killed (default: the config's)
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
+    },
     /// Run the daemon; other commands start it when it isn't running
     Daemon,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LeadCommand {
+    /// One line per lead: working, waiting (on what), blocked, asking, finished or dead
+    List,
+    /// One lead's line, and its pane's last lines when it is blocked or asking
+    Status {
+        /// The lead's slug, or lead-<slug>
+        lead: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WaitCommand {
+    /// Until the lead finishes (exit 0), blocks, asks or dies (exit 10)
+    Lead {
+        /// The lead's slug, or lead-<slug>
+        lead: String,
+        /// Give up after this long with exit 124, such as 90s, 9m or 2h
+        #[arg(long, default_value = "9m", value_parser = duration)]
+        timeout: Duration,
+    },
+}
+
+fn duration(text: &str) -> Result<Duration, String> {
+    factory_core::duration::parse(text).map_err(|e| e.to_string())
 }
 
 pub fn parse(args: Vec<OsString>) -> Result<Cli, clap::Error> {
