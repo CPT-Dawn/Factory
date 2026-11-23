@@ -115,7 +115,11 @@ impl GitRepo {
             .to_str()
             .ok_or_else(|| GitError(format!("{} is not UTF-8", dir.display())))?;
         let checkout = Checkout {
-            repo: GitRepo::at(&self.dir),
+            repo: GitRepo {
+                dir: self.dir.clone(),
+                git_dir: self.git_dir.clone(),
+                work_tree: self.work_tree.clone(),
+            },
             dir: dir.to_owned(),
         };
         checkout.remove();
