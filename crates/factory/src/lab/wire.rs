@@ -39,8 +39,8 @@ pub const RELEASE: &str = "lab.release";
 /// Marks the caller's slot as having its stack stopped, so it stays held whatever happens to
 /// the lease until the stopper's release: [`StopParams`] in, the caller's lease out.
 pub const STOPPING: &str = "lab.stopping";
-/// Drops the leases of owners that exited: no params, out a line per lease dropped since the last
-/// gc, by it or by the daemon, which drops them as their owners exit.
+/// Drops the leases of owners that exited: no params, out a line per lease and reservation
+/// this call freed (the daemon frees them as their owners exit, and says nothing of those).
 pub const GC: &str = "lab.gc";
 /// The whole board: no params, [`Board`] out.
 pub const STATUS: &str = "lab.status";
