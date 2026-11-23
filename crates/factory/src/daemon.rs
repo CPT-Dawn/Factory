@@ -97,6 +97,8 @@ pub fn run(json: bool) -> Result<(), Failure> {
         let listener = UnixListener::from_std(listener).map_err(|e| {
             Failure::precondition(format!("cannot listen on {}: {e}; retry", socket.display()))
         })?;
+        // Before the ready line, so a stop that follows it drains, and a failure is the one line.
+        let stop = stop_on_signal()?;
         // Ready only once requests can be answered, so this is the one line the daemon prints.
         output::print(
             &Done::new(
@@ -105,7 +107,6 @@ pub fn run(json: bool) -> Result<(), Failure> {
             ),
             json,
         );
-        let stop = stop_on_signal()?;
         tokio::spawn(Arc::clone(&leads).start());
         serve(listener, Arc::new(Daemon { ledger, leads }), stop).await;
         Ok(())

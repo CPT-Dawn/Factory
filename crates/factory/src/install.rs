@@ -8,10 +8,11 @@
 use std::env;
 use std::fs::{self, File, TryLockError};
 use std::io;
+use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use factory_adapters::systemd::{Systemctl, UserManager};
+use factory_adapters::systemd::{Systemctl, SystemdError, UserManager};
 use rustix::process::{Pid, Signal, kill_process};
 use serde_json::json;
 
@@ -35,16 +36,20 @@ pub fn install(units: Option<&Path>) -> Result<Done, Failure> {
     let upgraded = paths.bin.join("factory").exists();
     let binary = install_binary(&paths)?;
     let systemd = Systemctl;
-    systemd.reload().map_err(told)?;
+    systemd.reload().map_err(systemd_failed("install"))?;
     // The daemon systemd runs stops; the socket starts the new binary on the next call.
-    systemd.stop(&[SERVICE]).map_err(told)?;
+    systemd
+        .stop(&[SERVICE])
+        .map_err(systemd_failed("install"))?;
     {
         // No CLI starts a daemon of its own between the old daemon going and the socket
         // listening: they queue on the start lock, then find the socket.
         paths.create_runtime()?;
         let _start_lock = client::take_start_lock(&paths).map_err(Failure::precondition)?;
         stop_cli_daemon(&paths, "install")?;
-        systemd.enable_now(SOCKET).map_err(told)?;
+        systemd
+            .enable_now(SOCKET)
+            .map_err(systemd_failed("install"))?;
     }
     let socket = paths.socket();
     Ok(Done::new(
@@ -72,12 +77,14 @@ pub fn uninstall() -> Result<Done, Failure> {
         .collect();
     if !present.is_empty() {
         let systemd = Systemctl;
-        systemd.stop(&UNITS).map_err(told_uninstall)?;
-        systemd.disable(SOCKET).map_err(told_uninstall)?;
+        systemd.stop(&UNITS).map_err(systemd_failed("uninstall"))?;
+        systemd
+            .disable(SOCKET)
+            .map_err(systemd_failed("uninstall"))?;
         for unit in &present {
             remove(unit)?;
         }
-        systemd.reload().map_err(told_uninstall)?;
+        systemd.reload().map_err(systemd_failed("uninstall"))?;
     }
     stop_cli_daemon(&paths, "uninstall")?;
     let binary = paths.bin.join("factory");
@@ -107,10 +114,6 @@ fn remove(path: &Path) -> Result<(), Failure> {
     }
 }
 
-fn told_uninstall(e: impl std::fmt::Display) -> Failure {
-    Failure::precondition(format!("{e}; fix it and run factory uninstall again"))
-}
-
 /// Stops a daemon a CLI started outside systemd: it holds the daemon lock and a socket of its
 /// own, so the daemon the socket unit starts could not run beside it.
 fn stop_cli_daemon(paths: &Paths, command: &str) -> Result<(), Failure> {
@@ -122,9 +125,11 @@ fn stop_cli_daemon(paths: &Paths, command: &str) -> Result<(), Failure> {
             lock_path.display()
         ))
     };
-    // No lock file: no daemon has run in this session.
-    let Ok(lock) = File::options().write(true).open(&lock_path) else {
-        return Ok(());
+    let lock = match File::options().write(true).open(&lock_path) {
+        Ok(lock) => lock,
+        // No lock file: no daemon has run in this session.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(cannot_lock(&e)),
     };
     match lock.try_lock() {
         Ok(()) => return Ok(()),
@@ -156,7 +161,11 @@ fn stop_cli_daemon(paths: &Paths, command: &str) -> Result<(), Failure> {
             )));
         }
     }
-    // Its socket stays behind; systemd's takes the path.
+    // Its socket stays behind, refusing calls, and systemd's takes the path. A socket that
+    // takes a call is systemd's, which started the daemon just stopped: it stays.
+    if UnixStream::connect(paths.socket()).is_ok() {
+        return Ok(());
+    }
     match fs::remove_file(paths.socket()) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(Failure::precondition(format!(
             "cannot remove the old daemon's socket {}: {e}; remove it, {again}",
@@ -166,16 +175,20 @@ fn stop_cli_daemon(paths: &Paths, command: &str) -> Result<(), Failure> {
     }
 }
 
-fn told(e: impl std::fmt::Display) -> Failure {
-    Failure::precondition(format!("{e}; fix it and run factory install again"))
+/// A systemd failure, as one line that says to fix it and run `command` again.
+fn systemd_failed(command: &str) -> impl Fn(SystemdError) -> Failure + '_ {
+    move |e| Failure::precondition(format!("{e}; fix it and run factory {command} again"))
 }
 
 /// Copies this binary to `~/.local/bin/factory` through a rename, so a daemon running the old
 /// one keeps running until it is restarted.
 fn install_binary(paths: &Paths) -> Result<PathBuf, Failure> {
     let target = paths.bin.join("factory");
-    let exe = env::current_exe()
-        .map_err(|e| Failure::precondition(format!("cannot find this factory binary: {e}")))?;
+    let exe = env::current_exe().map_err(|e| {
+        Failure::precondition(format!(
+            "cannot find this factory binary: {e}; run factory install from the build to install"
+        ))
+    })?;
     let cannot = |e: io::Error| {
         Failure::precondition(format!(
             "cannot install {}: {e}; check that {} is writable",

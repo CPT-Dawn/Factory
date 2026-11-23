@@ -346,3 +346,59 @@ fn uninstall_stops_a_daemon_the_cli_started() {
     assert!(lock.try_lock().is_ok(), "the daemon still runs");
     assert_eq!(sandbox.ledger_lines().len(), 1);
 }
+
+#[test]
+fn an_upgrade_while_the_socket_listens_keeps_the_socket() {
+    let sandbox = installed();
+    let socket = SocketUnit::from_installed(&sandbox);
+    // A call that came in as the old daemon stopped: the socket started a daemon already.
+    assert_eq!(sandbox.factory(&["log", "review", "n=1"]).code, 0);
+    let units = sandbox.path("dots/factory/.config/systemd/user");
+
+    let out = sandbox.factory(&["install", "--units", units.to_str().unwrap()]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(out.stdout.starts_with("upgraded factory at "), "{out:?}");
+    assert_eq!(sandbox.factory(&["log", "review", "n=2"]).code, 0);
+    assert_eq!(
+        socket.activations(),
+        2,
+        "the next call did not come through the socket"
+    );
+    assert_eq!(sandbox.ledger_lines().len(), 2);
+}
+
+#[test]
+fn install_and_uninstall_answer_in_json() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("systemctl", "exit 0");
+    let units = dotfiles_units(&sandbox);
+    let binary = sandbox.path("home/.local/bin/factory");
+
+    let out = sandbox.factory(&["install", "--units", units.to_str().unwrap(), "--json"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let lines = out.stdout_lines();
+    assert_eq!(lines.len(), 1, "{out:?}");
+    let done: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(done["binary"], binary.to_str().unwrap());
+    assert_eq!(done["upgraded"], false);
+    assert_eq!(
+        done["socket"],
+        sandbox.path("run/factory/factory.sock").to_str().unwrap()
+    );
+    assert_eq!(done["units"].as_array().map(Vec::len), Some(2));
+
+    let out = sandbox.factory(&["uninstall", "--json"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let lines = out.stdout_lines();
+    assert_eq!(lines.len(), 1, "{out:?}");
+    let done: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(done["binary"], binary.to_str().unwrap());
+    assert_eq!(done["units"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        done["state"],
+        sandbox.path("state/factory").to_str().unwrap()
+    );
+}
