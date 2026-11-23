@@ -3,9 +3,12 @@
 //! Every test builds a [`support::Sandbox`] and drives the built `factory` binary inside it.
 //! Add a module per command here.
 
+mod agy;
+mod ci;
 mod devlab_golden;
 mod harness;
 mod help;
+mod install;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
 mod lab;

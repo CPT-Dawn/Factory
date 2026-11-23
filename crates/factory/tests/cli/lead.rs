@@ -5,10 +5,11 @@ use std::process::Child;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rustix::process::Signal;
 use serde_json::Value;
 
 use crate::support::herdr::FakeHerdr;
-use crate::support::{DEADLINE, Sandbox, finish, spawn};
+use crate::support::{DEADLINE, Sandbox, finish, kill_group, spawn};
 
 #[test]
 fn a_herdr_on_another_protocol_is_reported_and_not_used() {
@@ -430,5 +431,23 @@ fn a_lead_that_appears_later_is_found() {
         (out.code, out.stdout_lines()[0]),
         (0, "lead-pay blocked"),
         "{out:?}"
+    );
+}
+
+#[test]
+fn a_wait_the_daemon_stops_under_says_to_wait_again() {
+    let sandbox = Sandbox::new();
+    let herdr = shop(&sandbox, &[("lead-cart", "w1:p1", "working")]);
+    let child = waiting(&sandbox, &herdr, &["cart"], "w1:p1");
+
+    // As systemd stops it for a restart or an upgrade.
+    let daemon = fs::read_to_string(sandbox.path("run/factory/daemon.pid")).unwrap();
+    kill_group(daemon.trim().parse().unwrap(), Signal::TERM);
+    let out = finish(child);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(
+        out.stderr,
+        "factory: the daemon stopped (a restart or an upgrade); run the wait again\n"
     );
 }

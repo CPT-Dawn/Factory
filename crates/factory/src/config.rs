@@ -2,17 +2,29 @@
 //!
 //! Its `[[review.backend]]` entries are the review backends, tried in the order they are
 //! written (spec #1, "Reviewer router"). Without the file, or without entries, the backends are
-//! Codex on its own config, then Claude Opus at high effort.
+//! Antigravity's Gemini 4 Neon at high effort, then Codex on its own config, then Claude Opus at
+//! high effort.
+//!
+//! Its `[ci]` table sets how often a wait on CI polls GitHub when it can't listen for events.
 //!
 //! ```toml
+//! [ci]
+//! poll = "30s"             # a duration: 90s, 9m, 2h
+//!
 //! [[review.backend]]
-//! cli = "codex"            # which adapter runs it: codex or claude
+//! cli = "codex"            # which adapter runs it: agy, codex or claude
 //! name = "codex"           # its quota's name in the ledger and the daemon (default: cli)
 //! model = "gpt-6.2-sol"    # default: the CLI's own
 //! effort = "high"          # default: the CLI's own
 //! timeout = 1800           # seconds before its process group is killed
 //! concurrency = 2          # reviews it runs at once
 //! when_busy = "queue"      # at its limit: "queue" for it, or take the "next" backend
+//!
+//! [[review.backend]]
+//! cli = "agy"
+//! model = "gemini-4-neon"
+//! auth = "subscription"    # agy only: its "subscription" login, or an "api-key" in
+//!                          # GEMINI_API_KEY (default: subscription)
 //! ```
 //!
 //! Its `[lead]` table sets how `factory lead spawn` starts Claude:
@@ -28,9 +40,10 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use factory_adapters::reviewer::AgyAuth;
 use factory_core::quota::WhenBusy;
 use serde::Deserialize;
 
@@ -39,11 +52,13 @@ use crate::paths::Paths;
 
 const DEFAULT_TIMEOUT_S: u64 = 1800;
 const DEFAULT_CONCURRENCY: u32 = 2;
+const DEFAULT_POLL: Duration = Duration::from_secs(30);
 
 /// The CLI a backend runs on, which picks its adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Cli {
+    Agy,
     Codex,
     Claude,
 }
@@ -59,6 +74,8 @@ pub struct Backend {
     pub timeout: Duration,
     pub concurrency: u32,
     pub when_busy: WhenBusy,
+    /// How agy signs in; the other CLIs take none.
+    pub auth: AgyAuth,
 }
 
 #[derive(Deserialize, Default)]
@@ -67,6 +84,14 @@ struct ConfigFile {
     review: Review,
     #[serde(default)]
     lead: LeadSection,
+    #[serde(default)]
+    ci: CiSection,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct CiSection {
+    poll: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -117,6 +142,7 @@ struct Entry {
     timeout: Option<u64>,
     concurrency: Option<u32>,
     when_busy: Option<Busy>,
+    auth: Option<AgyAuth>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -126,10 +152,45 @@ enum Busy {
     Next,
 }
 
+/// How often a wait on CI polls GitHub when it can't listen for events.
+pub fn ci_poll(paths: &Paths) -> Result<Duration, Failure> {
+    let (path, file) = load(paths)?;
+    let Some(poll) = file.ci.poll else {
+        return Ok(DEFAULT_POLL);
+    };
+    match factory_core::duration::parse(&poll) {
+        Ok(poll) if !poll.is_zero() => Ok(poll),
+        Ok(_) => Err(Failure::precondition(format!(
+            "{}: ci.poll is 0s; give it 1s or more",
+            path.display()
+        ))),
+        Err(e) => Err(Failure::precondition(format!(
+            "{}: ci.poll: {e}; fix the config",
+            path.display()
+        ))),
+    }
+}
+
+/// The config file's path and contents; an absent file is an empty config.
+fn load(paths: &Paths) -> Result<(PathBuf, ConfigFile), Failure> {
+    let path = paths.config_file();
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(Failure::precondition(format!(
+                "cannot read {}: {e}; check its permissions",
+                path.display()
+            )));
+        }
+    };
+    let file = toml::from_str(&text).map_err(|e| bad(&path, &text, &e))?;
+    Ok((path, file))
+}
+
 /// The review backends in the order they are tried.
 pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
-    let path = paths.config_file();
-    let file = read(paths)?;
+    let (path, file) = load(paths)?;
     if file.review.backend.is_empty() {
         return Ok(defaults());
     }
@@ -138,7 +199,15 @@ pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
         .backend
         .into_iter()
         .map(|entry| {
+            let auth = entry.auth.is_some();
             let backend = backend(entry);
+            if auth && backend.cli != Cli::Agy {
+                return Err(Failure::precondition(format!(
+                    "{}: backend {} sets auth, which only agy takes; remove it",
+                    path.display(),
+                    backend.name
+                )));
+            }
             if backend.concurrency == 0 {
                 return Err(Failure::precondition(format!(
                     "{}: backend {} has concurrency 0; give it 1 or more",
@@ -160,13 +229,14 @@ pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
 
 /// How `factory lead spawn` starts Claude.
 pub fn lead_setup(paths: &Paths) -> Result<LeadSetup, Failure> {
-    let lead = read(paths)?.lead;
+    let (path, file) = load(paths)?;
+    let lead = file.lead;
     let pause = lead.retry_pause.unwrap_or(DEFAULT_RETRY_PAUSE_S);
     if pause > MAX_RETRY_PAUSE_S {
         return Err(Failure::usage(format!(
             "{}: [lead] retry_pause is {pause}s, at most {MAX_RETRY_PAUSE_S}s keeps a spawn \
              inside the CLI's wait; lower it",
-            paths.config_file().display()
+            path.display()
         )));
     }
     Ok(LeadSetup {
@@ -184,22 +254,6 @@ pub fn lead_setup(paths: &Paths) -> Result<LeadSetup, Failure> {
     })
 }
 
-/// The config file as written; an absent file is an empty one.
-fn read(paths: &Paths) -> Result<ConfigFile, Failure> {
-    let path = paths.config_file();
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(Failure::precondition(format!(
-                "cannot read {}: {e}; check its permissions",
-                path.display()
-            )));
-        }
-    };
-    toml::from_str(&text).map_err(|e| bad(&path, &text, &e))
-}
-
 fn backend(entry: Entry) -> Backend {
     Backend {
         name: entry.name.unwrap_or_else(|| cli_name(entry.cli).to_owned()),
@@ -212,6 +266,7 @@ fn backend(entry: Entry) -> Backend {
             Some(Busy::Next) => WhenBusy::Next,
             Some(Busy::Queue) | None => WhenBusy::Queue,
         },
+        auth: entry.auth.unwrap_or_default(),
     }
 }
 
@@ -225,9 +280,11 @@ fn defaults() -> Vec<Backend> {
             timeout: None,
             concurrency: None,
             when_busy: None,
+            auth: None,
         })
     };
     vec![
+        entry(Cli::Agy, Some("gemini-4-neon"), Some("high")),
         entry(Cli::Codex, None, None),
         entry(Cli::Claude, Some("opus"), Some("high")),
     ]
@@ -235,6 +292,7 @@ fn defaults() -> Vec<Backend> {
 
 pub fn cli_name(cli: Cli) -> &'static str {
     match cli {
+        Cli::Agy => "agy",
         Cli::Codex => "codex",
         Cli::Claude => "claude",
     }

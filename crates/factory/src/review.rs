@@ -1,7 +1,9 @@
 //! `factory review <base> <label> [spec] [prev]`: review.sh's arguments, a prepared review
 //! bundle, a run on the first configured backend the daemon's router grants, and one line back.
 //! A backend that runs out of quota partway is cooled down until its reset, and the same review
-//! re-runs on the next one.
+//! re-runs on the next one. A backend's preflight runs before the review is prepared for it: one
+//! out of quota is cooled down the same way, and one that can't review now (agy without a usage
+//! answer or an active sandbox) is skipped for this run.
 //!
 //! Every file of a review is kept in `<state>/reviews/<repo>/`, named by its label: the
 //! bundle (`.bundle.md`), the prompt (`.prompt`), the report (`.md`) and Codex's event
@@ -17,8 +19,9 @@ use std::time::{Duration, Instant};
 
 use factory_adapters::gh::{Gh, Issues};
 use factory_adapters::git::{GitError, GitRepo, Repo};
-use factory_adapters::reviewer::{Claude, Codex, Job, Reviewer, ReviewerError, home_of};
+use factory_adapters::reviewer::{Agy, Claude, Codex, Job, Reviewer, ReviewerError, home_of};
 use factory_core::exit::Exit;
+use factory_core::quota::Reset;
 use factory_core::review::{self, Bundle, Finding, Part, Reading, Record, Verdict};
 use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
@@ -41,6 +44,8 @@ const DIFF_CONTEXT: u32 = 15;
 const STANDARDS: [&str; 2] = ["CODING_STANDARDS.md", "CONTRIBUTING.md"];
 /// Where the implementer leaves its evidence, in the git dir so it is never committed.
 const EVIDENCE: &str = "factory-evidence.md";
+/// The longest a review may run, in seconds: a week.
+const MAX_TIMEOUT_S: u64 = 7 * 24 * 60 * 60;
 
 pub struct Args {
     pub base: String,
@@ -59,7 +64,7 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         backends
             .into_iter()
             .map(|backend| Route {
-                reviewer: reviewer(&backend),
+                reviewer: reviewer(&backend, &paths),
                 backend,
             })
             .collect::<Vec<_>>()
@@ -69,6 +74,14 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         Ok(routes) => review(args, &paths, routes, &mut run),
         Err(failure) => Err(Failure::new(failure.exit, failure.message.clone())),
     };
+    // A skip the spec has reported (an inactive sandbox) stays in the line of a run that fails.
+    let result = result.map_err(|failure| match run.notes.is_empty() {
+        true => failure,
+        false => Failure::new(
+            failure.exit,
+            format!("{}; {}", failure.message, run.notes.join("; ")),
+        ),
+    });
     let failed = result.as_ref().err().map(|failure| failure.message.clone());
     let chosen = routes
         .as_ref()
@@ -77,6 +90,8 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
     let reviewer = chosen.map(|route| &route.reviewer);
     let fallback_from: Vec<&str> = run.cooled.iter().map(|(name, _)| name.as_str()).collect();
     let fallback_from = fallback_from.join(",");
+    let skipped: Vec<&str> = run.skipped.iter().map(|(name, _)| name.as_str()).collect();
+    let skipped = skipped.join(",");
     let record = Record {
         repo: &run.repo,
         label: &args.label,
@@ -89,6 +104,7 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         effort: reviewer.and_then(|reviewer| reviewer.effort()),
         duration_s: started.elapsed().as_secs(),
         fallback_from: &fallback_from,
+        skipped: &skipped,
         report: &run.report,
         stream: &run.stream,
         findings: &run.findings,
@@ -123,9 +139,15 @@ struct Route {
 }
 
 /// The adapter that runs a configured backend.
-fn reviewer(backend: &Backend) -> Box<dyn Reviewer> {
+fn reviewer(backend: &Backend, paths: &Paths) -> Box<dyn Reviewer> {
     let (model, effort) = (backend.model.clone(), backend.effort.clone());
     match backend.cli {
+        Cli::Agy => Box::new(Agy::new(
+            model,
+            effort,
+            backend.auth,
+            paths.state.join("agy-usage.json"),
+        )),
         Cli::Codex => Box::new(Codex::new(model, effort, &home_of("CODEX_HOME", ".codex"))),
         Cli::Claude => Box::new(Claude::new(
             model,
@@ -146,6 +168,10 @@ struct Run {
     backend: usize,
     /// The backends that ran out of quota on the way, with their reset.
     cooled: Vec<(String, Timestamp)>,
+    /// The backends passed over for this run, with why.
+    skipped: Vec<(String, String)>,
+    /// What the run reports besides its result: a backend whose sandbox is not active.
+    notes: Vec<String>,
     report: String,
     stream: String,
     findings: String,
@@ -153,6 +179,7 @@ struct Run {
 }
 
 fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result<Done, Failure> {
+    bounded(args.timeout, routes)?;
     let cwd = env::current_dir().map_err(|e| {
         Failure::precondition(format!(
             "cannot read the working directory: {e}; cd into the repo under review"
@@ -172,17 +199,28 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
     write(&files.bundle, &inputs.bundle(args).render())?;
     // The daemon holds the backend's slot for as long as this session lives.
     let mut daemon = client::Session::open(paths)?;
-    let slots = AcquireParams {
-        backends: routes
-            .iter()
-            .map(|Route { backend, .. }| BackendSlots {
-                name: backend.name.clone(),
-                concurrency: backend.concurrency,
-                when_busy: backend.when_busy.into(),
-            })
-            .collect(),
-    };
     let text = loop {
+        let slots = AcquireParams {
+            backends: candidates(routes, run)
+                .into_iter()
+                .map(|Route { backend, .. }| BackendSlots {
+                    name: backend.name.clone(),
+                    concurrency: backend.concurrency,
+                    when_busy: backend.when_busy.into(),
+                })
+                .collect(),
+        };
+        if slots.backends.is_empty() && !run.skipped.is_empty() {
+            let why: Vec<String> = run
+                .skipped
+                .iter()
+                .map(|(name, why)| format!("{name} {why}"))
+                .collect();
+            return Err(Failure::precondition(format!(
+                "no review backend can take the review: {}; fix that or configure another backend",
+                why.join(", ")
+            )));
+        }
         let granted: AcquireResult = daemon.wait(REVIEW_ACQUIRE, &slots)?;
         let index = routes
             .iter()
@@ -194,13 +232,38 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
                 ))
             })?;
         let Route { backend, reviewer } = &routes[index];
-        if run.cooled.iter().any(|(name, _)| *name == backend.name) {
+        // Granted again only once its reset has come and no other backend is left; a backend
+        // that runs out twice in one review is not tried a third time.
+        if run
+            .cooled
+            .iter()
+            .filter(|(name, _)| *name == backend.name)
+            .count()
+            > 1
+        {
             return Err(Failure::precondition(format!(
-                "the daemon granted {} again although it ran out of quota; restart the daemon",
+                "{} ran out of quota twice in this review; retry after its reset",
                 backend.name
             )));
         }
         run.backend = index;
+        match reviewer.preflight() {
+            Ok(()) => {}
+            Err(ReviewerError::OutOfQuota(reset)) => {
+                cool(&mut daemon, run, &backend.name, reset)?;
+                continue;
+            }
+            Err(ReviewerError::NoSandbox(why)) => {
+                run.notes.push(format!("{} skipped: {why}", backend.name));
+                run.skipped.push((backend.name.clone(), why));
+                continue;
+            }
+            Err(ReviewerError::Unready(why)) => {
+                run.skipped.push((backend.name.clone(), why));
+                continue;
+            }
+            Err(e) => return Err(reviewer_failed(reviewer.as_ref(), &e, &files.prompt)),
+        }
         let prompt = review::prompt(
             &reviewer.opening(&args.base),
             &files.bundle.display().to_string(),
@@ -222,16 +285,7 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
         match reviewer.review(&job) {
             Ok(()) => {}
             Err(ReviewerError::OutOfQuota(reset)) => {
-                let now = clock::now();
-                let until = reset.until(now, clock::utc_offset(now));
-                let cooling = QuotaParams {
-                    backend: backend.name.clone(),
-                    quota: QuotaParam::Cooling {
-                        until: until.unix_millis(),
-                    },
-                };
-                let _: QuotaParams = daemon.call(REVIEW_QUOTA, &cooling)?;
-                run.cooled.push((backend.name.clone(), until));
+                cool(&mut daemon, run, &backend.name, reset)?;
                 continue;
             }
             Err(e) => return Err(reviewer_failed(reviewer.as_ref(), &e, &stream)),
@@ -280,12 +334,18 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
         .iter()
         .map(|(name, until)| json!({"backend": name, "until": until.to_string()}))
         .collect();
+    let skipped: Vec<Value> = run
+        .skipped
+        .iter()
+        .map(|(name, why)| json!({"backend": name, "reason": why}))
+        .collect();
     let mut done = Done::new(
         reading.summary(&args.label, &run.report),
         json!({
             "label": args.label,
             "backend": backend.name,
             "cooled": cooled,
+            "skipped": skipped,
             "verdict": reading.verdict.to_string(),
             "blocking": reading.counts.blocking,
             "advisory": reading.counts.advisory,
@@ -296,6 +356,7 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
         }),
     );
     done.more = reading.blocking_lines();
+    done.notes = std::mem::take(&mut run.notes);
     if reading.verdict == Verdict::Findings {
         done.exit = Exit::NeedsAttention;
         if reading.findings.is_none() {
@@ -307,6 +368,65 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
     }
     run.reading = Some(reading);
     Ok(done)
+}
+
+/// Cools `backend` down until its `reset`, in the daemon and in the run's record.
+/// The routes a run may still be granted: none it skipped, and none it cooled down while
+/// another is left. The daemon decides whether a cooled one's reset has come.
+fn candidates<'a>(routes: &'a [Route], run: &Run) -> Vec<&'a Route> {
+    let skipped = |route: &Route| {
+        run.skipped
+            .iter()
+            .any(|(name, _)| *name == route.backend.name)
+    };
+    let cooled = |route: &Route| {
+        run.cooled
+            .iter()
+            .any(|(name, _)| *name == route.backend.name)
+    };
+    let open: Vec<&Route> = routes.iter().filter(|route| !skipped(route)).collect();
+    if open.iter().all(|route| cooled(route)) {
+        return open;
+    }
+    open.into_iter().filter(|route| !cooled(route)).collect()
+}
+
+/// Refuses a timeout too long to wait on: the wait would have no deadline.
+fn bounded(timeout: Option<Duration>, routes: &[Route]) -> Result<(), Failure> {
+    let limit = Duration::from_secs(MAX_TIMEOUT_S);
+    if let Some(timeout) = timeout.filter(|timeout| *timeout > limit) {
+        return Err(Failure::usage(format!(
+            "--timeout {} is longer than a week; give at most {MAX_TIMEOUT_S}",
+            timeout.as_secs()
+        )));
+    }
+    match routes.iter().find(|route| route.backend.timeout > limit) {
+        Some(route) if timeout.is_none() => Err(Failure::precondition(format!(
+            "backend {} has a timeout of {}s, longer than a week; set at most {MAX_TIMEOUT_S} in the factory config",
+            route.backend.name,
+            route.backend.timeout.as_secs()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn cool(
+    daemon: &mut client::Session,
+    run: &mut Run,
+    backend: &str,
+    reset: Reset,
+) -> Result<(), Failure> {
+    let now = clock::now();
+    let until = reset.until(now, clock::utc_offset(now));
+    let cooling = QuotaParams {
+        backend: backend.to_owned(),
+        quota: QuotaParam::Cooling {
+            until: until.unix_millis(),
+        },
+    };
+    let _: QuotaParams = daemon.call(REVIEW_QUOTA, &cooling)?;
+    run.cooled.push((backend.to_owned(), until));
+    Ok(())
 }
 
 /// What the bundle holds, read from the repo and the files the caller named. A text the

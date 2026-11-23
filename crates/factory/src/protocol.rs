@@ -32,6 +32,9 @@ pub const LEAD_SPAWN: &str = "lead.spawn";
 /// Answered once a lead finishes, blocks, asks or dies: [`WaitLeadParams`] in,
 /// [`WaitLeadResult`] out; an error with exit 124 when the time runs out first.
 pub const WAIT_LEAD: &str = "wait.lead";
+/// Answered once every check on a pull request's head has finished: [`WaitCiParams`] in,
+/// [`WaitCiResult`] out; an error with exit 124 when the time runs out first.
+pub const WAIT_CI: &str = "wait.ci";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -231,5 +234,37 @@ pub struct WaitLeadResult {
     #[serde(flatten)]
     pub lead: LeadReport,
     /// 0 when the lead finished, 10 when it needs attention.
+    pub exit: u8,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WaitCiParams {
+    /// The pull request as the caller named it: a number, a URL or a branch.
+    pub pr: String,
+    /// The caller's working directory, where `gh` finds the repo a number belongs to.
+    pub cwd: String,
+    /// The herdr pane the wait comes from, so the lead in it shows as waiting.
+    pub waiter: Option<String>,
+    pub timeout_secs: u64,
+    /// How often to poll GitHub when it can't listen for events; the first wait on a pull
+    /// request sets it for all.
+    pub poll_secs: u64,
+}
+
+/// A pull request whose checks all finished.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WaitCiResult {
+    /// `<owner>/<repo>#<number>`.
+    pub pr: String,
+    pub url: String,
+    /// The head commit the checks ran on.
+    pub head: String,
+    pub passed: usize,
+    pub skipped: usize,
+    /// The failed checks' names.
+    pub failed: Vec<String>,
+    /// The file holding each failure's URL and log tail; none when nothing failed.
+    pub file: Option<String>,
+    /// 0 when nothing failed, 10 when something did.
     pub exit: u8,
 }

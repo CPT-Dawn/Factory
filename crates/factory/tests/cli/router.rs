@@ -2,6 +2,7 @@
 //! daemon, the fallback from Codex to Claude, and each backend's concurrency limit.
 
 use std::fs;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use factory_core::timestamp::Timestamp;
@@ -293,6 +294,30 @@ fn holds_a_socket(pid: u32) -> bool {
     })
 }
 
+/// How many connections on `socket` the daemon `pid` has accepted and still holds.
+fn connections_taken(pid: u32, socket: &Path) -> usize {
+    let held: Vec<String> = fs::read_dir(format!("/proc/{pid}/fd"))
+        .map(|fds| {
+            fds.flatten()
+                .filter_map(|fd| fs::read_link(fd.path()).ok())
+                .filter_map(|to| {
+                    let to = to.to_string_lossy().into_owned();
+                    Some(to.strip_prefix("socket:[")?.strip_suffix(']')?.to_owned())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let path = socket.to_string_lossy();
+    fs::read_to_string("/proc/net/unix")
+        .unwrap_or_default()
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        // Num RefCount Protocol Flags Type St Inode Path; St 03 is connected.
+        .filter(|fields| fields.len() == 8 && fields[5] == "03" && fields[7] == path)
+        .filter(|fields| held.iter().any(|inode| inode == fields[6]))
+        .count()
+}
+
 const ONE_CODEX_THEN_CLAUDE: &str = "[[review.backend]]\ncli = \"codex\"\nconcurrency = 1\nwhen_busy = \"WHEN\"\n\n\
      [[review.backend]]\ncli = \"claude\"\n";
 
@@ -472,4 +497,47 @@ fn codex_writes(report: &str) -> String {
          cat > /dev/null\n\
          cat > \"$out\" <<'REPORT'\n{report}REPORT"
     )
+}
+
+#[test]
+fn a_review_queued_when_the_daemon_stops_says_to_run_it_again() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    configure(&sandbox, &ONE_CODEX_THEN_CLAUDE.replace("WHEN", "queue"));
+    let gate = gate(&sandbox);
+    sandbox.fake("codex", &codex_waits_for(&gate, CLEAN_REPORT));
+    let review = |label: &str| {
+        let mut cmd = sandbox.factory_command(&["review", "main", label]);
+        cmd.current_dir(&repo);
+        support::spawn(cmd)
+    };
+    let first = review("t1");
+    assert!(
+        world::poll_until(|| codex_log(&sandbox).len() == 1),
+        "codex never started"
+    );
+    let pid: u32 = fs::read_to_string(sandbox.path("run/factory/daemon.pid"))
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    let socket = sandbox.path("run/factory/factory.sock");
+    let second = review("t2");
+    // Once the daemon has taken t2's connection, t2's acquire is this daemon's to answer.
+    assert!(
+        world::poll_until(|| connections_taken(pid, &socket) == 2),
+        "the daemon never took t2's connection"
+    );
+
+    // As systemd stops it for a restart or an upgrade.
+    support::kill_group(pid, rustix::process::Signal::TERM);
+    let second = support::finish(second);
+
+    assert_eq!(second.code, 3, "{second:?}");
+    assert_eq!(
+        second.stderr,
+        "factory: the daemon stopped (a restart or an upgrade); run the review again\n"
+    );
+    open(&gate);
+    support::finish(first);
 }
