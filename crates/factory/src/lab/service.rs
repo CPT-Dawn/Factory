@@ -116,11 +116,16 @@ impl Lab {
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
-    fn drop_unanswered(&self, lease: &Lease) {
-        if self
-            .write(|c, now| store::drop_lease(c, lease, now))
-            .is_ok()
-        {
+    /// Ends a granted request once its answer is sent, or couldn't be: `unanswered` is the lease
+    /// to give back, which its caller never learned of.
+    fn settle(&self, waiter: i64, unanswered: Option<&Lease>) {
+        let wrote = self.write(|c, now| {
+            if let Some(lease) = unanswered {
+                store::drop_lease(c, lease, now)?;
+            }
+            store::delete_waiter(c, waiter)
+        });
+        if unanswered.is_some() && wrote.is_ok() {
             self.notify();
         }
     }
@@ -271,21 +276,49 @@ impl Drop for Attached {
     }
 }
 
-/// Queues the request, or takes back the place it named if it is still its own; the place and
-/// when it gives up. The caller counts as attached from here.
-fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<(i64, Option<i64>)> {
+/// Where a request stands once queued.
+enum Queued {
+    /// In the queue at `id`, giving up at `deadline_ms`; `resumed`: a place it had before.
+    Waiting {
+        id: i64,
+        deadline_ms: Option<i64>,
+        resumed: bool,
+    },
+    /// Granted before the daemon could answer it.
+    Granted { id: i64, granted: Granted },
+}
+
+/// Queues the request, or takes back the place it had if it is still its own: the one it names,
+/// else the one its devlab call holds, so a caller that never heard of its place keeps it too.
+/// The caller counts as attached from here.
+fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<Queued> {
     lab.write(|c, now| {
-        let kept = match p.resume {
-            Some(id) => store::waiter(c, id)?
-                .filter(|w| w.owner == p.owner.key() && w.worktree == p.worktree)
-                .map(|w| (w.id, w.deadline_ms)),
-            None => None,
-        };
+        let kept = store::place(c, p.resume, p.client.as_ref(), &p.owner.key(), &p.worktree)?;
         let queued = match kept {
-            Some(kept) => kept,
-            None => insert(c, p, now)?,
+            Some(store::Place {
+                waiter,
+                granted: Some(granted),
+            }) => Queued::Granted {
+                id: waiter.id,
+                granted,
+            },
+            Some(store::Place { waiter, .. }) => Queued::Waiting {
+                id: waiter.id,
+                deadline_ms: waiter.deadline_ms,
+                resumed: true,
+            },
+            None => {
+                let (id, deadline_ms) = insert(c, p, now)?;
+                Queued::Waiting {
+                    id,
+                    deadline_ms,
+                    resumed: false,
+                }
+            }
         };
-        lab.attached().insert(queued.0);
+        lab.attached().insert(match &queued {
+            Queued::Waiting { id, .. } | Queued::Granted { id, .. } => *id,
+        });
         Ok(queued)
     })
 }
@@ -397,7 +430,11 @@ fn try_grant(
             _ => None,
         };
         store::touch(c, lease.id, now)?;
-        store::delete_waiter(c, waiter)?;
+        if fresh {
+            store::mark_granted(c, waiter, lease.id, previous.as_deref())?;
+        } else {
+            store::delete_waiter(c, waiter)?;
+        }
         Ok(Ok((Granted { lease, previous }, fresh)))
     })
 }
@@ -437,8 +474,20 @@ where
         let (lab, p) = (Arc::clone(&lab), Arc::clone(&p));
         blocking(move || enqueue(&lab, &p)).await
     };
-    let (waiter, deadline_ms) = match queued {
-        Ok(queued) => queued,
+    let (waiter, deadline_ms, resumed) = match queued {
+        Ok(Queued::Waiting {
+            id,
+            deadline_ms,
+            resumed,
+        }) => (id, deadline_ms, resumed),
+        Ok(Queued::Granted {
+            id: waiter,
+            granted,
+        }) => {
+            let _attached = Attached(Arc::clone(&lab), waiter);
+            answer(&lab, writer, id, waiter, granted, true).await;
+            return;
+        }
         Err(body) => {
             send(
                 writer,
@@ -461,6 +510,26 @@ where
         lab.remove_waiter(waiter);
         return;
     }
+    // A wait that ran out while the daemon was away takes nothing that came free meanwhile.
+    if resumed && deadline_ms.is_some_and(|ms| ms <= now_ms()) {
+        lab.remove_waiter(waiter);
+        let body = ErrorBody {
+            code: Exit::Busy.code(),
+            message: format!(
+                "gave up after {} s: the wait ran out while the daemon restarted",
+                js_number(p.wait_sec)
+            ),
+        };
+        send(
+            writer,
+            Response {
+                id,
+                outcome: Outcome::Error(body),
+            },
+        )
+        .await;
+        return;
+    }
     let deadline = Instant::now()
         + deadline_ms.map_or(FOREVER, |ms| {
             Duration::from_millis(u64::try_from(ms.saturating_sub(now_ms())).unwrap_or(0))
@@ -479,20 +548,7 @@ where
         let why = match tried {
             Ok(Ok((granted, fresh))) => {
                 lab.notify();
-                let lease = granted.lease.clone();
-                let value = serde_json::to_value(granted).unwrap_or(Value::Null);
-                let answered = send(
-                    writer,
-                    Response {
-                        id,
-                        outcome: Outcome::Result(value),
-                    },
-                )
-                .await;
-                // A caller gone before its answer never learns of the lease: give it back.
-                if !answered && fresh {
-                    lab.drop_unanswered(&lease);
-                }
+                answer(&lab, writer, id, waiter, granted, fresh).await;
                 return;
             }
             Ok(Err(why)) => why,
@@ -548,6 +604,29 @@ where
             }
         }
     }
+}
+
+/// Sends the grant, then lets the waiter go. A caller gone before its answer never learns of a
+/// `fresh` lease: it is given back.
+async fn answer<W: AsyncWrite + Unpin>(
+    lab: &Lab,
+    writer: &mut W,
+    id: Option<u64>,
+    waiter: i64,
+    granted: Granted,
+    fresh: bool,
+) {
+    let lease = granted.lease.clone();
+    let value = serde_json::to_value(granted).unwrap_or(Value::Null);
+    let answered = send(
+        writer,
+        Response {
+            id,
+            outcome: Outcome::Result(value),
+        },
+    )
+    .await;
+    lab.settle(waiter, (!answered && fresh).then_some(&lease));
 }
 
 async fn blocking<T: Send + 'static>(

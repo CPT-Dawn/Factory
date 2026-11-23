@@ -66,9 +66,10 @@ pub fn wait<P: Serialize, R: DeserializeOwned>(
 /// [`call`] for a request that waits in a queue the daemon keeps (`lab.acquire`): each note
 /// before its answer goes to `on_note`, and each line may take up to `read_timeout` (none waits
 /// as long as it takes).
-/// When the daemon goes away after queueing it, the CLI connects again (starting a daemon if
-/// none runs) and asks with `params(Some(place))`, keeping its place; for up to
-/// [`RESUME_TIMEOUT`] each time.
+/// When the daemon goes away once asked, the CLI connects again (starting a daemon if none runs)
+/// and asks with `params(Some(place))`, keeping its place; for up to [`RESUME_TIMEOUT`] each
+/// time. Before it heard of a place it asks with `params(None)`: the daemon finds the place by
+/// the caller `params` names.
 pub fn call_queued<P: Serialize, R: DeserializeOwned>(
     paths: &Paths,
     method: &str,
@@ -78,6 +79,7 @@ pub fn call_queued<P: Serialize, R: DeserializeOwned>(
 ) -> Result<R, Failure> {
     let mut place = None;
     let mut give_up = None;
+    let mut asked = false;
     loop {
         let mut placed = None;
         let lost = match Session::open(paths) {
@@ -91,7 +93,10 @@ pub fn call_queued<P: Serialize, R: DeserializeOwned>(
             ) {
                 Ok(answer) => return Ok(answer),
                 Err(Ended::Refused(failure)) => return Err(failure),
-                Err(Ended::Lost(failure)) => failure,
+                Err(Ended::Lost(failure)) => {
+                    asked = true;
+                    failure
+                }
             },
             Err(failure) => failure,
         };
@@ -99,7 +104,7 @@ pub fn call_queued<P: Serialize, R: DeserializeOwned>(
             place = placed;
             give_up = None;
         }
-        if place.is_none() {
+        if !asked {
             return Err(lost);
         }
         let until = *give_up.get_or_insert_with(|| Instant::now() + RESUME_TIMEOUT);

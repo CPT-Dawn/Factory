@@ -1,8 +1,9 @@
 //! `factory lab` under its own name: devlab's verbs under the output contract (spec #1,
 //! "Output contract"). One line on stdout, naming a file when there is more; nothing while it
 //! waits; one JSON object instead with `--json`, which every verb takes; a failure as
-//! `factory: …`. `run` and `exec` pass their command's output and exit code through. Under the
-//! `devlab` name the lab keeps devlab's dialect ([`super::cli`]).
+//! `factory: …`. `run` and `exec` put their command's output in a file the line names, and
+//! exit with its code. Under the `devlab` name the lab keeps devlab's dialect ([`super::cli`]),
+//! the command's output its caller's.
 
 use std::ffi::OsString;
 use std::fs;
@@ -27,9 +28,12 @@ pub fn main(args: &[OsString], json: bool) -> ExitCode {
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     let json = strip_json(&mut args) || json;
-    match dispatch(&args, json) {
+    match dispatch(&args) {
         Ok(Verb::Done(done)) => output::finish(Ok(done), json),
-        Ok(Verb::Ran(code)) => ExitCode::from(code),
+        Ok(Verb::Ran(done, code)) => {
+            output::print(&done, json);
+            ExitCode::from(code)
+        }
         Err(failure) => output::finish(Err(failure), json),
     }
 }
@@ -37,8 +41,8 @@ pub fn main(args: &[OsString], json: bool) -> ExitCode {
 enum Verb {
     /// What the verb shows under the output contract.
     Done(Done),
-    /// The verb printed its own output (help, or the command `run` and `exec` ran): its code.
-    Ran(u8),
+    /// What `run` or `exec` shows, and its command's exit code, which it exits with.
+    Ran(Done, u8),
 }
 
 /// Takes every `--json` before a `--` out of `args`; whether there was one.
@@ -53,18 +57,21 @@ fn strip_json(args: &mut Vec<String>) -> bool {
     args.len() != before
 }
 
-fn dispatch(argv: &[String], json: bool) -> Result<Verb, Failure> {
+fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
     let (cmd, args) = match argv.split_first() {
         Some((cmd, args)) => (cmd.as_str(), args),
         None => ("help", &[][..]),
     };
     let done = match cmd {
         "help" | "-h" | "--help" => {
-            if !json {
-                print!("{HELP}");
-                return Ok(Verb::Ran(0));
-            }
-            Done::new("", json!({ "help": HELP }))
+            let file = save("help.txt", HELP)?;
+            Done::new(
+                format!(
+                    "factory lab: acquire, run, exec, env, release, stack, status, gc; usage in {}",
+                    file.display()
+                ),
+                json!({ "help": HELP, "helpFile": file }),
+            )
         }
         "status" => status_done(&status::board()?)?,
         "acquire" | "run" => {
@@ -81,7 +88,7 @@ fn dispatch(argv: &[String], json: bool) -> Result<Verb, Failure> {
                 warnings.push(warning.to_owned());
             })?;
             if cmd == "run" {
-                return run::exec_in(&ctx, &granted, rest).map(Verb::Ran);
+                return ran(&ctx, &granted, rest);
             }
             lease_done(&ctx, &granted, &warnings)?
         }
@@ -94,8 +101,7 @@ fn dispatch(argv: &[String], json: bool) -> Result<Verb, Failure> {
             if rest.is_empty() {
                 return Err(Failure::usage("factory lab exec -- <cmd...>"));
             }
-            let held = lease::live(&ctx)?;
-            return run::exec_in(&ctx, &held, rest).map(Verb::Ran);
+            return ran(&ctx, &lease::live(&ctx)?, rest);
         }
         "env" => {
             let ctx = context()?;
@@ -115,12 +121,22 @@ fn dispatch(argv: &[String], json: bool) -> Result<Verb, Failure> {
         )?),
         "gc" => {
             let freed = lease::gc()?;
-            let line = if freed.is_empty() {
-                "no lease of an exited owner".to_owned()
-            } else {
-                format!("released {}", freed.join("; "))
-            };
-            Done::new(line, json!({ "released": freed }))
+            match freed.as_slice() {
+                [] => Done::new("no lease of an exited owner", json!({ "released": freed })),
+                [one] => Done::new(format!("released {one}"), json!({ "released": freed })),
+                many => {
+                    let lines: String = many.iter().map(|f| format!("released {f}\n")).collect();
+                    let file = save("gc.txt", &lines)?;
+                    Done::new(
+                        format!(
+                            "released {} leases of exited owners; list in {}",
+                            many.len(),
+                            file.display()
+                        ),
+                        json!({ "released": freed, "releasedFile": file }),
+                    )
+                }
+            }
         }
         "prep" | "watch" => {
             return Err(Failure::usage(format!(
@@ -182,6 +198,21 @@ fn lease_done(ctx: &Ctx, lease: &Lease, warnings: &[String]) -> Result<Done, Fai
         line,
         json!({ "lease": lease, "env": vars, "envFile": file, "warnings": warnings }),
     ))
+}
+
+/// Runs `argv` in the lease, its output in `<runtime>/lab/lease-N.out`: ``cmd` exited 0 in
+/// lease 3; output in <file>`, and the command's code to exit with.
+fn ran(ctx: &Ctx, lease: &Lease, argv: &[String]) -> Result<Verb, Failure> {
+    let file = save(&format!("lease-{}.out", lease.id), "")?;
+    let code = run::exec_logged(ctx, lease, argv, &file)?;
+    let program = argv.first().map_or("", String::as_str);
+    let line = format!(
+        "{program} exited {code} in lease {}; output in {}",
+        lease.id,
+        file.display()
+    );
+    let json = json!({ "lease": lease.id, "exit": code, "outputFile": file });
+    Ok(Verb::Ran(Done::new(line, json), code))
 }
 
 fn stack_done(done: &Stack) -> Done {

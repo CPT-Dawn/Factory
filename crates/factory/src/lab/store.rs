@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::wire::{Lease, Owner, Process, SlotRow, Waiter};
+use super::wire::{Granted, Lease, Owner, Process, SlotRow, Waiter};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS leases (
@@ -27,9 +27,14 @@ CREATE TABLE IF NOT EXISTS slots (
   last_worktree TEXT,
   stack_ours INTEGER NOT NULL DEFAULT 0,
   idle_since INTEGER,
-  stopper_pid INTEGER,
-  stopper_start TEXT,
   PRIMARY KEY (project, slot)
+);
+CREATE TABLE IF NOT EXISTS stoppers (
+  project TEXT NOT NULL,
+  slot INTEGER NOT NULL,
+  pid INTEGER NOT NULL,
+  start TEXT NOT NULL,
+  PRIMARY KEY (project, slot, pid, start)
 );
 CREATE TABLE IF NOT EXISTS waiters (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,12 +49,14 @@ CREATE TABLE IF NOT EXISTS waiters (
   max_slots INTEGER NOT NULL,
   deadline_ms INTEGER,
   client_pid INTEGER,
-  client_start TEXT
+  client_start TEXT,
+  granted INTEGER,
+  previous TEXT
 );
 ";
 
 /// The schema's version, in `PRAGMA user_version`. Version 0 kept waiters only while the
-/// daemon that queued them ran, so their table is rebuilt; its slots gain their stopper.
+/// daemon that queued them ran, so their table is rebuilt; `stoppers` is new.
 const VERSION: i64 = 1;
 
 pub struct Store {
@@ -67,10 +74,6 @@ impl Store {
             conn.execute_batch("DROP TABLE IF EXISTS waiters")?;
         }
         conn.execute_batch(SCHEMA)?;
-        if version < 1 {
-            add_column(&conn, "slots", "stopper_pid", "INTEGER")?;
-            add_column(&conn, "slots", "stopper_start", "TEXT")?;
-        }
         if version < VERSION {
             conn.pragma_update(None, "user_version", VERSION)?;
         }
@@ -89,18 +92,6 @@ impl Store {
         tx.commit()?;
         Ok(out)
     }
-}
-
-/// Adds `column` to `table` unless it has it.
-fn add_column(conn: &Connection, table: &str, column: &str, decl: &str) -> rusqlite::Result<()> {
-    let mut q = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let names: Vec<String> = q
-        .query_map([], |row| row.get::<_, String>("name"))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !names.iter().any(|name| name == column) {
-        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
-    }
-    Ok(())
 }
 
 fn lease_row(row: &Row<'_>) -> rusqlite::Result<Lease> {
@@ -128,7 +119,11 @@ pub fn lease(c: &Connection, id: i64) -> rusqlite::Result<Option<Lease>> {
 }
 
 pub fn slots(c: &Connection) -> rusqlite::Result<Vec<SlotRow>> {
-    let mut q = c.prepare("SELECT * FROM slots ORDER BY project, slot")?;
+    let mut q = c.prepare(
+        "SELECT *, EXISTS (SELECT 1 FROM stoppers s WHERE s.project = slots.project
+                            AND s.slot = slots.slot) AS stopping
+         FROM slots ORDER BY project, slot",
+    )?;
     q.query_map([], |row| {
         Ok(SlotRow {
             project: row.get("project")?,
@@ -136,36 +131,105 @@ pub fn slots(c: &Connection) -> rusqlite::Result<Vec<SlotRow>> {
             last_worktree: row.get("last_worktree")?,
             stack_ours: row.get("stack_ours")?,
             idle_since: row.get("idle_since")?,
-            stopping: row.get::<_, Option<i64>>("stopper_pid")?.is_some(),
+            stopping: row.get("stopping")?,
         })
     })?
     .collect()
 }
 
+/// The requests still waiting, oldest first; not those granted and not yet answered.
 pub fn waiters(c: &Connection) -> rusqlite::Result<Vec<Waiter>> {
-    let mut q = c.prepare("SELECT * FROM waiters ORDER BY id")?;
-    q.query_map([], |row| {
-        Ok(Waiter {
-            id: row.get("id")?,
-            created: row.get("created")?,
-            label: row.get("label")?,
-            owner: row.get("owner")?,
-            owner_label: row.get("owner_label")?,
-            worktree: row.get("worktree")?,
-            lease: row.get("lease")?,
-            project: row.get("project")?,
-            slot_cap: row.get("slot_cap")?,
-            max_slots: row.get("max_slots")?,
-            deadline_ms: row.get("deadline_ms")?,
-            client_pid: row.get("client_pid")?,
-            client_start: row.get("client_start")?,
-        })
-    })?
-    .collect()
+    let mut q = c.prepare("SELECT * FROM waiters WHERE granted IS NULL ORDER BY id")?;
+    q.query_map([], waiter_row)?.collect()
 }
 
-pub fn waiter(c: &Connection, id: i64) -> rusqlite::Result<Option<Waiter>> {
-    Ok(waiters(c)?.into_iter().find(|w| w.id == id))
+fn waiter_row(row: &Row<'_>) -> rusqlite::Result<Waiter> {
+    Ok(Waiter {
+        id: row.get("id")?,
+        created: row.get("created")?,
+        label: row.get("label")?,
+        owner: row.get("owner")?,
+        owner_label: row.get("owner_label")?,
+        worktree: row.get("worktree")?,
+        lease: row.get("lease")?,
+        project: row.get("project")?,
+        slot_cap: row.get("slot_cap")?,
+        max_slots: row.get("max_slots")?,
+        deadline_ms: row.get("deadline_ms")?,
+        client_pid: row.get("client_pid")?,
+        client_start: row.get("client_start")?,
+    })
+}
+
+/// A request as its caller finds it again after losing the daemon.
+pub struct Place {
+    pub waiter: Waiter,
+    /// What it was granted, when the daemon committed a grant it never got to send.
+    pub granted: Option<Granted>,
+}
+
+/// The request this caller made before, by the place it names or else by the devlab call that
+/// asks, if it is the same owner's in the same worktree. A grant whose lease has gone since goes
+/// with it.
+pub fn place(
+    c: &Connection,
+    resume: Option<i64>,
+    client: Option<&Process>,
+    owner: &str,
+    worktree: &str,
+) -> rusqlite::Result<Option<Place>> {
+    let row = |row: &Row<'_>| {
+        Ok((
+            waiter_row(row)?,
+            row.get::<_, Option<i64>>("granted")?,
+            row.get::<_, Option<String>>("previous")?,
+        ))
+    };
+    let found = match (resume, client) {
+        (Some(id), _) => c
+            .query_row("SELECT * FROM waiters WHERE id = ?1", [id], row)
+            .optional()?,
+        (None, Some(client)) => c
+            .query_row(
+                "SELECT * FROM waiters WHERE client_pid = ?1 AND client_start = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![client.pid, client.start],
+                row,
+            )
+            .optional()?,
+        (None, None) => None,
+    };
+    let Some((waiter, granted, previous)) =
+        found.filter(|(w, _, _)| w.owner == owner && w.worktree == worktree)
+    else {
+        return Ok(None);
+    };
+    let granted = match granted {
+        Some(id) => match lease(c, id)? {
+            Some(lease) => Some(Granted { lease, previous }),
+            None => {
+                delete_waiter(c, waiter.id)?;
+                return Ok(None);
+            }
+        },
+        None => None,
+    };
+    Ok(Some(Place { waiter, granted }))
+}
+
+/// Keeps the waiter, granted `lease`, until its answer is sent: a caller that never gets it
+/// still finds it, and one that is gone has it given back.
+pub fn mark_granted(
+    c: &Connection,
+    waiter: i64,
+    lease: i64,
+    previous: Option<&str>,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE waiters SET granted = ?2, previous = ?3 WHERE id = ?1",
+        params![waiter, lease, previous],
+    )?;
+    Ok(())
 }
 
 /// The lease `forced` names when set; else this worktree's for this owner.
@@ -249,7 +313,8 @@ pub fn insert_waiter(c: &Connection, w: &Waiter) -> rusqlite::Result<i64> {
 }
 
 /// Drops the waiters no caller is attached to that can't come back: their devlab call exited
-/// (or never said which it was), or their wait ran out `grace_ms` ago; how many it dropped.
+/// (or never said which it was), or their wait ran out `grace_ms` ago; how many it dropped. A
+/// grant that never reached its caller goes once that call exits, its lease given back.
 pub fn prune_waiters(
     c: &Connection,
     now_ms: i64,
@@ -257,15 +322,25 @@ pub fn prune_waiters(
     attached: &dyn Fn(i64) -> bool,
     alive: &dyn Fn(i64, &str) -> bool,
 ) -> rusqlite::Result<usize> {
+    let mut q = c.prepare("SELECT * FROM waiters ORDER BY id")?;
+    let rows: Vec<(Waiter, Option<i64>)> = q
+        .query_map([], |row| Ok((waiter_row(row)?, row.get("granted")?)))?
+        .collect::<rusqlite::Result<_>>()?;
     let mut pruned = 0;
-    for w in waiters(c)?.iter().filter(|w| !attached(w.id)) {
+    for (w, granted) in rows.iter().filter(|(w, _)| !attached(w.id)) {
         let gone = w
             .client_pid
             .is_none_or(|pid| !alive(pid, w.client_start.as_deref().unwrap_or_default()));
-        let lapsed = w
-            .deadline_ms
-            .is_some_and(|deadline| deadline.saturating_add(grace_ms) < now_ms);
-        if (gone || lapsed) && delete_waiter(c, w.id)? {
+        let lapsed = granted.is_none()
+            && w.deadline_ms
+                .is_some_and(|deadline| deadline.saturating_add(grace_ms) < now_ms);
+        if !(gone || lapsed) {
+            continue;
+        }
+        if let Some(lease) = granted.map(|id| lease(c, id)).transpose()?.flatten() {
+            drop_lease(c, &lease, now_ms / 1000)?;
+        }
+        if delete_waiter(c, w.id)? {
             pruned += 1;
         }
     }
@@ -327,7 +402,8 @@ pub fn claim_slot(
     Ok(previous)
 }
 
-/// Holds the slot for `stopper` while it stops the slot's stack.
+/// Holds the slot for `stopper` while it stops the slot's stack, beside any other stopper's
+/// hold: the slot stays held until the last of them lets go.
 pub fn mark_stopping(
     c: &Connection,
     project: &str,
@@ -335,7 +411,7 @@ pub fn mark_stopping(
     stopper: &Process,
 ) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE slots SET stopper_pid = ?3, stopper_start = ?4 WHERE project = ?1 AND slot = ?2",
+        "INSERT OR IGNORE INTO stoppers (project, slot, pid, start) VALUES (?1, ?2, ?3, ?4)",
         params![project, slot, stopper.pid, stopper.start],
     )?;
     Ok(())
@@ -344,8 +420,7 @@ pub fn mark_stopping(
 /// Lets go of the slots `stopper` held; how many it held.
 pub fn clear_stopping(c: &Connection, stopper: &Process) -> rusqlite::Result<usize> {
     c.execute(
-        "UPDATE slots SET stopper_pid = NULL, stopper_start = NULL
-         WHERE stopper_pid = ?1 AND stopper_start = ?2",
+        "DELETE FROM stoppers WHERE pid = ?1 AND start = ?2",
         params![stopper.pid, stopper.start],
     )
 }
@@ -355,14 +430,12 @@ pub fn clear_dead_stoppers(
     c: &Connection,
     alive: &dyn Fn(i64, &str) -> bool,
 ) -> rusqlite::Result<usize> {
-    let mut q = c.prepare(
-        "SELECT DISTINCT stopper_pid, stopper_start FROM slots WHERE stopper_pid IS NOT NULL",
-    )?;
+    let mut q = c.prepare("SELECT DISTINCT pid, start FROM stoppers")?;
     let stoppers: Vec<Process> = q
         .query_map([], |row| {
             Ok(Process {
                 pid: row.get(0)?,
-                start: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                start: row.get(1)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -384,4 +457,91 @@ pub fn set_stack_ours(
         params![project, slot, ours],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owner(pid: i64) -> Owner {
+        Owner {
+            pid,
+            start: "1".to_owned(),
+            label: format!("claude:{pid}"),
+            found: true,
+        }
+    }
+
+    fn waiter(client: i64) -> Waiter {
+        Waiter {
+            id: 0,
+            created: 1,
+            label: "claude:7 @ demo-a".to_owned(),
+            owner: owner(7).key(),
+            owner_label: "claude:7".to_owned(),
+            worktree: "/w/demo-a".to_owned(),
+            lease: None,
+            project: Some("demo".to_owned()),
+            slot_cap: Some(1),
+            max_slots: 2,
+            deadline_ms: Some(1_000),
+            client_pid: Some(client),
+            client_start: Some("1".to_owned()),
+        }
+    }
+
+    /// A store holding one request by owner 7 from devlab call `client`, granted slot 0 but not
+    /// yet answered; the store, the dir it lives in, and the request's place.
+    fn granted_unanswered(client: i64) -> (Store, tempfile::TempDir, i64) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut store = Store::open(&dir.path().join("lab.db")).expect("open the store");
+        let id = store
+            .write(|c| {
+                let id = insert_waiter(c, &waiter(client))?;
+                let lease = insert_lease(c, Some("demo"), "/w/demo-a", &owner(7), Some(0), 1)?;
+                mark_granted(c, id, lease.id, None)?;
+                Ok(id)
+            })
+            .expect("write the store");
+        (store, dir, id)
+    }
+
+    #[test]
+    fn a_grant_whose_caller_exits_before_hearing_of_it_is_given_back() {
+        let (mut store, _dir, _) = granted_unanswered(41);
+        let only_7 = |pid: i64, _: &str| pid == 7;
+
+        let (pruned, left) = store
+            .write(|c| {
+                let pruned = prune_waiters(c, 2_000, 30_000, &|_| false, &only_7)?;
+                Ok((pruned, leases(c)?))
+            })
+            .expect("prune");
+
+        assert_eq!((pruned, left), (1, Vec::new()));
+    }
+
+    #[test]
+    fn a_grant_not_yet_answered_waits_for_its_caller_out_of_the_queue() {
+        let (mut store, _dir, id) = granted_unanswered(41);
+        let all_alive = |_: i64, _: &str| true;
+        let client = Process {
+            pid: 41,
+            start: "1".to_owned(),
+        };
+
+        let (queue, found) = store
+            .write(|c| {
+                // Long past its deadline: a grant waits for its caller all the same.
+                prune_waiters(c, 1_000_000, 30_000, &|_| false, &all_alive)?;
+                let found = place(c, None, Some(&client), &owner(7).key(), "/w/demo-a")?;
+                Ok((waiters(c)?, found))
+            })
+            .expect("read the store");
+
+        assert_eq!(queue, Vec::new());
+        let found = found.expect("the caller finds its request");
+        assert_eq!(found.waiter.id, id);
+        assert_eq!(found.granted.map(|g| g.lease.slot), Some(Some(0)));
+    }
 }

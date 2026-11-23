@@ -3,8 +3,11 @@
 //! being stopped, and the output contract under the `factory lab` name.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustix::process::Signal;
 
@@ -138,15 +141,16 @@ fn the_owner_is_the_nearest_agent_above_the_shell() {
 }
 
 #[test]
-fn factory_lab_shows_devlabs_help_and_takes_the_global_json_flag() {
+fn factory_lab_names_a_file_with_devlabs_help_and_takes_the_global_json_flag() {
     let (sandbox, world) = lab();
     let wt = world.worktree("demo-name");
     let as_devlab = owned(&sandbox, &wt, &["help"]);
-    let as_factory = sandbox.factory_in(&wt, &["lab", "help"]);
-    assert_eq!(
-        (as_factory.code, &as_factory.stdout),
-        (0, &as_devlab.stdout)
-    );
+    for args in [&["lab", "help"][..], &["lab"]] {
+        let as_factory = sandbox.factory_in(&wt, args);
+        let line = one_line(&as_factory);
+        assert!(line.starts_with("factory lab: acquire, run, "), "{line}");
+        assert_eq!(named_file(line), as_devlab.stdout, "{line}");
+    }
 
     let status = sandbox.factory_in(&wt, &["--json", "lab", "status"]);
     assert_eq!(status.code, 0, "{status:?}");
@@ -296,31 +300,47 @@ impl Drop for Agent {
     }
 }
 
-/// Fakes the project's supabase CLI as the world does, except that `stop` first marks
-/// `began`, then holds until `gate` exists (for at most the test deadline).
-fn hold_stops(sandbox: &Sandbox, began: &Path, gate: &Path) {
-    let body = fs::read_to_string(fixtures().join("fakes/supabase.sh"))
+/// The world's fake of `tool`, except that its first `holds` calls of `verb` each mark that they
+/// began, then hold until the test opens their gate (or the test deadline passes).
+fn hold(sandbox: &Sandbox, tool: &str, verb: &str, holds: u32) -> Holds {
+    let dir = sandbox.path(format!("holds-{tool}"));
+    fs::create_dir_all(&dir).expect("create the holds dir");
+    let body = fs::read_to_string(fixtures().join(format!("fakes/{tool}.sh")))
         .expect("read a fake")
         .replace("@WORLD@", &sandbox.path("world").display().to_string());
     let hold = format!(
-        "if [ \"$1\" = stop ]; then\n  : > '{began}'\n  i=0\n  while [ ! -e '{gate}' ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done\nfi\n",
-        began = began.display(),
-        gate = gate.display()
+        "if [ \"$1\" = {verb} ]; then\n\
+         \x20 n=1; while ! mkdir '{dir}/began-'$n 2>/dev/null; do n=$((n+1)); done\n\
+         \x20 if [ $n -le {holds} ]; then i=0\n\
+         \x20   while [ ! -e '{dir}/gate-'$n ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done\n\
+         \x20 fi\n\
+         fi\n",
+        dir = dir.display()
     );
-    sandbox.fake("supabase", &(hold + &body));
+    sandbox.fake(tool, &(hold + &body));
+    Holds(dir)
+}
+
+/// The calls [`hold`] holds, by number from 1.
+struct Holds(PathBuf);
+
+impl Holds {
+    fn began(&self, n: u32) -> bool {
+        self.0.join(format!("began-{n}")).exists()
+    }
+
+    fn open(&self, n: u32) {
+        fs::write(self.0.join(format!("gate-{n}")), "").expect("open a gate");
+    }
 }
 
 /// Owner a holds demo's slot 0 with its stack up and b holds slot 1. While a's
 /// `release --stop-stack` is still stopping the stack, `free` drops a's lease some other way:
 /// slot 0 stays held until the stack is down, then goes to the next owner.
-fn a_slot_stays_held_while_its_stack_stops(free: impl FnOnce(&Sandbox, &Path, &mut Agent)) {
+fn a_slot_stays_held_while_its_stack_stops(free: impl FnOnce(&Sandbox, &Path, &mut Agent, &Holds)) {
     let (sandbox, world) = lab();
     let (mut a, b, c) = (Agent::start(), Agent::start(), Agent::start());
-    let (wa, wb, wc) = (
-        world.worktree("demo-a"),
-        world.worktree("demo-b"),
-        world.worktree("demo-c"),
-    );
+    let [wa, wb, wc] = ["demo-a", "demo-b", "demo-c"].map(|n| world.worktree(n));
     let up = run(for_owner(
         &sandbox,
         &wa,
@@ -335,24 +355,23 @@ fn a_slot_stays_held_while_its_stack_stops(free: impl FnOnce(&Sandbox, &Path, &m
         &["acquire", "--no-device"],
     ));
     assert!(other.stdout.contains("DEVLAB_SLOT=1"), "{other:?}");
-    let (began, gate) = (sandbox.path("stop-began"), sandbox.path("stop-gate"));
-    hold_stops(&sandbox, &began, &gate);
+    let holds = hold(&sandbox, "supabase", "stop", 2);
     let stopping = spawn(for_owner(
         &sandbox,
         &wa,
         a.pid(),
         &["release", "--stop-stack"],
     ));
-    assert!(poll_until(|| began.exists()), "supabase stop never ran");
+    assert!(poll_until(|| holds.began(1)), "supabase stop never ran");
 
-    free(&sandbox, &wa, &mut a);
+    free(&sandbox, &wa, &mut a, &holds);
     let mid_stop = run(for_owner(
         &sandbox,
         &wc,
         c.pid(),
         &["acquire", "--no-device", "--wait", "0"],
     ));
-    fs::write(&gate, "").expect("open the gate");
+    holds.open(1);
     let stopped = finish(stopping);
     let after = run(for_owner(
         &sandbox,
@@ -375,7 +394,7 @@ fn a_slot_stays_held_while_its_stack_stops(free: impl FnOnce(&Sandbox, &Path, &m
 
 #[test]
 fn a_plain_release_mid_stop_leaves_the_slot_held_until_the_stack_is_down() {
-    a_slot_stays_held_while_its_stack_stops(|sandbox, wa, a| {
+    a_slot_stays_held_while_its_stack_stops(|sandbox, wa, a, _| {
         let plain = run(for_owner(sandbox, wa, a.pid(), &["release"]));
         assert_eq!(plain.stderr, "devlab: released lease 1\n", "{plain:?}");
     });
@@ -383,10 +402,29 @@ fn a_plain_release_mid_stop_leaves_the_slot_held_until_the_stack_is_down() {
 
 #[test]
 fn an_owner_that_exits_mid_stop_leaves_the_slot_held_until_the_stack_is_down() {
-    a_slot_stays_held_while_its_stack_stops(|sandbox, wa, a| {
+    a_slot_stays_held_while_its_stack_stops(|sandbox, wa, a, _| {
         a.exit();
         let gc = run(devlab(sandbox, wa, &["gc"]));
         assert!(gc.stdout.starts_with("released lease 1 "), "{gc:?}");
+    });
+}
+
+#[test]
+fn a_second_stop_that_ends_first_leaves_the_slot_held_for_the_first() {
+    a_slot_stays_held_while_its_stack_stops(|sandbox, wa, a, holds| {
+        let second = spawn(for_owner(
+            sandbox,
+            wa,
+            a.pid(),
+            &["release", "--stop-stack"],
+        ));
+        assert!(
+            poll_until(|| holds.began(2)),
+            "the second supabase stop never ran"
+        );
+        holds.open(2);
+        let second = finish(second);
+        assert_eq!(second.stderr, "devlab: released lease 1\n", "{second:?}");
     });
 }
 
@@ -483,16 +521,7 @@ fn a_queued_request_whose_caller_died_while_the_daemon_was_down_is_pruned() {
 fn a_lease_granted_after_its_caller_left_is_given_back() {
     let (sandbox, world) = lab();
     let wt = world.worktree("demo-gone");
-    let (began, gate) = (sandbox.path("inspect-began"), sandbox.path("inspect-gate"));
-    let body = fs::read_to_string(fixtures().join("fakes/docker.sh"))
-        .expect("read a fake")
-        .replace("@WORLD@", &sandbox.path("world").display().to_string());
-    let hold = format!(
-        "if [ \"$1\" = inspect ]; then\n  : > '{began}'\n  i=0\n  while [ ! -e '{gate}' ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done\nfi\n",
-        began = began.display(),
-        gate = gate.display()
-    );
-    sandbox.fake("docker", &(hold + &body));
+    let holds = hold(&sandbox, "docker", "inspect", 1);
     let agent = Agent::start();
     let asking = spawn(for_owner(
         &sandbox,
@@ -501,10 +530,10 @@ fn a_lease_granted_after_its_caller_left_is_given_back() {
         &["acquire", "--no-device"],
     ));
     // The daemon looks at the stacks before it grants: the caller leaves meanwhile.
-    assert!(poll_until(|| began.exists()), "docker inspect never ran");
+    assert!(poll_until(|| holds.began(1)), "docker inspect never ran");
     kill_group(asking.id(), Signal::KILL);
     let _ = finish(asking);
-    fs::write(&gate, "").expect("open the gate");
+    holds.open(1);
 
     let given_back = poll_until(|| {
         let out = run(devlab(&sandbox, &wt, &["status", "--json"]));
@@ -594,6 +623,37 @@ fn factory_lab_says_one_line_per_verb_and_json_with_the_flag() {
     assert!(
         help["help"].as_str().is_some_and(|h| h.contains("devlab")),
         "{help}"
+    );
+
+    let ran = lab(&["exec", "--", "sh", "-c", "echo one; echo two >&2; exit 3"]);
+    assert_eq!((ran.code, ran.stderr.as_str()), (3, ""), "{ran:?}");
+    assert_eq!(ran.stdout.lines().count(), 1, "{ran:?}");
+    assert!(
+        ran.stdout.starts_with("sh exited 3 in lease 1; output in "),
+        "{ran:?}"
+    );
+    assert_eq!(named_file(ran.stdout.trim_end()), "one\ntwo\n");
+    let ran = lab(&[
+        "run",
+        "--json",
+        "--no-device",
+        "--",
+        "sh",
+        "-c",
+        "echo $DEVLAB_SLOT",
+    ]);
+    assert_eq!(ran.code, 0, "{ran:?}");
+    let ran = one_json(&ran);
+    assert_eq!(
+        (&ran["lease"], &ran["exit"]),
+        (&serde_json::json!(1), &serde_json::json!(0)),
+        "{ran}"
+    );
+    let output = ran["outputFile"].as_str().unwrap_or_default();
+    assert_eq!(
+        fs::read_to_string(output).unwrap_or_default(),
+        "0\n",
+        "{ran}"
     );
 
     assert_eq!(one_line(&lab(&["release"])), "released lease 1");
@@ -700,5 +760,172 @@ fn a_queued_request_keeps_its_deadline_across_a_daemon_restart() {
     assert_eq!(
         (&after["id"], &after["deadline_ms"]),
         (&before["id"], &before["deadline_ms"])
+    );
+}
+
+fn epoch_ms() -> i64 {
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("a clock past 1970");
+    i64::try_from(since.as_millis()).expect("a clock before 2262")
+}
+
+#[test]
+fn a_wait_that_ran_out_while_the_daemon_was_down_takes_no_slot_freed_meanwhile() {
+    let (sandbox, world) = lab();
+    let (mut a, b, c) = (Agent::start(), Agent::start(), Agent::start());
+    let [wa, wb, wc] = ["demo-a", "demo-b", "demo-c"].map(|n| world.worktree(n));
+    for (agent, wt) in [(&a, &wa), (&b, &wb)] {
+        let held = run(for_owner(
+            &sandbox,
+            wt,
+            agent.pid(),
+            &["acquire", "--no-device"],
+        ));
+        assert_eq!(held.code, 0, "{held:?}");
+    }
+    let queued = spawn(for_owner(
+        &sandbox,
+        &wc,
+        c.pid(),
+        &["acquire", "--no-device", "--wait", "3"],
+    ));
+    let me = std::process::id();
+    let mut deadline = 0;
+    assert!(poll_until(|| {
+        let board = one_json(&native(&sandbox, &wa, me, &["lab", "status", "--json"]));
+        deadline = board["waiters"][0]["deadline_ms"].as_i64().unwrap_or(0);
+        deadline > 0
+    }));
+
+    // The caller sleeps through the restart; its wait runs out and a slot comes free meanwhile.
+    kill_group(queued.id(), Signal::STOP);
+    stop_daemon(&sandbox);
+    assert!(
+        epoch_ms() < deadline,
+        "the daemon gave up before it stopped"
+    );
+    a.exit();
+    assert!(poll_until(|| epoch_ms() > deadline));
+    kill_group(queued.id(), Signal::CONT);
+    let gave_up = finish(queued);
+
+    assert_eq!(gave_up.code, 75, "{gave_up:?}");
+    assert_eq!(
+        gave_up.stderr.lines().last(),
+        Some("devlab: gave up after 3 s: the wait ran out while the daemon restarted"),
+        "{gave_up:?}"
+    );
+    assert!(!gave_up.stdout.contains("DEVLAB_SLOT"), "{gave_up:?}");
+}
+
+/// Field 22 of `/proc/<pid>/stat`: when the process started.
+fn started(pid: u32) -> String {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("a live process");
+    stat.rsplit(')')
+        .next()
+        .and_then(|rest| rest.split_whitespace().nth(19))
+        .expect("a start time")
+        .to_owned()
+}
+
+/// Sends the daemon a `lab.acquire` for a one-slot project straight over its socket, by
+/// `owner` from the devlab call `client`; the connection, and the first line that holds `until`
+/// (`queued` or `result`) or an error.
+fn ask(
+    sandbox: &Sandbox,
+    worktree: &Path,
+    owner: u32,
+    client: u32,
+    until: &str,
+) -> (UnixStream, serde_json::Value) {
+    let params = serde_json::json!({
+        "worktree": worktree,
+        "owner": {"pid": owner, "start": started(owner), "label": format!("sleep:{owner}"), "found": true},
+        "lease": null,
+        "project": {"name": "solo", "max_slots": 1, "stride": 10, "cap": 1, "ports": [], "stack": null},
+        "wait_sec": 30,
+        "client": {"pid": client, "start": started(client)},
+    });
+    let mut stream =
+        UnixStream::connect(sandbox.path("run/factory/factory.sock")).expect("reach the daemon");
+    let request = serde_json::json!({"id": 1, "method": "lab.acquire", "params": params});
+    writeln!(stream, "{request}").expect("send a request");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone the stream"));
+    loop {
+        let mut line = String::new();
+        assert!(
+            reader.read_line(&mut line).expect("read the daemon") > 0,
+            "the daemon hung up"
+        );
+        let answer: serde_json::Value = serde_json::from_str(&line).expect("a JSON line");
+        if answer.get(until).is_some() || answer.get("error").is_some() {
+            return (stream, answer);
+        }
+    }
+}
+
+#[test]
+fn a_request_its_caller_sends_again_keeps_the_place_it_never_heard_of() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-a");
+    let (a, b, caller) = (Agent::start(), Agent::start(), Agent::start());
+    let daemon = || run(devlab(&sandbox, &wt, &["status"]));
+    assert_eq!(daemon().code, 0);
+    let (_first, held) = ask(&sandbox, &wt, a.pid(), caller.pid(), "result");
+    assert!(held["result"]["lease"]["slot"] == 0, "{held}");
+    let (gone, queued) = ask(&sandbox, &wt, b.pid(), caller.pid(), "queued");
+    assert!(queued["queued"].is_i64(), "{queued}");
+
+    // The daemon restarts before the caller hears of its place: it asks again from scratch.
+    stop_daemon(&sandbox);
+    drop(gone);
+    assert_eq!(daemon().code, 0);
+    let (_again, requeued) = ask(&sandbox, &wt, b.pid(), caller.pid(), "queued");
+    let board = one_json(&native(
+        &sandbox,
+        &wt,
+        std::process::id(),
+        &["lab", "status", "--json"],
+    ));
+
+    assert_eq!(requeued["queued"], queued["queued"], "{requeued}");
+    assert_eq!(
+        board["waiters"].as_array().map(Vec::len),
+        Some(1),
+        "{board}"
+    );
+}
+
+#[test]
+fn factory_lab_gc_names_a_file_with_the_leases_it_released() {
+    let (sandbox, world) = lab();
+    let (mut a, mut b) = (Agent::start(), Agent::start());
+    let [wa, wb] = ["demo-a", "demo-b"].map(|n| world.worktree(n));
+    for (agent, wt) in [(&a, &wa), (&b, &wb)] {
+        let held = run(for_owner(
+            &sandbox,
+            wt,
+            agent.pid(),
+            &["acquire", "--no-device"],
+        ));
+        assert_eq!(held.code, 0, "{held:?}");
+    }
+    let (pa, pb) = (a.pid(), b.pid());
+    a.exit();
+    b.exit();
+
+    let gc = native(&sandbox, &wa, std::process::id(), &["lab", "gc"]);
+
+    let line = one_line(&gc);
+    assert!(
+        line.starts_with("released 2 leases of exited owners; list in "),
+        "{line}"
+    );
+    assert_eq!(
+        named_file(line),
+        format!(
+            "released lease 1 (sleep:{pa}, owner exited)\nreleased lease 2 (sleep:{pb}, owner exited)\n"
+        )
     );
 }
