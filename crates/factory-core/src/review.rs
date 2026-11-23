@@ -61,6 +61,13 @@ pub fn issue_ref(spec: &str) -> Option<&str> {
     }
 }
 
+/// The head a review ledger says it reviewed: where a fix round's diff starts.
+pub fn reviewed_head(ledger: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(ledger).ok()?;
+    let head = value.get("head")?.as_str()?;
+    (!head.is_empty()).then(|| head.to_owned())
+}
+
 /// One named text the bundle carries: a spec, a report, a standards file, an evidence file.
 #[derive(Clone, Copy, Debug)]
 pub struct Part<'a> {
@@ -76,6 +83,9 @@ pub struct Bundle<'a> {
     pub base: &'a str,
     pub base_commit: &'a str,
     pub head: &'a str,
+    /// On a fix round, the head the previous round reviewed: the diff starts there, not at
+    /// the base.
+    pub fix_from: Option<&'a str>,
     pub commits: &'a str,
     pub diff_stat: &'a str,
     pub diff: &'a str,
@@ -91,10 +101,20 @@ impl Bundle<'_> {
     /// The bundle as one Markdown file, each part fenced so nothing inside it reads as
     /// structure. The diff comes last, being the largest.
     pub fn render(&self) -> String {
-        let mut out = format!(
-            "# Review bundle: {}\n\nRound {}: the commits from {} ({}) to {}.\n",
-            self.label, self.round, self.base, self.base_commit, self.head
-        );
+        let mut out = match self.fix_from {
+            Some(from) => format!(
+                "# Review bundle: {}\n\nRound {}, the fix only: the commits from {} (the head round {} reviewed) to {}.\n",
+                self.label,
+                self.round,
+                from,
+                self.round - 1,
+                self.head
+            ),
+            None => format!(
+                "# Review bundle: {}\n\nRound {}: the commits from {} ({}) to {}.\n",
+                self.label, self.round, self.base, self.base_commit, self.head
+            ),
+        };
         fenced(&mut out, "Commits", self.commits, "");
         fenced(&mut out, "Diff stat", self.diff_stat, "");
         named(
@@ -547,6 +567,17 @@ mod tests {
                 round,
                 "{label} {has_previous}"
             );
+        }
+    }
+
+    #[test]
+    fn a_ledger_names_the_head_it_reviewed() {
+        assert_eq!(
+            reviewed_head(r#"{"label": "t1-r1", "head": "abc123"}"#).as_deref(),
+            Some("abc123")
+        );
+        for ledger in ["", "not json", "{}", r#"{"head": ""}"#, r#"{"head": 4}"#] {
+            assert_eq!(reviewed_head(ledger), None, "{ledger}");
         }
     }
 

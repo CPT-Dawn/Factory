@@ -22,7 +22,7 @@ use factory_adapters::git::{GitError, GitRepo, Repo};
 use factory_adapters::reviewer::{Agy, Claude, Codex, Job, Reviewer, ReviewerError, home_of};
 use factory_core::exit::Exit;
 use factory_core::quota::Reset;
-use factory_core::review::{self, Bundle, Finding, Part, Reading, Record, Verdict};
+use factory_core::review::{self, Bundle, Finding, Part, Reading, Record, Verdict, reviewed_head};
 use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
 
@@ -194,6 +194,7 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
     let files = Files::new(paths, &run.repo, &args.label)?;
     let inputs = Inputs::gather(&repo, args, &files)?;
     run.head = inputs.head.clone();
+    run.notes.extend(inputs.notes.iter().cloned());
     let spec = inputs.spec.as_ref().map_or("none", |(name, _)| name);
     run.spec = spec.to_owned();
     write(&files.bundle, &inputs.bundle(args).render())?;
@@ -437,6 +438,10 @@ struct Inputs {
     commits: String,
     diff_stat: String,
     diff: String,
+    /// On a fix round, the head the previous round reviewed, where the diff starts.
+    fix_from: Option<String>,
+    /// Why this fix round reviews the whole diff after all.
+    notes: Vec<String>,
     spec: Option<(String, String)>,
     previous: Option<(String, String)>,
     standards: Vec<(String, String)>,
@@ -450,11 +455,21 @@ impl Inputs {
         let base_commit = repo.commit(base).map_err(git_failed)?.ok_or_else(|| {
             Failure::usage(format!("unknown ref: {base}; name a branch, tag or commit"))
         })?;
-        let diff = repo.diff(base, DIFF_CONTEXT).map_err(git_failed)?;
+        let mut notes = Vec::new();
+        let fix_from = match &args.previous {
+            Some(previous) => fix_start(repo, args, previous, &mut notes)?,
+            None => None,
+        };
+        let since = fix_from.as_deref().unwrap_or(base);
+        let diff = repo.diff(since, DIFF_CONTEXT).map_err(git_failed)?;
         if diff.is_empty() {
-            return Err(Failure::usage(format!(
-                "no committed changes since {base} (commit first)"
-            )));
+            return Err(Failure::usage(match &fix_from {
+                Some(from) => format!(
+                    "no committed changes since the previous review's head {} (commit the fix first)",
+                    short(from)
+                ),
+                None => format!("no committed changes since {base} (commit first)"),
+            }));
         }
         let spec = args
             .spec
@@ -485,9 +500,11 @@ impl Inputs {
         Ok(Inputs {
             base_commit,
             head: repo.commit("HEAD").map_err(git_failed)?.unwrap_or_default(),
-            commits: repo.commits(base).map_err(git_failed)?,
-            diff_stat: repo.diff_stat(base).map_err(git_failed)?,
+            commits: repo.commits(since).map_err(git_failed)?,
+            diff_stat: repo.diff_stat(since).map_err(git_failed)?,
             diff,
+            fix_from,
+            notes,
             spec,
             previous,
             standards,
@@ -503,6 +520,7 @@ impl Inputs {
             base: &args.base,
             base_commit: &self.base_commit,
             head: &self.head,
+            fix_from: self.fix_from.as_deref(),
             commits: &self.commits,
             diff_stat: &self.diff_stat,
             diff: &self.diff,
@@ -512,6 +530,40 @@ impl Inputs {
             evidence: self.evidence.as_ref().map(part),
         }
     }
+}
+
+/// Where a fix round's diff starts: the head the previous report's findings ledger says it
+/// reviewed, when that is on this branch. Otherwise the round reviews the whole diff, and
+/// says why in `notes`.
+fn fix_start(
+    repo: &impl Repo,
+    args: &Args,
+    previous: &Path,
+    notes: &mut Vec<String>,
+) -> Result<Option<String>, Failure> {
+    let ledger = previous.with_extension("findings.json");
+    let named = fs::read_to_string(&ledger)
+        .ok()
+        .and_then(|text| reviewed_head(&text));
+    let on_branch = match named {
+        Some(head) => match repo.commit(&head).map_err(git_failed)? {
+            Some(commit) if repo.is_ancestor(&commit).map_err(git_failed)? => Some(commit),
+            _ => None,
+        },
+        None => None,
+    };
+    if on_branch.is_none() {
+        notes.push(format!(
+            "no reviewed head for {} on this branch; round {} reviews the whole diff",
+            previous.display(),
+            review::round(&args.label, true)
+        ));
+    }
+    Ok(on_branch)
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(8)]
 }
 
 /// The files of one review, in `<state>/reviews/<repo>/`.

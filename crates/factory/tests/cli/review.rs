@@ -553,3 +553,87 @@ fn an_event_that_cannot_be_logged_fails_the_run_in_one_line_naming_the_report() 
         "{out:?}"
     );
 }
+
+/// Reviews `work` as round 1 with a ledger of `report`, then commits `fix` (a file and its
+/// text) and returns the round-2 run's output. The fake codex answers round 2 with `second`.
+fn fix_round(sandbox: &Sandbox, repo: &std::path::Path, report: &str, second: &str) -> crate::support::Run {
+    sandbox.fake("codex", &codex_writes(report));
+    let first = sandbox.factory_in(repo, &["review", "main", "t1-r1"]);
+    assert!(first.code == 0 || first.code == 10, "{first:?}");
+    fs::write(repo.join("b.txt"), "b\n").unwrap();
+    sandbox.git(repo, &["add", "."]);
+    sandbox.git(repo, &["commit", "-q", "-m", "fix: add b"]);
+    sandbox.fake("codex", &codex_writes(second));
+    let previous = sandbox.reviews().join("t1-r1.md");
+    sandbox.factory_in(
+        repo,
+        &["review", "main", "t1-r2", "none", previous.to_str().unwrap()],
+    )
+}
+
+#[test]
+fn a_fix_round_bundles_only_the_diff_since_the_previous_reviews_head() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+
+    let out = fix_round(&sandbox, &repo, FINDINGS_REPORT, CLEAN_REPORT);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let round_one = fs::read_to_string(sandbox.reviews().join("t1-r1.bundle.md")).unwrap();
+    let round_two = fs::read_to_string(sandbox.reviews().join("t1-r2.bundle.md")).unwrap();
+    assert!(round_one.contains("+++ b/a.txt"), "{round_one}");
+    assert!(round_two.contains("+++ b/b.txt"), "{round_two}");
+    assert!(!round_two.contains("+++ b/a.txt"), "{round_two}");
+    assert!(round_two.contains("fix: add b"), "{round_two}");
+    assert!(!round_two.contains("feat: add a"), "{round_two}");
+}
+
+#[test]
+fn a_fix_round_without_a_reviewed_head_reviews_the_whole_diff_and_says_so() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    let previous = sandbox.path("t1-r1.md");
+    fs::write(&previous, "a lacks a test\nVERDICT: findings\n").unwrap();
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+
+    let out = sandbox.factory_in(
+        &repo,
+        &["review", "main", "t1-r2", "none", previous.to_str().unwrap()],
+    );
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(
+        out.stderr,
+        format!(
+            "factory: no reviewed head for {} on this branch; round 2 reviews the whole diff\n",
+            previous.display()
+        )
+    );
+    let bundle = fs::read_to_string(sandbox.reviews().join("t1-r2.bundle.md")).unwrap();
+    assert!(bundle.contains("+++ b/a.txt"), "{bundle}");
+    assert!(bundle.contains("a lacks a test"), "{bundle}");
+}
+
+#[test]
+fn a_fix_round_with_nothing_committed_since_the_previous_head_fails_with_exit_2() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake("codex", &codex_writes(FINDINGS_REPORT));
+    sandbox.factory_in(&repo, &["review", "main", "t1-r1"]);
+    let previous = sandbox.reviews().join("t1-r1.md");
+    let calls = sandbox.calls("codex").len();
+
+    let out = sandbox.factory_in(
+        &repo,
+        &["review", "main", "t1-r2", "none", previous.to_str().unwrap()],
+    );
+
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr
+            .starts_with("factory: no committed changes since the previous review's head "),
+        "{out:?}"
+    );
+    assert_eq!(sandbox.calls("codex").len(), calls);
+}

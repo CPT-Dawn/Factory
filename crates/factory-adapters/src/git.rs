@@ -34,6 +34,8 @@ pub trait Repo {
     fn commit(&self, rev: &str) -> Result<Option<String>, GitError>;
     /// The full diff of `base...HEAD`, with `context` lines around each change.
     fn diff(&self, base: &str, context: u32) -> Result<String, GitError>;
+    /// Whether the commit `rev` names is an ancestor of HEAD (or HEAD itself).
+    fn is_ancestor(&self, rev: &str) -> Result<bool, GitError>;
     /// The diff stat of `base...HEAD`.
     fn diff_stat(&self, base: &str) -> Result<String, GitError>;
     /// The commits of `base..HEAD`, newest first: short sha, subject and body.
@@ -149,6 +151,16 @@ impl Repo for GitRepo {
 
     fn diff_stat(&self, base: &str) -> Result<String, GitError> {
         self.git(&["diff", "--no-color", "--stat", &format!("{base}...HEAD")])
+    }
+
+    fn is_ancestor(&self, rev: &str) -> Result<bool, GitError> {
+        let args = ["merge-base", "--is-ancestor", rev, HEAD];
+        let output = self.output(&args)?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(failed(&args, &output)),
+        }
     }
 
     fn commits(&self, base: &str) -> Result<String, GitError> {
@@ -343,6 +355,8 @@ pub struct FakeRepo {
     pub revs: Vec<(String, String)>,
     pub diff: String,
     pub diff_stat: String,
+    /// The revs that are ancestors of HEAD.
+    pub ancestors: Vec<String>,
     pub commits: String,
     /// The local branches that exist.
     pub branches: Vec<String>,
@@ -371,6 +385,10 @@ impl Repo for FakeRepo {
 
     fn diff_stat(&self, _base: &str) -> Result<String, GitError> {
         Ok(self.diff_stat.clone())
+    }
+
+    fn is_ancestor(&self, rev: &str) -> Result<bool, GitError> {
+        Ok(self.ancestors.iter().any(|known| known == rev))
     }
 
     fn commits(&self, _base: &str) -> Result<String, GitError> {
