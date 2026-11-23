@@ -177,7 +177,14 @@ async fn answer(stream: UnixStream, daemon: Arc<Daemon>) {
         if let Ok(request) = serde_json::from_str::<Request>(&line)
             && request.method == ACQUIRE
         {
-            service::acquire(Arc::clone(&daemon.lab), request, &mut writer, &mut lines).await;
+            service::acquire(
+                Arc::clone(&daemon.lab),
+                Arc::clone(&daemon.ledger),
+                request,
+                &mut writer,
+                &mut lines,
+            )
+            .await;
             continue;
         }
         let response = tokio::select! {
@@ -350,7 +357,7 @@ fn refusal(exit: Exit, message: String) -> ErrorBody {
 
 /// The append-only event ledger. Each event is stamped and written as one line under one lock,
 /// so lines never interleave.
-struct Ledger {
+pub(crate) struct Ledger {
     path: PathBuf,
     file: Mutex<File>,
 }
@@ -373,7 +380,7 @@ impl Ledger {
         })
     }
 
-    fn append(&self, event: &Event) -> io::Result<Fields> {
+    pub(crate) fn append(&self, event: &Event) -> io::Result<Fields> {
         let mut file = self
             .file
             .lock()

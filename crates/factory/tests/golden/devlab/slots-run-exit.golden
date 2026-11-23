@@ -1,6 +1,6 @@
 # run and exec hand the command their lease's env and give back its exit code: a code passes
 # through, a signal ends as 128 plus its number, and its stdout and stderr stay apart. A second
-# run finds the lease the first one took.
+# run finds the lease the first one took. A run whose command a signal ends says so (#24).
 $ a@demo-a devlab run --no-device -- sh -c 'echo "out $DEVLAB_LEASE"; echo "err $DEVLAB_SLOT" >&2; exit 3'
 1> out 1
 2> devlab: lease 1, slot 0 (stack http://127.0.0.1:27321, down)
@@ -8,8 +8,10 @@ $ a@demo-a devlab run --no-device -- sh -c 'echo "out $DEVLAB_LEASE"; echo "err 
 ? 3
 $ a@demo-a devlab run --no-device -- sh -c 'kill -TERM $$'
 2> devlab: lease 1, slot 0 (stack http://127.0.0.1:27321, down)
+2> devlab: sh killed by SIGTERM after <n> s
 ? 143
 $ a@demo-a devlab run --no-device --quiet -- sh -c 'kill -KILL $$'
+2> devlab: sh killed by SIGKILL after <n> s
 ? 137
 $ a@demo-a devlab exec -- sh -c 'echo "exec $DEVLAB_LEASE $DEVLAB_SLOT"; exit 7'
 1> exec 1 0

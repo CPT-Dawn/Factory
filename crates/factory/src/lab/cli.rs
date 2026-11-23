@@ -57,21 +57,19 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
             if opts.wait_sec.is_none() {
                 opts.wait_sec = Some(ctx.cfg.wait_sec);
             }
-            if cmd == "run" && rest.is_empty() {
-                return Err(Failure::usage("devlab run [opts] -- <cmd...>"));
+            let quiet = flags.iter().any(|f| f == "--quiet");
+            if cmd == "run" {
+                return run::run(&ctx, &opts, quiet, rest);
             }
             let granted = lease::acquire(&ctx, &opts)?;
-            if !flags.iter().any(|f| f == "--quiet") {
+            if !quiet {
                 note(&lease::summary(&granted, ctx.project.as_ref())?);
             }
-            if cmd == "acquire" {
-                println!(
-                    "{}",
-                    export_lines(&lease::lease_env(&granted, ctx.project.as_ref())?)
-                );
-                return Ok(0);
-            }
-            run::exec_in(&ctx, &granted, rest)
+            println!(
+                "{}",
+                export_lines(&lease::lease_env(&granted, ctx.project.as_ref())?)
+            );
+            Ok(0)
         }
         "exec" => {
             let ctx = context()?;

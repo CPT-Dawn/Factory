@@ -373,3 +373,204 @@ fn docker_and_systemctl_run_while_the_store_is_unlocked() {
     }
     assert!(!seen.contains("held"), "{seen}");
 }
+
+/// The `lab-run` events in the ledger.
+fn lab_runs(sandbox: &Sandbox) -> Vec<serde_json::Value> {
+    sandbox
+        .ledger_lines()
+        .iter()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event.to_string().contains("\"lab-run\""))
+        .collect()
+}
+
+/// Waits for the ledger's only `lab-run` event and returns it.
+fn the_lab_run(sandbox: &Sandbox) -> serde_json::Value {
+    poll_until(|| !lab_runs(sandbox).is_empty());
+    let runs = lab_runs(sandbox);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    runs.into_iter().next().expect("one run")
+}
+
+/// A `devlab run` started beside the test, owned by the test process.
+fn spawn_run(sandbox: &Sandbox, dir: &Path, script: &str) -> std::process::Child {
+    let mut cmd = devlab(
+        sandbox,
+        dir,
+        &["run", "--no-device", "--quiet", "--", "sh", "-c", script],
+    );
+    cmd.env("DEVLAB_OWNER_PID", std::process::id().to_string());
+    spawn(cmd)
+}
+
+/// Sends `signal` to one process.
+fn signal(pid: u32, signal: Signal) {
+    let pid = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .expect("a pid");
+    rustix::process::kill_process(pid, signal).expect("signal the process");
+}
+
+/// Waits until `devlab status` shows a waiter.
+fn await_waiter(sandbox: &Sandbox, dir: &Path) {
+    let queued = poll_until(|| {
+        run(devlab(sandbox, dir, &["status"]))
+            .stdout
+            .contains("waiting:")
+    });
+    assert!(queued, "no run queued");
+}
+
+/// Holds the test owner's only demo slot, so its next run in demo queues.
+fn hold_the_owners_slot(sandbox: &Sandbox, world: &World) {
+    let holder = world.worktree("demo-holder");
+    let held = owned(sandbox, &holder, &["acquire", "--no-device", "--quiet"]);
+    assert_eq!(held.code, 0, "{held:?}");
+}
+
+#[test]
+fn a_run_lands_in_the_ledger_with_its_command_slot_and_exit() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-ledger");
+    let out = owned(
+        &sandbox,
+        &wt,
+        &["run", "--no-device", "--quiet", "--", "sh", "-c", "exit 3"],
+    );
+    assert_eq!(out.code, 3, "{out:?}");
+
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "exit 3", "{event}");
+    assert_eq!(event["phase"], "running", "{event}");
+    assert_eq!(event["command"], "sh -c exit 3", "{event}");
+    assert_eq!(event["worktree"], wt.display().to_string(), "{event}");
+    assert_eq!(event["slot"], 0, "{event}");
+    assert!(event["lease"].is_u64(), "{event}");
+    assert!(event["queue_s"].is_u64(), "{event}");
+    assert!(event["run_s"].is_u64(), "{event}");
+}
+
+#[test]
+fn sigterm_while_queued_leaves_the_queue_and_the_ledger_says_so() {
+    let (sandbox, world) = lab();
+    hold_the_owners_slot(&sandbox, &world);
+    let wt = world.worktree("demo-queued");
+    let child = spawn_run(&sandbox, &wt, "true");
+    await_waiter(&sandbox, &wt);
+
+    signal(child.id(), Signal::TERM);
+    let out = finish(child);
+
+    assert_eq!(out.code, 143, "{out:?}");
+    assert!(
+        out.stderr.contains("devlab: stopped by SIGTERM after ")
+            && out.stderr.contains(" s, while queued: "),
+        "{out:?}"
+    );
+    let status = run(devlab(&sandbox, &wt, &["status"]));
+    assert!(!status.stdout.contains("waiting:"), "{status:?}");
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "stopped SIGTERM", "{event}");
+    assert_eq!(event["phase"], "queued", "{event}");
+    assert_eq!(event["run_s"], 0, "{event}");
+}
+
+#[test]
+fn sigterm_while_the_command_runs_reaches_the_command_and_the_ledger() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-running");
+    let got = wt.join("got");
+    let script =
+        r#"trap 'kill $!; echo TERM > got; exit 0' TERM; sleep 30 & echo $$ > child.pid; wait"#;
+    let child = spawn_run(&sandbox, &wt, script);
+    assert!(
+        poll_until(|| wt.join("child.pid").exists()),
+        "the command never started"
+    );
+
+    signal(child.id(), Signal::TERM);
+    let out = finish(child);
+
+    assert_eq!(out.code, 143, "{out:?}");
+    assert!(
+        out.stderr.contains("devlab: sh stopped by SIGTERM after "),
+        "{out:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&got).ok().as_deref(),
+        Some("TERM\n"),
+        "{out:?}"
+    );
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "stopped SIGTERM", "{event}");
+    assert_eq!(event["phase"], "running", "{event}");
+}
+
+#[test]
+fn a_command_killed_by_sigkill_is_named_and_recorded_as_a_signal() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-killed");
+    let child = spawn_run(&sandbox, &wt, "echo $$ > child.pid; exec sleep 30");
+    let pid = wt.join("child.pid");
+    assert!(
+        poll_until(|| fs::read_to_string(&pid).is_ok_and(|p| p.ends_with('\n'))),
+        "the command never started"
+    );
+    let command: u32 = fs::read_to_string(&pid)
+        .expect("child.pid")
+        .trim()
+        .parse()
+        .expect("a pid");
+
+    signal(command, Signal::KILL);
+    let out = finish(child);
+
+    assert_eq!(out.code, 137, "{out:?}");
+    assert!(
+        out.stderr.contains("devlab: sh killed by SIGKILL after "),
+        "{out:?}"
+    );
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "signal SIGKILL", "{event}");
+    assert_eq!(event["phase"], "running", "{event}");
+}
+
+#[test]
+fn a_client_killed_while_its_command_runs_is_recorded_as_lost() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-lost");
+    let child = spawn_run(&sandbox, &wt, "echo $$ > child.pid; sleep 30");
+    assert!(
+        poll_until(|| wt.join("child.pid").exists()),
+        "the command never started"
+    );
+    let devlab_pid = child.id();
+
+    signal(devlab_pid, Signal::KILL);
+    let event = the_lab_run(&sandbox);
+    kill_group(devlab_pid, Signal::KILL);
+    let out = finish(child);
+
+    assert_eq!(out.code, -1, "{out:?}");
+    assert_eq!(event["outcome"], "lost", "{event}");
+    assert_eq!(event["phase"], "running", "{event}");
+}
+
+#[test]
+fn a_client_killed_while_queued_is_recorded_as_lost_and_leaves_the_queue() {
+    let (sandbox, world) = lab();
+    hold_the_owners_slot(&sandbox, &world);
+    let wt = world.worktree("demo-lost-queued");
+    let child = spawn_run(&sandbox, &wt, "true");
+    await_waiter(&sandbox, &wt);
+
+    signal(child.id(), Signal::KILL);
+    let _ = finish(child);
+
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "lost", "{event}");
+    assert_eq!(event["phase"], "queued", "{event}");
+    let status = run(devlab(&sandbox, &wt, &["status"]));
+    assert!(!status.stdout.contains("waiting:"), "{status:?}");
+}
