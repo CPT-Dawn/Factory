@@ -272,8 +272,14 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
         lab_holds_nothing()?;
     }
     let unit_gone = fs::symlink_metadata(&place.watcher).is_err();
+    // --force goes on without a unit the marker gives no link for, and says it did.
+    let mut skipped = false;
     let link_unit = match &marker.watcher {
         Unit::Link(text) if unit_gone => Some(text),
+        Unit::Unrecorded | Unit::File if unit_gone && force => {
+            skipped = true;
+            None
+        }
         Unit::Unrecorded | Unit::File if unit_gone => {
             return Err(Failure::precondition(format!(
                 "{} is gone and {} names no link to put back; link it again (dots link), then run factory cutover --rollback again",
@@ -304,7 +310,13 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
     }
     remove(&place.marker(), "cutover --rollback")?;
     Ok(Done::new(
-        if retire {
+        if skipped {
+            format!(
+                "rolled back: {} runs today's devlab again; skipped {}, which is gone",
+                place.link.display(),
+                place.watcher.display()
+            )
+        } else if retire {
             format!(
                 "rolled back: {} runs today's devlab again and {WATCHER} is enabled; cut over again with factory cutover",
                 place.link.display()
@@ -318,7 +330,8 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
         json!({
             "devlab": place.link,
             "restored": marker.devlab,
-            "watcher": if retire { "enabled" } else { "not installed" },
+            "watcher": if retire { "enabled" } else { "skipped" },
+            "skipped": skipped.then_some(&place.watcher),
         }),
     ))
 }

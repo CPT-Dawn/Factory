@@ -583,3 +583,51 @@ fn rollback_says_how_to_link_a_missing_unit_the_marker_does_not_name() {
     let old = old_devlab(&sandbox, &["status"]);
     assert_eq!((old.code, old.stderr.as_str()), (3, REFUSAL));
 }
+
+#[test]
+fn rollback_force_goes_on_without_the_unit_and_says_it_skipped_it() {
+    let (sandbox, _world) = machine();
+    cut_over(&sandbox);
+    marker_without_watcher(&sandbox);
+    fs::remove_file(watcher_unit(&sandbox)).unwrap();
+
+    let out = sandbox.factory(&["cutover", "--rollback", "--force"]);
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (
+            0,
+            format!(
+                "rolled back: {} runs today's devlab again; skipped {}, which is gone\n",
+                link(&sandbox).display(),
+                watcher_unit(&sandbox).display()
+            )
+            .as_str(),
+            ""
+        )
+    );
+    assert_eq!(fs::read_link(link(&sandbox)).unwrap(), PathBuf::from(OLD));
+    assert!(!sandbox.path("state/devlab/cutover.json").exists());
+    assert!(fs::symlink_metadata(watcher_unit(&sandbox)).is_err());
+    // Today's devlab no longer refuses.
+    let old = old_devlab(&sandbox, &["status"]);
+    assert_ne!(old.stderr, REFUSAL);
+}
+
+#[test]
+fn rollback_force_says_in_json_which_unit_it_skipped() {
+    let (sandbox, _world) = machine();
+    cut_over(&sandbox);
+    marker_without_watcher(&sandbox);
+    fs::remove_file(watcher_unit(&sandbox)).unwrap();
+
+    let out = sandbox.factory(&["cutover", "--rollback", "--force", "--json"]);
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    let json: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(json["watcher"], "skipped");
+    assert_eq!(
+        json["skipped"],
+        watcher_unit(&sandbox).display().to_string()
+    );
+}
