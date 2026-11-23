@@ -14,14 +14,14 @@ use serde_json::{Value, json};
 /// The most characters a default line shows; a longer one is cut and ends in `…`.
 pub const LINE_LIMIT: usize = 200;
 
-/// What a command that answered shows: one line, or the JSON object with `--json`.
+/// What a command that succeeded shows.
 #[derive(Debug)]
 pub struct Done {
     pub line: String,
-    /// Lines shown after the line, where the spec names them (a lead's last pane lines).
-    pub detail: Vec<String>,
     pub json: Value,
-    /// Ok, or another code for an answer that is not a failure (a lead that needs attention).
+    /// Lines after the first, only where the spec names them (a review's blocking findings).
+    pub more: Vec<String>,
+    /// [`Exit::Ok`], or [`Exit::NeedsAttention`] for a result that asks for work.
     pub exit: Exit,
 }
 
@@ -29,8 +29,8 @@ impl Done {
     pub fn new(line: impl Into<String>, json: Value) -> Done {
         Done {
             line: line.into(),
-            detail: Vec::new(),
             json,
+            more: Vec::new(),
             exit: Exit::Ok,
         }
     }
@@ -67,8 +67,7 @@ pub fn print(done: &Done, json: bool) {
         let _ = writeln!(out, "{}", done.json);
         return;
     }
-    let _ = writeln!(out, "{}", bounded(&one_line(&done.line)));
-    for line in &done.detail {
+    for line in std::iter::once(&done.line).chain(&done.more) {
         let _ = writeln!(out, "{}", bounded(&one_line(line)));
     }
 }

@@ -1,0 +1,8 @@
+{
+  "maxEmulators": 1,
+  "emulatorImage": "system-images;android-35;google_apis;x86_64",
+  "emulatorRamMB": 0,
+  "hostFloorMB": 0,
+  "stackRamMB": 0,
+  "notify": false
+}

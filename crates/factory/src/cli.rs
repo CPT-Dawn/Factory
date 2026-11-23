@@ -1,6 +1,7 @@
 //! The command line: what each command takes, and `--help` kept short.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -42,6 +43,20 @@ pub enum Command {
     Wait {
         #[command(subcommand)]
         command: WaitCommand,
+    },
+    /// Review the commits since BASE on a second vendor's model
+    Review {
+        /// The fixed point the work started from
+        base: String,
+        /// Names the report: letters, digits, _ and -; a -rN suffix is the round
+        label: String,
+        /// The spec: a file, an issue ref (#12, 12, an issue URL) or none
+        spec: Option<String>,
+        /// The previous round's report
+        previous: Option<PathBuf>,
+        /// Seconds the reviewer may take before its process group is killed
+        #[arg(long, value_name = "SECONDS", default_value_t = 1800)]
+        timeout: u64,
     },
     /// Run the daemon; other commands start it when it isn't running
     Daemon,

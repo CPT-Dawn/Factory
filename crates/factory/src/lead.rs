@@ -25,7 +25,7 @@ pub fn list() -> Result<Done, Failure> {
         return Ok(Done::new("no leads in herdr", json));
     };
     let mut done = Done::new(first, json);
-    done.detail = lines.collect();
+    done.more = lines.collect();
     Ok(done)
 }
 
@@ -60,7 +60,7 @@ fn shown(report: &LeadReport, exit: Exit) -> Done {
         line(report),
         serde_json::to_value(report).unwrap_or(Value::Null),
     );
-    done.detail.clone_from(&report.lines);
+    done.more.clone_from(&report.lines);
     done.exit = exit;
     done
 }

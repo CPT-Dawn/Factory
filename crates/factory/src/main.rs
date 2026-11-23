@@ -9,6 +9,7 @@ mod log;
 mod output;
 mod paths;
 mod protocol;
+mod review;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -37,6 +38,19 @@ fn run(command: Command, json: bool) -> Result<Done, Failure> {
         Command::Wait {
             command: WaitCommand::Lead { lead, timeout },
         } => lead::wait(&lead, timeout),
+        Command::Review {
+            base,
+            label,
+            spec,
+            previous,
+            timeout,
+        } => review::run(&review::Args {
+            base,
+            label,
+            spec,
+            previous,
+            timeout: std::time::Duration::from_secs(timeout),
+        }),
         Command::Daemon => daemon::run(json),
     }
 }
