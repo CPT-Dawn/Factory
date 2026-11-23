@@ -1,6 +1,7 @@
 //! The lab's daemon methods and what they carry. The CLI reads configs, finds the owner and runs
 //! stacks; the daemon keeps the lease store and decides grants.
 
+use factory_core::lab::queue::{Holding, QueueEntry};
 use serde::{Deserialize, Serialize};
 
 /// Waits in the queue until a lease can be granted: [`AcquireParams`] in, notes while it waits
@@ -91,6 +92,16 @@ impl Lease {
     pub fn owner_key(&self) -> String {
         format!("{}:{}", self.owner_pid, self.owner_start)
     }
+
+    /// The lease as the planner sees it.
+    pub fn holding(&self) -> Holding {
+        Holding {
+            project: self.project.clone(),
+            slot: self.slot,
+            owner: self.owner_key(),
+            owner_label: self.owner_label.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +132,22 @@ pub struct Waiter {
     pub project: Option<String>,
     pub slot_cap: Option<u32>,
     pub max_slots: u32,
+}
+
+impl Waiter {
+    /// The waiter as the planner sees it.
+    pub fn entry(&self) -> QueueEntry {
+        QueueEntry {
+            id: self.id,
+            label: self.label.clone(),
+            created: self.created,
+            owner: self.owner.clone(),
+            owner_label: self.owner_label.clone(),
+            project: self.project.clone(),
+            cap: self.slot_cap,
+            max_slots: self.max_slots,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

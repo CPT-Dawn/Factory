@@ -7,7 +7,11 @@ use std::process::ExitCode;
 use factory_core::lab::slots::export_lines;
 
 use super::context::{Ctx, context};
-use super::lease::{self, Opts};
+use factory_core::lab::args::parse_opts;
+use factory_core::lab::config::ProjectConfig;
+
+use super::lease;
+use super::wire::Lease;
 use super::{run, stack, status};
 use crate::output::Failure;
 
@@ -49,7 +53,7 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
         }
         "acquire" | "run" => {
             let ctx = context()?;
-            let (mut opts, rest, flags) = parse_opts(args)?;
+            let (mut opts, rest, flags) = parse_opts(args).map_err(Failure::usage)?;
             if opts.wait_sec.is_none() {
                 opts.wait_sec = Some(ctx.cfg.wait_sec);
             }
@@ -107,21 +111,38 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
     }
 }
 
+/// Gives the lease back. With `--stop-stack` the stack stops first, while the lease still keeps
+/// the slot from the next in the queue; a stop that fails still gives the lease back.
 fn release(ctx: &Ctx, stop_stack: bool) -> Result<u8, Failure> {
+    let held = if stop_stack { lease::find(ctx)? } else { None };
+    let stopped = match (&held, &ctx.project) {
+        (
+            Some(Lease {
+                slot: Some(slot), ..
+            }),
+            Some(project),
+        ) => Some(stop(ctx, project, *slot)),
+        _ => None,
+    };
     let Some(dropped) = lease::release(ctx)? else {
         note("nothing held here");
         return Ok(0);
     };
-    if let (true, Some(project), Some(slot)) = (stop_stack, &ctx.project, dropped.slot) {
-        if let Some(info) = stack::info(project, &ctx.worktree, slot)?
-            && stack::running(&info.project_id)
-        {
-            stack::down(project, &info.project_id, &ctx.worktree)?;
-        }
-        lease::stack_ours(&project.name, slot, false)?;
+    if let Some(stopped) = stopped {
+        stopped?;
     }
     note(&format!("released lease {}", dropped.id));
     Ok(0)
+}
+
+/// Stops the slot's stack if it runs, and marks it no longer devlab's to stop.
+fn stop(ctx: &Ctx, project: &ProjectConfig, slot: u32) -> Result<(), Failure> {
+    if let Some(info) = stack::info(project, &ctx.worktree, slot)?
+        && stack::running(&info.project_id)
+    {
+        stack::down(project, &info.project_id, &ctx.worktree)?;
+    }
+    lease::stack_ours(&project.name, slot, false)
 }
 
 fn stack_command(ctx: &Ctx, sub: &str) -> Result<u8, Failure> {
@@ -167,127 +188,4 @@ fn stack_command(ctx: &Ctx, sub: &str) -> Result<u8, Failure> {
         }
     }
     Ok(0)
-}
-
-/// Options for run and acquire, the command after them, and the other `--flags` seen.
-fn parse_opts(args: &[String]) -> Result<(Opts, &[String], Vec<String>), Failure> {
-    let mut want = 1.0;
-    let mut opts = Opts::default();
-    let mut flags = Vec::new();
-    let mut i = 0;
-    while let Some(a) = args.get(i) {
-        match a.as_str() {
-            "--" => {
-                i += 1;
-                break;
-            }
-            "--devices" => {
-                i += 1;
-                want = js_number(args.get(i));
-            }
-            "--pair" => want = 2.0,
-            "--no-device" => want = 0.0,
-            "--phone" => opts.mode = "phone",
-            "--emulator" => opts.mode = "emulator",
-            "--stack" => opts.stack = true,
-            "--wait" => {
-                i += 1;
-                let sec = js_number(args.get(i));
-                if sec.is_nan() || sec < 0.0 {
-                    return Err(Failure::usage(
-                        "--wait takes a number of seconds (0 = do not wait)",
-                    ));
-                }
-                opts.wait_sec = Some(sec);
-            }
-            flag if flag.starts_with("--") => flags.push(flag.to_owned()),
-            _ => break,
-        }
-        i += 1;
-    }
-    if want.fract() != 0.0 || !want.is_finite() || want < 0.0 {
-        return Err(Failure::usage("--devices takes a whole number"));
-    }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    {
-        opts.want = want as u32;
-    }
-    Ok((opts, args.get(i..).unwrap_or_default(), flags))
-}
-
-/// JavaScript's `Number(text)`, near enough: blank is 0, junk (or nothing) is NaN.
-fn js_number(text: Option<&String>) -> f64 {
-    let Some(text) = text else { return f64::NAN };
-    let text = text.trim();
-    if text.is_empty() {
-        return 0.0;
-    }
-    if text
-        .chars()
-        .any(|c| c.is_ascii_alphabetic() && !matches!(c, 'e' | 'E'))
-    {
-        return if text.trim_start_matches(['+', '-']) == "Infinity" {
-            text.parse().unwrap_or(f64::NAN)
-        } else {
-            f64::NAN
-        };
-    }
-    text.parse().unwrap_or(f64::NAN)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn opts(args: &[&str]) -> Result<(Opts, Vec<String>, Vec<String>), String> {
-        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
-        parse_opts(&args)
-            .map(|(o, rest, flags)| (o, rest.to_vec(), flags))
-            .map_err(|f| f.message)
-    }
-
-    #[test]
-    fn options_stop_at_the_command_and_keep_unknown_flags() {
-        let (o, rest, flags) =
-            opts(&["--no-device", "--stack", "--quiet", "--", "echo", "--x"]).unwrap();
-        assert_eq!(
-            (o.want, o.stack, rest, flags),
-            (
-                0,
-                true,
-                vec!["echo".into(), "--x".into()],
-                vec!["--quiet".to_owned()]
-            )
-        );
-        let (o, rest, _) = opts(&["--pair", "--wait", "2.5", "true"]).unwrap();
-        assert_eq!(
-            (o.want, o.wait_sec, rest),
-            (2, Some(2.5), vec!["true".to_owned()])
-        );
-    }
-
-    #[test]
-    fn a_bad_count_or_wait_is_refused() {
-        assert_eq!(
-            opts(&["--devices", "two"]).unwrap_err(),
-            "--devices takes a whole number"
-        );
-        assert_eq!(
-            opts(&["--devices", "1.5"]).unwrap_err(),
-            "--devices takes a whole number"
-        );
-        assert_eq!(
-            opts(&["--devices"]).unwrap_err(),
-            "--devices takes a whole number"
-        );
-        for bad in ["soon", "-1", "nan"] {
-            assert!(
-                opts(&["--wait", bad])
-                    .unwrap_err()
-                    .starts_with("--wait takes"),
-                "{bad}"
-            );
-        }
-        assert_eq!(opts(&["--wait", " 7 "]).unwrap().0.wait_sec, Some(7.0));
-    }
 }

@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use factory_core::exit::Exit;
+use factory_core::lab::args::Opts;
 use factory_core::lab::config::{ProjectConfig, owner_cap};
 use factory_core::lab::slots::{Env, slot_env};
 
@@ -17,30 +18,6 @@ use super::wire::{
 use crate::client;
 use crate::output::Failure;
 use crate::paths::Paths;
-
-/// What `acquire` and `run` ask for.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Opts {
-    /// Devices to hold (#16); 0 holds only a stack slot.
-    pub want: u32,
-    /// `any`, `phone` or `emulator` (#16).
-    pub mode: &'static str,
-    /// Start the slot's stack too.
-    pub stack: bool,
-    /// How long to queue; none takes the machine's default.
-    pub wait_sec: Option<f64>,
-}
-
-impl Default for Opts {
-    fn default() -> Opts {
-        Opts {
-            want: 1,
-            mode: "any",
-            stack: false,
-            wait_sec: None,
-        }
-    }
-}
 
 /// How much longer than its wait the CLI listens for the daemon's answer.
 const ANSWER_GRACE: Duration = Duration::from_secs(60);
@@ -125,10 +102,14 @@ fn project_ask(ctx: &Ctx, p: &ProjectConfig) -> Result<ProjectAsk, Failure> {
     })
 }
 
+/// The caller's lease, if it holds one.
+pub fn find(ctx: &Ctx) -> Result<Option<Lease>, Failure> {
+    client::call(&paths()?, LEASE, &ctx.find())
+}
+
 /// The caller's lease, or exit 4.
 pub fn live(ctx: &Ctx) -> Result<Lease, Failure> {
-    let found: Option<Lease> = client::call(&paths()?, LEASE, &ctx.find())?;
-    found.ok_or_else(|| {
+    find(ctx)?.ok_or_else(|| {
         Failure::new(
             Exit::NoLease,
             format!(

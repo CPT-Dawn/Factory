@@ -75,47 +75,93 @@ fn lease_ids_climb_and_are_never_reused_even_across_a_daemon_restart() {
     assert_eq!(owned(&sandbox, &wt, &["release"]).code, 0);
     // The highest id was just freed: a plain max+1 would hand it out again.
     let second = lease_id(&owned(&sandbox, &wt, &["acquire", "--no-device"]));
-    assert_eq!(owned(&sandbox, &wt, &["release"]).code, 0);
     stop_daemon(&sandbox);
+    // The lease outlives the daemon that granted it.
+    let held = lease_id(&owned(&sandbox, &wt, &["env"]));
+    assert_eq!(owned(&sandbox, &wt, &["release"]).code, 0);
     let third = lease_id(&owned(&sandbox, &wt, &["acquire", "--no-device"]));
 
     assert_eq!(
-        (first.as_str(), second.as_str(), third.as_str()),
-        ("1", "2", "3")
+        (
+            first.as_str(),
+            second.as_str(),
+            held.as_str(),
+            third.as_str()
+        ),
+        ("1", "2", "2", "3")
     );
 }
 
 #[test]
-fn the_owner_is_the_nearest_claude_above_the_shell() {
+fn the_owner_is_the_nearest_agent_above_the_shell() {
     let (sandbox, world) = lab();
     let wt = world.worktree("demo-owner");
     let agent = sandbox.path("agent");
     fs::create_dir(&agent).expect("create the agent dir");
-    std::os::unix::fs::symlink("/bin/sh", agent.join("claude")).expect("link a claude");
-    // The trailing `true` keeps the shell from exec-ing into devlab, so it stays the parent.
-    let mut cmd = sandbox.command(
-        agent.join("claude"),
-        &[
-            "-c",
-            "devlab acquire --no-device --quiet >/dev/null && devlab status --json; true",
-        ],
-    );
+    for name in ["claude", "codex"] {
+        std::os::unix::fs::symlink("/bin/sh", agent.join(name)).expect("link an agent");
+    }
+    // A claude runs a codex, which runs the shell devlab is called from: codex is the nearest.
+    // Each trailing `true` keeps a shell from exec-ing into its last command, so it stays a parent.
+    let inner =
+        "echo $$; devlab acquire --no-device --quiet >/dev/null && devlab status --json; true";
+    let outer = format!("{} -c '{inner}'; true", agent.join("codex").display());
+    let mut cmd = sandbox.command(agent.join("claude"), &["-c", &outer]);
     cmd.current_dir(&wt);
     let child = spawn(cmd);
-    let pid = child.id();
+    let claude = child.id();
     let out = finish(child);
 
+    let (codex, json) = out
+        .stdout
+        .split_once('\n')
+        .unwrap_or_else(|| panic!("{out:?}"));
     let status: serde_json::Value =
-        serde_json::from_str(&out.stdout).unwrap_or_else(|e| panic!("{e}: {out:?}"));
+        serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    assert_ne!(codex, claude.to_string());
     assert_eq!(
         status["owners"][0]["owner"],
-        format!("claude:{pid}"),
+        format!("codex:{codex}"),
         "{out:?}"
     );
     assert!(
         !daemon_log(&sandbox).contains("warning"),
         "{}",
         daemon_log(&sandbox)
+    );
+}
+
+#[test]
+fn factory_lab_is_devlab_and_takes_the_global_json_flag() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-name");
+    let as_devlab = owned(&sandbox, &wt, &["help"]);
+    let as_factory = sandbox.factory_in(&wt, &["lab", "help"]);
+    assert_eq!(
+        (as_factory.code, &as_factory.stdout),
+        (0, &as_devlab.stdout)
+    );
+
+    let status = sandbox.factory_in(&wt, &["--json", "lab", "status"]);
+    assert_eq!(status.code, 0, "{status:?}");
+    let status: serde_json::Value =
+        serde_json::from_str(&status.stdout).unwrap_or_else(|e| panic!("{e}: {status:?}"));
+    assert!(status["slots"].is_array(), "{status}");
+}
+
+#[test]
+fn a_wait_that_is_no_number_of_seconds_is_refused() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-wait");
+    let out = owned(&sandbox, &wt, &["acquire", "--no-device", "--wait", "soon"]);
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (
+            2,
+            "",
+            "devlab: --wait takes a number of seconds (0 = do not wait)\n"
+        )
     );
 }
 

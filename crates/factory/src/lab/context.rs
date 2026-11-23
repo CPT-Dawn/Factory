@@ -2,10 +2,8 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
 
-use factory_adapters::process;
+use factory_adapters::git::{GitRepo, Repo};
 use factory_core::exit::Exit;
 use factory_core::lab::config::{self, MachineConfig, ProjectConfig};
 
@@ -48,16 +46,10 @@ pub fn context() -> Result<Ctx, Failure> {
 
 /// The git worktree's top directory, when `cwd` is in one.
 fn toplevel(cwd: &Path) -> Option<String> {
-    let mut git = Command::new("git");
-    git.args(["rev-parse", "--show-toplevel"])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let out = process::run(git, Duration::from_secs(5)).ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    GitRepo::at(cwd)
+        .toplevel()
+        .ok()
+        .map(|top| top.to_string_lossy().into_owned())
 }
 
 fn var(key: &str) -> Option<OsString> {

@@ -29,6 +29,10 @@ fn main() -> ExitCode {
     }
     let json = args.iter().skip(1).any(|arg| arg == "--json");
     match cli::parse(args) {
+        Ok(cli::Cli {
+            command: Command::Lab { args },
+            json,
+        }) => lab::main(&lab_args(args, json)),
         Ok(cli) => output::finish(run(cli.command, cli.json), cli.json),
         Err(refusal) => cli::refuse(refusal, json),
     }
@@ -51,7 +55,17 @@ fn run(command: Command, json: bool) -> Result<Done, Failure> {
             timeout: std::time::Duration::from_secs(timeout),
         }),
         Command::Daemon => daemon::run(json),
-        // main hands `factory lab` to the lab before parsing; this entry is its line in --help.
+        // main hands every `factory lab` to the lab; this arm is never reached.
         Command::Lab { .. } => Err(Failure::usage("run factory lab help")),
     }
+}
+
+/// The lab's arguments when global flags came before `lab` (`factory --json lab status`): the
+/// lab speaks devlab's dialect, where only `status` takes `--json`.
+fn lab_args(args: Vec<String>, json: bool) -> Vec<OsString> {
+    let mut out: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+    if json && out.first().is_some_and(|cmd| cmd == "status") {
+        out.push(OsString::from("--json"));
+    }
+    out
 }

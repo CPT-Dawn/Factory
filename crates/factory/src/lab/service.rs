@@ -15,7 +15,6 @@ use factory_adapters::docker::{Containers, Docker};
 use factory_core::exit::Exit;
 use factory_core::lab::grant::{self, Ask, Decision};
 use factory_core::lab::js_number;
-use factory_core::lab::queue::{Holding, QueueEntry};
 use factory_core::lab::slots::{SlotView, slot_host_ports, slot_project_id};
 use rusqlite::Connection;
 use serde::Serialize;
@@ -26,6 +25,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::host;
+use super::lease::base_name;
 use super::store::{self, Store};
 use super::wire::{
     AcquireParams, Board, FindParams, GC, Granted, LEASE, Lease, RELEASE, SLOT, STATUS, SlotParams,
@@ -209,9 +209,7 @@ fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<i64> {
     lab.write(|c, now| {
         let existing = store::find_lease(c, &p.worktree, &p.owner, p.lease)?;
         let ask = project_ask(p);
-        let name = Path::new(&p.worktree)
-            .file_name()
-            .map_or_else(|| p.worktree.clone(), |n| n.to_string_lossy().into_owned());
+        let name = base_name(&p.worktree);
         store::insert_waiter(
             c,
             &Waiter {
@@ -249,28 +247,8 @@ fn try_grant(
         let leases = store::leases(c)?;
         let rows = store::slots(c)?;
         let board = grant::Board {
-            leases: leases
-                .iter()
-                .map(|l| Holding {
-                    project: l.project.clone(),
-                    slot: l.slot,
-                    owner: l.owner_key(),
-                    owner_label: l.owner_label.clone(),
-                })
-                .collect(),
-            queue: store::waiters(c)?
-                .into_iter()
-                .map(|w| QueueEntry {
-                    id: w.id,
-                    label: w.label,
-                    created: w.created,
-                    owner: w.owner,
-                    owner_label: w.owner_label,
-                    project: w.project,
-                    cap: w.slot_cap,
-                    max_slots: w.max_slots,
-                })
-                .collect(),
+            leases: leases.iter().map(Lease::holding).collect(),
+            queue: store::waiters(c)?.iter().map(Waiter::entry).collect(),
             slots: p.project.as_ref().map_or_else(Vec::new, |project| {
                 (0..project.max_slots)
                     .map(|slot| {

@@ -3,9 +3,9 @@
 use std::collections::BTreeMap;
 
 use factory_adapters::systemd::{Systemctl, Units};
+use factory_core::lab::ago;
 use factory_core::lab::config::MachineConfig;
-use factory_core::lab::js_round;
-use factory_core::lab::queue::{Holding, QueueEntry, held_by, owner_slot_counts, waiter_capped};
+use factory_core::lab::queue::{Holding, held_by, owner_slot_counts, waiter_capped};
 use factory_core::lab::slots::slot_project_id;
 use serde::Serialize;
 
@@ -48,28 +48,6 @@ struct OwnerLine {
     held: u32,
     cap: Option<u32>,
     max_slots: Option<u32>,
-}
-
-/// `3m`, or `1.5h` from an hour on.
-fn ago(now: i64, t: i64) -> String {
-    #[allow(clippy::cast_precision_loss)]
-    let m = js_round((now - t) as f64 / 60.0);
-    if m < 60 {
-        format!("{m}m")
-    } else {
-        #[allow(clippy::cast_precision_loss)]
-        let tenths = js_round(m as f64 / 6.0);
-        format!("{}h", factory_core::lab::js_number(tenths as f64 / 10.0))
-    }
-}
-
-fn holding(l: &Lease) -> Holding {
-    Holding {
-        project: l.project.clone(),
-        slot: l.slot,
-        owner: l.owner_key(),
-        owner_label: l.owner_label.clone(),
-    }
 }
 
 pub fn render(json: bool) -> Result<String, Failure> {
@@ -181,7 +159,7 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
             }
         })
         .collect();
-    let holdings: Vec<Holding> = board.leases.iter().map(holding).collect();
+    let holdings: Vec<Holding> = board.leases.iter().map(Lease::holding).collect();
     // Each project's cap, read from the config of a worktree that holds one of its slots.
     let mut caps: BTreeMap<String, Option<(u32, u32)>> = BTreeMap::new();
     let mut cap_of = |project: &str| -> Option<(u32, u32)> {
@@ -212,17 +190,7 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
         .waiters
         .iter()
         .map(|w| {
-            let entry = QueueEntry {
-                id: w.id,
-                label: w.label.clone(),
-                created: w.created,
-                owner: w.owner.clone(),
-                owner_label: w.owner_label.clone(),
-                project: w.project.clone(),
-                cap: w.slot_cap,
-                max_slots: w.max_slots,
-            };
-            let capped = if waiter_capped(&entry, &held).is_some() {
+            let capped = if waiter_capped(&w.entry(), &held).is_some() {
                 " (owner at its slot cap)"
             } else {
                 ""
@@ -237,18 +205,5 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
         waiting,
         watcher: Systemctl.is_active("devlab-watch"),
         mem_available_mb: mem_available_mb(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ago;
-
-    #[test]
-    fn ages_read_in_minutes_then_tenths_of_hours() {
-        assert_eq!(ago(1000, 1000), "0m");
-        assert_eq!(ago(1000 + 89, 1000), "1m");
-        assert_eq!(ago(3600 * 2 + 1000, 1000), "2h");
-        assert_eq!(ago(5400 + 1000, 1000), "1.5h");
     }
 }
