@@ -1351,20 +1351,23 @@ pub async fn acquire<W, R, S>(
                         if body.code == Exit::Emulator.code() {
                             match lab.give_back(waiter, lease.id) {
                                 Ok(()) => given_back = true,
+                                // Not exit 77: the lease is still held.
                                 Err(why) => {
-                                    body.message = format!(
-                                        "{}; lease {} could not be given back ({}): run devlab release",
-                                        body.message, lease.id, why.message
-                                    );
+                                    body = ErrorBody {
+                                        code: why.code,
+                                        message: format!(
+                                            "{}; lease {} is still held ({}): run devlab release",
+                                            body.message, lease.id, why.message
+                                        ),
+                                    };
                                 }
                             }
                         }
                         let outcome = Outcome::Error(body);
                         let answered = send(writer, Response { id, outcome }).await;
-                        let _ = lab.settle(
-                            waiter,
-                            (!given_back && !answered && fresh).then_some(&lease),
-                        );
+                        if !given_back {
+                            let _ = lab.settle(waiter, (!answered && fresh).then_some(&lease));
+                        }
                         if let Some(mut run) = run {
                             run.granted = Some(Instant::now());
                             if answered {
