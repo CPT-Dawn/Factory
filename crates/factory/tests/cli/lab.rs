@@ -1596,30 +1596,161 @@ fn a_client_killed_while_queued_is_recorded_as_lost_and_leaves_the_queue() {
     assert!(!status.stdout.contains("waiting:"), "{status:?}");
 }
 
+/// The lab board, as `factory lab status --json` shows it.
+fn board(sandbox: &Sandbox, dir: &Path) -> serde_json::Value {
+    one_json(&native(
+        sandbox,
+        dir,
+        std::process::id(),
+        &["lab", "status", "--json"],
+    ))
+}
+
+/// Each lease on the board: its id, slot and worktree.
+fn leases_on(board: &serde_json::Value) -> Vec<(i64, i64, String)> {
+    board["leases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|lease| {
+            (
+                lease["id"].as_i64().unwrap_or_default(),
+                lease["slot"].as_i64().unwrap_or(-1),
+                lease["worktree"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The waiters on the board, oldest first: their ids and worktrees.
+fn waiters_on(board: &serde_json::Value) -> Vec<(i64, String)> {
+    board["waiters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|waiter| {
+            (
+                waiter["id"].as_i64().unwrap_or_default(),
+                waiter["worktree"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// A command for `spawn_run` that starts, then ends with `code` once the test writes `go`.
+fn until_go(code: u8) -> String {
+    format!("echo $$ > child.pid; while [ ! -e go ]; do sleep 0.1; done; exit {code}")
+}
+
 #[test]
-fn a_daemon_stopping_under_a_run_records_it_as_lost_without_waiting_for_it() {
+fn a_run_whose_command_runs_across_a_daemon_restart_keeps_its_lease_and_records_its_exit() {
     let (sandbox, world) = lab();
     let wt = world.worktree("demo-restart");
-    let child = spawn_run(&sandbox, &wt, "echo $$ > child.pid; exec sleep 30");
+    let child = spawn_run(&sandbox, &wt, &until_go(3));
     assert!(
         poll_until(|| wt.join("child.pid").exists()),
         "the command never started"
     );
-    let devlab_pid = child.id();
+    let held = leases_on(&board(&sandbox, &wt));
 
     let stopping = std::time::Instant::now();
     stop_daemon(&sandbox);
     let took = stopping.elapsed();
-    let event = the_lab_run(&sandbox);
-    kill_group(devlab_pid, Signal::KILL);
-    let _ = finish(child);
+    let kept = leases_on(&board(&sandbox, &wt));
+    fs::write(wt.join("go"), "").expect("write go");
+    let out = finish(child);
 
     assert!(
         took < std::time::Duration::from_secs(5),
         "the stop took {took:?}"
     );
-    assert_eq!(event["outcome"], "lost", "{event}");
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(kept, held);
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "exit 3", "{event}");
     assert_eq!(event["phase"], "running", "{event}");
+    assert_eq!(event["lease"], held[0].0, "{event}");
+    assert_eq!(event["slot"], 0, "{event}");
+}
+
+#[test]
+fn runs_queued_across_a_daemon_restart_keep_their_places_and_are_granted_in_turn() {
+    let (sandbox, world) = lab();
+    hold_the_owners_slot(&sandbox, &world);
+    let (first, second) = (world.worktree("demo-first"), world.worktree("demo-second"));
+    let a = spawn_run(&sandbox, &first, "echo ran > ran");
+    assert!(poll_until(
+        || waiters_on(&board(&sandbox, &first)).len() == 1
+    ));
+    let b = spawn_run(&sandbox, &second, "echo ran > ran");
+    assert!(poll_until(
+        || waiters_on(&board(&sandbox, &first)).len() == 2
+    ));
+    let queued = waiters_on(&board(&sandbox, &first));
+
+    stop_daemon(&sandbox);
+    let requeued = waiters_on(&board(&sandbox, &first));
+    let holder = world.worktree("demo-holder");
+    assert_eq!(owned(&sandbox, &holder, &["release"]).code, 0);
+    let out_a = finish(a);
+    let second_waited = !second.join("ran").exists();
+    assert_eq!(owned(&sandbox, &first, &["release"]).code, 0);
+    let out_b = finish(b);
+
+    assert_eq!(requeued, queued);
+    assert_eq!(out_a.code, 0, "{out_a:?}");
+    assert!(second_waited, "the second run went before the first");
+    assert_eq!(out_b.code, 0, "{out_b:?}");
+    assert!(poll_until(|| lab_runs(&sandbox).len() == 2));
+    for event in lab_runs(&sandbox) {
+        assert_eq!(event["outcome"], "exit 0", "{event}");
+        assert_eq!(event["phase"], "running", "{event}");
+    }
+}
+
+#[test]
+fn a_run_a_daemon_stop_cut_off_for_good_is_recorded_as_daemon_stopped_not_lost() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-cut-off");
+    let child = spawn_run(&sandbox, &wt, "echo $$ > child.pid; exec sleep 30");
+    assert!(
+        poll_until(|| wt.join("child.pid").exists()),
+        "the command never started"
+    );
+
+    // Frozen, the run can't get back to a daemon before it is killed.
+    freeze(&child);
+    stop_daemon(&sandbox);
+    kill_group(child.id(), Signal::KILL);
+    let _ = finish(child);
+    let after = board(&sandbox, &wt);
+
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "daemon-stopped", "{event}");
+    assert_eq!(event["phase"], "running", "{event}");
+    assert_eq!(leases_on(&after).len(), 1, "{after}");
+}
+
+#[test]
+fn a_run_still_queued_when_the_daemon_stops_for_good_is_recorded_as_daemon_stopped() {
+    let (sandbox, world) = lab();
+    hold_the_owners_slot(&sandbox, &world);
+    let wt = world.worktree("demo-queued-gone");
+    let child = spawn_run(&sandbox, &wt, "true");
+    await_waiter(&sandbox, &wt);
+
+    freeze(&child);
+    stop_daemon(&sandbox);
+    kill_group(child.id(), Signal::KILL);
+    let _ = finish(child);
+    let after = board(&sandbox, &wt);
+
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "daemon-stopped", "{event}");
+    assert_eq!(event["phase"], "queued", "{event}");
+    assert_eq!(event["run_s"], 0, "{event}");
+    assert_eq!(waiters_on(&after), Vec::new());
 }
 
 /// A process that stands in for an agent owning leases, until the test kills it.

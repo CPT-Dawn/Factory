@@ -21,9 +21,17 @@ pub const ACQUIRE: &str = "lab.acquire";
 pub const RECEIVED: &str = "lab.received";
 /// A notification on a run's connection, unanswered: its command started. No params.
 pub const RUN_START: &str = "lab.run.start";
-/// A notification on a run's connection, unanswered: how the run ended, [`RunEnd`]. Sent while
-/// queued, it also takes the run out of the queue, and the acquire is answered with an error.
+/// How a run ended, [`RunEnd`], on a run's connection. Sent while queued, it takes the run out
+/// of the queue, and the acquire is answered with an error. Sent as [`RUN_END_ID`] once the run
+/// has its grant, it is answered `true` once recorded; sent as a notification, it is not.
 pub const RUN_END: &str = "lab.run.end";
+/// Picks up the run of a devlab process whose daemon went away: [`RunResume`] in, `true` out
+/// once the daemon follows it on this connection, as it did on the acquire's. A run the daemon
+/// doesn't keep, or that another connection follows, is refused.
+pub const RUN_RESUME: &str = "lab.run.resume";
+/// The id a run sends [`RUN_END`] with: the daemon answers it, `true`, once the end is in the
+/// ledger.
+pub const RUN_END_ID: u64 = u64::MAX;
 /// The caller's lease, touched: [`FindParams`] in, `Option<Lease>` out.
 pub const LEASE: &str = "lab.lease";
 /// Drops the caller's lease: [`ReleaseParams`] in, the lease it dropped (`Option<Lease>`) out.
@@ -223,6 +231,12 @@ pub struct FindParams {
     pub worktree: String,
     pub owner: Owner,
     pub lease: Option<i64>,
+}
+
+/// The devlab process whose run to pick up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunResume {
+    pub client: Process,
 }
 
 /// One process by pid and start time: the devlab call that stops a stack.

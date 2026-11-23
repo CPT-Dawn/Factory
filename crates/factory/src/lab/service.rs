@@ -42,11 +42,12 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::reservations;
-use super::store::{self, Store};
+use super::store::{self, RunRow, Store};
 use super::wire::{
     AcquireParams, Board, DeviceAsk, DeviceLine, FindParams, GC, Granted, LEASE, Lease,
-    LeaseDevice, ProjectAsk, RECEIVED, RELEASE, RUN_END, RUN_START, ReleaseParams, RunAsk, RunEnd,
-    SLOT, STATUS, STOPPING, SlotParams, StopParams, UNRESERVE, Waiter,
+    LeaseDevice, Process, ProjectAsk, RECEIVED, RELEASE, RUN_END, RUN_END_ID, RUN_START,
+    ReleaseParams, RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING, SlotParams, StopParams,
+    UNRESERVE, Waiter,
 };
 use super::{android, host};
 use crate::ledger::Ledger;
@@ -89,6 +90,8 @@ pub struct Lab {
     /// A line for each lease dropped because its owner exited, until `devlab gc` tells it: the
     /// keeper usually drops it first. The newest [`UNREPORTED`].
     unreported: Mutex<VecDeque<String>>,
+    /// Where runs no daemon can follow any more are recorded.
+    ledger: Arc<Ledger>,
 }
 
 /// How many dropped leases wait for `devlab gc` to tell them.
@@ -104,7 +107,7 @@ mod overview;
 type Answer<T> = Result<T, ErrorBody>;
 
 impl Lab {
-    pub fn open(path: &Path) -> Result<Lab, String> {
+    pub fn open(path: &Path, ledger: Arc<Ledger>) -> Result<Lab, String> {
         let store =
             Store::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         Ok(Lab {
@@ -117,6 +120,7 @@ impl Lab {
             stopping: Mutex::new(keeper::Stopping::default()),
             unreported: Mutex::new(VecDeque::new()),
             callers: Mutex::new(HashSet::new()),
+            ledger,
         })
     }
 
@@ -187,7 +191,8 @@ impl Lab {
     }
 
     /// One write transaction; dead owners' leases, dead stoppers' holds and waiters that can't
-    /// come back are dropped first, telling waiters and `devlab gc`. The reverses the dropped
+    /// come back are dropped first, telling waiters and `devlab gc`, and runs whose devlab went
+    /// while no daemon followed them are recorded as `daemon-stopped`. The reverses the dropped
     /// leases' devices were given are taken back beside it, after the transaction.
     fn write<T>(&self, work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>) -> Answer<T> {
         let mut store = self
@@ -195,7 +200,7 @@ impl Lab {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = now();
-        let (freed, unreserved, unstopped, out) = store
+        let (freed, unreserved, unstopped, orphans, out) = store
             .write(|c| {
                 let (freed, unreserved) = store::gc(c, now, &host::alive)?;
                 let unstopped = store::clear_dead_stoppers(c, &host::alive)?;
@@ -207,13 +212,34 @@ impl Lab {
                     &|id| attached.contains(&id),
                     &host::alive,
                 )?;
-                Ok((freed, unreserved, unstopped + pruned, work(c, now)?))
+                let orphans =
+                    store::take_orphan_runs(c, &|id| attached.contains(&id), &host::alive)?;
+                Ok((
+                    freed,
+                    unreserved,
+                    unstopped + pruned,
+                    orphans,
+                    work(c, now)?,
+                ))
             })
             .map_err(|e| ErrorBody {
                 code: Exit::Precondition.code(),
                 message: format!("lab store {}: {e}; retry", self.path.display()),
             })?;
         drop(store);
+        for run in &orphans {
+            let phase = if run.started_ms.is_some() {
+                Phase::Running
+            } else {
+                Phase::Queued
+            };
+            append_run(
+                &self.ledger,
+                run,
+                End::DaemonStopped.outcome(),
+                phase.word(),
+            );
+        }
         let lines: Vec<String> = freed
             .iter()
             .map(|l| format!("lease {} ({}, owner exited)", l.id, l.owner_label))
@@ -680,7 +706,7 @@ enum Queued {
 /// Queues the request, or takes back the place it had if it is still its own: the one it names,
 /// else the one its devlab call holds, so a caller that never heard of its place keeps it too.
 /// The caller counts as attached from here.
-fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<Queued> {
+fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<(Queued, Option<RunRow>)> {
     lab.write(|c, now| {
         let kept = store::place(c, p)?;
         let queued = match kept {
@@ -705,11 +731,39 @@ fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<Queued> {
                 }
             }
         };
-        lab.callers().insert(match &queued {
+        let id = match &queued {
             Queued::Waiting { id, .. } | Queued::Granted { id, .. } => *id,
-        });
-        Ok(queued)
+        };
+        lab.callers().insert(id);
+        let run = match (&p.run, &p.client) {
+            (Some(_), Some(_)) => Some(store::begin_run(c, &fresh_run(p, id))?),
+            _ => None,
+        };
+        Ok((queued, run))
     })
+}
+
+/// The run `p` asks for, as queued now at waiter `id`.
+fn fresh_run(p: &AcquireParams, id: i64) -> RunRow {
+    let ask = p.run.clone().unwrap_or(RunAsk {
+        command: String::new(),
+        session: None,
+    });
+    RunRow {
+        id,
+        worktree: p.worktree.clone(),
+        command: ask.command,
+        session: ask.session,
+        client: p.client.clone().unwrap_or(Process {
+            pid: 0,
+            start: String::new(),
+        }),
+        queued_ms: now_ms(),
+        granted_ms: None,
+        started_ms: None,
+        lease: None,
+        slot: None,
+    }
 }
 
 fn insert(c: &Connection, p: &AcquireParams, now: i64) -> rusqlite::Result<(i64, Option<i64>)> {
@@ -1187,7 +1241,6 @@ impl Lab {
 /// followed to its end, which lands in the ledger.
 pub async fn acquire<W, R, S>(
     lab: Arc<Lab>,
-    ledger: Arc<Ledger>,
     request: Request,
     writer: &mut W,
     lines: &mut Lines<R>,
@@ -1222,20 +1275,22 @@ pub async fn acquire<W, R, S>(
     }
     let p = Arc::new(p);
     tokio::pin!(stopping);
-    let mut run = p.run.clone().map(|ask| Run {
-        ask,
-        worktree: p.worktree.clone(),
-        ledger,
-        queued: Instant::now(),
-        granted: None,
-        started: None,
-        lease: None,
-    });
     let queued = {
         let (lab, p) = (Arc::clone(&lab), Arc::clone(&p));
         blocking(move || enqueue(&lab, &p)).await
     };
-    let (waiter, deadline_ms, resumed) = match queued {
+    let mut run = p.run.as_ref().map(|_| {
+        let (row, kept) = match &queued {
+            Ok((_, Some(row))) => (row.clone(), true),
+            _ => (fresh_run(&p, 0), false),
+        };
+        Run {
+            lab: Arc::clone(&lab),
+            row,
+            kept,
+        }
+    });
+    let (waiter, deadline_ms, resumed) = match queued.map(|(queued, _)| queued) {
         Ok(Queued::Waiting {
             id,
             deadline_ms,
@@ -1345,11 +1400,11 @@ pub async fn acquire<W, R, S>(
                         let answered = send(writer, Response { id, outcome }).await;
                         let _ = lab.settle(waiter, (!answered && fresh).then_some(&lease));
                         if let Some(mut run) = run {
-                            run.granted = Some(Instant::now());
                             if answered {
-                                run.lease = Some(lease);
-                                run.follow(lines, None, stopping.as_mut()).await;
+                                run.granted(Some(&lease)).await;
+                                run.follow(writer, lines, None, stopping.as_mut()).await;
                             } else {
+                                run.granted(None).await;
                                 run.record(End::Lost.outcome(), Phase::Queued.word()).await;
                             }
                         }
@@ -1413,15 +1468,9 @@ pub async fn acquire<W, R, S>(
             _ = changed.changed() => {}
             () = tokio::time::sleep(RECHECK) => {}
             () = tokio::time::sleep_until(deadline) => {}
-            // The daemon is stopping: the place stays for its caller to ask the next daemon for,
-            // but for a run's, which asks no other daemon.
-            () = stopping.as_mut() => {
-                if let Some(run) = &run {
-                    lab.remove_waiter(waiter);
-                    run.record(End::Lost.outcome(), Phase::Queued.word()).await;
-                }
-                return;
-            }
+            // The daemon is stopping: the place, and a run's, stay for its caller to ask the
+            // next daemon for.
+            () = stopping.as_mut() => return,
             line = lines.next_line() => {
                 let Ok(Some(line)) = line else {
                     lab.remove_waiter(waiter);
@@ -1460,7 +1509,7 @@ enum Receipt {
     Received { then: Option<String> },
     /// The caller never had it, and a fresh lease went back; `end`, a run's, if it said one.
     Gone { end: Option<RunEnd> },
-    /// The daemon stopped first: the grant stays for the caller to ask for again.
+    /// The daemon stopped first: the grant, and a run's, stay for the caller to ask for again.
     Stopping,
 }
 
@@ -1489,16 +1538,20 @@ async fn deliver<W, R, S>(
     )
     .await;
     let Some(mut run) = run else { return };
-    run.granted = Some(Instant::now());
     match receipt {
         Receipt::Received { then } => {
-            run.lease = Some(lease);
-            run.follow(lines, then, stopping).await;
+            run.granted(Some(&lease)).await;
+            run.follow(writer, lines, then, stopping).await;
         }
-        Receipt::Gone { end: Some(end) } => run.record(end.outcome, &end.phase).await,
-        Receipt::Gone { end: None } | Receipt::Stopping => {
+        Receipt::Gone { end: Some(end) } => {
+            run.granted(None).await;
+            run.record(end.outcome, &end.phase).await;
+        }
+        Receipt::Gone { end: None } => {
+            run.granted(None).await;
             run.record(End::Lost.outcome(), Phase::Queued.word()).await;
         }
+        Receipt::Stopping => {}
     }
 }
 
@@ -1577,24 +1630,44 @@ fn run_end(line: &str) -> Option<RunEnd> {
         .flatten()
 }
 
-/// A `devlab run` the daemon follows, from its acquire to its end.
+/// A `devlab run` the daemon follows, from its acquire to its end, across daemon restarts:
+/// the store keeps it (`kept`) until its end is recorded.
 struct Run {
-    ask: RunAsk,
-    worktree: String,
-    ledger: Arc<Ledger>,
-    queued: Instant,
-    granted: Option<Instant>,
-    started: Option<Instant>,
-    lease: Option<Lease>,
+    lab: Arc<Lab>,
+    row: RunRow,
+    kept: bool,
 }
 
 impl Run {
+    /// The run has had its grant: `lease`, or none when it was given back.
+    async fn granted(&mut self, lease: Option<&Lease>) {
+        self.row.granted_ms.get_or_insert_with(now_ms);
+        self.row.lease = lease.map(|lease| lease.id);
+        self.row.slot = lease.and_then(|lease| lease.slot);
+        if let (true, Some(lease)) = (self.kept, self.row.lease) {
+            let (lab, id, ms, slot) = (
+                Arc::clone(&self.lab),
+                self.row.id,
+                self.row.granted_ms.unwrap_or_default(),
+                self.row.slot,
+            );
+            let _ = blocking(move || lab.write(|c, _| store::run_granted(c, id, ms, lease, slot)))
+                .await;
+        }
+    }
+
     /// Reads the run's connection after the grant, from its line `first` if it was read
-    /// already: its start, then its end, or the connection closing without one, which is a lost
-    /// run. A daemon stopping under a run loses it too: the run may outlast any drain, and its
-    /// end would reach no one.
-    async fn follow<R, S>(&mut self, lines: &mut Lines<R>, first: Option<String>, stopping: S)
-    where
+    /// already: its start, then its end, which is answered once recorded, or the connection
+    /// closing without one, which is a lost run. A daemon that stops leaves the run to the next
+    /// one, which the run asks to follow it ([`RUN_RESUME`](super::wire::RUN_RESUME)).
+    async fn follow<W, R, S>(
+        &mut self,
+        writer: &mut W,
+        lines: &mut Lines<R>,
+        first: Option<String>,
+        stopping: S,
+    ) where
+        W: AsyncWrite + Unpin,
         R: AsyncBufRead + Unpin,
         S: Future<Output = ()>,
     {
@@ -1602,71 +1675,165 @@ impl Run {
         let mut first = first;
         loop {
             let line = match first.take() {
-                Some(line) => Ok(Some(line)),
+                Some(line) => line,
                 None => tokio::select! {
-                    line = lines.next_line() => line,
-                    () = &mut stopping => Ok(None),
+                    line = lines.next_line() => match line {
+                        Ok(Some(line)) => line,
+                        _ => {
+                            let phase = if self.row.started_ms.is_some() {
+                                Phase::Running
+                            } else {
+                                Phase::Queued
+                            };
+                            self.record(End::Lost.outcome(), phase.word()).await;
+                            return;
+                        }
+                    },
+                    () = &mut stopping => return,
                 },
             };
-            let Ok(Some(line)) = line else {
-                let phase = if self.started.is_some() {
-                    Phase::Running
-                } else {
-                    Phase::Queued
-                };
-                self.record(End::Lost.outcome(), phase.word()).await;
-                return;
+            let Ok(request) = serde_json::from_str::<Request>(&line) else {
+                continue;
             };
             if let Some(end) = run_end(&line) {
                 self.record(end.outcome, &end.phase).await;
+                if request.id == RUN_END_ID {
+                    let done = Outcome::Result(Value::Bool(true));
+                    send(
+                        writer,
+                        Response {
+                            id: Some(request.id),
+                            outcome: done,
+                        },
+                    )
+                    .await;
+                }
                 return;
             }
-            if serde_json::from_str::<Request>(&line).is_ok_and(|r| r.method == RUN_START) {
-                self.started.get_or_insert_with(Instant::now);
+            if request.method == RUN_START && self.row.started_ms.is_none() {
+                let ms = now_ms();
+                self.row.started_ms = Some(ms);
+                if self.kept {
+                    let (lab, id) = (Arc::clone(&self.lab), self.row.id);
+                    let _ = blocking(move || lab.write(|c, _| store::run_started(c, id, ms))).await;
+                }
             }
         }
     }
 
-    /// Writes the run's `lab-run` event.
+    /// Writes the run's `lab-run` event, unless another took the run out of the store first.
     async fn record(&self, outcome: String, phase: &str) {
-        let now = Instant::now();
-        let queued_until = self.granted.unwrap_or(now);
-        let mut fields = Fields::new();
-        fields.insert("worktree".to_owned(), self.worktree.clone().into());
-        if let Some(lease) = &self.lease {
-            fields.insert("lease".to_owned(), lease.id.into());
-            if let Some(slot) = lease.slot {
-                fields.insert("slot".to_owned(), slot.into());
+        if self.kept {
+            let (lab, id) = (Arc::clone(&self.lab), self.row.id);
+            let taken = blocking(move || lab.write(|c, _| store::take_run(c, id))).await;
+            if matches!(taken, Ok(None)) {
+                return;
             }
         }
-        fields.insert("command".to_owned(), self.ask.command.clone().into());
-        fields.insert(
-            "queue_s".to_owned(),
-            queued_until.duration_since(self.queued).as_secs().into(),
+        let (ledger, row, phase) = (
+            Arc::clone(&self.lab.ledger),
+            self.row.clone(),
+            phase.to_owned(),
         );
-        fields.insert(
-            "run_s".to_owned(),
-            self.started
-                .map_or(0, |started| now.duration_since(started).as_secs())
-                .into(),
-        );
-        fields.insert("outcome".to_owned(), outcome.into());
-        fields.insert("phase".to_owned(), phase.into());
-        if let Some(session) = &self.ask.session {
-            fields.insert("session".to_owned(), session.clone().into());
+        let _ =
+            tokio::task::spawn_blocking(move || append_run(&ledger, &row, outcome, &phase)).await;
+    }
+}
+
+/// Picks up a run ([`RUN_RESUME`](super::wire::RUN_RESUME)) whose daemon went away, and follows it to its end.
+pub async fn resume_run<W, R, S>(
+    lab: Arc<Lab>,
+    request: Request,
+    writer: &mut W,
+    lines: &mut Lines<R>,
+    stopping: S,
+) where
+    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+    S: Future<Output = ()>,
+{
+    let id = Some(request.id);
+    let found = match parse::<RunResume>(request.params) {
+        Ok(p) => {
+            let lab = Arc::clone(&lab);
+            blocking(move || {
+                lab.write(|c, _| {
+                    let run = store::run_of(c, &p.client)?;
+                    Ok(run.filter(|run| lab.callers().insert(run.id)))
+                })
+            })
+            .await
         }
-        let Ok(event) = Event::new("lab-run", fields) else {
+        Err(body) => Err(body),
+    };
+    let found = found.and_then(|row| {
+        row.ok_or_else(|| ErrorBody {
+            code: Exit::Precondition.code(),
+            message: "no run of this devlab for the daemon to follow".to_owned(),
+        })
+    });
+    let row = match found {
+        Ok(row) => row,
+        Err(body) => {
+            let outcome = Outcome::Error(body);
+            send(writer, Response { id, outcome }).await;
             return;
-        };
-        let ledger = Arc::clone(&self.ledger);
-        let landed = tokio::task::spawn_blocking(move || ledger.append(&event)).await;
-        if !matches!(landed, Ok(Ok(_))) {
-            let _ = writeln!(
-                std::io::stderr(),
-                "factory: lab: cannot record a run of {} in the ledger",
-                self.worktree
-            );
         }
+    };
+    let _attached = Present(Arc::clone(&lab), row.id);
+    let followed = Outcome::Result(Value::Bool(true));
+    if !send(
+        writer,
+        Response {
+            id,
+            outcome: followed,
+        },
+    )
+    .await
+    {
+        return;
+    }
+    let mut run = Run {
+        lab,
+        row,
+        kept: true,
+    };
+    run.follow(writer, lines, None, stopping).await;
+}
+
+/// Appends the `lab-run` event of `run`, ended with `outcome` in `phase`.
+fn append_run(ledger: &Ledger, run: &RunRow, outcome: String, phase: &str) {
+    let now = now_ms();
+    let secs = |since: i64| u64::try_from(now.saturating_sub(since) / 1000).unwrap_or(0);
+    let mut fields = Fields::new();
+    fields.insert("worktree".to_owned(), run.worktree.clone().into());
+    if let Some(lease) = run.lease {
+        fields.insert("lease".to_owned(), lease.into());
+        if let Some(slot) = run.slot {
+            fields.insert("slot".to_owned(), slot.into());
+        }
+    }
+    fields.insert("command".to_owned(), run.command.clone().into());
+    let queued_until = run.granted_ms.unwrap_or(now);
+    fields.insert(
+        "queue_s".to_owned(),
+        u64::try_from(queued_until.saturating_sub(run.queued_ms) / 1000)
+            .unwrap_or(0)
+            .into(),
+    );
+    fields.insert("run_s".to_owned(), run.started_ms.map_or(0, secs).into());
+    fields.insert("outcome".to_owned(), outcome.into());
+    fields.insert("phase".to_owned(), phase.into());
+    if let Some(session) = &run.session {
+        fields.insert("session".to_owned(), session.clone().into());
+    }
+    let landed = Event::new("lab-run", fields).map(|event| ledger.append(&event));
+    if !matches!(landed, Ok(Ok(_))) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "factory: lab: cannot record a run of {} in the ledger",
+            run.worktree
+        );
     }
 }
 
