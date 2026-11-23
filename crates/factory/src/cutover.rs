@@ -5,10 +5,11 @@
 //! holds nothing: not in its `status`, and not in its ledger, which the cutover reads under the
 //! ledger's write lock while it writes the marker (`cutover.json` in devlab's state dir). From
 //! that moment today's devlab refuses every call but `help`, a call already under way at its
-//! next transaction. Then the watcher unit is stopped and disabled, and `~/.local/bin/devlab`
+//! next transaction. Then the watcher unit is stopped and disabled, its unit file kept (systemd's
+//! `disable` deletes a linked one, so it is linked again), and `~/.local/bin/devlab`
 //! becomes a link to `factory`, which answers to the name. Each step that fails undoes the ones
-//! before it. The rollback, once factory lab holds nothing, puts the old link back, starts the
-//! watcher, and removes the marker.
+//! before it. The rollback, once factory lab holds nothing, puts the old link back, links the
+//! watcher's unit again if it went missing, starts the watcher, and removes the marker.
 
 use std::fs;
 use std::io;
@@ -45,6 +46,33 @@ struct Marker {
     devlab: PathBuf,
     factory: PathBuf,
     at: String,
+    /// What the watcher's unit file was: the rollback links it again when `disable` took it.
+    #[serde(default)]
+    watcher: Unit,
+}
+
+/// The watcher's unit file in systemd's user unit dir, as the cutover found it.
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Unit {
+    /// A marker from before #30 does not say.
+    #[default]
+    Unrecorded,
+    Absent,
+    /// A plain file, which `disable` leaves.
+    File,
+    /// A link (as stow makes), by its text, which `disable` deletes.
+    Link(PathBuf),
+}
+
+impl Unit {
+    fn at(path: &Path) -> Unit {
+        match fs::read_link(path) {
+            Ok(text) => Unit::Link(text),
+            Err(_) if fs::symlink_metadata(path).is_ok() => Unit::File,
+            Err(_) => Unit::Absent,
+        }
+    }
 }
 
 /// Where the cutover looks and writes.
@@ -172,7 +200,8 @@ pub fn cutover() -> Result<Done, Failure> {
             busy("devlab status shows", &held, UNTIL_CUT),
         ));
     }
-    mark_unless_held(&place, &old)?;
+    let unit = Unit::at(&place.watcher);
+    mark_unless_held(&place, &old, &unit)?;
     let undo = Undo { place: &place };
     if !refuses(&devlab) {
         return Err(undo.marker(Failure::precondition(format!(
@@ -187,13 +216,9 @@ pub fn cutover() -> Result<Done, Failure> {
         ))));
     }
     let systemd = Systemctl;
-    let retire = fs::symlink_metadata(&place.watcher).is_ok();
-    if retire
-        && let Err(e) = systemd
-            .disable(WATCHER)
-            .and_then(|()| systemd.stop(&[WATCHER]))
-    {
-        return Err(undo.watcher(&systemd, systemd_failed("cutover")(e)));
+    let retire = unit != Unit::Absent;
+    if retire && let Err(failure) = retire_watcher(&place, &systemd, &unit) {
+        return Err(undo.watcher(&systemd, failure));
     }
     if let Err(failure) = relink(&place, Path::new("factory")) {
         return Err(if retire {
@@ -246,6 +271,18 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
     if !force {
         lab_holds_nothing()?;
     }
+    let unit_gone = fs::symlink_metadata(&place.watcher).is_err();
+    let link_unit = match &marker.watcher {
+        Unit::Link(text) if unit_gone => Some(text),
+        Unit::Unrecorded | Unit::File if unit_gone => {
+            return Err(Failure::precondition(format!(
+                "{} is gone and {} names no link to put back; link it again (dots link), then run factory cutover --rollback again",
+                place.watcher.display(),
+                place.marker().display()
+            )));
+        }
+        _ => None,
+    };
     if !matches!(&link, Link::Old(text) if *text == marker.devlab) {
         relink(&place, &marker.devlab)?;
         if !force {
@@ -255,6 +292,9 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
                 return Err(failure);
             }
         }
+    }
+    if let Some(text) = link_unit {
+        link_watcher(&place, text, "cutover --rollback")?;
     }
     let retire = fs::symlink_metadata(&place.watcher).is_ok();
     if retire {
@@ -281,6 +321,33 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
             "watcher": if retire { "enabled" } else { "not installed" },
         }),
     ))
+}
+
+/// Disables and stops the watcher, keeping its unit file. systemd's `disable` deletes a unit
+/// file that is a link (as stow links it) along with its `[Install]` links, so the link is put
+/// back at once: the watcher stays off at login, and `enable --now` can start it again.
+fn retire_watcher(place: &Place, systemd: &impl UserManager, unit: &Unit) -> Result<(), Failure> {
+    systemd
+        .disable(WATCHER)
+        .map_err(systemd_failed("cutover"))?;
+    if let Unit::Link(text) = unit {
+        link_watcher(place, text, "cutover")?;
+    }
+    systemd.stop(&[WATCHER]).map_err(systemd_failed("cutover"))
+}
+
+/// Links the watcher's unit file to `text` again, unless it is there.
+fn link_watcher(place: &Place, text: &Path, command: &str) -> Result<(), Failure> {
+    if fs::symlink_metadata(&place.watcher).is_ok() {
+        return Ok(());
+    }
+    link_at(&place.watcher, text).map_err(|e| {
+        Failure::precondition(format!(
+            "cannot link {} to {} again: {e}; link it (dots link), then run factory {command} again",
+            place.watcher.display(),
+            text.display()
+        ))
+    })
 }
 
 /// What today's devlab's `status --json` shows held.
@@ -314,11 +381,12 @@ fn refuses(devlab: &impl OldDevlab) -> bool {
 /// Writes the marker while holding today's devlab's write lock, unless its ledger holds a lease
 /// or a waiting request: a call under way either committed before (and is seen here) or meets
 /// the marker at its next transaction.
-fn mark_unless_held(place: &Place, old: &Path) -> Result<(), Failure> {
+fn mark_unless_held(place: &Place, old: &Path, unit: &Unit) -> Result<(), Failure> {
     let marker = Marker {
         devlab: old.to_owned(),
         factory: place.factory.clone(),
         at: clock::now().to_string(),
+        watcher: unit.clone(),
     };
     let ledger = place.ledger();
     if !ledger.exists() {
@@ -497,19 +565,24 @@ fn write_marker(place: &Place, marker: &Marker) -> Result<(), Failure> {
 
 /// Points `~/.local/bin/devlab` at `target` through a rename, so the name is never missing.
 fn relink(place: &Place, target: &Path) -> Result<(), Failure> {
-    let partial = place
-        .bin
-        .join(format!(".devlab.{}.partial", std::process::id()));
+    link_at(&place.link, target).map_err(|e| {
+        Failure::precondition(format!(
+            "cannot link {} to {}: {e}; check that {} is writable",
+            place.link.display(),
+            target.display(),
+            place.bin.display()
+        ))
+    })
+}
+
+/// Makes `link` a link to `target` through a rename in its dir, so it is never half made.
+fn link_at(link: &Path, target: &Path) -> io::Result<()> {
+    let name = link.file_name().unwrap_or_default().to_string_lossy();
+    let partial = link.with_file_name(format!(".{name}.{}.partial", std::process::id()));
     std::os::unix::fs::symlink(target, &partial)
-        .and_then(|()| fs::rename(&partial, &place.link))
-        .map_err(|e| {
+        .and_then(|()| fs::rename(&partial, link))
+        .inspect_err(|_| {
             let _ = fs::remove_file(&partial);
-            Failure::precondition(format!(
-                "cannot link {} to {}: {e}; check that {} is writable",
-                place.link.display(),
-                target.display(),
-                place.bin.display()
-            ))
         })
 }
 

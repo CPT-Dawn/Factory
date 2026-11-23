@@ -23,6 +23,7 @@ use crate::support::{Run, Sandbox, run};
 const REFUSAL: &str = "devlab: this devlab was cut over to factory lab; run devlab from ~/.local/bin, or roll back with factory cutover --rollback\n";
 /// ~/.local/bin/devlab as stow links it: relative, into the devlab package.
 const OLD: &str = "../../../dots/devlab/.local/bin/devlab";
+const WATCHER: &str = "devlab-watch.service";
 const WATCHER_LINK: &str = "../../../dots/devlab/.config/systemd/user/devlab-watch.service";
 /// `devlab status --json` with nothing held.
 const FREE: &str = r#"{"devices":[],"slots":[],"owners":[],"waiting":[],"watcher":"active","memAvailableMB":1000}"#;
@@ -39,10 +40,32 @@ const LEASED: &str = r#"{
   "memAvailableMB": 1000
 }"#;
 
-/// The user's systemd: `is-active` says inactive; any other call works, unless its verb is the
-/// one in `systemctl-fails`.
-const SYSTEMCTL: &str = r#"case "$2" in is-active) echo inactive; exit 3 ;; esac
+/// The user's systemd, as far as the watcher needs: a unit is enabled while its `[Install]`
+/// link is in `default.target.wants` and active from `enable --now` until `stop`. Like real
+/// systemd, `disable` deletes a unit file that is a link (stow's, here) along with its
+/// `[Install]` link, and `enable` fails for a unit whose file is gone. A call whose verb is the
+/// one in `systemctl-fails` fails; any other call works.
+const SYSTEMCTL: &str = r#"units='@UNITS@'; active='@ACTIVE@'
+case "$2" in
+is-active) if [ -e "$active/$3" ]; then echo active; exit 0; fi; echo inactive; exit 3 ;;
+is-enabled)
+  if [ ! -e "$units/$3" ]; then echo not-found; exit 4; fi
+  if [ -L "$units/default.target.wants/$3" ]; then echo enabled; exit 0; fi
+  echo disabled; exit 1 ;;
+esac
 if [ "$2" = "$(cat '@FAILS@' 2>/dev/null)" ]; then echo "Failed to $2 unit: Access denied" >&2; exit 1; fi
+case "$2" in
+disable)
+  rm -f "$units/default.target.wants/$3"
+  if [ -L "$units/$3" ]; then rm -f "$units/$3"; fi ;;
+stop) shift 2; for unit in "$@"; do rm -f "$active/$unit"; done ;;
+enable)
+  shift 2; now=; if [ "$1" = --now ]; then now=1; shift; fi
+  if [ ! -e "$units/$1" ]; then echo "Failed to enable unit: Unit file $1 does not exist." >&2; exit 1; fi
+  mkdir -p "$units/default.target.wants" "$active"
+  ln -sfn "$units/$1" "$units/default.target.wants/$1"
+  if [ -n "$now" ]; then touch "$active/$1"; fi ;;
+esac
 exit 0"#;
 
 /// A machine before the cutover: factory installed, today's devlab on PATH with its watcher
@@ -51,8 +74,20 @@ exit 0"#;
 fn machine_with(honours_marker: bool) -> (Sandbox, World) {
     let sandbox = Sandbox::new();
     let world = World::install(&sandbox);
-    let fails = sandbox.path("systemctl-fails").display().to_string();
-    sandbox.fake("systemctl", &SYSTEMCTL.replace("@FAILS@", &fails));
+    let fake = SYSTEMCTL
+        .replace(
+            "@FAILS@",
+            &sandbox.path("systemctl-fails").display().to_string(),
+        )
+        .replace(
+            "@UNITS@",
+            &sandbox.path("config/systemd/user").display().to_string(),
+        )
+        .replace(
+            "@ACTIVE@",
+            &sandbox.path("systemd-active").display().to_string(),
+        );
+    sandbox.fake("systemctl", &fake);
 
     let units = sandbox.path("dots/factory/.config/systemd/user");
     fs::create_dir_all(&units).unwrap();
@@ -91,11 +126,13 @@ fn machine_with(honours_marker: bool) -> (Sandbox, World) {
     let unit = sandbox.path("dots/devlab/.config/systemd/user/devlab-watch.service");
     fs::create_dir_all(unit.parent().unwrap()).unwrap();
     fs::write(&unit, "[Service]\nExecStart=%h/.local/bin/devlab watch\n").unwrap();
-    symlink(
-        WATCHER_LINK,
-        sandbox.path("config/systemd/user/devlab-watch.service"),
-    )
-    .unwrap();
+    symlink(WATCHER_LINK, watcher_unit(&sandbox)).unwrap();
+    // Enabled and active, as the fake systemd keeps them.
+    let wants = sandbox.path("config/systemd/user/default.target.wants");
+    fs::create_dir_all(&wants).unwrap();
+    symlink(watcher_unit(&sandbox), wants.join(WATCHER)).unwrap();
+    fs::create_dir_all(sandbox.path("systemd-active")).unwrap();
+    fs::write(sandbox.path("systemd-active").join(WATCHER), "").unwrap();
 
     ledger(&sandbox);
     (sandbox, world)
@@ -123,6 +160,22 @@ fn ledger(sandbox: &Sandbox) -> Connection {
     )
     .unwrap();
     db
+}
+
+/// The watcher's unit in systemd's user unit dir, a link into the devlab package.
+fn watcher_unit(sandbox: &Sandbox) -> PathBuf {
+    sandbox.path("config/systemd/user").join(WATCHER)
+}
+
+/// What the user's systemd says of the watcher: `is-enabled`, then `is-active`.
+fn watcher_state(sandbox: &Sandbox) -> (String, String) {
+    let ask = |verb: &str| {
+        run(sandbox.command("systemctl", &["--user", verb, WATCHER]))
+            .stdout
+            .trim()
+            .to_owned()
+    };
+    (ask("is-enabled"), ask("is-active"))
 }
 
 fn link(sandbox: &Sandbox) -> PathBuf {
@@ -438,4 +491,95 @@ fn a_watcher_systemd_will_not_stop_leaves_todays_devlab_in_place() {
             "--user enable --now devlab-watch.service"
         ]
     );
+}
+
+#[test]
+fn a_linked_watcher_unit_outlives_the_cutover_so_rollback_starts_it_again() {
+    let (sandbox, _world) = machine();
+    assert_eq!(watcher_state(&sandbox), ("enabled".into(), "active".into()));
+
+    cut_over(&sandbox);
+
+    assert_eq!(
+        fs::read_link(watcher_unit(&sandbox)).unwrap(),
+        PathBuf::from(WATCHER_LINK)
+    );
+    assert_eq!(
+        watcher_state(&sandbox),
+        ("disabled".into(), "inactive".into())
+    );
+
+    let out = sandbox.factory(&["cutover", "--rollback"]);
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    assert_eq!(watcher_state(&sandbox), ("enabled".into(), "active".into()));
+}
+
+#[test]
+fn rollback_links_a_missing_watcher_unit_again_from_the_marker() {
+    let (sandbox, _world) = machine();
+    cut_over(&sandbox);
+    // As a cutover from before #30 left it: systemd's disable took the link.
+    fs::remove_file(watcher_unit(&sandbox)).unwrap();
+    assert_eq!(watcher_state(&sandbox).0, "not-found");
+
+    let out = sandbox.factory(&["cutover", "--rollback"]);
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    assert_eq!(
+        fs::read_link(watcher_unit(&sandbox)).unwrap(),
+        PathBuf::from(WATCHER_LINK)
+    );
+    assert_eq!(watcher_state(&sandbox), ("enabled".into(), "active".into()));
+}
+
+/// Rewrites the marker as a cutover from before #30 wrote it: without the watcher's unit.
+fn marker_without_watcher(sandbox: &Sandbox) {
+    let path = sandbox.path("state/devlab/cutover.json");
+    let mut marker: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    marker.as_object_mut().unwrap().remove("watcher").unwrap();
+    fs::write(&path, marker.to_string()).unwrap();
+}
+
+#[test]
+fn a_marker_from_before_the_unit_was_recorded_still_rolls_back() {
+    let (sandbox, _world) = machine();
+    cut_over(&sandbox);
+    marker_without_watcher(&sandbox);
+
+    let out = sandbox.factory(&["cutover", "--rollback"]);
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    assert_eq!(fs::read_link(link(&sandbox)).unwrap(), PathBuf::from(OLD));
+    assert_eq!(watcher_state(&sandbox), ("enabled".into(), "active".into()));
+}
+
+#[test]
+fn rollback_says_how_to_link_a_missing_unit_the_marker_does_not_name() {
+    let (sandbox, _world) = machine();
+    cut_over(&sandbox);
+    marker_without_watcher(&sandbox);
+    fs::remove_file(watcher_unit(&sandbox)).unwrap();
+
+    let out = sandbox.factory(&["cutover", "--rollback"]);
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr),
+        (
+            3,
+            "",
+            format!(
+                "factory: {} is gone and {} names no link to put back; link it again (dots link), then run factory cutover --rollback again\n",
+                watcher_unit(&sandbox).display(),
+                sandbox.path("state/devlab/cutover.json").display()
+            )
+        )
+    );
+    // Nothing changed: factory lab keeps the name, and today's devlab keeps refusing.
+    assert_eq!(
+        fs::read_link(link(&sandbox)).unwrap(),
+        PathBuf::from("factory")
+    );
+    let old = old_devlab(&sandbox, &["status"]);
+    assert_eq!((old.code, old.stderr.as_str()), (3, REFUSAL));
 }
