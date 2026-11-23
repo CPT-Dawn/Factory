@@ -53,6 +53,54 @@ pub trait HerdrApi: Send + Sync + 'static {
         &self,
         watches: &[Watch],
     ) -> impl Future<Output = Result<Events, HerdrError>> + Send;
+
+    /// Opens a workspace on a new worktree of the repository at `repo`, on a new `branch`
+    /// cut from `base`, without taking focus.
+    fn create_worktree(
+        &self,
+        repo: &Path,
+        branch: &str,
+        base: &str,
+        label: &str,
+    ) -> impl Future<Output = Result<NewWorktree, HerdrError>> + Send;
+
+    /// Starts the Claude agent `name` in `pane_id` with `args` and waits up to `timeout` for
+    /// it to come up.
+    fn start_agent(
+        &self,
+        name: &str,
+        pane_id: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> impl Future<Output = Result<(), HerdrError>> + Send;
+
+    /// What the agent's pane shows right now, without ANSI escapes.
+    fn read_agent(&self, name: &str) -> impl Future<Output = Result<String, HerdrError>> + Send;
+
+    /// Presses `keys` (such as `down` or `enter`) in the agent's pane.
+    fn send_keys(
+        &self,
+        name: &str,
+        keys: &[&str],
+    ) -> impl Future<Output = Result<(), HerdrError>> + Send;
+
+    /// Waits up to `timeout` for the agent to reach one of the statuses `until`.
+    fn wait_agent(
+        &self,
+        name: &str,
+        until: &[&str],
+        timeout: Duration,
+    ) -> impl Future<Output = Result<(), HerdrError>> + Send;
+
+    /// Types `text` into the agent and waits up to `timeout` for it to reach one of the
+    /// statuses `until`. herdr refuses with `agent_prompt_stalled` when it doesn't.
+    fn prompt_agent(
+        &self,
+        name: &str,
+        text: &str,
+        until: &[&str],
+        timeout: Duration,
+    ) -> impl Future<Output = Result<(), HerdrError>> + Send;
 }
 
 /// The herdr server listening on one socket.
@@ -100,6 +148,14 @@ pub struct Agent {
     pub agent_status: String,
     pub pane_id: String,
     pub workspace_id: String,
+}
+
+/// What `worktree.create` made: the workspace, its one pane and the worktree's folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewWorktree {
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub path: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -232,7 +288,7 @@ impl HerdrApi for Herdr {
         let (mut lines, writer) = self
             .send("events.subscribe", json!({"subscriptions": subscriptions}))
             .await?;
-        answer(&mut lines).await?;
+        answer(&mut lines, ANSWER_TIMEOUT).await?;
         Ok(Events {
             source: Source::Socket {
                 lines,
@@ -240,6 +296,114 @@ impl HerdrApi for Herdr {
             },
         })
     }
+
+    async fn create_worktree(
+        &self,
+        repo: &Path,
+        branch: &str,
+        base: &str,
+        label: &str,
+    ) -> Result<NewWorktree, HerdrError> {
+        #[derive(Deserialize)]
+        struct Created {
+            workspace: Workspace,
+            root_pane: Pane,
+            worktree: Folder,
+        }
+        #[derive(Deserialize)]
+        struct Pane {
+            pane_id: String,
+        }
+        #[derive(Deserialize)]
+        struct Folder {
+            path: String,
+        }
+        let params = json!({
+            "cwd": repo.to_string_lossy(),
+            "branch": branch,
+            "base": base,
+            "label": label,
+            "focus": false,
+        });
+        let created: Created = self.call("worktree.create", params).await?;
+        Ok(NewWorktree {
+            workspace_id: created.workspace.workspace_id,
+            pane_id: created.root_pane.pane_id,
+            path: created.worktree.path,
+        })
+    }
+
+    async fn start_agent(
+        &self,
+        name: &str,
+        pane_id: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<(), HerdrError> {
+        let params = json!({
+            "name": name,
+            "kind": "claude",
+            "pane_id": pane_id,
+            "args": args,
+            "timeout_ms": millis(timeout),
+        });
+        self.call_within::<Value>("agent.start", params, timeout)
+            .await
+            .map(drop)
+    }
+
+    async fn read_agent(&self, name: &str) -> Result<String, HerdrError> {
+        #[derive(Deserialize)]
+        struct Read {
+            read: Text,
+        }
+        #[derive(Deserialize)]
+        struct Text {
+            text: String,
+        }
+        let params = json!({"target": name, "source": "visible", "strip_ansi": true});
+        let read: Read = self.call("agent.read", params).await?;
+        Ok(read.read.text)
+    }
+
+    async fn send_keys(&self, name: &str, keys: &[&str]) -> Result<(), HerdrError> {
+        self.call::<Value>("agent.send_keys", json!({"target": name, "keys": keys}))
+            .await
+            .map(drop)
+    }
+
+    async fn wait_agent(
+        &self,
+        name: &str,
+        until: &[&str],
+        timeout: Duration,
+    ) -> Result<(), HerdrError> {
+        let params = json!({"target": name, "until": until, "timeout_ms": millis(timeout)});
+        self.call_within::<Value>("agent.wait", params, timeout)
+            .await
+            .map(drop)
+    }
+
+    async fn prompt_agent(
+        &self,
+        name: &str,
+        text: &str,
+        until: &[&str],
+        timeout: Duration,
+    ) -> Result<(), HerdrError> {
+        let params = json!({
+            "target": name,
+            "text": text,
+            "wait": {"until": until, "timeout_ms": millis(timeout)},
+        });
+        self.call_within::<Value>("agent.prompt", params, timeout)
+            .await
+            .map(drop)
+    }
+}
+
+fn millis(timeout: Duration) -> u64 {
+    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl Herdr {
@@ -249,8 +413,19 @@ impl Herdr {
         method: &str,
         params: Value,
     ) -> Result<R, HerdrError> {
+        self.call_within(method, params, Duration::ZERO).await
+    }
+
+    /// Like [`Herdr::call`] for a request herdr may hold for up to `patience` (a wait, or an
+    /// agent coming up) before it answers.
+    async fn call_within<R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+        patience: Duration,
+    ) -> Result<R, HerdrError> {
         let (mut lines, _writer) = self.send(method, params).await?;
-        let result = answer(&mut lines).await?;
+        let result = answer(&mut lines, patience + ANSWER_TIMEOUT).await?;
         serde_json::from_value(result)
             .map_err(|e| HerdrError::Broken(format!("unreadable answer to {method}: {e}")))
     }
@@ -277,10 +452,13 @@ impl Herdr {
 }
 
 /// Reads the answer line every connection starts with.
-async fn answer(lines: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<Value, HerdrError> {
-    let line = timeout(ANSWER_TIMEOUT, lines.next_line())
+async fn answer(
+    lines: &mut Lines<BufReader<OwnedReadHalf>>,
+    patience: Duration,
+) -> Result<Value, HerdrError> {
+    let line = timeout(patience, lines.next_line())
         .await
-        .map_err(|_| HerdrError::Broken(format!("no answer within {}s", ANSWER_TIMEOUT.as_secs())))?
+        .map_err(|_| HerdrError::Broken(format!("no answer within {}s", patience.as_secs())))?
         .map_err(|e| HerdrError::Broken(format!("lost herdr: {e}")))?
         .ok_or_else(|| HerdrError::Broken("herdr hung up without answering".to_owned()))?;
     let mut answer: Value = serde_json::from_str(&line)

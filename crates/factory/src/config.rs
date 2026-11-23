@@ -40,6 +40,16 @@
 //! [hook.report.agent.implementer]  # an agent type's own limits, over the ones above
 //! max_lines = 5
 //! ```
+//!
+//! Its `[lead]` table sets how `factory lead spawn` starts Claude:
+//!
+//! ```toml
+//! [lead]
+//! model = "opus"                                # default: opus
+//! effort = "medium"                             # default: medium
+//! disable_plugins = ["expo@claude-plugins-official", "cloudflare@cloudflare"]  # the default
+//! retry_pause = 2                               # seconds between tries to submit the prompt
+//! ```
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -87,6 +97,8 @@ pub struct Backend {
 struct ConfigFile {
     #[serde(default)]
     review: Review,
+    #[serde(default)]
+    lead: LeadSection,
     #[serde(default)]
     ci: CiSection,
 }
@@ -179,6 +191,37 @@ pub fn hook_settings(config_dir: &Path) -> Result<HookSettings, Failure> {
         },
     })
 }
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct LeadSection {
+    model: Option<String>,
+    effort: Option<String>,
+    disable_plugins: Option<Vec<String>>,
+    retry_pause: Option<u64>,
+}
+
+/// How a lead's Claude is started, as configured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeadSetup {
+    pub model: String,
+    pub effort: String,
+    /// Plugins (`name@marketplace`) the lead starts with turned off: the ones the factory never
+    /// uses, whose skills would otherwise ride along on every request.
+    pub disable_plugins: Vec<String>,
+    /// How long to wait between tries to get the lead's prompt submitted.
+    pub retry_pause: Duration,
+}
+
+const DEFAULT_LEAD_MODEL: &str = "opus";
+const DEFAULT_LEAD_EFFORT: &str = "medium";
+const DEFAULT_RETRY_PAUSE_S: u64 = 2;
+/// The most a pause may be: a spawn tries the prompt up to five times, and the CLI waits for
+/// all of them, so a longer pause only keeps a lead that needs one enter from its work.
+const MAX_RETRY_PAUSE_S: u64 = 30;
+/// The plugins the 2026-11-23 retro measured at about 6.3k tokens of skill listings per request.
+const DEFAULT_DISABLED_PLUGINS: [&str; 2] =
+    ["expo@claude-plugins-official", "cloudflare@cloudflare"];
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -291,6 +334,33 @@ fn read(path: &Path) -> Result<String, Failure> {
         }
     };
     Ok(text)
+}
+
+/// How `factory lead spawn` starts Claude.
+pub fn lead_setup(paths: &Paths) -> Result<LeadSetup, Failure> {
+    let (path, file) = load_config(paths)?;
+    let lead = file.lead;
+    let pause = lead.retry_pause.unwrap_or(DEFAULT_RETRY_PAUSE_S);
+    if pause > MAX_RETRY_PAUSE_S {
+        return Err(Failure::usage(format!(
+            "{}: [lead] retry_pause is {pause}s, more than the {MAX_RETRY_PAUSE_S}s a stalled \
+             prompt is worth; lower it",
+            path.display()
+        )));
+    }
+    Ok(LeadSetup {
+        model: lead.model.unwrap_or_else(|| DEFAULT_LEAD_MODEL.to_owned()),
+        effort: lead
+            .effort
+            .unwrap_or_else(|| DEFAULT_LEAD_EFFORT.to_owned()),
+        disable_plugins: lead.disable_plugins.unwrap_or_else(|| {
+            DEFAULT_DISABLED_PLUGINS
+                .iter()
+                .map(|plugin| (*plugin).to_owned())
+                .collect()
+        }),
+        retry_pause: Duration::from_secs(pause),
+    })
 }
 
 fn backend(entry: Entry) -> Backend {

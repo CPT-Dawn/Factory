@@ -26,6 +26,9 @@ pub struct Done {
     pub notes: Vec<String>,
     /// [`Exit::Ok`], or [`Exit::NeedsAttention`] for a result that asks for work.
     pub exit: Exit,
+    /// Shows the line whole even past [`LINE_LIMIT`]: for a line whose point is the file it
+    /// names, which a cut would leave naming nothing.
+    pub whole: bool,
 }
 
 impl Done {
@@ -36,6 +39,7 @@ impl Done {
             more: Vec::new(),
             notes: Vec::new(),
             exit: Exit::Ok,
+            whole: false,
         }
     }
 }
@@ -71,7 +75,13 @@ pub fn print(done: &Done, json: bool) {
         let _ = writeln!(out, "{}", done.json);
         return;
     }
-    for line in std::iter::once(&done.line).chain(&done.more) {
+    let first = if done.whole {
+        one_line(&done.line)
+    } else {
+        bounded(&one_line(&done.line))
+    };
+    let _ = writeln!(out, "{first}");
+    for line in &done.more {
         let _ = writeln!(out, "{}", bounded(&one_line(line)));
     }
     let mut err = io::stderr().lock();
