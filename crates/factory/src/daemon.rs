@@ -31,11 +31,12 @@ use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::pollers::Pollers;
 use crate::protocol::{
-    ErrorBody, LEAD_LIST, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH, Outcome,
-    REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, WAIT_CI, WAIT_LEAD, WaitCiParams,
-    WaitCiResult, WaitLeadParams,
+    ErrorBody, LEAD_LIST, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH,
+    MONITOR_START, MONITOR_STATUS, MONITOR_STOP, Outcome, REVIEW_ACQUIRE, REVIEW_QUOTA, Request,
+    Response, WAIT_CI, WAIT_LEAD, WaitCiParams, WaitCiResult, WaitLeadParams,
 };
 use crate::router::Router;
+use crate::steward::Steward;
 use crate::store::Store;
 
 /// What every connection answers from: the ledger, the picture of the leads, the reviewer
@@ -46,6 +47,7 @@ struct Daemon {
     router: Arc<Router>,
     lab: Arc<Lab>,
     pollers: Pollers,
+    steward: Arc<Steward>,
 }
 
 pub fn run(json: bool) -> Result<Done, Failure> {
@@ -62,6 +64,11 @@ pub fn run(json: bool) -> Result<Done, Failure> {
     let pollers = Pollers::new(paths.clone(), Gh);
     let _lock = take_daemon_lock(&paths)?;
     let router = Router::open(Store::open(&paths.database())?)?;
+    let steward = Steward::new(
+        paths.clone(),
+        Arc::clone(&leads),
+        Store::open(&paths.database())?,
+    );
     // Opened under the lock: it forgets the waiters a dead daemon left.
     let lab = Lab::open(&paths.lab_db()).map_err(|e| {
         Failure::precondition(format!("{e}; check FACTORY_STATE and XDG_STATE_HOME"))
@@ -94,6 +101,7 @@ pub fn run(json: bool) -> Result<Done, Failure> {
             json,
         );
         tokio::spawn(Arc::clone(&leads).start());
+        tokio::spawn(Arc::clone(&steward).resume());
         let router = Arc::new(router);
         match serve(
             listener,
@@ -103,6 +111,7 @@ pub fn run(json: bool) -> Result<Done, Failure> {
                 router,
                 lab: Arc::new(lab),
                 pollers,
+                steward,
             }),
         )
         .await {}
@@ -231,6 +240,9 @@ async fn respond(line: &str, daemon: &Daemon, held: &mut Option<String>) -> Resp
             Ok(params) => answered(wait_ci(daemon, params).await),
             Err(refused) => refused,
         },
+        MONITOR_START => answered(daemon.steward.start().await),
+        MONITOR_STOP => answered(daemon.steward.stop().await),
+        MONITOR_STATUS => answered(Ok::<_, Failure>(daemon.steward.status())),
         LOG => {
             let ledger = Arc::clone(&daemon.ledger);
             let params = request.params;

@@ -14,7 +14,7 @@ publish = false
 factory-core = { path = "crates/factory-core" }
 factory-adapters = { path = "crates/factory-adapters" }
 clap = { version = "4.6", features = ["derive"] }
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1.54", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "process"] }

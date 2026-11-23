@@ -1,16 +1,17 @@
 //! The daemon's SQLite database, `<state>/factory.db`, in WAL mode: what a daemon restart must
-//! not lose. Today that is each review backend's quota.
+//! not lose: each review backend's quota, and whether the context steward runs and what it has
+//! done to each session.
 
 use std::path::Path;
 
 use factory_core::quota::Quota;
 use factory_core::timestamp::Timestamp;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::output::Failure;
 
 /// The schema version this daemon writes, kept in `PRAGMA user_version`.
-const VERSION: i64 = 1;
+const VERSION: i64 = 2;
 
 pub struct Store {
     db: Connection,
@@ -42,7 +43,19 @@ impl Store {
                  state TEXT NOT NULL CHECK (state IN ('available', 'cooling')),
                  until_ms INTEGER
              );
-             PRAGMA user_version = 1;",
+             CREATE TABLE IF NOT EXISTS monitor (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 running INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS context (
+                 log TEXT PRIMARY KEY,
+                 lead TEXT NOT NULL,
+                 agent TEXT,
+                 tokens INTEGER,
+                 asked INTEGER NOT NULL DEFAULT 0,
+                 told INTEGER NOT NULL DEFAULT 0
+             );
+             PRAGMA user_version = 2;",
         )
         .map_err(cannot)?;
         Ok(Store { db })
@@ -79,6 +92,83 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+impl Store {
+    /// Whether the context steward was left running.
+    pub fn monitor_running(&self) -> rusqlite::Result<bool> {
+        let running: Option<bool> = self
+            .db
+            .query_row("SELECT running FROM monitor WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(running.unwrap_or(false))
+    }
+
+    pub fn set_monitor_running(&self, running: bool) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO monitor (id, running) VALUES (1, ?1)
+             ON CONFLICT (id) DO UPDATE SET running = ?1",
+            params![running],
+        )?;
+        Ok(())
+    }
+
+    /// The context table's row for the session logged at `log`, if it has one.
+    pub fn context(&self, log: &str) -> rusqlite::Result<Option<Context>> {
+        self.db
+            .query_row(
+                "SELECT lead, agent, tokens, asked, told FROM context WHERE log = ?1",
+                params![log],
+                |row| {
+                    Ok(Context {
+                        log: log.to_owned(),
+                        lead: row.get(0)?,
+                        agent: row.get(1)?,
+                        tokens: row
+                            .get::<_, Option<i64>>(2)?
+                            .and_then(|tokens| u64::try_from(tokens).ok()),
+                        asked: row.get(3)?,
+                        told: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    pub fn set_context(&self, context: &Context) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO context (log, lead, agent, tokens, asked, told)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (log) DO UPDATE
+             SET lead = ?2, agent = ?3, tokens = ?4, asked = ?5, told = ?6",
+            params![
+                context.log,
+                context.lead,
+                context.agent,
+                context.tokens.and_then(|tokens| i64::try_from(tokens).ok()),
+                context.asked,
+                context.told
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+/// One session in the context table: a lead's own (no agent) or one of its subagents'.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Context {
+    /// The session's log, which names it.
+    pub log: String,
+    pub lead: String,
+    /// The subagent's `agent-<id>`; none for the lead's own session.
+    pub agent: Option<String>,
+    pub tokens: Option<u64>,
+    /// Whether the lead has been asked to stop and not compacted since.
+    pub asked: bool,
+    /// Whether the subagent's lead has been told it passed the threshold.
+    pub told: bool,
 }
 
 fn quota_of(state: &str, until: Option<i64>) -> Quota {

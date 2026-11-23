@@ -16,7 +16,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use factory_adapters::herdr::{Event, Events, Herdr, HerdrApi, HerdrError, PROTOCOL, Watch};
+use factory_adapters::herdr::{
+    AgentSession, Event, Events, Herdr, HerdrApi, HerdrError, PROTOCOL, Watch,
+};
 use factory_core::duration;
 use factory_core::exit::Exit;
 use factory_core::lead::{self, AgentStatus, LeadFacts, LeadState};
@@ -62,6 +64,22 @@ struct Lead {
     report: Option<PathBuf>,
     /// None once the agent or its pane is gone.
     agent: Option<AgentStatus>,
+    cwd: Option<String>,
+    session: Option<AgentSession>,
+}
+
+/// A lead as the context steward sees it.
+#[derive(Clone, Debug)]
+pub struct Seen {
+    pub name: String,
+    /// None once the agent or its pane is gone.
+    pub agent: Option<AgentStatus>,
+    /// Whether a wait is registered in its pane.
+    pub waiting: bool,
+    /// Whether its final report is written.
+    pub reported: bool,
+    pub cwd: Option<String>,
+    pub session: Option<AgentSession>,
 }
 
 impl<H: HerdrApi> Leads<H> {
@@ -88,6 +106,46 @@ impl<H: HerdrApi> Leads<H> {
         if let Err(failure) = self.up().await {
             eprintln!("factory: {}", failure.message);
         }
+    }
+
+    /// Brings the link to herdr up, or says why it can't.
+    pub async fn check(self: &Arc<Self>) -> Result<(), Failure> {
+        self.up().await
+    }
+
+    pub fn herdr(&self) -> &H {
+        &self.herdr
+    }
+
+    /// Every lead seen since the daemon started, or none while the link to herdr is down.
+    pub fn seen(&self) -> Option<Vec<Seen>> {
+        let inner = self.lock();
+        if inner.down.is_some() {
+            return None;
+        }
+        let seen = inner
+            .leads
+            .iter()
+            .map(|(name, lead)| Seen {
+                name: name.clone(),
+                agent: lead.agent,
+                waiting: inner.waits.waiting_on(&lead.pane).is_some(),
+                reported: lead.report.as_ref().is_some_and(|path| path.is_file()),
+                cwd: lead.cwd.clone(),
+                session: lead.session.clone(),
+            })
+            .collect();
+        Some(seen)
+    }
+
+    /// Ticks on every change to the picture.
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    /// Lists herdr's agents again in the background, as when one may have started a new session.
+    pub fn relist(self: &Arc<Self>) {
+        tokio::spawn(Arc::clone(self).refresh());
     }
 
     pub async fn list(self: &Arc<Self>) -> Result<LeadList, Failure> {
@@ -245,6 +303,8 @@ impl<H: HerdrApi> Leads<H> {
                         pane: agent.pane_id,
                         report,
                         agent: status,
+                        cwd: agent.cwd,
+                        session: agent.agent_session,
                     },
                 );
             }

@@ -11,7 +11,8 @@ use std::sync::{Mutex, MutexGuard};
 use tokio::sync::mpsc;
 
 use super::{
-    Agent, Event, Events, HerdrApi, HerdrError, PROTOCOL, Pong, Source, Watch, Workspace, Worktree,
+    Agent, AgentSession, Event, Events, HerdrApi, HerdrError, PROTOCOL, Pong, PromptWait, Source,
+    Watch, Workspace, Worktree,
 };
 
 /// A herdr that answers from a script. Every request is recorded by its method name.
@@ -30,6 +31,7 @@ struct State {
     workspaces: Vec<Workspace>,
     screens: HashMap<String, String>,
     calls: Vec<String>,
+    prompts: Vec<(String, String)>,
     subscribers: Vec<(Vec<Watch>, mpsc::UnboundedSender<Event>)>,
 }
 
@@ -80,7 +82,25 @@ impl FakeHerdr {
             agent_status: status.to_owned(),
             pane_id: pane.to_owned(),
             workspace_id: pane.split(':').next().unwrap_or(pane).to_owned(),
+            cwd: None,
+            agent_session: None,
         });
+    }
+
+    /// Gives the agent in `pane` a working directory and the Claude Code session `id`.
+    pub fn session(&self, pane: &str, cwd: &str, id: &str) {
+        for agent in self.lock().agents.iter_mut().filter(|a| a.pane_id == pane) {
+            agent.cwd = Some(cwd.to_owned());
+            agent.agent_session = Some(AgentSession {
+                kind: "id".to_owned(),
+                value: id.to_owned(),
+            });
+        }
+    }
+
+    /// Every prompt's target and text, oldest first.
+    pub fn prompts(&self) -> Vec<(String, String)> {
+        self.lock().prompts.clone()
     }
 
     pub fn screen(&self, pane: &str, text: &str) {
@@ -180,6 +200,17 @@ impl HerdrApi for FakeHerdr {
         let all: Vec<&str> = text.lines().collect();
         let keep = usize::try_from(lines).unwrap_or(usize::MAX).min(all.len());
         Ok(all[all.len() - keep..].join("\n"))
+    }
+
+    async fn prompt(
+        &self,
+        target: &str,
+        text: &str,
+        _wait: Option<&PromptWait>,
+    ) -> Result<(), HerdrError> {
+        let mut state = self.call("agent.prompt")?;
+        state.prompts.push((target.to_owned(), text.to_owned()));
+        Ok(())
     }
 
     async fn subscribe(&self, watches: &[Watch]) -> Result<Events, HerdrError> {

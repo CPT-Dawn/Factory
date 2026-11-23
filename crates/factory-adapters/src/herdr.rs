@@ -48,6 +48,15 @@ pub trait HerdrApi: Send + Sync + 'static {
         lines: u32,
     ) -> impl Future<Output = Result<String, HerdrError>> + Send;
 
+    /// Types `text` into the agent `target` (its name) and submits it; with `wait`, answers once
+    /// the agent reaches one of its statuses, or fails when its timeout passes first.
+    fn prompt(
+        &self,
+        target: &str,
+        text: &str,
+        wait: Option<&PromptWait>,
+    ) -> impl Future<Output = Result<(), HerdrError>> + Send;
+
     /// Opens a subscription; it streams events until it is dropped or herdr hangs up.
     fn subscribe(
         &self,
@@ -100,6 +109,28 @@ pub struct Agent {
     pub agent_status: String,
     pub pane_id: String,
     pub workspace_id: String,
+    /// The agent's working directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// The agent's own session, as its integration reported it.
+    #[serde(default)]
+    pub agent_session: Option<AgentSession>,
+}
+
+/// The session an agent reported: an id (Claude Code's session id) or the path of its log.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct AgentSession {
+    /// `id` or `path`.
+    pub kind: String,
+    pub value: String,
+}
+
+/// What a prompt waits for: the agent reaching one of `until`, at most `timeout`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptWait {
+    /// herdr's statuses: idle, working, blocked, done, unknown.
+    pub until: Vec<String>,
+    pub timeout: Duration,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -215,6 +246,24 @@ impl HerdrApi for Herdr {
         Ok(read.read.text)
     }
 
+    async fn prompt(
+        &self,
+        target: &str,
+        text: &str,
+        wait: Option<&PromptWait>,
+    ) -> Result<(), HerdrError> {
+        let mut params = json!({"target": target, "text": text});
+        let mut limit = ANSWER_TIMEOUT;
+        if let Some(wait) = wait {
+            let timeout_ms = u64::try_from(wait.timeout.as_millis()).unwrap_or(u64::MAX);
+            params["wait"] = json!({"until": wait.until, "timeout_ms": timeout_ms});
+            limit += wait.timeout;
+        }
+        let (mut lines, _writer) = self.send("agent.prompt", params).await?;
+        answer(&mut lines, limit).await?;
+        Ok(())
+    }
+
     async fn subscribe(&self, watches: &[Watch]) -> Result<Events, HerdrError> {
         let subscriptions: Vec<Value> = watches
             .iter()
@@ -232,7 +281,7 @@ impl HerdrApi for Herdr {
         let (mut lines, writer) = self
             .send("events.subscribe", json!({"subscriptions": subscriptions}))
             .await?;
-        answer(&mut lines).await?;
+        answer(&mut lines, ANSWER_TIMEOUT).await?;
         Ok(Events {
             source: Source::Socket {
                 lines,
@@ -250,7 +299,7 @@ impl Herdr {
         params: Value,
     ) -> Result<R, HerdrError> {
         let (mut lines, _writer) = self.send(method, params).await?;
-        let result = answer(&mut lines).await?;
+        let result = answer(&mut lines, ANSWER_TIMEOUT).await?;
         serde_json::from_value(result)
             .map_err(|e| HerdrError::Broken(format!("unreadable answer to {method}: {e}")))
     }
@@ -276,11 +325,14 @@ impl Herdr {
     }
 }
 
-/// Reads the answer line every connection starts with.
-async fn answer(lines: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<Value, HerdrError> {
-    let line = timeout(ANSWER_TIMEOUT, lines.next_line())
+/// Reads the answer line every connection starts with, waiting at most `limit`.
+async fn answer(
+    lines: &mut Lines<BufReader<OwnedReadHalf>>,
+    limit: Duration,
+) -> Result<Value, HerdrError> {
+    let line = timeout(limit, lines.next_line())
         .await
-        .map_err(|_| HerdrError::Broken(format!("no answer within {}s", ANSWER_TIMEOUT.as_secs())))?
+        .map_err(|_| HerdrError::Broken(format!("no answer within {}s", limit.as_secs())))?
         .map_err(|e| HerdrError::Broken(format!("lost herdr: {e}")))?
         .ok_or_else(|| HerdrError::Broken("herdr hung up without answering".to_owned()))?;
     let mut answer: Value = serde_json::from_str(&line)
