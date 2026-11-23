@@ -30,13 +30,23 @@ pub use super::world::fixtures;
 use super::world::{World, poll_until};
 use super::{DEADLINE, Sandbox, kill_group};
 
-/// The devlab the transcripts replay against: the path in `GOLDEN_DEVLAB`, or none, which skips
-/// them. Today's devlab is `GOLDEN_DEVLAB=$HOME/.local/bin/devlab`; see `tests/golden/devlab/README.md`. The binary is linked as
-/// `devlab` in the sandbox, so a multicall binary sees that name; once `factory lab` answers to
-/// it, this returns the built `factory` binary when the variable is unset.
-pub fn devlab_under_test() -> Option<PathBuf> {
-    std::env::var_os("GOLDEN_DEVLAB").map(|path| resolve_devlab(Path::new(&path)))
+/// The devlab transcript `file` replays against: the path in `GOLDEN_DEVLAB`, else the built
+/// `factory`, which answers to the name `devlab`, for the groups it serves (`slots-*`, `cli-*`);
+/// none skips it. Today's devlab is `GOLDEN_DEVLAB=$HOME/.local/bin/devlab`; see
+/// `tests/golden/devlab/README.md`. The binary is linked as `devlab` in the sandbox, so a
+/// multicall binary sees that name.
+pub fn devlab_under_test(file: &str) -> Option<PathBuf> {
+    match std::env::var_os("GOLDEN_DEVLAB") {
+        Some(path) => Some(resolve_devlab(Path::new(&path))),
+        None => SERVED
+            .iter()
+            .any(|group| file.starts_with(group))
+            .then(|| PathBuf::from(env!("CARGO_BIN_EXE_factory"))),
+    }
 }
+
+/// The transcript groups the built `factory` replays; `devices-*` waits for #16.
+const SERVED: [&str; 2] = ["slots-", "cli-"];
 
 /// `path` as given, or read from the workspace root when relative: `cargo test` runs in the
 /// crate's directory, but `GOLDEN_DEVLAB=target/debug/factory` is written from the root.
