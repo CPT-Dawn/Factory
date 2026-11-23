@@ -10,6 +10,10 @@ use crate::process;
 /// How long one git command may take.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The most untracked files a staged-diff check reads, and the most bytes of them.
+const UNTRACKED_LIMIT: usize = 200;
+const UNTRACKED_BYTES: u64 = 16 << 20;
+
 /// A git command that failed: which one, and what it said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitError(pub String);
@@ -38,6 +42,10 @@ pub trait Repo {
     fn toplevel(&self) -> Result<PathBuf, GitError>;
     /// The git dir of this worktree, where the implementer leaves its evidence.
     fn git_dir(&self) -> Result<PathBuf, GitError>;
+    /// What a commit made now would add: the staged diff; with `tracked`, every tracked change
+    /// too (`commit -a`); with `added`, what `git add` of those pathspecs would stage as well,
+    /// the whole tree for none, untracked files included.
+    fn staged_diff(&self, tracked: bool, added: Option<&[String]>) -> Result<String, GitError>;
     /// The git dir its worktrees share, which holds their objects and refs.
     fn common_dir(&self) -> Result<PathBuf, GitError>;
 }
@@ -45,13 +53,26 @@ pub trait Repo {
 /// The repository at a directory, through the `git` on PATH.
 pub struct GitRepo {
     dir: PathBuf,
+    /// `GIT_DIR` and `GIT_WORK_TREE` for every call, when the repository is not found from `dir`.
+    git_dir: Option<PathBuf>,
+    work_tree: Option<PathBuf>,
 }
 
 impl GitRepo {
     pub fn at(dir: &Path) -> GitRepo {
         GitRepo {
             dir: dir.to_owned(),
+            git_dir: None,
+            work_tree: None,
         }
+    }
+
+    /// The repository at `git_dir` and the working tree at `work_tree`, as git's `--git-dir`
+    /// and `--work-tree` set them, each when given.
+    pub fn pointed_at(mut self, git_dir: Option<PathBuf>, work_tree: Option<PathBuf>) -> GitRepo {
+        self.git_dir = git_dir;
+        self.work_tree = work_tree;
+        self
     }
 
     /// Runs git to its end, whatever its exit status.
@@ -59,6 +80,10 @@ impl GitRepo {
         let mut cmd = Command::new("git");
         cmd.args(args)
             .current_dir(&self.dir)
+            // A hook runs on every tool call; it must not take the index lock to refresh stat info.
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .envs(self.git_dir.iter().map(|dir| ("GIT_DIR", dir)))
+            .envs(self.work_tree.iter().map(|dir| ("GIT_WORK_TREE", dir)))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -147,6 +172,149 @@ impl Repo for GitRepo {
         let dir = self.git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
         Ok(PathBuf::from(dir.trim_end()))
     }
+
+    fn staged_diff(&self, tracked: bool, added: Option<&[String]>) -> Result<String, GitError> {
+        // What a commit made now takes: the index, or with `tracked` every tracked file as it is
+        // in the working tree. An earlier `git add` puts its paths' working tree in the index
+        // too, untracked files included.
+        let all = [String::from(":/")];
+        // Declared before the jobs that may borrow it.
+        let empty_tree: String;
+        let spec = added.map(|paths| if paths.is_empty() { &all[..] } else { paths });
+        let mut jobs: Vec<Vec<&str>> = vec![if tracked {
+            vec![HEAD]
+        } else {
+            vec!["--cached"]
+        }];
+        if let (Some(spec), false) = (spec, tracked) {
+            jobs.push([&[HEAD, "--"][..], &as_strs(spec)].concat());
+        }
+        let mut jobs: Vec<Vec<&str>> = jobs
+            .into_iter()
+            .map(|job| [&["diff", "--no-color", "--no-ext-diff"][..], &job].concat())
+            .collect();
+        if let Some(spec) = spec {
+            let listing = [
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--full-name",
+                "--",
+            ];
+            jobs.push([&listing[..], &as_strs(spec)].concat());
+            // The listing names files from the top of the working tree.
+            jobs.push(vec!["rev-parse", "--show-toplevel"]);
+        }
+        // A hook runs on every tool call: the git calls run side by side.
+        let mut outputs = self.all(&jobs)?;
+        // Where a diff job names what it compares with, after its three options.
+        const AGAINST: usize = 3;
+        let against_head = |job: &Vec<&str>| job.get(AGAINST) == Some(&HEAD);
+        if jobs
+            .iter()
+            .zip(&outputs)
+            .any(|(job, out)| against_head(job) && !out.status.success())
+            && self.commit(HEAD)?.is_none()
+        {
+            // Before the first commit, what is tracked is all new.
+            empty_tree = self.git(&["hash-object", "-t", "tree", "/dev/null"])?;
+            let empty = empty_tree.trim_end();
+            for (job, out) in jobs.iter_mut().zip(outputs.iter_mut()) {
+                if against_head(job) {
+                    job[AGAINST] = empty;
+                    *out = self.output(job)?;
+                }
+            }
+        }
+        let mut text = String::new();
+        let mut untracked = None;
+        let mut top = None;
+        for (job, out) in jobs.iter().zip(&outputs) {
+            if !out.status.success() {
+                return Err(failed(job, out));
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            match job[0] {
+                "ls-files" => untracked = Some(stdout),
+                "rev-parse" => top = Some(PathBuf::from(stdout.trim_end())),
+                _ => text.push_str(&stdout),
+            }
+        }
+        if let (Some(listing), Some(top)) = (untracked, top) {
+            untracked_diff(&top, &listing, &mut text)?;
+        }
+        Ok(text)
+    }
+}
+
+/// What the staged diff compares with; before the first commit, the empty tree takes its place.
+const HEAD: &str = "HEAD";
+
+fn as_strs(strings: &[String]) -> Vec<&str> {
+    strings.iter().map(String::as_str).collect()
+}
+
+impl GitRepo {
+    /// Runs each git command to its end, side by side, in order of `jobs`.
+    fn all(&self, jobs: &[Vec<&str>]) -> Result<Vec<Output>, GitError> {
+        std::thread::scope(|scope| {
+            let running: Vec<_> = jobs
+                .iter()
+                .map(|job| scope.spawn(move || self.output(job)))
+                .collect();
+            running
+                .into_iter()
+                .map(|run| {
+                    run.join()
+                        .unwrap_or_else(|_| Err(GitError("a git call panicked".to_owned())))
+                })
+                .collect()
+        })
+    }
+}
+
+/// Appends the untracked files `ls-files -z --full-name` listed under `top` as the diff
+/// `git add` would stage: each file's lines added, a symlink's target as its content.
+fn untracked_diff(top: &Path, listing: &str, text: &mut String) -> Result<(), GitError> {
+    // A nested repository is listed with a trailing slash; `git add` stages no content of it.
+    let files: Vec<&str> = listing
+        .split('\0')
+        .filter(|file| !file.is_empty() && !file.ends_with('/'))
+        .collect();
+    if files.len() > UNTRACKED_LIMIT {
+        return Err(GitError(format!(
+            "{} untracked files are to be added, more than the {UNTRACKED_LIMIT} it checks",
+            files.len()
+        )));
+    }
+    let mut read = 0;
+    for file in files {
+        let path = top.join(file);
+        let unreadable = |e: std::io::Error| GitError(format!("cannot read {file}: {e}"));
+        let content = match std::fs::symlink_metadata(&path).map_err(unreadable)? {
+            meta if meta.file_type().is_symlink() => std::fs::read_link(&path)
+                .map_err(unreadable)?
+                .to_string_lossy()
+                .into_owned(),
+            meta if meta.len() + read > UNTRACKED_BYTES => {
+                return Err(GitError(format!(
+                    "the untracked files to be added hold more than the {UNTRACKED_BYTES} bytes it checks"
+                )));
+            }
+            _ => String::from_utf8_lossy(&std::fs::read(&path).map_err(unreadable)?).into_owned(),
+        };
+        read += content.len() as u64;
+        text.push_str(&format!(
+            "diff --git a/{file} b/{file}\nnew file mode 100644\n--- /dev/null\n+++ b/{file}\n@@ -0,0 +1 @@\n"
+        ));
+        for line in content.lines() {
+            text.push('+');
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    Ok(())
 }
 
 /// A repository held in memory, for tests of code that reads one.
@@ -160,6 +328,7 @@ pub struct FakeRepo {
     pub commits: String,
     pub toplevel: PathBuf,
     pub git_dir: PathBuf,
+    pub staged_diff: String,
     pub common_dir: PathBuf,
 }
 
@@ -198,5 +367,9 @@ impl Repo for FakeRepo {
 
     fn common_dir(&self) -> Result<PathBuf, GitError> {
         Ok(self.common_dir.clone())
+    }
+
+    fn staged_diff(&self, _tracked: bool, _added: Option<&[String]>) -> Result<String, GitError> {
+        Ok(self.staged_diff.clone())
     }
 }
