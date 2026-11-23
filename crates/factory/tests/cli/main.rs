@@ -9,6 +9,7 @@ mod help;
 mod lead;
 mod log;
 mod review;
+mod router;
 // Marked cfg(test) so clippy treats the harness as test code and lets it unwrap.
 #[cfg(test)]
 mod support;

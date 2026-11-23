@@ -54,9 +54,9 @@ pub enum Command {
         spec: Option<String>,
         /// The previous round's report
         previous: Option<PathBuf>,
-        /// Seconds the reviewer may take before its process group is killed
-        #[arg(long, value_name = "SECONDS", default_value_t = 1800)]
-        timeout: u64,
+        /// Seconds a reviewer may take before its process group is killed (default: the config's)
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
     },
     /// Run the daemon; other commands start it when it isn't running
     Daemon,

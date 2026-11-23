@@ -11,7 +11,7 @@ One binary, `factory`:
 
 Every command prints one line by default, `--json` on request, and uses fixed exit codes.
 
-Status: being built; `factory log` works, through the daemon. The spec is issue #1.
+Status: being built; `factory log` works, through the daemon, and so does `factory review` on Codex, falling back to Claude, with its backends in `~/.config/factory/config.toml`. The spec is issue #1.
 
 ## Licence
 

@@ -2,6 +2,8 @@
 
 mod cli;
 mod client;
+mod clock;
+mod config;
 mod daemon;
 mod lead;
 mod leads;
@@ -10,6 +12,8 @@ mod output;
 mod paths;
 mod protocol;
 mod review;
+mod router;
+mod store;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -49,7 +53,7 @@ fn run(command: Command, json: bool) -> Result<Done, Failure> {
             label,
             spec,
             previous,
-            timeout: std::time::Duration::from_secs(timeout),
+            timeout: timeout.map(std::time::Duration::from_secs),
         }),
         Command::Daemon => daemon::run(json),
     }
