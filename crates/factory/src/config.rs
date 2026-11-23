@@ -5,11 +5,17 @@
 //! Antigravity's Gemini 4 Neon at high effort, then Codex on its own config, then Claude Opus at
 //! high effort.
 //!
-//! Its `[ci]` table sets how often a wait on CI polls GitHub when it can't listen for events.
+//! Its `[ci]` table sets how often a wait on CI polls GitHub when it can't listen for events,
+//! and its `[monitor]` table the context steward's thresholds.
 //!
 //! ```toml
 //! [ci]
 //! poll = "30s"             # a duration: 90s, 9m, 2h
+//!
+//! [monitor]
+//! ask = 300000             # context at which an idle lead is asked to stop, then compacted
+//! grace = "2m"             # how long an asked lead stays idle before it is compacted
+//! subagent = 200000        # context at which a subagent is told about to its lead
 //!
 //! [[review.backend]]
 //! cli = "codex"            # which adapter runs it: agy, codex or claude
@@ -60,6 +66,7 @@ use std::time::Duration;
 use factory_adapters::reviewer::AgyAuth;
 use factory_core::hook::{Template, Templates};
 use factory_core::quota::WhenBusy;
+use factory_core::steward::Policy;
 use serde::Deserialize;
 
 use crate::output::Failure;
@@ -68,6 +75,11 @@ use crate::paths::Paths;
 const DEFAULT_TIMEOUT_S: u64 = 1800;
 const DEFAULT_CONCURRENCY: u32 = 2;
 const DEFAULT_POLL: Duration = Duration::from_secs(30);
+/// Today's ctx-monitor.sh threshold; Claude Code's own auto-compact near 380k is the backstop.
+const DEFAULT_ASK: u64 = 300_000;
+const DEFAULT_GRACE: Duration = Duration::from_secs(120);
+/// Below the spec's target for the largest subagent context, 250k.
+const DEFAULT_SUBAGENT: u64 = 200_000;
 
 /// The CLI a backend runs on, which picks its adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -101,6 +113,16 @@ struct ConfigFile {
     lead: LeadSection,
     #[serde(default)]
     ci: CiSection,
+    #[serde(default)]
+    monitor: MonitorSection,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct MonitorSection {
+    ask: Option<u64>,
+    grace: Option<String>,
+    subagent: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -267,6 +289,26 @@ pub fn ci_poll(paths: &Paths) -> Result<Duration, Failure> {
             path.display()
         ))),
     }
+}
+
+/// The context steward's thresholds.
+pub fn monitor_policy(paths: &Paths) -> Result<Policy, Failure> {
+    let (path, file) = load_config(paths)?;
+    let monitor = file.monitor;
+    let grace = match monitor.grace {
+        None => DEFAULT_GRACE,
+        Some(grace) => factory_core::duration::parse(&grace).map_err(|e| {
+            Failure::precondition(format!(
+                "{}: monitor.grace: {e}; fix the config",
+                path.display()
+            ))
+        })?,
+    };
+    Ok(Policy {
+        ask_at: monitor.ask.unwrap_or(DEFAULT_ASK),
+        grace,
+        subagent_at: monitor.subagent.unwrap_or(DEFAULT_SUBAGENT),
+    })
 }
 
 /// The config file's path and contents; an absent file is an empty config.
