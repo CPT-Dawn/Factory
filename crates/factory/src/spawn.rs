@@ -10,20 +10,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use factory_adapters::herdr::{HerdrApi, HerdrError};
+use factory_core::lead::{
+    KEY_PAUSE, PROMPT_TIMEOUT, START_TIMEOUT, SUBMIT_TIMEOUT, TRIES, TRUST_TIMEOUT,
+};
 use tokio::time::sleep;
 
-/// How long herdr waits for Claude to come up in its pane.
-const START_TIMEOUT: Duration = Duration::from_secs(120);
-/// How long Claude has to settle once the trust dialog is answered.
-const TRUST_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long Claude has to start working once the prompt is typed.
-const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long Claude has to start working once an enter submits a prompt that was left typed.
-const SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long the trust dialog's selection takes to move before enter confirms it.
-const KEY_PAUSE: Duration = Duration::from_millis(300);
-/// How many times a stalled prompt is pressed or typed again.
-const TRIES: u32 = 5;
 /// How many characters of the prompt identify it on the screen.
 const HEAD: usize = 60;
 const STALLED: &str = "agent_prompt_stalled";

@@ -2,7 +2,8 @@
 //! the daemon, which follows herdr's events.
 
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use factory_adapters::git::{GitRepo, Repo};
@@ -19,9 +20,9 @@ use crate::protocol::{
     WAIT_LEAD, WaitLeadParams, WaitLeadResult,
 };
 
-/// The longest a spawn may take: herdr waits up to two minutes for Claude to come up and then
-/// a minute per try at the prompt.
-const SPAWN_PATIENCE: Duration = Duration::from_secs(600);
+/// What the daemon asks of herdr around a spawn, beyond the spawn's own steps: its ping, and
+/// the listings and subscription before and after.
+const DAEMON_SLACK: Duration = Duration::from_secs(60);
 
 pub struct SpawnArgs {
     pub slug: String,
@@ -91,11 +92,10 @@ pub fn spawn(args: &SpawnArgs) -> Result<Done, Failure> {
             .ok()
             .filter(|id| !id.is_empty()),
     };
-    let started: SpawnResult = client::wait(&paths, LEAD_SPAWN, &params, SPAWN_PATIENCE)?;
-    Ok(Done::new(
-        spawned_line(&started),
-        serde_json::to_value(&started).unwrap_or(Value::Null),
-    ))
+    // As long as the slowest spawn takes, so the line always comes back.
+    let patience = lead::spawn_longest(setup.retry_pause) + DAEMON_SLACK;
+    let started: SpawnResult = client::wait(&paths, LEAD_SPAWN, &params, patience)?;
+    Ok(spawned(&started))
 }
 
 pub fn list() -> Result<Done, Failure> {
@@ -154,18 +154,30 @@ fn line(report: &LeadReport) -> String {
     }
 }
 
-/// The line that says where a lead is. When the worktree's path would push it past the output
-/// limit it is left to `--json`, so the report path, the one file the night page needs, stays.
-fn spawned_line(lead: &SpawnResult) -> String {
+/// The line that says where a lead is. When the paths would push it past the output limit, the
+/// worktree and report go to a details file beside the report, and the line names that file
+/// whole: a cut path is no path.
+fn spawned(lead: &SpawnResult) -> Done {
+    let json = serde_json::to_value(lead).unwrap_or(Value::Null);
     let full = format!(
         "{}: workspace {}, branch {}, worktree {}, report {}",
         lead.lead, lead.workspace, lead.branch, lead.worktree, lead.report
     );
-    if full.chars().count() <= LINE_LIMIT {
-        return full;
+    let mut done = Done::new(full, json);
+    if done.line.chars().count() <= LINE_LIMIT {
+        return done;
     }
-    format!(
-        "{}: workspace {}, branch {}, report {}",
-        lead.lead, lead.workspace, lead.branch, lead.report
-    )
+    let details = Path::new(&lead.report).with_extension("spawn.json");
+    // A details file that can't be written leaves the full line, shown whole.
+    if fs::write(&details, format!("{}\n", done.json)).is_ok() {
+        done.line = format!(
+            "{}: workspace {}, branch {}; worktree and report in {}",
+            lead.lead,
+            lead.workspace,
+            lead.branch,
+            details.display()
+        );
+    }
+    done.whole = true;
+    done
 }

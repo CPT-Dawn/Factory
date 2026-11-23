@@ -1,8 +1,10 @@
 //! A lead's state, folded from what herdr says, its report and its waits.
 
+use std::time::Duration;
+
 use factory_core::exit::Exit;
 use factory_core::lead::{
-    AgentStatus, LeadFacts, LeadState, branch, claude_args, lead_name, prompt, slug,
+    AgentStatus, LeadFacts, LeadState, branch, claude_args, lead_name, prompt, slug, spawn_longest,
 };
 use factory_core::wait::{Wait, WaitOn, Waits};
 
@@ -167,5 +169,24 @@ fn claude_gets_no_settings_when_no_plugin_is_disabled() {
     assert_eq!(
         claude_args("opus", "high", &[]),
         ["--model", "opus", "--effort", "high"]
+    );
+}
+
+/// Every herdr call at its limit: the worktree, Claude's two minutes to come up, the trust
+/// dialog's minute, the prompt's minute, then five stalled tries of the pause and a minute
+/// each, with 10 s of connect and answer on each of the 17 calls.
+#[test]
+fn a_spawns_longest_run_is_every_herdr_call_at_its_limit() {
+    assert_eq!(
+        spawn_longest(Duration::from_secs(2)),
+        Duration::from_millis(720_300)
+    );
+}
+
+#[test]
+fn each_second_of_pause_adds_five_to_a_spawns_longest_run() {
+    assert_eq!(
+        spawn_longest(Duration::from_secs(30)) - spawn_longest(Duration::from_secs(2)),
+        Duration::from_secs(5 * 28)
     );
 }

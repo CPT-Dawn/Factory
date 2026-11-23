@@ -118,8 +118,8 @@ pub struct LeadSetup {
 const DEFAULT_LEAD_MODEL: &str = "opus";
 const DEFAULT_LEAD_EFFORT: &str = "medium";
 const DEFAULT_RETRY_PAUSE_S: u64 = 2;
-/// The most a pause may be: a spawn tries the prompt up to five times, and the CLI waits ten
-/// minutes for all of it.
+/// The most a pause may be: a spawn tries the prompt up to five times, and the CLI waits for
+/// all of them, so a longer pause only keeps a lead that needs one enter from its work.
 const MAX_RETRY_PAUSE_S: u64 = 30;
 /// The plugins the 2026-11-23 retro measured at about 6.3k tokens of skill listings per request.
 const DEFAULT_DISABLED_PLUGINS: [&str; 2] =
@@ -234,8 +234,8 @@ pub fn lead_setup(paths: &Paths) -> Result<LeadSetup, Failure> {
     let pause = lead.retry_pause.unwrap_or(DEFAULT_RETRY_PAUSE_S);
     if pause > MAX_RETRY_PAUSE_S {
         return Err(Failure::usage(format!(
-            "{}: [lead] retry_pause is {pause}s, at most {MAX_RETRY_PAUSE_S}s keeps a spawn \
-             inside the CLI's wait; lower it",
+            "{}: [lead] retry_pause is {pause}s, more than the {MAX_RETRY_PAUSE_S}s a stalled \
+             prompt is worth; lower it",
             path.display()
         )));
     }

@@ -74,7 +74,9 @@ fn run(command: Command, json: bool) -> ExitCode {
             base,
             skill,
             repo,
-        }),
+        })
+        // lead.sh's failures said so, and factory-stats' classifier still matches the text.
+        .map_err(|failure| Failure::new(failure.exit, format!("lead.sh: {}", failure.message))),
         Command::Lead {
             command: LeadCommand::List,
         } => lead::list(),

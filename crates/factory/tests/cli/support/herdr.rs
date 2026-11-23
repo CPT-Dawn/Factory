@@ -13,7 +13,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -44,6 +44,17 @@ struct State {
     refusals: HashMap<String, VecDeque<(String, String)>>,
     subscribers: Vec<Subscriber>,
     next_subscriber: u64,
+    /// A status change made, unheard, as the next subscription arrives.
+    before_subscribe: Option<(String, String)>,
+    /// A status change that overtakes the next agent listing taken while its pane is watched.
+    overtake: Option<Overtake>,
+}
+
+struct Overtake {
+    pane: String,
+    status: String,
+    first: Box<dyn FnOnce() + Send>,
+    delay: Duration,
 }
 
 struct Subscriber {
@@ -122,29 +133,61 @@ impl FakeHerdr {
 
     /// Changes the status of the agent in `pane` and tells every subscriber watching it.
     pub fn status(&self, pane: &str, status: &str) {
-        let mut state = self.shared.lock();
-        let mut workspace = String::new();
-        for agent in state.agents.iter_mut().filter(|a| a["pane_id"] == pane) {
-            agent["agent_status"] = json!(status);
-            workspace = agent["workspace_id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned();
-        }
-        let event = json!({
-            "event": "pane.agent_status_changed",
-            "data": {
-                "pane_id": pane,
-                "workspace_id": workspace,
-                "agent_status": status,
-                "agent": "claude",
-            },
+        set_status(&mut self.shared.lock(), pane, status, true);
+    }
+
+    /// Changes the status of the agent in `pane` when the next subscription arrives, before it
+    /// is answered, telling no one: a change that falls between a listing and a subscription.
+    pub fn change_before_subscribing(&self, pane: &str, status: &str) {
+        self.shared.lock().before_subscribe = Some((pane.to_owned(), status.to_owned()));
+    }
+
+    /// The next time the agents are listed while a subscriber watches `pane`: takes the listing,
+    /// then runs `first`, changes the pane's status to `status` and tells the subscribers, and
+    /// only after `delay` answers. The event is newer than the listing, and arrives first.
+    pub fn overtake_listing(
+        &self,
+        pane: &str,
+        status: &str,
+        first: impl FnOnce() + Send + 'static,
+        delay: Duration,
+    ) {
+        self.shared.lock().overtake = Some(Overtake {
+            pane: pane.to_owned(),
+            status: status.to_owned(),
+            first: Box::new(first),
+            delay,
         });
-        tell(&mut state, &event, |sub| {
+    }
+}
+
+/// Changes the status of the agent in `pane`, telling the subscribers watching it if `heard`.
+fn set_status(state: &mut State, pane: &str, status: &str, heard: bool) {
+    let mut workspace = String::new();
+    for agent in state.agents.iter_mut().filter(|a| a["pane_id"] == pane) {
+        agent["agent_status"] = json!(status);
+        workspace = agent["workspace_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+    }
+    let event = json!({
+        "event": "pane.agent_status_changed",
+        "data": {
+            "pane_id": pane,
+            "workspace_id": workspace,
+            "agent_status": status,
+            "agent": "claude",
+        },
+    });
+    if heard {
+        tell(state, &event, |sub| {
             sub["type"] == "pane.agent_status_changed" && sub["pane_id"] == pane
         });
     }
+}
 
+impl FakeHerdr {
     /// Closes `pane`: its agent leaves the list and subscribers to `pane.closed` hear of it.
     pub fn close(&self, pane: &str) {
         let mut state = self.shared.lock();
@@ -266,6 +309,11 @@ fn serve(shared: &Shared, stream: UnixStream) {
         let _ = writeln!(&stream, "{error}");
         return;
     }
+    if method == "events.subscribe"
+        && let Some((pane, status)) = state.before_subscribe.take()
+    {
+        set_status(&mut state, &pane, &status, false);
+    }
     let result = match method {
         "ping" => json!({"type": "pong", "version": "0.9.5", "protocol": state.protocol}),
         "agent.list" => json!({"type": "agent_list", "agents": state.agents}),
@@ -286,6 +334,28 @@ fn serve(shared: &Shared, stream: UnixStream) {
             return;
         }
     };
+    if method == "agent.list" {
+        let watched = |state: &State, pane: &str| {
+            state.subscribers.iter().any(|subscriber| {
+                subscriber
+                    .subscriptions
+                    .iter()
+                    .any(|sub| sub["type"] == "pane.agent_status_changed" && sub["pane_id"] == pane)
+            })
+        };
+        let due = state
+            .overtake
+            .as_ref()
+            .is_some_and(|overtake| watched(&state, &overtake.pane));
+        if let Some(overtake) = state.overtake.take_if(|_| due) {
+            (overtake.first)();
+            set_status(&mut state, &overtake.pane, &overtake.status, true);
+            drop(state);
+            thread::sleep(overtake.delay);
+            let _ = writeln!(&stream, "{}", json!({"id": id, "result": result}));
+            return;
+        }
+    }
     let _ = writeln!(&stream, "{}", json!({"id": id, "result": result}));
     if method != "events.subscribe" {
         return;

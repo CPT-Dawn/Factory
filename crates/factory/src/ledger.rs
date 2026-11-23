@@ -20,13 +20,16 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// Whether the ledger holds a `lead-end` for the lead `slug` of `repo` after its latest
-    /// `lead-start`.
-    pub fn has_ended(&self, repo: &str, slug: &str) -> bool {
-        let Ok(text) = std::fs::read_to_string(&self.path) else {
-            return false;
+    /// Whether the lead `slug` of `repo` still owes the ledger its `lead-end`: its latest event
+    /// is a `lead-start`. A lead with no events owes nothing, since an end without a start
+    /// reads as a lead that never began.
+    pub fn owes_end(&self, repo: &str, slug: &str) -> io::Result<bool> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
         };
-        let mut ended = false;
+        let mut owes = false;
         for event in text
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -40,12 +43,12 @@ impl Ledger {
                 continue;
             }
             match event["type"].as_str() {
-                Some("lead-start") => ended = false,
-                Some("lead-end") => ended = true,
+                Some("lead-start") => owes = true,
+                Some("lead-end") => owes = false,
                 _ => {}
             }
         }
-        ended
+        Ok(owes)
     }
 
     pub fn open(path: PathBuf) -> Result<Ledger, Failure> {

@@ -5,11 +5,41 @@
 //! lead answers.
 
 use std::fmt;
+use std::time::Duration;
 
 use crate::exit::Exit;
 
 /// The prefix of every lead's herdr agent name.
 pub const PREFIX: &str = "lead-";
+
+/// How long herdr waits for Claude to come up in a lead's pane.
+pub const START_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long Claude has to settle once the folder-trust dialog is answered.
+pub const TRUST_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long Claude has to start working once the prompt is typed.
+pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long Claude has to start working once an enter submits a prompt that was left typed.
+pub const SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the trust dialog's selection takes to move before enter confirms it.
+pub const KEY_PAUSE: Duration = Duration::from_millis(300);
+/// How many times a stalled prompt is pressed or typed again.
+pub const TRIES: u32 = 5;
+/// What herdr's adapter adds to each call's own wait: 5 s to connect and 5 s to answer.
+const CALL_SLACK: Duration = Duration::from_secs(10);
+
+/// The longest a spawn can take with `pause` between its tries at a stalled prompt: every
+/// herdr call at its limit, down the slowest path (the trust dialog, then every try typed
+/// again), so a caller that waits this long always hears how the spawn ended.
+pub fn spawn_longest(pause: Duration) -> Duration {
+    let worktree = CALL_SLACK;
+    let start = START_TIMEOUT + CALL_SLACK;
+    // The screen read, down, enter and the wait for Claude to settle.
+    let trust = CALL_SLACK * 4 + KEY_PAUSE + TRUST_TIMEOUT;
+    let prompt = PROMPT_TIMEOUT + CALL_SLACK;
+    // The screen read, then the prompt typed again: slower than an enter and its short wait.
+    let try_again = pause + CALL_SLACK * 2 + PROMPT_TIMEOUT;
+    worktree + start + trust + prompt + try_again * TRIES
+}
 
 /// What herdr reports about an agent: herdr's `AgentStatus`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,10 +1,14 @@
 //! The daemon's picture of the leads, kept current by herdr's events.
 //!
 //! At start (and again whenever the link is down and a lead command comes in) the daemon pings
-//! herdr and refuses any protocol but [`PROTOCOL`]. It then lists herdr's agents and workspaces
-//! once and keeps one subscribed connection open, watching each lead's pane. Status changes
-//! arrive as events; an agent appearing or leaving makes the daemon list again and resubscribe,
-//! since herdr can't add to a live subscription. Nothing polls.
+//! herdr and refuses any protocol but [`PROTOCOL`]. It then lists herdr's agents and workspaces,
+//! subscribes to each lead's pane on one connection it keeps open, and lists once more, so no
+//! change falls between the listing and the subscription. Status changes arrive as events; an
+//! agent appearing or leaving makes the daemon list again and resubscribe, since herdr can't
+//! add to a live subscription. Nothing polls.
+//!
+//! Each lead the daemon spawns gets one `lead-end` in the ledger: `finished` once it has written
+//! its report, `dead` when its agent is gone without one.
 //!
 //! A wait on a lead registers itself in the wait registry, so the lead it runs in shows as
 //! waiting, and is answered when an event settles the lead it waits on.
@@ -16,7 +20,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use factory_adapters::herdr::{Event, Events, Herdr, HerdrApi, HerdrError, PROTOCOL, Watch};
+use factory_adapters::herdr::{Agent, Event, Events, Herdr, HerdrApi, HerdrError, PROTOCOL, Watch};
 use factory_core::duration;
 use factory_core::event;
 use factory_core::exit::Exit;
@@ -70,9 +74,6 @@ struct Inner {
 struct Unfinished {
     repo: String,
     report: PathBuf,
-    /// Read back from the database after a restart: its end may already be in the ledger, if the
-    /// daemon stopped between writing it and keeping that.
-    recovered: bool,
 }
 
 struct Lead {
@@ -89,25 +90,35 @@ impl<H: HerdrApi> Leads<H> {
         ledger: Arc<Ledger>,
         store: Store,
     ) -> Result<Arc<Leads<H>>, Failure> {
-        let unfinished = store
-            .leads_running()
-            .map_err(|e| {
+        let running = store.leads_running().map_err(|e| {
+            Failure::precondition(format!(
+                "cannot read the running leads from the database: {e}; check FACTORY_STATE"
+            ))
+        })?;
+        // The ledger says which still owe their end: a daemon that stopped between keeping a
+        // lead and writing its start, or between writing its end and keeping that, owes none.
+        let mut unfinished = BTreeMap::new();
+        for (name, repo, report) in running {
+            let owes = ledger.owes_end(&repo, lead::slug(&name)).map_err(|e| {
                 Failure::precondition(format!(
-                    "cannot read the running leads from the database: {e}; check FACTORY_STATE"
+                    "cannot read {}: {e}; check FACTORY_STATE",
+                    ledger.path.display()
                 ))
-            })?
-            .into_iter()
-            .map(|(name, repo, report)| {
-                (
-                    name,
-                    Unfinished {
-                        repo,
-                        report: PathBuf::from(report),
-                        recovered: true,
-                    },
-                )
-            })
-            .collect();
+            })?;
+            if !owes {
+                if let Err(e) = store.lead_ended(&name) {
+                    eprintln!("factory: cannot mark {name} ended in the database: {e}");
+                }
+                continue;
+            }
+            unfinished.insert(
+                name,
+                Unfinished {
+                    repo,
+                    report: PathBuf::from(report),
+                },
+            );
+        }
         Ok(Arc::new(Leads {
             herdr,
             paths,
@@ -181,9 +192,10 @@ impl<H: HerdrApi> Leads<H> {
             ("effort", params.effort.as_str()),
         ]
         .map(|(key, value)| format!("{key}={value}"));
-        // Kept before the event is written: a daemon that stops in between still owes the end.
+        // Kept before the event is written: a daemon that stops after it still owes the end,
+        // and one that stops before it owes none, which the ledger shows on restart.
         if started.is_ok() {
-            self.expect_end(&name, &params.repo_name, &report, false);
+            self.keep(&name, &params.repo_name, &report);
         }
         let event = event::Event::from_args("lead-start", &pairs, params.session.as_deref())
             .map_err(|e| Failure::usage(e.to_string()))?;
@@ -201,7 +213,15 @@ impl<H: HerdrApi> Leads<H> {
                 eprintln!("factory: {}", failure.message);
             }
         }
-        self.resync().await;
+        // Settled only once the picture has the lead: before, it would read as gone.
+        self.lock().unfinished.insert(
+            name.clone(),
+            Unfinished {
+                repo: params.repo_name.clone(),
+                report: report.clone(),
+            },
+        );
+        self.bump();
         Ok(SpawnResult {
             lead: name,
             workspace: started.workspace,
@@ -211,28 +231,8 @@ impl<H: HerdrApi> Leads<H> {
         })
     }
 
-    /// Lists the agents again, now that the subscription is live. The listing a rebuild took is
-    /// older than its subscription, so a lead that finished in between would show as working
-    /// for good, and its end would never be written.
-    async fn resync(&self) {
-        if let Ok(agents) = self.herdr.agents().await {
-            let mut inner = self.lock();
-            for agent in agents {
-                let Some(lead) = agent.name.and_then(|name| inner.leads.get_mut(&name)) else {
-                    continue;
-                };
-                lead.agent = agent
-                    .agent
-                    .as_ref()
-                    .map(|_| AgentStatus::parse(&agent.agent_status));
-            }
-            drop(inner);
-            self.bump();
-        }
-    }
-
-    /// Remembers that `name` is running and owes the ledger a `lead-end`.
-    fn expect_end(&self, name: &str, repo: &str, report: &Path, recovered: bool) {
+    /// Keeps `name` in the database as running, so a restarted daemon still owes its end.
+    fn keep(&self, name: &str, repo: &str, report: &Path) {
         let kept = self
             .store
             .lock()
@@ -243,17 +243,9 @@ impl<H: HerdrApi> Leads<H> {
                 "factory: cannot keep {name} in the database: {e}; its end is lost on a restart"
             );
         }
-        self.lock().unfinished.insert(
-            name.to_owned(),
-            Unfinished {
-                repo: repo.to_owned(),
-                report: report.to_owned(),
-                recovered,
-            },
-        );
     }
 
-    /// Writes the `lead-end` of every spawned lead that has finished, once each, whenever the
+    /// Writes the `lead-end` of every spawned lead that has finished or died, once each, whenever the
     /// picture changes.
     async fn settle_loop(self: Arc<Self>) {
         let mut changes = self.changed.subscribe();
@@ -266,40 +258,39 @@ impl<H: HerdrApi> Leads<H> {
     }
 
     fn settle(&self) {
-        let done: Vec<(String, Unfinished)> = {
+        let done: Vec<(String, Unfinished, &'static str)> = {
             let mut inner = self.lock();
             if inner.down.is_some() {
                 return;
             }
-            let names: Vec<String> = inner
+            let names: Vec<(String, &'static str)> = inner
                 .unfinished
                 .iter()
-                .filter(|(name, lead)| ended(&inner, name, lead))
-                .map(|(name, _)| name.clone())
+                .filter_map(|(name, lead)| {
+                    ending(&inner, name, lead).map(|how| (name.clone(), how))
+                })
                 .collect();
             names
                 .into_iter()
-                .filter_map(|name| inner.unfinished.remove(&name).map(|lead| (name, lead)))
+                .filter_map(|(name, how)| {
+                    inner.unfinished.remove(&name).map(|lead| (name, lead, how))
+                })
                 .collect()
         };
-        for (name, lead) in done {
+        for (name, lead, how) in done {
             let pairs = [
                 format!("repo={}", lead.repo),
                 format!("slug={}", lead::slug(&name)),
-                "outcome=finished".to_owned(),
+                format!("outcome={how}"),
             ];
-            let landed = if lead.recovered && self.ledger.has_ended(&lead.repo, lead::slug(&name)) {
-                Ok(())
-            } else {
-                event::Event::from_args("lead-end", &pairs, None)
-                    .map_err(|e| e.to_string())
-                    .and_then(|event| {
-                        self.ledger
-                            .append(&event)
-                            .map(|_| ())
-                            .map_err(|e| e.to_string())
-                    })
-            };
+            let landed = event::Event::from_args("lead-end", &pairs, None)
+                .map_err(|e| e.to_string())
+                .and_then(|event| {
+                    self.ledger
+                        .append(&event)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                });
             match landed {
                 Ok(_) => {
                     let kept = self
@@ -444,58 +435,26 @@ impl<H: HerdrApi> Leads<H> {
 
     /// Lists herdr's agents and workspaces into the picture and subscribes to the lead panes,
     /// replacing the subscription when they changed. The caller holds the turn.
+    ///
+    /// A listing is older than any event after it, so it never overrides one. A new
+    /// subscription is followed by a second listing, and its events are read only once that
+    /// listing is in: a change before the listing is in the listing, a change after it is an
+    /// event applied after it. While the subscription stands, its events speak for the panes it
+    /// watches, and a listing only adds and removes leads.
     async fn rebuild(self: &Arc<Self>) -> Result<(), Failure> {
-        let listed = async {
-            Ok::<_, HerdrError>((self.herdr.agents().await?, self.herdr.workspaces().await?))
-        };
-        let (agents, workspaces) = listed.await.map_err(|e| self.fail(&e))?;
-        let repos: HashMap<String, String> = workspaces
-            .into_iter()
-            .filter_map(|ws| Some((ws.workspace_id, ws.worktree?.repo_name)))
-            .collect();
-        let panes = {
+        let (agents, repos) = self.listing().await?;
+        let panes = lead_panes(&agents);
+        {
             let mut inner = self.lock();
-            let mut seen = BTreeSet::new();
-            for agent in agents {
-                let Some(name) = agent.name.filter(|name| is_lead(name)) else {
-                    continue;
-                };
-                let report = repos
-                    .get(&agent.workspace_id)
-                    .map(|repo| self.paths.lead_report(repo, lead::slug(&name)));
-                let status = agent
-                    .agent
-                    .as_ref()
-                    .map(|_| AgentStatus::parse(&agent.agent_status));
-                seen.insert(name.clone());
-                inner.leads.insert(
-                    name,
-                    Lead {
-                        pane: agent.pane_id,
-                        report,
-                        agent: status,
-                    },
-                );
-            }
-            for (name, lead) in &mut inner.leads {
-                if !seen.contains(name) {
-                    lead.agent = None;
-                }
-            }
-            let panes: BTreeSet<String> = inner
-                .leads
-                .values()
-                .filter(|lead| lead.agent.is_some())
-                .map(|lead| lead.pane.clone())
-                .collect();
-            if inner.follower.is_some() && inner.watched == panes {
+            let unchanged = inner.follower.is_some() && inner.watched == panes;
+            self.take_in(&mut inner, agents, &repos);
+            if unchanged {
                 inner.down = None;
                 drop(inner);
                 self.bump();
                 return Ok(());
             }
-            panes
-        };
+        }
         let mut watches: Vec<Watch> = panes.iter().cloned().map(Watch::AgentStatus).collect();
         watches.extend([Watch::PaneGone, Watch::AgentDetected]);
         let events = self
@@ -503,13 +462,17 @@ impl<H: HerdrApi> Leads<H> {
             .subscribe(&watches)
             .await
             .map_err(|e| self.fail(&e))?;
+        let (agents, repos) = self.listing().await?;
         {
             let mut inner = self.lock();
-            inner.generation += 1;
-            let generation = inner.generation;
             if let Some((_, old)) = inner.follower.take() {
                 old.abort();
             }
+            // The old subscription is gone, so this listing is the newest word on every pane.
+            inner.watched = BTreeSet::new();
+            self.take_in(&mut inner, agents, &repos);
+            inner.generation += 1;
+            let generation = inner.generation;
             let task = tokio::spawn(Arc::clone(self).follow(events, generation));
             inner.follower = Some((generation, task.abort_handle()));
             inner.watched = panes;
@@ -517,6 +480,59 @@ impl<H: HerdrApi> Leads<H> {
         }
         self.bump();
         Ok(())
+    }
+
+    /// herdr's agents, and the repo of each workspace on a worktree.
+    async fn listing(&self) -> Result<(Vec<Agent>, HashMap<String, String>), Failure> {
+        let listed = async {
+            Ok::<_, HerdrError>((self.herdr.agents().await?, self.herdr.workspaces().await?))
+        };
+        let (agents, workspaces) = listed.await.map_err(|e| self.fail(&e))?;
+        let repos = workspaces
+            .into_iter()
+            .filter_map(|ws| Some((ws.workspace_id, ws.worktree?.repo_name)))
+            .collect();
+        Ok((agents, repos))
+    }
+
+    /// Takes a listing into the picture. A lead whose pane the live subscription watches keeps
+    /// the status its events gave it; a lead the listing lacks is gone.
+    fn take_in(&self, inner: &mut Inner, agents: Vec<Agent>, repos: &HashMap<String, String>) {
+        let mut seen = BTreeSet::new();
+        for agent in agents {
+            let Some(name) = agent.name.filter(|name| is_lead(name)) else {
+                continue;
+            };
+            let report = repos
+                .get(&agent.workspace_id)
+                .map(|repo| self.paths.lead_report(repo, lead::slug(&name)));
+            let listed = agent
+                .agent
+                .as_ref()
+                .map(|_| AgentStatus::parse(&agent.agent_status));
+            let status = match inner.leads.get(&name) {
+                Some(known)
+                    if known.pane == agent.pane_id && inner.watched.contains(&known.pane) =>
+                {
+                    known.agent
+                }
+                _ => listed,
+            };
+            seen.insert(name.clone());
+            inner.leads.insert(
+                name,
+                Lead {
+                    pane: agent.pane_id,
+                    report,
+                    agent: status,
+                },
+            );
+        }
+        for (name, lead) in &mut inner.leads {
+            if !seen.contains(name) {
+                lead.agent = None;
+            }
+        }
     }
 
     /// Reads one subscription until herdr hangs up or a newer one replaces it.
@@ -624,6 +640,15 @@ impl<H: HerdrApi> Drop for Registered<H> {
     }
 }
 
+/// The panes of the leads in a listing that have an agent: the ones a subscription watches.
+fn lead_panes(agents: &[Agent]) -> BTreeSet<String> {
+    agents
+        .iter()
+        .filter(|agent| agent.agent.is_some() && agent.name.as_deref().is_some_and(is_lead))
+        .map(|agent| agent.pane_id.clone())
+        .collect()
+}
+
 /// The last [`SCREEN_LINES`] lines of a pane's text, after dropping the blank rows at its end.
 fn last_lines(text: &str) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
@@ -691,14 +716,18 @@ fn prepare(report: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Whether a spawned lead is over: its report is written and its agent isn't working, or its
-/// agent is gone with the report. A lead that died without one never ends here.
-fn ended(inner: &Inner, name: &str, lead: &Unfinished) -> bool {
+/// How a spawned lead ended, as its `lead-end` outcome: `finished` with its report written and
+/// its agent not working, `dead` with its agent gone and no report; none while it runs.
+fn ending(inner: &Inner, name: &str, lead: &Unfinished) -> Option<&'static str> {
     let agent = inner.leads.get(name).and_then(|seen| seen.agent);
     let state = LeadState::of(LeadFacts {
         agent,
         reported: lead.report.is_file(),
         waiting_on: None,
     });
-    state == LeadState::Finished
+    match state {
+        LeadState::Finished => Some("finished"),
+        LeadState::Dead => Some("dead"),
+        _ => None,
+    }
 }

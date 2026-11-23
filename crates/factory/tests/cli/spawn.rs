@@ -234,7 +234,7 @@ fn a_missing_repo_fails_before_anything_starts() {
     assert_eq!(
         out.stderr_lines(),
         vec![format!(
-            "factory: {} is not a git repository (no such directory); run from the repo or pass --repo",
+            "factory: lead.sh: {} is not a git repository (no such directory); run from the repo or pass --repo",
             nowhere.display()
         )]
     );
@@ -257,7 +257,7 @@ fn a_directory_that_is_no_repo_fails_before_anything_starts() {
     assert_eq!(out.code, 3, "{out:?}");
     assert!(
         out.stderr.starts_with(&format!(
-            "factory: {} is not a git repository",
+            "factory: lead.sh: {} is not a git repository",
             plain.display()
         )),
         "{out:?}"
@@ -283,7 +283,7 @@ fn an_existing_branch_fails_before_anything_starts() {
     assert_eq!(
         out.stderr_lines(),
         vec![
-            "factory: factory/cart already exists in repo; pick another slug, or delete the branch"
+            "factory: lead.sh: factory/cart already exists in repo; pick another slug, or delete the branch"
         ]
     );
     assert_eq!(
@@ -303,12 +303,34 @@ fn an_unknown_base_is_a_usage_error_before_anything_starts() {
 
     assert_eq!(out.code, 2, "{out:?}");
     assert!(
-        out.stderr.starts_with("factory: unknown base: nope"),
+        out.stderr
+            .starts_with("factory: lead.sh: unknown base: nope"),
         "{out:?}"
     );
     assert_eq!(
         herdr.count("worktree.create") + herdr.count("agent.start"),
         0
+    );
+}
+
+/// factory-stats sorts a failure that says `lead.sh: ` as the lead script's, so the text stays.
+#[test]
+fn a_spawn_failure_keeps_the_lead_sh_prefix_factory_stats_matches() {
+    let sandbox = Sandbox::new();
+    let _herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    configure(&sandbox, "[lead]\nretry_pause = 700\n");
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+    let json = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12", "--json"]);
+
+    assert!(out.stderr.starts_with("factory: lead.sh: "), "{out:?}");
+    let said: Value = serde_json::from_str(json.stdout.trim()).expect("one JSON line");
+    assert!(
+        said["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("lead.sh: ")),
+        "{said}"
     );
 }
 
@@ -366,7 +388,7 @@ fn a_start_that_fails_off_the_trust_dialog_is_reported() {
     assert_eq!(out.stdout, "");
     assert!(
         out.stderr.starts_with(
-            "factory: lead-cart is stuck at startup on something other than folder trust"
+            "factory: lead.sh: lead-cart is stuck at startup on something other than folder trust"
         ),
         "{out:?}"
     );
@@ -505,10 +527,161 @@ fn an_existing_branch_beats_an_unknown_base() {
     assert_eq!(herdr.count("worktree.create"), 0);
 }
 
+/// Kills the daemon as a crash would, and waits until it is gone.
+// cfg(test), as the harness is, so clippy lets it unwrap.
+#[cfg(test)]
+fn crash_daemon(sandbox: &Sandbox) {
+    let pid = fs::read_to_string(sandbox.path("run/factory/daemon.pid")).expect("the daemon's pid");
+    let killed = sandbox
+        .command("kill", &["-9", pid.trim()])
+        .output()
+        .expect("run kill");
+    assert!(killed.status.success(), "{killed:?}");
+    // A command sent while it is dying would be reset, not start a new one.
+    let gone = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
+    assert!(poll_until(|| !gone.exists()), "the daemon never died");
+}
+
+/// Spawns `slug`, lets it finish, and waits for its `lead-end`: once it lands, the daemon has
+/// settled every lead it knew of.
+// cfg(test), as the harness is, so clippy lets it unwrap.
+#[cfg(test)]
+fn spawn_and_finish(
+    sandbox: &Sandbox,
+    herdr: &FakeHerdr,
+    repo: &std::path::Path,
+    slug: &str,
+    pane: &str,
+) {
+    let out = sandbox.factory_in(repo, &["lead", "spawn", slug, "#99"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    herdr.await_watch(pane);
+    fs::write(
+        sandbox.path(format!("state/factory/leads/repo/{slug}.md")),
+        "done\n",
+    )
+    .expect("write the report");
+    herdr.status(pane, "idle");
+    assert!(
+        poll_until(|| events(sandbox, "lead-end")
+            .iter()
+            .any(|end| end["slug"] == slug)),
+        "no lead-end for {slug} in {:?}",
+        sandbox.ledger_lines()
+    );
+}
+
 #[test]
-fn a_long_state_path_keeps_the_report_in_the_one_line_and_json_keeps_the_worktree() {
-    let state = "s".repeat(80);
-    let sandbox = Sandbox::new().env("FACTORY_STATE", Sandbox::new().path(&state));
+fn a_lead_whose_agent_dies_without_a_report_ends_dead() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    herdr.await_watch("w1:p1");
+
+    herdr.close("w1:p1");
+
+    assert!(
+        poll_until(|| !events(&sandbox, "lead-end").is_empty()),
+        "no lead-end in {:?}",
+        sandbox.ledger_lines()
+    );
+    let ends = events(&sandbox, "lead-end");
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert_eq!(ends[0]["slug"], "cart");
+    assert_eq!(ends[0]["outcome"], "dead");
+}
+
+#[test]
+fn a_lead_that_finishes_between_the_listing_and_the_subscription_still_ends() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    crash_daemon(&sandbox);
+    fs::write(sandbox.path("state/factory/leads/repo/cart.md"), "done\n")
+        .expect("write the report");
+
+    // The new daemon lists cart working; it goes idle before the subscription is up.
+    herdr.change_before_subscribing("w1:p1", "idle");
+    let listed = sandbox.factory(&["lead", "list"]);
+    assert_eq!(listed.code, 0, "{listed:?}");
+
+    assert!(
+        poll_until(|| !events(&sandbox, "lead-end").is_empty()),
+        "no lead-end in {:?}",
+        sandbox.ledger_lines()
+    );
+    assert_eq!(events(&sandbox, "lead-end")[0]["outcome"], "finished");
+}
+
+#[test]
+fn an_idle_event_newer_than_a_listing_is_not_undone_by_it() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    let report = sandbox.path("state/factory/leads/repo/cart.md");
+    herdr.overtake_listing(
+        "w1:p1",
+        "idle",
+        move || fs::write(&report, "done\n").expect("write the report"),
+        std::time::Duration::from_millis(300),
+    );
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+    assert_eq!(out.code, 0, "{out:?}");
+
+    assert!(
+        poll_until(|| !events(&sandbox, "lead-end").is_empty()),
+        "no lead-end in {:?}",
+        sandbox.ledger_lines()
+    );
+}
+
+#[test]
+fn a_lead_whose_start_never_reached_the_ledger_gets_no_end_either() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    // The daemon kept cart as running, then died before its lead-start was written.
+    crash_daemon(&sandbox);
+    let ledger = sandbox.path("state/factory/events.jsonl");
+    fs::write(&ledger, "").expect("empty the ledger");
+    fs::write(sandbox.path("state/factory/leads/repo/cart.md"), "done\n")
+        .expect("write the report");
+    herdr.status("w1:p1", "idle");
+
+    spawn_and_finish(&sandbox, &herdr, &repo, "pay", "w2:p1");
+
+    let ends: Vec<Value> = events(&sandbox, "lead-end");
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert_eq!(ends[0]["slug"], "pay");
+}
+
+/// The details file a spawn line names when the paths are too long for one line, read back.
+// cfg(test), as the harness is, so clippy lets it unwrap.
+#[cfg(test)]
+fn details_named_in(line: &str) -> Value {
+    let file = line
+        .split(" in ")
+        .last()
+        .unwrap_or_else(|| panic!("no file named in {line}"));
+    let text = fs::read_to_string(file).unwrap_or_else(|e| panic!("cannot read {file}: {e}"));
+    serde_json::from_str(text.trim()).expect("the details file is JSON")
+}
+
+#[test]
+fn a_long_state_path_leaves_the_worktree_and_report_in_a_file_the_line_names() {
+    // A report path of 120 characters: too long for the full line, not for the short one.
+    let outer = Sandbox::new();
+    let base = outer.path("").display().to_string();
+    let state =
+        "s".repeat(120 - "/leads/repo/cart.md".len() - base.trim_end_matches('/').len() - 1);
+    let sandbox = Sandbox::new().env("FACTORY_STATE", outer.path(&state));
     let _herdr = FakeHerdr::start(&sandbox);
     let repo = sandbox.repo();
 
@@ -519,13 +692,38 @@ fn a_long_state_path_keeps_the_report_in_the_one_line_and_json_keeps_the_worktre
     assert_eq!(lines.len(), 1, "{out:?}");
     assert!(lines[0].chars().count() <= 200, "{}", lines[0]);
     assert!(
-        lines[0].contains(&format!("/{state}/")) && lines[0].contains(".md"),
-        "the report path is missing: {}",
+        lines[0]
+            .starts_with("lead-cart: workspace w1, branch factory/cart; worktree and report in "),
+        "{}",
         lines[0]
     );
-    let json = sandbox.factory_in(&repo, &["lead", "spawn", "pay", "#13", "--json"]);
-    let said: Value = serde_json::from_str(json.stdout.trim()).expect("one JSON line");
-    assert_eq!(said["worktree"], "/worktrees/repo/pay");
+    let details = details_named_in(lines[0]);
+    assert_eq!(details["worktree"], "/worktrees/repo/cart");
+    assert!(
+        details["report"]
+            .as_str()
+            .is_some_and(|report| report.ends_with(&format!("/{state}/leads/repo/cart.md"))),
+        "{details}"
+    );
+}
+
+#[test]
+fn a_state_path_too_long_for_any_line_still_names_its_file_whole() {
+    let state = ["s".repeat(100), "t".repeat(100), "u".repeat(100)].join("/");
+    let sandbox = Sandbox::new().env("FACTORY_STATE", Sandbox::new().path(&state));
+    let _herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let lines = out.stdout_lines();
+    assert_eq!(lines.len(), 1, "{out:?}");
+    assert!(!lines[0].contains('…'), "cut: {}", lines[0]);
+    assert_eq!(
+        details_named_in(lines[0])["worktree"],
+        "/worktrees/repo/cart"
+    );
 }
 
 #[test]
