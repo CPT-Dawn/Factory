@@ -42,15 +42,19 @@ fn the_line_is_the_one_the_review_itself_printed() {
         counts,
         findings: None,
         tallies: Vec::new(),
+        fixed: 2,
+        still_present: 1,
+        dropped: Vec::new(),
     };
     let ended = finished::of(&event(json!({
         "type": "review", "label": "t1-r1", "outcome": "ok", "verdict": "findings",
-        "blocking": 2, "advisory": 1, "question": 3, "report": "/r/t1-r1.md",
+        "blocking": 2, "advisory": 1, "question": 3, "fixed": 2, "still_present": 1, "dropped": 0,
+        "report": "/r/t1-r1.md",
     })));
     assert_eq!(ended.line, reading.summary("t1-r1", "/r/t1-r1.md"));
     assert_eq!(
         ended.line,
-        "review t1-r1: findings (2 blocking, 1 advisory, 3 question) → /r/t1-r1.md"
+        "review t1-r1: findings (2 blocking, 1 advisory, 3 question; 2 fixed, 1 still present) → /r/t1-r1.md"
     );
 }
 
@@ -78,6 +82,19 @@ fn a_failed_review_says_why_and_where_its_files_are_and_asks_for_attention() {
             (line, Exit::NeedsAttention)
         );
     }
+}
+
+#[test]
+fn a_fix_rounds_line_carries_what_it_settled_as_the_review_printed_it() {
+    let ended = finished::of(&event(json!({
+        "type": "review", "label": "t1-r2", "outcome": "ok", "verdict": "findings",
+        "blocking": 1, "advisory": 0, "question": 0, "fixed": 2, "still_present": 1, "dropped": 0,
+        "report": "/r/t1-r2.md",
+    })));
+    assert_eq!(
+        ended.line,
+        "review t1-r2: findings (1 blocking, 0 advisory, 0 question; 2 fixed, 1 still present) → /r/t1-r2.md"
+    );
 }
 
 #[test]

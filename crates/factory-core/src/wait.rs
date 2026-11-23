@@ -57,6 +57,11 @@ impl Waits {
         self.waits.remove(&id);
     }
 
+    /// Every registered wait, oldest first.
+    pub fn all(&self) -> impl Iterator<Item = &Wait> {
+        self.waits.values()
+    }
+
     /// What the oldest wait registered from `pane` is on, if any wait is.
     pub fn waiting_on(&self, pane: &str) -> Option<&WaitOn> {
         self.waits

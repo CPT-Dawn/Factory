@@ -122,6 +122,55 @@ impl FakeHerdr {
         }));
     }
 
+    /// Gives the agent in `pane` a working directory and the Claude Code session `id`.
+    pub fn session(&self, pane: &str, cwd: &str, id: &str) {
+        for agent in self
+            .shared
+            .lock()
+            .agents
+            .iter_mut()
+            .filter(|a| a["pane_id"] == pane)
+        {
+            agent["cwd"] = json!(cwd);
+            agent["agent_session"] = json!({
+                "source": "claude-hook",
+                "agent": "claude",
+                "kind": "id",
+                "value": id,
+            });
+        }
+    }
+
+    /// Every `agent.prompt` the fake got: its target and text, oldest first.
+    pub fn prompts(&self) -> Vec<(String, String)> {
+        prompts_of(&self.shared.lock())
+    }
+
+    /// Waits until the fake has got `n` prompts and returns them, failing the test after
+    /// [`DEADLINE`].
+    pub fn await_prompts(&self, n: usize) -> Vec<(String, String)> {
+        let start = Instant::now();
+        let mut state = self.shared.lock();
+        loop {
+            let prompts = prompts_of(&state);
+            if prompts.len() >= n {
+                return prompts;
+            }
+            let left = DEADLINE.checked_sub(start.elapsed()).unwrap_or_else(|| {
+                panic!(
+                    "got {} of {n} prompts within {DEADLINE:?}: {prompts:?}",
+                    prompts.len()
+                )
+            });
+            state = self
+                .shared
+                .changed
+                .wait_timeout(state, left)
+                .expect("wait on the fake herdr")
+                .0;
+        }
+    }
+
     /// What `pane.read` returns for `pane`.
     pub fn screen(&self, pane: &str, text: &str) {
         self.shared
@@ -268,6 +317,23 @@ impl FakeHerdr {
     }
 }
 
+fn prompts_of(state: &State) -> Vec<(String, String)> {
+    state
+        .requests
+        .iter()
+        .filter(|request| request["method"] == "agent.prompt")
+        .map(|request| {
+            let text = |key: &str| {
+                request["params"][key]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            (text("target"), text("text"))
+        })
+        .collect()
+}
+
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state
@@ -350,6 +416,7 @@ fn serve(shared: &Shared, stream: UnixStream) {
         }
     }
     let _ = writeln!(&stream, "{}", json!({"id": id, "result": result}));
+    shared.changed.notify_all();
     if method != "events.subscribe" {
         return;
     }

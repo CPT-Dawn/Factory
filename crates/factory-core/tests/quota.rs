@@ -301,10 +301,38 @@ fn an_agy_model_draws_on_its_groups_quota() {
         ("gemini-4-argon-high", "Gemini 4 Argon"),
         ("claude-opus-5-5-thinking", "Claude and GPT models"),
         ("gpt-oss-120b-medium", "Claude and GPT models"),
+        // Labels, as agy's `/model` saves them in its settings.
+        ("Gemini 4 Neon (High)", "Gemini Models"),
+        ("Gemini 4 Argon (Low)", "Gemini 4 Argon"),
+        ("Claude Opus 5.5 (Thinking)", "Claude and GPT models"),
+        ("GPT-OSS 120B (Medium)", "Claude and GPT models"),
     ];
     for (model, group) in cases {
         assert_eq!(quota::agy_group(model), group, "{model}");
     }
+}
+
+#[test]
+fn with_no_model_configured_agy_draws_on_the_model_its_settings_chose_else_its_default() {
+    let cases = [
+        (
+            Some(r#"{"model": "Claude Opus 5.5 (Thinking)"}"#),
+            "Claude Opus 5.5 (Thinking)",
+        ),
+        (
+            Some(r#"{"model": " Gemini 4 Argon (High) "}"#),
+            "Gemini 4 Argon (High)",
+        ),
+        (Some(r#"{"model": ""}"#), "gemini-4-neon"),
+        (Some(r#"{"trustedWorkspaces": ["~"]}"#), "gemini-4-neon"),
+        (Some(r#"{"model": 4}"#), "gemini-4-neon"),
+        (Some("not json"), "gemini-4-neon"),
+        (None, "gemini-4-neon"),
+    ];
+    for (settings, model) in cases {
+        assert_eq!(quota::agy_chosen_model(settings), model, "{settings:?}");
+    }
+    assert_eq!(quota::agy_group(quota::AGY_DEFAULT_MODEL), "Gemini Models");
 }
 
 #[test]

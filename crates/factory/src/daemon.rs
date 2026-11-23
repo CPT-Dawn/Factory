@@ -33,7 +33,7 @@ use factory_adapters::herdr::Herdr;
 use listenfd::ListenFd;
 
 use crate::lab::service::{self, Lab};
-use crate::lab::wire::ACQUIRE;
+use crate::lab::wire::{ACQUIRE, RESERVE};
 use crate::leads::Leads;
 use crate::ledger::Ledger;
 use crate::output::{self, Done, Failure};
@@ -41,11 +41,14 @@ use crate::paths::Paths;
 use crate::pollers::Pollers;
 use crate::protocol::{
     ErrorBody, LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH,
-    Outcome, REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, ReviewRef, SpawnParams, WAIT_CI,
-    WAIT_LEAD, WAIT_REVIEW, WaitCiParams, WaitCiResult, WaitLeadParams, WaitReviewParams,
+    MONITOR_START, MONITOR_STATUS, MONITOR_STOP, Outcome, REVIEW_ACQUIRE, REVIEW_QUOTA, Request,
+    Response, ReviewRef, STATUS, SpawnParams, StatusParams, WAIT_CI, WAIT_LEAD, WAIT_REVIEW,
+    WaitCiParams, WaitCiResult, WaitLeadParams, WaitReviewParams,
 };
 use crate::reviews::Reviews;
 use crate::router::Router;
+use crate::status;
+use crate::steward::Steward;
 use crate::store::Store;
 
 /// What every connection answers from: the ledger, the picture of the leads, the reviewer
@@ -57,6 +60,7 @@ struct Daemon {
     reviews: Arc<Reviews>,
     lab: Arc<Lab>,
     pollers: Pollers,
+    steward: Arc<Steward>,
 }
 
 /// How long a stopping daemon gives the connections it holds to finish their requests.
@@ -88,6 +92,11 @@ pub fn run(json: bool) -> Result<(), Failure> {
     )?;
     let pollers = Pollers::new(paths.clone(), Gh);
     let router = Arc::new(Router::open(Store::open(&paths.database())?)?);
+    let steward = Steward::new(
+        paths.clone(),
+        Arc::clone(&leads),
+        Store::open(&paths.database())?,
+    );
     // Opened under the lock: it forgets the waiters a dead daemon left.
     let lab = Lab::open(&paths.lab_db()).map_err(|e| {
         Failure::precondition(format!("{e}; check FACTORY_STATE and XDG_STATE_HOME"))
@@ -131,6 +140,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
             json,
         );
         tokio::spawn(Arc::clone(&leads).start());
+        tokio::spawn(Arc::clone(&steward).resume());
         let lab = Arc::new(lab);
         lab.recover();
         let daemon = Daemon {
@@ -140,6 +150,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
             reviews: Arc::new(Reviews::default()),
             lab,
             pollers,
+            steward,
         };
         serve(listener, Arc::new(daemon), stop).await;
         Ok(())
@@ -293,6 +304,12 @@ async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut O
         };
         first = false;
         if let Ok(request) = serde_json::from_str::<Request>(&line)
+            && request.method == RESERVE
+        {
+            service::reserve(Arc::clone(&daemon.lab), request, &mut writer, &mut lines).await;
+            continue;
+        }
+        if let Ok(request) = serde_json::from_str::<Request>(&line)
             && request.method == ACQUIRE
         {
             // Not cut short by a stop: a lease granted as it was dropped would go unanswered.
@@ -393,6 +410,22 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
                     waited = daemon.reviews.wait(&daemon.ledger, &params) => answered(waited),
                 }
             }
+            Err(refused) => refused,
+        },
+        MONITOR_START => answered(daemon.steward.start().await),
+        MONITOR_STOP => answered(daemon.steward.stop().await),
+        MONITOR_STATUS => answered(Ok::<_, Failure>(daemon.steward.status())),
+        STATUS => match params::<StatusParams>(STATUS, request.params) {
+            Ok(params) => answered(
+                status::gather(
+                    &params,
+                    &daemon.router,
+                    &daemon.lab,
+                    &daemon.leads,
+                    &daemon.steward,
+                )
+                .await,
+            ),
             Err(refused) => refused,
         },
         LOG => {

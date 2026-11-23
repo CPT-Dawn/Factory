@@ -6,7 +6,7 @@ use factory_adapters::systemd::{Systemctl, Units};
 use factory_core::lab::ago;
 use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{DeviceRow, device_line};
-use factory_core::lab::queue::{Holding, held_by, owner_slot_counts, waiter_capped};
+use factory_core::lab::queue::{Holding, held_by, live_queue, owner_slot_counts, waiter_capped};
 use factory_core::lab::slots::slot_project_id;
 use serde::Serialize;
 
@@ -14,7 +14,7 @@ use super::context::{self, project_config};
 use super::host::mem_available_mb;
 use super::lease::base_name;
 use super::stack;
-use super::wire::{Board, DeviceLine, Lease, STATUS};
+use super::wire::{Board, DeviceLine, Lease, Reservation, STATUS, SlotRow, Waiter};
 use crate::client;
 use crate::output::Failure;
 use crate::paths::Paths;
@@ -52,8 +52,7 @@ struct OwnerLine {
 
 /// The devices adb lists as `device`, in the status table's order.
 pub fn ready_serials() -> Result<Vec<String>, Failure> {
-    let board: Board = client::call(&Paths::from_env()?, STATUS, &())?;
-    Ok(board
+    Ok(board()?
         .devices
         .into_iter()
         .filter(|d| d.state == "ready")
@@ -61,14 +60,25 @@ pub fn ready_serials() -> Result<Vec<String>, Failure> {
         .collect())
 }
 
+/// devlab's status: its screen, or with `json` the screen's JSON.
 pub fn render(json: bool) -> Result<String, Failure> {
-    let board: Board = client::call(&Paths::from_env()?, STATUS, &())?;
-    let cfg = context::machine_config()?;
-    let report = report(&board, &cfg);
+    let board = board()?;
     if json {
+        let report = report(&board, &context::machine_config()?);
         return serde_json::to_string_pretty(&report)
             .map_err(|e| Failure::precondition(format!("cannot write the status: {e}")));
     }
+    screen(&board)
+}
+
+/// The daemon's board.
+pub fn board() -> Result<Board, Failure> {
+    client::call(&Paths::from_env()?, STATUS, &())
+}
+
+/// The board as devlab's status screen shows it.
+pub fn screen(board: &Board) -> Result<String, Failure> {
+    let report = report(board, &context::machine_config()?);
     let mut out = Vec::new();
     if report.devices.is_empty() {
         out.push("devices: none attached".to_owned());
@@ -148,13 +158,34 @@ pub fn render(json: bool) -> Result<String, Failure> {
 }
 
 fn report(board: &Board, cfg: &MachineConfig) -> Report {
-    let slots = board
-        .slots
+    // A reserved slot that was never leased has no row of its own yet.
+    let mut rows: Vec<SlotRow> = board.slots.clone();
+    for r in &board.reservations {
+        if !rows
+            .iter()
+            .any(|s| s.project == r.project && s.slot == r.slot)
+        {
+            rows.push(SlotRow {
+                project: r.project.clone(),
+                slot: r.slot,
+                last_worktree: None,
+                stack_ours: false,
+                idle_since: None,
+                stopping: false,
+            });
+        }
+    }
+    rows.sort_by(|a, b| (&a.project, a.slot).cmp(&(&b.project, b.slot)));
+    let slots = rows
         .iter()
         .map(|s| {
             let holder = board.leases.iter().find(|l| {
                 l.project.as_deref() == Some(s.project.as_str()) && l.slot == Some(s.slot)
             });
+            let reserved = board
+                .reservations
+                .iter()
+                .find(|r| r.project == s.project && r.slot == s.slot);
             let id = s
                 .last_worktree
                 .as_deref()
@@ -174,7 +205,12 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
                     "down".to_owned()
                 },
                 holder: holder.map_or_else(
-                    || "free".to_owned(),
+                    || {
+                        reserved.map_or_else(
+                            || "free".to_owned(),
+                            |r| format!("reserved by {} (reservation {})", r.owner_label, r.id),
+                        )
+                    },
                     |l| format!("lease {} {}", l.id, base_name(&l.worktree)),
                 ),
                 last: s
@@ -184,16 +220,30 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
             }
         })
         .collect();
-    let holdings: Vec<Holding> = board.leases.iter().map(Lease::holding).collect();
+    // A reservation counts against its owner's cap like a lease.
+    let holdings: Vec<Holding> = board
+        .leases
+        .iter()
+        .map(Lease::holding)
+        .chain(board.reservations.iter().map(Reservation::holding))
+        .collect();
     // Each project's cap, read from the config of a worktree that holds one of its slots.
     let mut caps: BTreeMap<String, Option<(u32, u32)>> = BTreeMap::new();
     let mut cap_of = |project: &str| -> Option<(u32, u32)> {
         *caps.entry(project.to_owned()).or_insert_with(|| {
-            let l = board
+            let worktree = board
                 .leases
                 .iter()
-                .find(|l| l.project.as_deref() == Some(project))?;
-            let p = project_config(&l.worktree).ok().flatten()?;
+                .find(|l| l.project.as_deref() == Some(project))
+                .map(|l| &l.worktree)
+                .or_else(|| {
+                    board
+                        .reservations
+                        .iter()
+                        .find(|r| r.project == project)
+                        .map(|r| &r.worktree)
+                })?;
+            let p = project_config(worktree).ok().flatten()?;
             Some((factory_core::lab::config::owner_cap(cfg, &p), p.max_slots))
         })
     };
@@ -211,11 +261,13 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
         })
         .collect();
     let held = held_by(&holdings);
+    let queue: Vec<_> = board.waiters.iter().map(Waiter::entry).collect();
     let waiting = board
         .waiters
         .iter()
-        .map(|w| {
-            let capped = if waiter_capped(&w.entry(), &held).is_some() {
+        .zip(live_queue(&queue, &holdings))
+        .map(|(w, entry)| {
+            let capped = if waiter_capped(&entry, &held).is_some() {
                 " (owner at its slot cap)"
             } else {
                 ""

@@ -15,16 +15,40 @@ pub struct Finished {
     pub exit: Exit,
 }
 
+/// What a fix round settled, as its line says: findings fixed, still present, and new ones dropped for
+/// lying outside the fix.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fixes {
+    pub fixed: u64,
+    pub still_present: u64,
+    pub dropped: u64,
+}
+
 /// The line of a review that reached a verdict, the one `factory review` prints:
-/// `review <label>: <verdict> (n blocking, n advisory, n question) → <report>`.
-pub fn summary(label: &str, verdict: &str, counts: Counts, report: &str) -> String {
+/// `review <label>: <verdict> (n blocking, n advisory, n question[; n fixed, ...]) → <report>`.
+pub fn summary(label: &str, verdict: &str, counts: Counts, fixes: Fixes, report: &str) -> String {
     let Counts {
         blocking,
         advisory,
         question,
     } = counts;
+    // A fix round adds what it settled, what it left and what it dropped, when any.
+    let fix: Vec<String> = [
+        (fixes.fixed, "fixed"),
+        (fixes.still_present, "still present"),
+        (fixes.dropped, "dropped"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    let fix = if fix.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", fix.join(", "))
+    };
     format!(
-        "review {label}: {verdict} ({blocking} blocking, {advisory} advisory, {question} question) → {report}"
+        "review {label}: {verdict} ({blocking} blocking, {advisory} advisory, {question} question{fix}) → {report}"
     )
 }
 
@@ -59,8 +83,13 @@ pub fn of(event: &Fields) -> Finished {
         advisory: count("advisory"),
         question: count("question"),
     };
+    let fixes = Fixes {
+        fixed: count("fixed"),
+        still_present: count("still_present"),
+        dropped: count("dropped"),
+    };
     Finished {
-        line: summary(&label, &verdict, counts, &report),
+        line: summary(&label, &verdict, counts, fixes, &report),
         exit: if verdict == Verdict::Clean.to_string() {
             Exit::Ok
         } else {

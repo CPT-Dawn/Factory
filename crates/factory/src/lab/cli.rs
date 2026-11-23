@@ -12,11 +12,11 @@ use factory_core::lab::config::ProjectConfig;
 
 use super::lease;
 use super::wire::Lease;
-use super::{android, run, stack, status};
+use super::{android, reserve, run, stack, status};
 use crate::output::Failure;
 use factory_adapters::adb::AdbCli;
 
-const HELP: &str = include_str!("help.txt");
+pub(super) const HELP: &str = include_str!("help.txt");
 
 /// Runs one devlab command; `args` come after the name (`devlab` or `factory lab`).
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -62,7 +62,7 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
             if cmd == "run" {
                 return run::run(&ctx, &opts, quiet, rest);
             }
-            let granted = lease::acquire(&ctx, &opts)?;
+            let granted = lease::acquire(&ctx, &opts, &mut |why| note(why), &mut |w| note(w))?;
             if !quiet {
                 note(&lease::summary(&granted, ctx.project.as_ref())?);
             }
@@ -72,6 +72,7 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
             );
             Ok(0)
         }
+        "reserve" => reserve::main(args),
         "exec" => {
             let ctx = context()?;
             let rest = match args.split_first() {
@@ -82,7 +83,7 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
                 return Err(Failure::usage("devlab exec -- <cmd...>"));
             }
             let held = lease::live(&ctx)?;
-            run::exec_in(&ctx, &held, rest)
+            run::exec_in(&ctx, &held, rest, None)
         }
         "env" => {
             let ctx = context()?;
@@ -93,8 +94,22 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
             );
             Ok(0)
         }
-        "release" => release(&context()?, args.iter().any(|a| a == "--stop-stack")),
-        "stack" => stack_command(&context()?, args.first().map_or("status", String::as_str)),
+        "release" => {
+            match release(&context()?, args.iter().any(|a| a == "--stop-stack"))? {
+                Some(dropped) => note(&format!("released lease {}", dropped.id)),
+                None => note("nothing held here"),
+            }
+            Ok(0)
+        }
+        "stack" => {
+            let done = stack(&context()?, args.first().map_or("status", String::as_str))?;
+            if let Stack::State { .. } = done {
+                println!("{}", done.devlab_line());
+            } else {
+                note(&done.devlab_line());
+            }
+            Ok(0)
+        }
         "gc" => {
             for freed in lease::gc()? {
                 println!("released {freed}");
@@ -128,10 +143,15 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
     }
 }
 
-/// Gives the lease back. With `--stop-stack` the stack stops first, while the lease still keeps
-/// the slot from the next in the queue; a stop that fails still gives the lease back.
-fn release(ctx: &Ctx, stop_stack: bool) -> Result<u8, Failure> {
-    let held = if stop_stack { lease::find(ctx)? } else { None };
+/// Gives the lease back; the lease it gave back, if one was held. With `--stop-stack` the
+/// stack stops first, its slot held for this call meanwhile, whatever ends the lease, so the next
+/// in the queue never gets a stack being torn down; a stop that fails still gives the lease back.
+pub(super) fn release(ctx: &Ctx, stop_stack: bool) -> Result<Option<Lease>, Failure> {
+    let held = if stop_stack {
+        lease::stopping(ctx)?
+    } else {
+        None
+    };
     let stopped = match (&held, &ctx.project) {
         (
             Some(Lease {
@@ -142,14 +162,12 @@ fn release(ctx: &Ctx, stop_stack: bool) -> Result<u8, Failure> {
         _ => None,
     };
     let Some(dropped) = lease::release(ctx)? else {
-        note("nothing held here");
-        return Ok(0);
+        return Ok(None);
     };
     if let Some(stopped) = stopped {
         stopped?;
     }
-    note(&format!("released lease {}", dropped.id));
-    Ok(0)
+    Ok(Some(dropped))
 }
 
 /// Stops the slot's stack if it runs, and marks it no longer devlab's to stop.
@@ -162,7 +180,36 @@ fn stop(ctx: &Ctx, project: &ProjectConfig, slot: u32) -> Result<(), Failure> {
     lease::stack_ours(&project.name, slot, false)
 }
 
-fn stack_command(ctx: &Ctx, sub: &str) -> Result<u8, Failure> {
+/// What `stack up`, `down` or `status` did to the lease's stack, by its project id.
+pub(super) enum Stack {
+    Up {
+        id: String,
+        slot: u32,
+        how: stack::Up,
+    },
+    Down {
+        id: String,
+        slot: u32,
+    },
+    State {
+        id: String,
+        slot: u32,
+        up: bool,
+    },
+}
+
+impl Stack {
+    /// How devlab says it.
+    pub(super) fn devlab_line(&self) -> String {
+        match self {
+            Stack::Up { id, slot, how } => format!("stack {id} {} on slot {slot}", how.word()),
+            Stack::Down { id, .. } => format!("stack {id} stopped"),
+            Stack::State { id, up, .. } => format!("{id} {}", if *up { "up" } else { "down" }),
+        }
+    }
+}
+
+pub(super) fn stack(ctx: &Ctx, sub: &str) -> Result<Stack, Failure> {
     let held = lease::live(ctx)?;
     let (Some(project), Some(slot)) = (
         ctx.project.as_ref().filter(|p| p.supabase.is_some()),
@@ -177,32 +224,24 @@ fn stack_command(ctx: &Ctx, sub: &str) -> Result<u8, Failure> {
             "this lease has no stack slot (devlab.json has no supabase)",
         ));
     };
-    match sub {
+    let id = info.project_id;
+    Ok(match sub {
         "up" => {
             let env = lease::lease_env(&held, Some(project))?;
             let how = stack::up(project, &ctx.worktree, slot, &env, &ctx.cfg)?;
             if how == stack::Up::Started {
                 lease::stack_ours(&project.name, slot, true)?;
             }
-            note(&format!(
-                "stack {} {} on slot {slot}",
-                info.project_id,
-                how.word()
-            ));
+            Stack::Up { id, slot, how }
         }
         "down" => {
-            stack::down(project, &info.project_id, &ctx.worktree)?;
+            stack::down(project, &id, &ctx.worktree)?;
             lease::stack_ours(&project.name, slot, false)?;
-            note(&format!("stack {} stopped", info.project_id));
+            Stack::Down { id, slot }
         }
         _ => {
-            let state = if stack::running(&info.project_id) {
-                "up"
-            } else {
-                "down"
-            };
-            println!("{} {state}", info.project_id);
+            let up = stack::running(&id);
+            Stack::State { id, slot, up }
         }
-    }
-    Ok(0)
+    })
 }

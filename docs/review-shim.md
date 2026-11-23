@@ -28,7 +28,7 @@ On stdout, with the review done:
 
 1. One line, never cut, even past the 200 characters of the output contract, because it ends in the report's
    path: `review <label>: <verdict> (<n> blocking, <n> advisory, <n> question) → <absolute report path>`.
-   The verdict is `clean` or `findings`.
+   The verdict is `clean` or `findings`. A fix round adds what it settled inside the brackets, after a `;`: `; 2 fixed, 1 still present, 1 dropped`, each only when above 0.
 2. Then one line per blocking finding, from the report's `FINDINGS:` ledger.
 
 With `--json`, one object: the event's fields plus `report`, `findings` and `blocking_findings`.

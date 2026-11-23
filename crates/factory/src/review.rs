@@ -22,7 +22,7 @@ use factory_adapters::git::{GitError, GitRepo, Repo};
 use factory_adapters::reviewer::{Agy, Claude, Codex, Job, Reviewer, ReviewerError, home_of};
 use factory_core::exit::Exit;
 use factory_core::quota::Reset;
-use factory_core::review::{self, Bundle, Finding, Part, Reading, Record, Verdict};
+use factory_core::review::{self, Bundle, Finding, Fix, Part, Previous, Reading, Record, Verdict};
 use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
 
@@ -111,6 +111,7 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         report: &run.report,
         stream: &run.stream,
         findings: &run.findings,
+        from: &run.from,
         result: match (&run.reading, &failed) {
             (Some(reading), None) => Ok(reading),
             _ => Err(failed
@@ -152,6 +153,7 @@ fn reviewer(backend: &Backend, paths: &Paths) -> Box<dyn Reviewer> {
             effort,
             backend.auth,
             paths.state.join("agy-usage.json"),
+            paths.state.join("checkouts"),
         )),
         Cli::Codex => Box::new(Codex::new(model, effort, &home_of("CODEX_HOME", ".codex"))),
         Cli::Claude => Box::new(Claude::new(
@@ -180,6 +182,8 @@ struct Run {
     report: String,
     stream: String,
     findings: String,
+    /// On a fix round, the head the previous round reviewed.
+    from: String,
     reading: Option<Reading>,
 }
 
@@ -199,6 +203,11 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
     let files = Files::new(paths, &run.repo, &args.label)?;
     let inputs = Inputs::gather(&repo, args, &files)?;
     run.head = inputs.head.clone();
+    run.notes.extend(inputs.notes.iter().cloned());
+    run.from = inputs
+        .fix
+        .as_ref()
+        .map_or_else(String::new, |fix| fix.head.clone());
     let spec = inputs.spec.as_ref().map_or("none", |(name, _)| name);
     run.spec = spec.to_owned();
     write(&files.bundle, &inputs.bundle(args).render())?;
@@ -274,15 +283,22 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
             Err(e) => return Err(reviewer_failed(reviewer.as_ref(), &e, &files.prompt)),
         }
         let prompt = review::prompt(
-            &reviewer.opening(&args.base),
+            &reviewer.opening(
+                inputs
+                    .fix
+                    .as_ref()
+                    .map_or(args.base.as_str(), |fix| short(&fix.head)),
+            ),
             &files.bundle.display().to_string(),
             spec,
             inputs.previous.as_ref().map(|(name, _)| name.as_str()),
+            inputs.fix.as_ref().is_some_and(|fix| fix.open.is_some()),
         );
         write(&files.prompt, &prompt)?;
         let stream = files.stream(reviewer.stream_extension());
         let job = Job {
             cwd: cwd.clone(),
+            head: inputs.head.clone(),
             prompt: files.prompt.clone(),
             report: files.report.clone(),
             stream: stream.clone(),
@@ -295,6 +311,12 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
             Ok(()) => {}
             Err(ReviewerError::OutOfQuota(reset)) => {
                 cool(&mut daemon, run, &backend.name, reset)?;
+                continue;
+            }
+            // Its review ran without the sandbox, so it is not kept: the next backend reviews.
+            Err(ReviewerError::NoSandbox(why)) => {
+                run.notes.push(format!("{} skipped: {why}", backend.name));
+                run.skipped.push((backend.name.clone(), why));
                 continue;
             }
             Err(e) => return Err(reviewer_failed(reviewer.as_ref(), &e, &stream)),
@@ -321,6 +343,11 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
     let reading = Reading::of(&text).map_err(|e| {
         Failure::precondition(format!("{e}: {}; read it there", files.report.display()))
     })?;
+    // A fix round is held to its rules: old findings marked, new ones only on the fix's lines.
+    let reading = match inputs.fix.as_ref().and_then(|fix| fix.open.as_deref()) {
+        Some(open) => reading.within(open, &Fix::of_diff(&inputs.diff)),
+        None => reading,
+    };
     let ledger = json!({
         "label": args.label,
         "round": review::round(&args.label, args.previous.is_some()),
@@ -336,6 +363,14 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
             .as_ref()
             .map(|findings| findings.iter().map(Finding::to_value).collect::<Vec<_>>()),
     });
+    let mut ledger = ledger;
+    if !run.from.is_empty() {
+        ledger["from"] = run.from.clone().into();
+        ledger["fixed"] = reading.fixed.into();
+        ledger["still_present"] = reading.still_present.into();
+        ledger["dropped"] = reading.dropped.len().into();
+        ledger["dropped_findings"] = reading.dropped.iter().map(Finding::to_value).collect();
+    }
     write(&files.findings, &format!("{ledger:#}\n"))?;
     run.findings = files.findings.display().to_string();
     let cooled: Vec<Value> = run
@@ -359,6 +394,9 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
             "blocking": reading.counts.blocking,
             "advisory": reading.counts.advisory,
             "question": reading.counts.question,
+            "fixed": reading.fixed,
+            "still_present": reading.still_present,
+            "dropped": reading.dropped.len(),
             "report": run.report,
             "findings": run.findings,
             "blocking_findings": reading.blocking_lines(),
@@ -381,7 +419,6 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
     Ok(done)
 }
 
-/// Cools `backend` down until its `reset`, in the daemon and in the run's record.
 /// The routes a run may still be granted: none it skipped, and none it cooled down while
 /// another is left. The daemon decides whether a cooled one's reset has come.
 fn candidates<'a>(routes: &'a [Route], run: &Run) -> Vec<&'a Route> {
@@ -421,6 +458,7 @@ fn bounded(timeout: Option<Duration>, routes: &[Route]) -> Result<(), Failure> {
     }
 }
 
+/// Cools `backend` down until its `reset`, in the daemon and in the run's record.
 fn cool(
     daemon: &mut client::Session,
     run: &mut Run,
@@ -448,6 +486,11 @@ struct Inputs {
     commits: String,
     diff_stat: String,
     diff: String,
+    /// On a fix round, what the previous round's ledger gave: the head it reviewed, where the
+    /// diff starts, and its open findings.
+    fix: Option<Previous>,
+    /// Why this fix round reviews the whole diff after all.
+    notes: Vec<String>,
     spec: Option<(String, String)>,
     previous: Option<(String, String)>,
     standards: Vec<(String, String)>,
@@ -461,11 +504,21 @@ impl Inputs {
         let base_commit = repo.commit(base).map_err(git_failed)?.ok_or_else(|| {
             Failure::usage(format!("unknown ref: {base}; name a branch, tag or commit"))
         })?;
-        let diff = repo.diff(base, DIFF_CONTEXT).map_err(git_failed)?;
+        let mut notes = Vec::new();
+        let fix = match &args.previous {
+            Some(previous) => fix_start(repo, args, previous, &mut notes)?,
+            None => None,
+        };
+        let since = fix.as_ref().map_or(base.as_str(), |fix| fix.head.as_str());
+        let diff = repo.diff(since, DIFF_CONTEXT).map_err(git_failed)?;
         if diff.is_empty() {
-            return Err(Failure::usage(format!(
-                "no committed changes since {base} (commit first)"
-            )));
+            return Err(Failure::usage(match &fix {
+                Some(fix) => format!(
+                    "no committed changes since the previous review's head {} (commit the fix first)",
+                    short(&fix.head)
+                ),
+                None => format!("no committed changes since {base} (commit first)"),
+            }));
         }
         let spec = args
             .spec
@@ -496,9 +549,11 @@ impl Inputs {
         Ok(Inputs {
             base_commit,
             head: repo.commit("HEAD").map_err(git_failed)?.unwrap_or_default(),
-            commits: repo.commits(base).map_err(git_failed)?,
-            diff_stat: repo.diff_stat(base).map_err(git_failed)?,
+            commits: repo.commits(since).map_err(git_failed)?,
+            diff_stat: repo.diff_stat(since).map_err(git_failed)?,
             diff,
+            fix,
+            notes,
             spec,
             previous,
             standards,
@@ -514,6 +569,8 @@ impl Inputs {
             base: &args.base,
             base_commit: &self.base_commit,
             head: &self.head,
+            fix_from: self.fix.as_ref().map(|fix| fix.head.as_str()),
+            open: self.fix.as_ref().and_then(|fix| fix.open.as_deref()),
             commits: &self.commits,
             diff_stat: &self.diff_stat,
             diff: &self.diff,
@@ -523,6 +580,42 @@ impl Inputs {
             evidence: self.evidence.as_ref().map(part),
         }
     }
+}
+
+/// Where a fix round's diff starts: the head the previous report's findings ledger says it
+/// reviewed, when that is on this branch. Otherwise the round reviews the whole diff, and
+/// says why in `notes`.
+fn fix_start(
+    repo: &impl Repo,
+    args: &Args,
+    previous: &Path,
+    notes: &mut Vec<String>,
+) -> Result<Option<Previous>, Failure> {
+    let ledger = previous.with_extension("findings.json");
+    let named = fs::read_to_string(&ledger)
+        .ok()
+        .and_then(|text| Previous::of_ledger(&text));
+    let on_branch = match named {
+        Some(named) => match repo.commit(&named.head).map_err(git_failed)? {
+            Some(head) if repo.is_ancestor(&head).map_err(git_failed)? => {
+                Some(Previous { head, ..named })
+            }
+            _ => None,
+        },
+        None => None,
+    };
+    if on_branch.is_none() {
+        notes.push(format!(
+            "no reviewed head for {} on this branch; round {} reviews the whole diff",
+            previous.display(),
+            review::round(&args.label, true)
+        ));
+    }
+    Ok(on_branch)
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(8)]
 }
 
 /// The files of one review, in `<state>/reviews/<repo>/`.
@@ -628,6 +721,7 @@ fn reviewer_failed(reviewer: &dyn Reviewer, e: &ReviewerError, stream: &Path) ->
         ReviewerError::Start(_) => {
             format!("check that {} is installed and on PATH", reviewer.name())
         }
+        ReviewerError::Checkout(_) => "check the repository and its worktrees".to_owned(),
         ReviewerError::TimedOut(_) => format!(
             "its process group was killed; see {}, then retry or raise --timeout",
             stream.display()
