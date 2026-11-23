@@ -24,11 +24,32 @@ pub struct Paths {
     /// herdr's socket: `$HERDR_SOCKET_PATH`, as herdr sets it in its panes, else herdr's
     /// default `${XDG_CONFIG_HOME:-$HOME/.config}/herdr/herdr.sock`.
     pub herdr: PathBuf,
+    /// Claude Code's config dir, where it logs its sessions: `$CLAUDE_CONFIG_DIR`, else
+    /// `$HOME/.claude`.
+    pub claude: PathBuf,
     /// Where `factory install` puts the binary: `$HOME/.local/bin`, where the service unit
     /// runs it from.
     pub bin: PathBuf,
     /// systemd's user unit dir: `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user`.
     pub units: PathBuf,
+}
+
+/// The config dir, `${XDG_CONFIG_HOME:-$HOME/.config}/factory`: all a hook needs of the paths, since
+/// it never talks to the daemon.
+pub fn config_dir() -> PathBuf {
+    let var = |key: &str| env::var_os(key).filter(|value| !value.is_empty());
+    var("XDG_CONFIG_HOME")
+        .map_or_else(
+            || Path::new(&var("HOME").unwrap_or_else(|| OsString::from("/"))).join(".config"),
+            PathBuf::from,
+        )
+        .join("factory")
+}
+
+/// The runtime dir, `$XDG_RUNTIME_DIR/factory`, when the variable is set.
+pub fn runtime_dir() -> Option<PathBuf> {
+    let dir = env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty())?;
+    Some(Path::new(&dir).join("factory"))
 }
 
 impl Paths {
@@ -45,15 +66,18 @@ impl Paths {
             .map_or_else(|| Path::new(&home()).join(".config"), PathBuf::from);
         let herdr = var("HERDR_SOCKET_PATH")
             .map_or_else(|| config_home.join("herdr/herdr.sock"), PathBuf::from);
-        let config = config_home.join("factory");
-        let runtime = var("XDG_RUNTIME_DIR").ok_or_else(|| {
+        let config = config_dir();
+        let claude = var("CLAUDE_CONFIG_DIR")
+            .map_or_else(|| Path::new(&home()).join(".claude"), PathBuf::from);
+        let runtime = runtime_dir().ok_or_else(|| {
             Failure::precondition("XDG_RUNTIME_DIR is not set; run factory inside a user session")
         })?;
         Ok(Paths {
             state,
-            runtime: Path::new(&runtime).join("factory"),
+            runtime,
             config,
             herdr,
+            claude,
             bin: Path::new(&home()).join(".local/bin"),
             units: config_home.join("systemd/user"),
         })
@@ -87,6 +111,11 @@ impl Paths {
                 pr.number,
                 head.get(..12).unwrap_or(head)
             ))
+    }
+
+    /// Where Claude Code keeps one directory of session logs per working directory.
+    pub fn claude_projects(&self) -> PathBuf {
+        self.claude.join("projects")
     }
 
     pub fn config_file(&self) -> PathBuf {

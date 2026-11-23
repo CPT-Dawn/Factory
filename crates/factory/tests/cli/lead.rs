@@ -253,7 +253,8 @@ fn wait_answers_0_when_an_event_says_the_lead_finished() {
     assert_eq!(out.code, 0, "{out:?}");
     assert_eq!(out.stdout, format!("lead-cart finished: {shipped}\n"));
     assert_eq!(out.stderr, "");
-    assert_eq!(herdr.count("agent.list"), 1, "{:?}", herdr.methods());
+    // Nothing polls: the agents are listed to learn the panes, and once more after subscribing.
+    assert_eq!(herdr.count("agent.list"), 2, "{:?}", herdr.methods());
 }
 
 #[test]
@@ -276,7 +277,7 @@ fn wait_answers_10_with_the_screen_when_the_lead_blocks_or_asks() {
                 "1. Yes  2. No"
             ]
         );
-        assert_eq!(herdr.count("agent.list"), 1, "{:?}", herdr.methods());
+        assert_eq!(herdr.count("agent.list"), 2, "{:?}", herdr.methods());
     }
 }
 
@@ -325,7 +326,7 @@ fn wait_times_out_with_124_never_0() {
         "factory: lead-cart is still working after 1s; \
          wait again, or see factory lead status cart\n"
     );
-    assert_eq!(herdr.count("agent.list"), 1, "{:?}", herdr.methods());
+    assert_eq!(herdr.count("agent.list"), 2, "{:?}", herdr.methods());
 }
 
 #[test]
@@ -384,8 +385,19 @@ fn a_wait_whose_caller_is_gone_stops_waiting() {
 #[test]
 fn a_wait_that_loses_herdr_fails_and_the_next_command_reconnects() {
     let sandbox = Sandbox::new();
-    let herdr = shop(&sandbox, &[("lead-cart", "w1:p1", "working")]);
-    let child = waiting(&sandbox, &herdr, &["cart"], "w1:p1");
+    let herdr = shop(
+        &sandbox,
+        &[
+            ("lead-cart", "w1:p1", "working"),
+            ("lead-pay", "w2:p1", "working"),
+        ],
+    );
+    // The waiter names its own pane, so `lead status` shows once the daemon has the wait:
+    // a hang-up before that would only make the wait reconnect.
+    let mut cmd = sandbox.factory_command(&["wait", "lead", "cart"]);
+    cmd.env("HERDR_PANE_ID", "w2:p1");
+    let child = spawn(cmd);
+    await_status(&sandbox, "pay", "lead-pay waiting: lead-cart");
 
     herdr.hang_up();
     let out = finish(child);

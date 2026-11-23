@@ -3,7 +3,7 @@
 //! A client writes one request per line, `{"id", "method", "params"}`, and reads one response
 //! line per request, `{"id", "result"}` or `{"id", "error": {"code", "message"}}`, where
 //! `code` is an exit code from [`factory_core::exit`]. A request that waits (`lab.acquire`) may
-//! send `{"id", "note"}` lines before its answer.
+//! send `{"id", "note"}` and `{"id", "queued"}` lines before its answer.
 
 use factory_core::event::Fields;
 use factory_core::exit::Exit;
@@ -27,12 +27,20 @@ pub const REVIEW_QUOTA: &str = "review.quota";
 pub const LEAD_LIST: &str = "lead.list";
 /// One lead: [`LeadParams`] in, [`LeadReport`] out.
 pub const LEAD_STATUS: &str = "lead.status";
+/// Starts a lead in a new herdr workspace: [`SpawnParams`] in, [`SpawnResult`] out.
+pub const LEAD_SPAWN: &str = "lead.spawn";
 /// Answered once a lead finishes, blocks, asks or dies: [`WaitLeadParams`] in,
 /// [`WaitLeadResult`] out; an error with exit 124 when the time runs out first.
 pub const WAIT_LEAD: &str = "wait.lead";
 /// Answered once every check on a pull request's head has finished: [`WaitCiParams`] in,
 /// [`WaitCiResult`] out; an error with exit 124 when the time runs out first.
 pub const WAIT_CI: &str = "wait.ci";
+/// Starts the context steward unless it runs: no params, [`MonitorSwitch`] out.
+pub const MONITOR_START: &str = "monitor.start";
+/// Stops the context steward if it runs: no params, [`MonitorSwitch`] out.
+pub const MONITOR_STOP: &str = "monitor.stop";
+/// Whether the context steward runs, and what it watches: no params, [`MonitorStatus`] out.
+pub const MONITOR_STATUS: &str = "monitor.status";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -57,6 +65,9 @@ pub enum Outcome {
     Error(ErrorBody),
     /// Progress before the result, `{"id", "note"}`: a request that waits may send any number.
     Note(String),
+    /// `{"id", "queued": n}`: a request that waits in a queue the daemon keeps across restarts
+    /// (`lab.acquire`) holds place `n`, which it names to keep it when it asks again.
+    Queued(i64),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -168,6 +179,36 @@ pub struct LeadParams {
     pub lead: String,
 }
 
+/// What the daemon needs to start a lead, checked by the CLI against the repo already.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SpawnParams {
+    /// The lead's herdr agent name, `lead-<slug>`.
+    pub lead: String,
+    /// The repository to cut the lead's worktree from.
+    pub repo_path: String,
+    pub repo_name: String,
+    pub base: String,
+    pub skill: String,
+    pub spec: String,
+    /// What Claude starts with, after its own name.
+    pub claude_args: Vec<String>,
+    pub model: String,
+    pub effort: String,
+    pub retry_pause_ms: u64,
+    /// The Claude Code session that asked, for the ledger.
+    pub session: Option<String>,
+}
+
+/// The lead a spawn started, as the night page takes it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SpawnResult {
+    pub lead: String,
+    pub workspace: String,
+    pub branch: String,
+    pub worktree: String,
+    pub report: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WaitLeadParams {
     pub lead: String,
@@ -235,4 +276,49 @@ pub struct WaitCiResult {
     pub file: Option<String>,
     /// 0 when nothing failed, 10 when something did.
     pub exit: u8,
+}
+
+/// What a start or stop of the context steward did.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MonitorSwitch {
+    pub running: bool,
+    /// False when the steward already ran (start) or already stood still (stop).
+    pub changed: bool,
+}
+
+/// The context steward and its context table.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct MonitorStatus {
+    pub running: bool,
+    /// Every lead it watches, by name.
+    pub leads: Vec<LeadContext>,
+}
+
+/// One lead's context, and its subagents'.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LeadContext {
+    pub lead: String,
+    /// The Claude Code session herdr reports for it.
+    pub session: Option<String>,
+    /// The session log the context is read from, once it is found.
+    pub log: Option<String>,
+    /// The latest context; none before the log has said.
+    pub tokens: Option<u64>,
+    /// Whether the steward has asked it to stop and not yet compacted it.
+    pub asked: bool,
+    /// Whether a compaction of it is under way.
+    pub compacting: bool,
+    pub subagents: Vec<SubagentContext>,
+}
+
+/// One subagent of a lead.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubagentContext {
+    /// Its session log's name, `agent-<id>`.
+    pub agent: String,
+    /// What it was started to do, when Claude Code recorded it.
+    pub description: Option<String>,
+    pub tokens: Option<u64>,
+    /// Whether its lead has been told it passed the threshold.
+    pub told: bool,
 }

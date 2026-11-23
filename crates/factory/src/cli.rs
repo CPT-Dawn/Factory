@@ -39,6 +39,11 @@ pub enum Command {
         #[command(subcommand)]
         command: LeadCommand,
     },
+    /// Watch every lead's and subagent's context; compact idle leads over the threshold
+    Monitor {
+        #[command(subcommand)]
+        command: MonitorCommand,
+    },
     /// Block, silent, until something happens
     Wait {
         #[command(subcommand)]
@@ -57,6 +62,11 @@ pub enum Command {
         /// Seconds a reviewer may take before its process group is killed (default: the config's)
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
+    },
+    /// Answer a Claude Code hook: its JSON on stdin, its hook protocol on stdout
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
     },
     /// Run the daemon; other commands start it when it isn't running
     Daemon,
@@ -77,7 +87,33 @@ pub enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum HookCommand {
+    /// Before a tool runs: refuse npm, a leaking commit or push, a REPL script that can't run
+    PreTool,
+    /// After a tool ran: one line when its result is over 12k characters
+    PostTool,
+    /// When a subagent stops: send back a report longer than its template
+    SubagentStop,
+}
+
+#[derive(Subcommand, Debug)]
 pub enum LeadCommand {
+    /// Start a lead on a spec in a new herdr workspace, and say where it is
+    Spawn {
+        /// The lead's slug: lowercase letters, digits and -, at most 27
+        slug: String,
+        /// The spec the lead works: an issue ref such as #12
+        spec: String,
+        /// The branch the lead's worktree is cut from
+        #[arg(default_value = "main")]
+        base: String,
+        /// The skill the lead runs
+        #[arg(default_value = "implement-spec")]
+        skill: String,
+        /// The repository to work in (default: the current directory's)
+        #[arg(long, value_name = "PATH")]
+        repo: Option<PathBuf>,
+    },
     /// One line per lead: working, waiting (on what), blocked, asking, finished or dead
     List,
     /// One lead's line, and its pane's last lines when it is blocked or asking
@@ -85,6 +121,16 @@ pub enum LeadCommand {
         /// The lead's slug, or lead-<slug>
         lead: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MonitorCommand {
+    /// Start the context steward in the daemon; starting it twice changes nothing
+    Start,
+    /// Stop it; a compaction under way still finishes
+    Stop,
+    /// Whether it runs, and the context of each lead and subagent it watches
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
