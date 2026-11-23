@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
+use super::reservations;
 use super::wire::{Lease, Owner, SlotRow, Waiter};
 
 const SCHEMA: &str = "
@@ -53,6 +54,7 @@ impl Store {
         conn.busy_timeout(Duration::from_secs(15))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(reservations::SCHEMA)?;
         conn.execute("DELETE FROM waiters", [])?;
         Ok(Store { conn })
     }
@@ -153,7 +155,7 @@ pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<(
         )?;
     }
     c.execute("DELETE FROM leases WHERE id = ?1", [lease.id])?;
-    Ok(())
+    reservations::record_lease_end(c, lease, now)
 }
 
 /// Drops every lease whose owner exited; a line per lease dropped.
@@ -172,6 +174,7 @@ pub fn gc(
             ));
         }
     }
+    freed.extend(reservations::gc(c, now, alive)?);
     Ok(freed)
 }
 

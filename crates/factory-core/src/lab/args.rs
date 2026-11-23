@@ -67,7 +67,7 @@ pub fn parse_opts(args: &[String]) -> Result<(Opts, &[String], Vec<String>), Str
 
 /// An argument read as JavaScript's `Number(text)` reads it, near enough: blank is 0, junk (or
 /// nothing) is NaN.
-fn number_arg(text: Option<&String>) -> f64 {
+pub fn number_arg(text: Option<&String>) -> f64 {
     let Some(text) = text else { return f64::NAN };
     let text = text.trim();
     if text.is_empty() {

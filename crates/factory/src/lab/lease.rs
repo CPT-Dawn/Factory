@@ -20,7 +20,7 @@ use crate::output::Failure;
 use crate::paths::Paths;
 
 /// How much longer than its wait the CLI listens for the daemon's answer.
-const ANSWER_GRACE: Duration = Duration::from_secs(60);
+pub const ANSWER_GRACE: Duration = Duration::from_secs(60);
 
 pub fn paths() -> Result<Paths, Failure> {
     Paths::from_env()
@@ -71,6 +71,7 @@ pub fn ask(
         project,
         wait_sec,
         run,
+        reservation: super::context::reserved(),
     };
     let listen = Duration::try_from_secs_f64(wait_sec)
         .ok()
@@ -104,7 +105,7 @@ pub fn take(ctx: &Ctx, opts: &Opts, granted: Granted) -> Result<Lease, Failure> 
 }
 
 /// The project as a grant needs it: its cap here, its ports and its stack's.
-fn project_ask(ctx: &Ctx, p: &ProjectConfig) -> Result<ProjectAsk, Failure> {
+pub fn project_ask(ctx: &Ctx, p: &ProjectConfig) -> Result<ProjectAsk, Failure> {
     let stack = stack::info(p, &ctx.worktree, 0)?.map(|info| StackAsk {
         project_id: info.project_id,
         ports: info.ports.iter().map(|(_, port)| *port).collect(),

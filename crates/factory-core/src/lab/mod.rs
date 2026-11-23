@@ -7,12 +7,15 @@
 //! - [`grant`] decides, from one picture of the board, whether a request is served now.
 //! - [`run`] says how a `devlab run` ended.
 //!
-//! Devices (#16) and reservations (#17) get modules of their own beside these.
+//! - [`reserve`] sets slots aside for a lead's implementers.
+//!
+//! Devices (#16) get a module of their own beside these.
 
 pub mod args;
 pub mod config;
 pub mod grant;
 pub mod queue;
+pub mod reserve;
 pub mod run;
 pub mod slots;
 

@@ -28,10 +28,11 @@ use tokio::time::Instant;
 
 use super::host;
 use super::lease::base_name;
+use super::reservations;
 use super::store::{self, Store};
 use super::wire::{
-    AcquireParams, Board, FindParams, GC, Granted, LEASE, Lease, RELEASE, RUN_END, RUN_START,
-    RunAsk, RunEnd, SLOT, STATUS, SlotParams, Waiter,
+    AcquireParams, Board, FindParams, GC, Granted, LEASE, Lease, ProjectAsk, RELEASE, RUN_END,
+    RUN_START, RunAsk, RunEnd, SLOT, STATUS, SlotParams, UNRESERVE, Waiter,
 };
 use crate::daemon::Ledger;
 use crate::protocol::{ErrorBody, Outcome, Request, Response};
@@ -39,6 +40,9 @@ use crate::protocol::{ErrorBody, Outcome, Request, Response};
 /// How often a waiting acquire looks again without a change to the board: an owner that exited
 /// or a port that freed tells no one (the daemon watches owners itself from #18).
 const RECHECK: Duration = Duration::from_secs(3);
+
+mod reserve;
+pub use reserve::reserve;
 
 pub struct Lab {
     path: PathBuf,
@@ -118,6 +122,7 @@ pub async fn respond(lab: &Arc<Lab>, method: &str, params: Value) -> Option<Outc
         GC => |lab, _| reply(lab.write_gc(|_, _| Ok(())).map(|(freed, ())| freed)),
         STATUS => |lab, _| reply(status(lab)),
         SLOT => |lab, p| reply(slot(lab, parse(p)?)),
+        UNRESERVE => |lab, p| reply(reserve::unreserve(lab, parse(p)?)),
         _ => return None,
     };
     let lab = Arc::clone(lab);
@@ -181,6 +186,7 @@ fn status(lab: &Lab) -> Answer<Board> {
             leases: store::leases(c)?,
             slots: store::slots(c)?,
             waiters: store::waiters(c)?,
+            reservations: reservations::all(c)?,
         })
     })
 }
@@ -196,8 +202,8 @@ struct Facts {
     running: Vec<bool>,
 }
 
-fn gather(p: &AcquireParams) -> Facts {
-    let running = match &p.project {
+fn gather(project: Option<&ProjectAsk>) -> Facts {
+    let running = match project {
         Some(project) => match &project.stack {
             Some(stack) => (0..project.max_slots)
                 .map(|slot| {
@@ -239,11 +245,56 @@ fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<i64> {
 }
 
 fn project_ask(p: &AcquireParams) -> Option<grant::ProjectAsk> {
-    p.project.as_ref().map(|project| grant::ProjectAsk {
+    p.project.as_ref().map(grant_project)
+}
+
+fn grant_project(project: &ProjectAsk) -> grant::ProjectAsk {
+    grant::ProjectAsk {
         name: project.name.clone(),
         max_slots: project.max_slots,
         cap: project.cap,
         has_stack: project.stack.is_some(),
+    }
+}
+
+/// The board a request is decided on: the leases and the reservations (both hold a slot of their
+/// owner's), the queue, and the asker's project's slots.
+fn grant_board(
+    c: &Connection,
+    project: Option<&ProjectAsk>,
+    worktree: &str,
+    facts: &Facts,
+) -> rusqlite::Result<grant::Board> {
+    let mut leases: Vec<_> = store::leases(c)?.iter().map(Lease::holding).collect();
+    leases.extend(reservations::all(c)?.iter().map(|r| r.holding()));
+    let rows = store::slots(c)?;
+    Ok(grant::Board {
+        leases,
+        queue: store::waiters(c)?.iter().map(Waiter::entry).collect(),
+        slots: project.map_or_else(Vec::new, |project| {
+            (0..project.max_slots)
+                .map(|slot| {
+                    let (own_ports, stack_ports) = slot_host_ports(
+                        &project.ports,
+                        project.stride,
+                        slot,
+                        project.stack.as_ref().map(|s| s.ports.as_slice()),
+                    );
+                    SlotView {
+                        held: false,
+                        last_is_mine: rows.iter().any(|r| {
+                            r.project == project.name
+                                && r.slot == slot
+                                && r.last_worktree.as_deref() == Some(worktree)
+                        }),
+                        stack_running: facts.running.get(slot as usize).copied().unwrap_or(false),
+                        own_ports,
+                        stack_ports,
+                    }
+                })
+                .collect()
+        }),
+        listening: facts.listening.clone(),
     })
 }
 
@@ -256,40 +307,19 @@ fn try_grant(
 ) -> Answer<Result<(Granted, bool), String>> {
     lab.write(|c, now| {
         let lease = store::find_lease(c, &p.worktree, &p.owner, p.lease)?;
-        let leases = store::leases(c)?;
-        let rows = store::slots(c)?;
-        let board = grant::Board {
-            leases: leases.iter().map(Lease::holding).collect(),
-            queue: store::waiters(c)?.iter().map(Waiter::entry).collect(),
-            slots: p.project.as_ref().map_or_else(Vec::new, |project| {
-                (0..project.max_slots)
-                    .map(|slot| {
-                        let (own_ports, stack_ports) = slot_host_ports(
-                            &project.ports,
-                            project.stride,
-                            slot,
-                            project.stack.as_ref().map(|s| s.ports.as_slice()),
-                        );
-                        SlotView {
-                            held: false,
-                            last_is_mine: rows.iter().any(|r| {
-                                r.project == project.name
-                                    && r.slot == slot
-                                    && r.last_worktree.as_deref() == Some(p.worktree.as_str())
-                            }),
-                            stack_running: facts
-                                .running
-                                .get(slot as usize)
-                                .copied()
-                                .unwrap_or(false),
-                            own_ports,
-                            stack_ports,
-                        }
-                    })
-                    .collect()
-            }),
-            listening: facts.listening.clone(),
-        };
+        // A reservation of the caller's project is used once: it becomes the caller's lease,
+        // without a turn in the queue. One that is gone (used, released or its lead exited)
+        // asks for a slot the normal way.
+        if lease.is_none()
+            && let (Some(id), Some(project)) = (p.reservation, &p.project)
+            && let Some(granted) =
+                reservations::claim(c, id, &project.name, &p.worktree, &p.owner, now)?
+        {
+            store::touch(c, granted.lease.id, now)?;
+            store::delete_waiter(c, waiter)?;
+            return Ok(Ok((granted, true)));
+        }
+        let board = grant_board(c, p.project.as_ref(), &p.worktree, facts)?;
         let ask = Ask {
             waiter,
             project: project_ask(p),
@@ -405,7 +435,7 @@ pub async fn acquire<W, R, S>(
         let tried = {
             let (lab, p) = (Arc::clone(&lab), Arc::clone(&p));
             blocking(move || {
-                let facts = gather(&p);
+                let facts = gather(p.project.as_ref());
                 try_grant(&lab, &p, waiter, &facts)
             })
             .await

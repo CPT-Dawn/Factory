@@ -12,7 +12,7 @@ use factory_core::lab::config::ProjectConfig;
 
 use super::lease;
 use super::wire::Lease;
-use super::{run, stack, status};
+use super::{reserve, run, stack, status};
 use crate::output::Failure;
 
 const HELP: &str = include_str!("help.txt");
@@ -71,6 +71,7 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
             );
             Ok(0)
         }
+        "reserve" => reserve::main(args),
         "exec" => {
             let ctx = context()?;
             let rest = match args.split_first() {

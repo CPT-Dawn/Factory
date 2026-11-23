@@ -94,7 +94,11 @@ fn run(command: Command, json: bool) -> ExitCode {
 /// lab speaks devlab's dialect, where only `status` takes `--json`.
 fn lab_args(args: Vec<String>, json: bool) -> Vec<OsString> {
     let mut out: Vec<OsString> = args.into_iter().map(OsString::from).collect();
-    if json && out.first().is_some_and(|cmd| cmd == "status") {
+    if json
+        && out
+            .first()
+            .is_some_and(|cmd| cmd == "status" || cmd == "reserve")
+    {
         out.push(OsString::from("--json"));
     }
     out

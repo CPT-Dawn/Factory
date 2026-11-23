@@ -1,0 +1,169 @@
+//! The reservations table of `lab.db`, and the history of how long leases ran, which an
+//! over-cap owner's ETA is read from. Written by the daemon alone, in the lab's short transactions.
+
+use rusqlite::{Connection, Row, params};
+
+use super::store;
+use super::wire::{Granted, Lease, Owner, Reservation};
+
+pub const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS reservations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project TEXT NOT NULL,
+  slot INTEGER NOT NULL,
+  worktree TEXT NOT NULL,
+  owner_pid INTEGER NOT NULL,
+  owner_start TEXT NOT NULL,
+  owner_label TEXT NOT NULL,
+  created INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS reservations_slot ON reservations (project, slot);
+CREATE TABLE IF NOT EXISTS lease_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project TEXT NOT NULL,
+  seconds INTEGER NOT NULL
+);
+";
+
+/// How many of a project's latest leases its ETA is read from.
+const HISTORY: i64 = 20;
+
+fn row(row: &Row<'_>) -> rusqlite::Result<Reservation> {
+    Ok(Reservation {
+        id: row.get("id")?,
+        project: row.get("project")?,
+        slot: row.get("slot")?,
+        worktree: row.get("worktree")?,
+        owner_pid: row.get("owner_pid")?,
+        owner_start: row.get("owner_start")?,
+        owner_label: row.get("owner_label")?,
+        created: row.get("created")?,
+    })
+}
+
+pub fn all(c: &Connection) -> rusqlite::Result<Vec<Reservation>> {
+    let mut q = c.prepare("SELECT * FROM reservations ORDER BY id")?;
+    q.query_map([], row)?.collect()
+}
+
+/// A new reservation of `slot`; its id is never one an earlier reservation had.
+pub fn insert(
+    c: &Connection,
+    project: &str,
+    slot: u32,
+    worktree: &str,
+    owner: &Owner,
+    now: i64,
+) -> rusqlite::Result<Reservation> {
+    c.execute(
+        "INSERT INTO reservations (project, slot, worktree, owner_pid, owner_start, owner_label, created)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![project, slot, worktree, owner.pid, owner.start, owner.label, now],
+    )?;
+    // The slot is spoken for: it does not idle.
+    c.execute(
+        "UPDATE slots SET idle_since = NULL WHERE project = ?1 AND slot = ?2",
+        params![project, slot],
+    )?;
+    Ok(Reservation {
+        id: c.last_insert_rowid(),
+        project: project.to_owned(),
+        slot,
+        worktree: worktree.to_owned(),
+        owner_pid: owner.pid,
+        owner_start: owner.start.clone(),
+        owner_label: owner.label.clone(),
+        created: now,
+    })
+}
+
+/// Forgets a reservation; its slot starts idling.
+fn drop_reservation(c: &Connection, r: &Reservation, now: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE slots SET idle_since = ?1 WHERE project = ?2 AND slot = ?3",
+        params![now, r.project, r.slot],
+    )?;
+    c.execute("DELETE FROM reservations WHERE id = ?1", [r.id])?;
+    Ok(())
+}
+
+/// Gives the owner's reservations of `project` back; how many there were.
+pub fn release(c: &Connection, owner: &Owner, project: &str, now: i64) -> rusqlite::Result<usize> {
+    let mine: Vec<Reservation> = all(c)?
+        .into_iter()
+        .filter(|r| r.project == project && r.owner_key() == owner.key())
+        .collect();
+    for r in &mine {
+        drop_reservation(c, r, now)?;
+    }
+    Ok(mine.len())
+}
+
+/// Gives one reservation back, when it is still there.
+pub fn drop_by_id(c: &Connection, id: i64, now: i64) -> rusqlite::Result<()> {
+    if let Some(r) = all(c)?.into_iter().find(|r| r.id == id) {
+        drop_reservation(c, &r, now)?;
+    }
+    Ok(())
+}
+
+/// Drops every reservation whose owner exited; a line per reservation dropped.
+pub fn gc(
+    c: &Connection,
+    now: i64,
+    alive: &dyn Fn(i64, &str) -> bool,
+) -> rusqlite::Result<Vec<String>> {
+    let mut freed = Vec::new();
+    for r in all(c)? {
+        if !alive(r.owner_pid, &r.owner_start) {
+            drop_reservation(c, &r, now)?;
+            freed.push(format!(
+                "reservation {} ({}, owner exited)",
+                r.id, r.owner_label
+            ));
+        }
+    }
+    Ok(freed)
+}
+
+/// Turns reservation `id` of `project` into a lease of `worktree` for `owner`, when there is
+/// such a reservation: the slot it held, held by the new lease now.
+pub fn claim(
+    c: &Connection,
+    id: i64,
+    project: &str,
+    worktree: &str,
+    owner: &Owner,
+    now: i64,
+) -> rusqlite::Result<Option<Granted>> {
+    let Some(r) = all(c)?
+        .into_iter()
+        .find(|r| r.id == id && r.project == project)
+    else {
+        return Ok(None);
+    };
+    c.execute("DELETE FROM reservations WHERE id = ?1", [r.id])?;
+    let lease = store::insert_lease(c, Some(project), worktree, owner, Some(r.slot), now)?;
+    let previous = store::claim_slot(c, project, r.slot, worktree)?;
+    Ok(Some(Granted { lease, previous }))
+}
+
+/// Records how long a lease ran, for the ETAs of its project.
+pub fn record_lease_end(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<()> {
+    if let (Some(project), Some(_)) = (&lease.project, lease.slot) {
+        c.execute(
+            "INSERT INTO lease_history (project, seconds) VALUES (?1, ?2)",
+            params![project, (now - lease.created).max(0)],
+        )?;
+    }
+    Ok(())
+}
+
+/// How long the project's latest leases ran, in seconds.
+pub fn durations(c: &Connection, project: &str) -> rusqlite::Result<Vec<i64>> {
+    let mut q = c.prepare(
+        "SELECT seconds FROM lease_history WHERE project = ?1 ORDER BY id DESC LIMIT ?2",
+    )?;
+    q.query_map(params![project, HISTORY], |row| row.get(0))?
+        .collect()
+}

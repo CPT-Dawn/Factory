@@ -13,7 +13,7 @@ use super::context::{self, project_config};
 use super::host::mem_available_mb;
 use super::lease::base_name;
 use super::stack;
-use super::wire::{Board, Lease, STATUS};
+use super::wire::{Board, Lease, Reservation, STATUS, SlotRow};
 use crate::client;
 use crate::output::Failure;
 use crate::paths::Paths;
@@ -123,13 +123,33 @@ pub fn render(json: bool) -> Result<String, Failure> {
 }
 
 fn report(board: &Board, cfg: &MachineConfig) -> Report {
-    let slots = board
-        .slots
+    // A reserved slot that was never leased has no row of its own yet.
+    let mut rows: Vec<SlotRow> = board.slots.clone();
+    for r in &board.reservations {
+        if !rows
+            .iter()
+            .any(|s| s.project == r.project && s.slot == r.slot)
+        {
+            rows.push(SlotRow {
+                project: r.project.clone(),
+                slot: r.slot,
+                last_worktree: None,
+                stack_ours: false,
+                idle_since: None,
+            });
+        }
+    }
+    rows.sort_by(|a, b| (&a.project, a.slot).cmp(&(&b.project, b.slot)));
+    let slots = rows
         .iter()
         .map(|s| {
             let holder = board.leases.iter().find(|l| {
                 l.project.as_deref() == Some(s.project.as_str()) && l.slot == Some(s.slot)
             });
+            let reserved = board
+                .reservations
+                .iter()
+                .find(|r| r.project == s.project && r.slot == s.slot);
             let id = s
                 .last_worktree
                 .as_deref()
@@ -149,7 +169,12 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
                     "down".to_owned()
                 },
                 holder: holder.map_or_else(
-                    || "free".to_owned(),
+                    || {
+                        reserved.map_or_else(
+                            || "free".to_owned(),
+                            |r| format!("reserved by {} (reservation {})", r.owner_label, r.id),
+                        )
+                    },
                     |l| format!("lease {} {}", l.id, base_name(&l.worktree)),
                 ),
                 last: s
@@ -159,16 +184,30 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
             }
         })
         .collect();
-    let holdings: Vec<Holding> = board.leases.iter().map(Lease::holding).collect();
+    // A reservation counts against its owner's cap like a lease.
+    let holdings: Vec<Holding> = board
+        .leases
+        .iter()
+        .map(Lease::holding)
+        .chain(board.reservations.iter().map(Reservation::holding))
+        .collect();
     // Each project's cap, read from the config of a worktree that holds one of its slots.
     let mut caps: BTreeMap<String, Option<(u32, u32)>> = BTreeMap::new();
     let mut cap_of = |project: &str| -> Option<(u32, u32)> {
         *caps.entry(project.to_owned()).or_insert_with(|| {
-            let l = board
+            let worktree = board
                 .leases
                 .iter()
-                .find(|l| l.project.as_deref() == Some(project))?;
-            let p = project_config(&l.worktree).ok().flatten()?;
+                .find(|l| l.project.as_deref() == Some(project))
+                .map(|l| &l.worktree)
+                .or_else(|| {
+                    board
+                        .reservations
+                        .iter()
+                        .find(|r| r.project == project)
+                        .map(|r| &r.worktree)
+                })?;
+            let p = project_config(worktree).ok().flatten()?;
             Some((factory_core::lab::config::owner_cap(cfg, &p), p.max_slots))
         })
     };
