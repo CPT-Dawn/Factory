@@ -13,20 +13,23 @@ mod lead;
 mod leads;
 mod ledger;
 mod log;
+mod monitor;
 mod output;
 mod paths;
 mod pollers;
 mod protocol;
 mod review;
 mod router;
+mod sessions;
 mod spawn;
+mod steward;
 mod store;
 
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
 
-use cli::{Cli, Command, LeadCommand, WaitCommand};
+use cli::{Cli, Command, LeadCommand, MonitorCommand, WaitCommand};
 use output::{Done, Failure};
 
 fn main() -> ExitCode {
@@ -92,6 +95,11 @@ fn run(command: Command, json: bool) -> ExitCode {
         Command::Lead {
             command: LeadCommand::Status { lead },
         } => lead::status(&lead),
+        Command::Monitor { command } => match command {
+            MonitorCommand::Start => monitor::start(),
+            MonitorCommand::Stop => monitor::stop(),
+            MonitorCommand::Status => monitor::status(),
+        },
         Command::Wait {
             command: WaitCommand::Lead { lead, timeout },
         } => lead::wait(&lead, timeout),

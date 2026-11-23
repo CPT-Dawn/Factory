@@ -24,6 +24,9 @@ pub struct Paths {
     /// herdr's socket: `$HERDR_SOCKET_PATH`, as herdr sets it in its panes, else herdr's
     /// default `${XDG_CONFIG_HOME:-$HOME/.config}/herdr/herdr.sock`.
     pub herdr: PathBuf,
+    /// Claude Code's config dir, where it logs its sessions: `$CLAUDE_CONFIG_DIR`, else
+    /// `$HOME/.claude`.
+    pub claude: PathBuf,
     /// Where `factory install` puts the binary: `$HOME/.local/bin`, where the service unit
     /// runs it from.
     pub bin: PathBuf,
@@ -64,6 +67,8 @@ impl Paths {
         let herdr = var("HERDR_SOCKET_PATH")
             .map_or_else(|| config_home.join("herdr/herdr.sock"), PathBuf::from);
         let config = config_dir();
+        let claude = var("CLAUDE_CONFIG_DIR")
+            .map_or_else(|| Path::new(&home()).join(".claude"), PathBuf::from);
         let runtime = runtime_dir().ok_or_else(|| {
             Failure::precondition("XDG_RUNTIME_DIR is not set; run factory inside a user session")
         })?;
@@ -72,6 +77,7 @@ impl Paths {
             runtime,
             config,
             herdr,
+            claude,
             bin: Path::new(&home()).join(".local/bin"),
             units: config_home.join("systemd/user"),
         })
@@ -105,6 +111,11 @@ impl Paths {
                 pr.number,
                 head.get(..12).unwrap_or(head)
             ))
+    }
+
+    /// Where Claude Code keeps one directory of session logs per working directory.
+    pub fn claude_projects(&self) -> PathBuf {
+        self.claude.join("projects")
     }
 
     pub fn config_file(&self) -> PathBuf {

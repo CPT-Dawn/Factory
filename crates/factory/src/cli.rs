@@ -39,6 +39,11 @@ pub enum Command {
         #[command(subcommand)]
         command: LeadCommand,
     },
+    /// Watch every lead's and subagent's context; compact idle leads over the threshold
+    Monitor {
+        #[command(subcommand)]
+        command: MonitorCommand,
+    },
     /// Block, silent, until something happens
     Wait {
         #[command(subcommand)]
@@ -116,6 +121,16 @@ pub enum LeadCommand {
         /// The lead's slug, or lead-<slug>
         lead: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MonitorCommand {
+    /// Start the context steward in the daemon; starting it twice changes nothing
+    Start,
+    /// Stop it; a compaction under way still finishes
+    Stop,
+    /// Whether it runs, and the context of each lead and subagent it watches
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
