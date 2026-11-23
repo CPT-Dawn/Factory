@@ -2,19 +2,25 @@
 
 mod cli;
 mod client;
+mod clock;
+mod config;
 mod daemon;
 mod lab;
+mod lead;
+mod leads;
 mod log;
 mod output;
 mod paths;
 mod protocol;
 mod review;
+mod router;
+mod store;
 
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
 
-use cli::Command;
+use cli::{Command, LeadCommand, WaitCommand};
 use output::{Done, Failure};
 
 fn main() -> ExitCode {
@@ -41,6 +47,15 @@ fn main() -> ExitCode {
 fn run(command: Command, json: bool) -> Result<Done, Failure> {
     match command {
         Command::Log { kind, pairs } => log::run(&kind, &pairs),
+        Command::Lead {
+            command: LeadCommand::List,
+        } => lead::list(),
+        Command::Lead {
+            command: LeadCommand::Status { lead },
+        } => lead::status(&lead),
+        Command::Wait {
+            command: WaitCommand::Lead { lead, timeout },
+        } => lead::wait(&lead, timeout),
         Command::Review {
             base,
             label,
@@ -52,7 +67,7 @@ fn run(command: Command, json: bool) -> Result<Done, Failure> {
             label,
             spec,
             previous,
-            timeout: std::time::Duration::from_secs(timeout),
+            timeout: timeout.map(std::time::Duration::from_secs),
         }),
         Command::Daemon => daemon::run(json),
         // main hands every `factory lab` to the lab; this arm is never reached.

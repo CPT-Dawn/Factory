@@ -168,10 +168,20 @@ pub const REPORT_CONTRACT: &str = r#"End the report with its findings ledger, th
 
 One entry per open finding (an empty list when none is open): severity is blocking, advisory or question; axis is standards or spec; tag is one from the rubric's list."#;
 
-/// The prompt a backend gets: the bundle is its whole input.
-pub fn prompt(base: &str, bundle: &str, spec: &str, previous: Option<&str>) -> String {
+/// What a headless Claude reviewer is told beside its prompt: it stands in for the others, so
+/// it reads the reviewer skill they run as a file and follows it.
+pub const STANDIN_REVIEWER: &str = "You are the factory's code reviewer, standing in while the \
+     other review backends are out of quota. Your steps are the review skill at \
+     ~/.agents/skills/code-review/SKILL.md (a `code-review` skill in your listing is the \
+     dispatcher, not the reviewer). Read it first and follow it exactly: both axes, the report \
+     format, and the closing FINDINGS and VERDICT lines. The reviewer rules in \
+     ~/.codex/AGENTS.md apply as well.";
+
+/// The prompt a backend gets: the bundle is its whole input. `opening` is the backend's own
+/// first line, which sets it reviewing the changes since the base.
+pub fn prompt(opening: &str, bundle: &str, spec: &str, previous: Option<&str>) -> String {
     let mut out = format!(
-        "$code-review since {base}.\n\
+        "{opening}\n\
          The review bundle is your whole input: {bundle}. It holds the commits, the diff stat, \
          the full diff, the spec, the previous review, the repo's standards (skip what they say \
          tooling enforces) and the implementer's evidence. Open other files only to check a \
@@ -414,6 +424,8 @@ pub struct Record<'a> {
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
     pub duration_s: u64,
+    /// The backends that ran out of quota before this one took the review, comma-joined.
+    pub fallback_from: &'a str,
     pub report: &'a str,
     pub stream: &'a str,
     /// The run's findings ledger file.
@@ -443,6 +455,7 @@ impl Record<'_> {
             format!("reviewer={}", self.backend),
             format!("backend={}", self.backend),
             format!("duration_s={}", self.duration_s),
+            format!("fallback_from={}", self.fallback_from),
             format!("model={}", self.model.unwrap_or_default()),
             format!("effort={}", self.effort.unwrap_or_default()),
             format!("report={}", self.report),
@@ -656,6 +669,7 @@ mod tests {
             model: Some("m"),
             effort: None,
             duration_s: 7,
+            fallback_from: "",
             report: "r.md",
             stream: "r.jsonl",
             findings: "r.findings.json",

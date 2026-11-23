@@ -21,6 +21,8 @@ tokio = { version = "1.54", features = ["rt-multi-thread", "net", "io-util", "ti
 regex = "1"
 rusqlite = { version = "0.43", features = ["bundled"] }
 proptest = "1"
+toml = "1.2"
+jiff = "1"
 tempfile = "3"
 
 [workspace.lints.rust]
