@@ -222,6 +222,26 @@ pub fn agy_usage(usage: &str, group: &str) -> AgyUsage {
     until.map_or(AgyUsage::Left, |until| AgyUsage::Empty { until })
 }
 
+/// Whether a bucket of agy's model `group` over `window` (`5h`, `weekly`) has less than
+/// `fraction` of its quota left, by its usage query: a reserve kept for the reviews that may
+/// spend it. An answer that can't be read keeps nothing back.
+pub fn agy_below(usage: &str, group: &str, window: &str, fraction: f64) -> bool {
+    let Ok(usage) = serde_json::from_str::<Value>(usage) else {
+        return false;
+    };
+    usage
+        .pointer("/command/data/groups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|candidate| candidate.get("name").and_then(Value::as_str) == Some(group))
+        .filter_map(|group| group.get("buckets")?.as_array())
+        .flatten()
+        .filter(|bucket| bucket.get("window").and_then(Value::as_str) == Some(window))
+        .filter_map(|bucket| bucket.get("remaining_fraction")?.as_f64())
+        .any(|left| left < fraction)
+}
+
 /// The model agy runs when none is chosen, in the factory's config or in agy: its log names it
 /// `Gemini 4 Neon (High)` (agy 1.5).
 pub const AGY_DEFAULT_MODEL: &str = "gemini-4-neon";

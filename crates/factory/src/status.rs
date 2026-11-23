@@ -16,6 +16,7 @@ use crate::paths::Paths;
 use crate::protocol::{BackendSlots, LeadContext, STATUS, StatusParams};
 use crate::router::Router;
 use crate::steward::Steward;
+use factory_core::quota::WhenBusy;
 
 pub fn run() -> Result<Done, Failure> {
     let paths = Paths::from_env()?;
@@ -24,7 +25,7 @@ pub fn run() -> Result<Done, Failure> {
         .map(|backend| BackendSlots {
             name: backend.name,
             concurrency: backend.concurrency,
-            when_busy: backend.when_busy.into(),
+            when_busy: backend.when_busy.unwrap_or(WhenBusy::Queue).into(),
         })
         .collect();
     let status: Status = client::call(&paths, STATUS, &StatusParams { backends })?;

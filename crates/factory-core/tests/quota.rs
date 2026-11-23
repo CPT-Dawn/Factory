@@ -401,3 +401,18 @@ fn a_reset_after_a_while_or_at_a_moment_is_that_moment() {
     );
     assert_eq!(Reset::On(at(T13_00)).until(at(T10_00), -18_000), at(T13_00));
 }
+
+#[test]
+fn a_groups_bucket_under_a_fraction_is_below_its_reserve() {
+    let usage = r#"{"command": {"data": {"groups": [
+        {"name": "Gemini Models", "buckets": [
+            {"window": "weekly", "remaining_fraction": 0.1},
+            {"window": "5h", "remaining_fraction": 0.19}]},
+        {"name": "Gemini 4 Argon", "buckets": [{"window": "5h", "remaining_fraction": 0.5}]}]}}}"#;
+
+    assert!(quota::agy_below(usage, "Gemini Models", "5h", 0.2));
+    assert!(!quota::agy_below(usage, "Gemini Models", "5h", 0.19));
+    assert!(!quota::agy_below(usage, "Gemini 4 Argon", "5h", 0.2));
+    assert!(!quota::agy_below(usage, "Claude and GPT models", "5h", 0.2));
+    assert!(!quota::agy_below("not json", "Gemini Models", "5h", 0.2));
+}

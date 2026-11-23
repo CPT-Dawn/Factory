@@ -68,6 +68,11 @@ fn event(sandbox: &Sandbox, index: usize) -> Value {
 fn a_codex_usage_limit_cools_codex_down_to_its_reset_and_reruns_the_review_on_claude() {
     let sandbox = Sandbox::new().env("TZ", "UTC");
     let repo = sandbox.repo();
+    // Codex then claude, each on its own model: the default chains are not what this is about.
+    configure(
+        &sandbox,
+        "[[review.backend]]\ncli = \"codex\"\n\n[[review.backend]]\ncli = \"claude\"\nmodel = \"opus\"\neffort = \"high\"\n",
+    );
     let (reset, until) = reset_in_two_hours();
     sandbox.fake("codex", &codex_out_of_quota(&reset));
     sandbox.fake("claude", &claude_writes(CLEAN_REPORT));
@@ -485,7 +490,35 @@ fn what_the_config_leaves_unset_is_left_to_codexs_own_config() {
     assert_eq!(out.code, 0, "{out:?}");
     let argv = &sandbox.calls("codex")[0];
     assert_eq!(after(argv, "-m"), Some("gpt-test"), "{argv:?}");
-    assert!(!argv.iter().any(|arg| arg == "-c"), "{argv:?}");
+    let settings: Vec<&str> = argv
+        .windows(2)
+        .filter(|pair| pair[0] == "-c")
+        .map(|pair| pair[1].as_str())
+        .collect();
+    assert_eq!(
+        settings,
+        ["web_search=\"disabled\""],
+        "no effort or other setting is passed: {argv:?}"
+    );
+    let disabled: Vec<&str> = argv
+        .windows(2)
+        .filter(|pair| pair[0] == "--disable")
+        .map(|pair| pair[1].as_str())
+        .collect();
+    assert_eq!(
+        disabled,
+        [
+            "image_generation",
+            "browser_use",
+            "computer_use",
+            "in_app_browser",
+            "plugins",
+            "goals",
+            "tool_suggest",
+            "multi_agent"
+        ],
+        "{argv:?}"
+    );
     let logged = event(&sandbox, 0);
     assert_eq!(logged["model"], "gpt-test", "{logged}");
     assert_eq!(logged["effort"], "xhigh", "{logged}");
