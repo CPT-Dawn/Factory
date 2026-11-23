@@ -12,8 +12,8 @@ use super::context::Ctx;
 use super::host::proc;
 use super::stack;
 use super::wire::{
-    ACQUIRE, AcquireParams, GC, Granted, LEASE, Lease, Process, ProjectAsk, RELEASE, ReleaseParams,
-    SLOT, STOPPING, SlotParams, StackAsk, StopParams,
+    ACQUIRE, AcquireParams, GC, Granted, LEASE, Lease, Process, ProjectAsk, RECEIVED, RELEASE,
+    ReleaseParams, SLOT, STOPPING, SlotParams, StackAsk, StopParams,
 };
 use crate::client;
 use crate::output::Failure;
@@ -72,12 +72,13 @@ pub fn acquire(
         .and_then(|wait| wait.checked_add(ANSWER_GRACE));
     // A daemon that comes back says why it waits again: say it once.
     let mut said = String::new();
-    let granted: Granted = client::call_queued(&paths()?, ACQUIRE, params, listen, |why| {
-        if why != said {
-            waiting(why);
-            said = why.to_owned();
-        }
-    })?;
+    let granted: Granted =
+        client::call_queued(&paths()?, ACQUIRE, RECEIVED, params, listen, |why| {
+            if why != said {
+                waiting(why);
+                said = why.to_owned();
+            }
+        })?;
     let lease = granted.lease;
     if let (Some(p), Some(slot)) = (&ctx.project, lease.slot) {
         stack::prepare_workdir(p, &ctx.worktree, slot)?;

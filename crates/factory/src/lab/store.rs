@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::wire::{Granted, Lease, Owner, Process, SlotRow, Waiter};
+use super::wire::{AcquireParams, Granted, Lease, Owner, Process, SlotRow, Waiter};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS leases (
@@ -171,13 +171,7 @@ pub struct Place {
 /// The request this caller made before, by the place it names or else by the devlab call that
 /// asks, if it is the same owner's in the same worktree. A grant whose lease has gone since goes
 /// with it.
-pub fn place(
-    c: &Connection,
-    resume: Option<i64>,
-    client: Option<&Process>,
-    owner: &str,
-    worktree: &str,
-) -> rusqlite::Result<Option<Place>> {
+pub fn place(c: &Connection, p: &AcquireParams) -> rusqlite::Result<Option<Place>> {
     let row = |row: &Row<'_>| {
         Ok((
             waiter_row(row)?,
@@ -185,7 +179,7 @@ pub fn place(
             row.get::<_, Option<String>>("previous")?,
         ))
     };
-    let found = match (resume, client) {
+    let found = match (p.resume, &p.client) {
         (Some(id), _) => c
             .query_row("SELECT * FROM waiters WHERE id = ?1", [id], row)
             .optional()?,
@@ -200,7 +194,7 @@ pub fn place(
         (None, None) => None,
     };
     let Some((waiter, granted, previous)) =
-        found.filter(|(w, _, _)| w.owner == owner && w.worktree == worktree)
+        found.filter(|(w, _, _)| w.owner == p.owner.key() && w.worktree == p.worktree)
     else {
         return Ok(None);
     };
@@ -457,91 +451,4 @@ pub fn set_stack_ours(
         params![project, slot, ours],
     )?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn owner(pid: i64) -> Owner {
-        Owner {
-            pid,
-            start: "1".to_owned(),
-            label: format!("claude:{pid}"),
-            found: true,
-        }
-    }
-
-    fn waiter(client: i64) -> Waiter {
-        Waiter {
-            id: 0,
-            created: 1,
-            label: "claude:7 @ demo-a".to_owned(),
-            owner: owner(7).key(),
-            owner_label: "claude:7".to_owned(),
-            worktree: "/w/demo-a".to_owned(),
-            lease: None,
-            project: Some("demo".to_owned()),
-            slot_cap: Some(1),
-            max_slots: 2,
-            deadline_ms: Some(1_000),
-            client_pid: Some(client),
-            client_start: Some("1".to_owned()),
-        }
-    }
-
-    /// A store holding one request by owner 7 from devlab call `client`, granted slot 0 but not
-    /// yet answered; the store, the dir it lives in, and the request's place.
-    fn granted_unanswered(client: i64) -> (Store, tempfile::TempDir, i64) {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let mut store = Store::open(&dir.path().join("lab.db")).expect("open the store");
-        let id = store
-            .write(|c| {
-                let id = insert_waiter(c, &waiter(client))?;
-                let lease = insert_lease(c, Some("demo"), "/w/demo-a", &owner(7), Some(0), 1)?;
-                mark_granted(c, id, lease.id, None)?;
-                Ok(id)
-            })
-            .expect("write the store");
-        (store, dir, id)
-    }
-
-    #[test]
-    fn a_grant_whose_caller_exits_before_hearing_of_it_is_given_back() {
-        let (mut store, _dir, _) = granted_unanswered(41);
-        let only_7 = |pid: i64, _: &str| pid == 7;
-
-        let (pruned, left) = store
-            .write(|c| {
-                let pruned = prune_waiters(c, 2_000, 30_000, &|_| false, &only_7)?;
-                Ok((pruned, leases(c)?))
-            })
-            .expect("prune");
-
-        assert_eq!((pruned, left), (1, Vec::new()));
-    }
-
-    #[test]
-    fn a_grant_not_yet_answered_waits_for_its_caller_out_of_the_queue() {
-        let (mut store, _dir, id) = granted_unanswered(41);
-        let all_alive = |_: i64, _: &str| true;
-        let client = Process {
-            pid: 41,
-            start: "1".to_owned(),
-        };
-
-        let (queue, found) = store
-            .write(|c| {
-                // Long past its deadline: a grant waits for its caller all the same.
-                prune_waiters(c, 1_000_000, 30_000, &|_| false, &all_alive)?;
-                let found = place(c, None, Some(&client), &owner(7).key(), "/w/demo-a")?;
-                Ok((waiters(c)?, found))
-            })
-            .expect("read the store");
-
-        assert_eq!(queue, Vec::new());
-        let found = found.expect("the caller finds its request");
-        assert_eq!(found.waiter.id, id);
-        assert_eq!(found.granted.map(|g| g.lease.slot), Some(Some(0)));
-    }
 }

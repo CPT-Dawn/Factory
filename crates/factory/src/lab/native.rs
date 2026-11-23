@@ -200,11 +200,11 @@ fn lease_done(ctx: &Ctx, lease: &Lease, warnings: &[String]) -> Result<Done, Fai
     ))
 }
 
-/// Runs `argv` in the lease, its output in `<runtime>/lab/lease-N.out`: ``cmd` exited 0 in
-/// lease 3; output in <file>`, and the command's code to exit with.
+/// Runs `argv` in the lease, its output in `<runtime>/lab/lease-N.out`: the line
+/// `sh exited 3 in lease 1; output in <file>`, and the command's code to exit with.
 fn ran(ctx: &Ctx, lease: &Lease, argv: &[String]) -> Result<Verb, Failure> {
     let file = save(&format!("lease-{}.out", lease.id), "")?;
-    let code = run::exec_logged(ctx, lease, argv, &file)?;
+    let code = run::exec_in(ctx, lease, argv, Some(&file))?;
     let program = argv.first().map_or("", String::as_str);
     let line = format!(
         "{program} exited {code} in lease {}; output in {}",

@@ -872,8 +872,9 @@ fn a_request_its_caller_sends_again_keeps_the_place_it_never_heard_of() {
     let (a, b, caller) = (Agent::start(), Agent::start(), Agent::start());
     let daemon = || run(devlab(&sandbox, &wt, &["status"]));
     assert_eq!(daemon().code, 0);
-    let (_first, held) = ask(&sandbox, &wt, a.pid(), caller.pid(), "result");
+    let (mut first, held) = ask(&sandbox, &wt, a.pid(), caller.pid(), "result");
     assert!(held["result"]["lease"]["slot"] == 0, "{held}");
+    assert_eq!(received(&mut first)["result"], true);
     let (gone, queued) = ask(&sandbox, &wt, b.pid(), caller.pid(), "queued");
     assert!(queued["queued"].is_i64(), "{queued}");
 
@@ -928,4 +929,96 @@ fn factory_lab_gc_names_a_file_with_the_leases_it_released() {
             "released lease 1 (sleep:{pa}, owner exited)\nreleased lease 2 (sleep:{pb}, owner exited)\n"
         )
     );
+}
+
+/// Tells the daemon the grant on `stream` reached its caller; its confirmation.
+fn received(stream: &mut UnixStream) -> serde_json::Value {
+    let said = serde_json::json!({"id": 2, "method": "lab.received"});
+    writeln!(stream, "{said}").expect("say the grant arrived");
+    let mut line = String::new();
+    BufReader::new(stream.try_clone().expect("clone the stream"))
+        .read_line(&mut line)
+        .expect("read the daemon");
+    serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line:?}"))
+}
+
+/// The ids of the leases on the one-slot project [`ask`] asks for.
+fn solo_leases(sandbox: &Sandbox, dir: &Path) -> Vec<i64> {
+    let board = one_json(&native(
+        sandbox,
+        dir,
+        std::process::id(),
+        &["lab", "status", "--json"],
+    ));
+    board["leases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|lease| lease["project"] == "solo")
+        .filter_map(|lease| lease["id"].as_i64())
+        .collect()
+}
+
+#[test]
+fn a_grant_its_caller_never_says_it_received_is_given_back() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-a");
+    let (a, caller) = (Agent::start(), Agent::start());
+    assert_eq!(run(devlab(&sandbox, &wt, &["status"])).code, 0);
+    let (unread, held) = ask(&sandbox, &wt, a.pid(), caller.pid(), "result");
+    assert!(held["result"]["lease"]["id"].is_i64(), "{held}");
+
+    drop(unread);
+
+    assert!(
+        poll_until(|| solo_leases(&sandbox, &wt).is_empty()),
+        "the grant outlived its caller"
+    );
+}
+
+#[test]
+fn a_grant_lost_in_a_restart_goes_to_its_caller_when_it_asks_again() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-a");
+    let (a, mut caller) = (Agent::start(), Agent::start());
+    let daemon = || run(devlab(&sandbox, &wt, &["status"]));
+    assert_eq!(daemon().code, 0);
+    let (lost, held) = ask(&sandbox, &wt, a.pid(), caller.pid(), "result");
+
+    // The daemon restarts before it hears that the grant arrived.
+    stop_daemon(&sandbox);
+    drop(lost);
+    assert_eq!(daemon().code, 0);
+    let (mut again, regranted) = ask(&sandbox, &wt, a.pid(), caller.pid(), "result");
+    let confirmed = received(&mut again);
+    drop(again);
+    caller.exit();
+
+    assert_eq!(
+        regranted["result"]["lease"], held["result"]["lease"],
+        "{regranted}"
+    );
+    assert_eq!(confirmed["result"], true, "{confirmed}");
+    assert_eq!(
+        solo_leases(&sandbox, &wt),
+        vec![held["result"]["lease"]["id"].as_i64().unwrap_or_default()]
+    );
+}
+
+#[test]
+fn a_grant_lost_in_a_restart_is_given_back_once_its_caller_exits() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-a");
+    let (a, mut caller) = (Agent::start(), Agent::start());
+    let daemon = || run(devlab(&sandbox, &wt, &["status"]));
+    assert_eq!(daemon().code, 0);
+    let (lost, held) = ask(&sandbox, &wt, a.pid(), caller.pid(), "result");
+    assert!(held["result"]["lease"]["id"].is_i64(), "{held}");
+
+    stop_daemon(&sandbox);
+    drop(lost);
+    caller.exit();
+    assert_eq!(daemon().code, 0);
+
+    assert_eq!(solo_leases(&sandbox, &wt), Vec::<i64>::new());
 }

@@ -69,10 +69,12 @@ pub fn wait<P: Serialize, R: DeserializeOwned>(
 /// When the daemon goes away once asked, the CLI connects again (starting a daemon if none runs)
 /// and asks with `params(Some(place))`, keeping its place; for up to [`RESUME_TIMEOUT`] each
 /// time. Before it heard of a place it asks with `params(None)`: the daemon finds the place by
-/// the caller `params` names.
+/// the caller `params` names. With its answer in hand it sends `received` and returns once the
+/// daemon confirms it; a lost confirmation asks again, and is answered the same.
 pub fn call_queued<P: Serialize, R: DeserializeOwned>(
     paths: &Paths,
     method: &str,
+    received: &str,
     params: impl Fn(Option<i64>) -> P,
     read_timeout: Option<Duration>,
     mut on_note: impl FnMut(&str),
@@ -91,7 +93,20 @@ pub fn call_queued<P: Serialize, R: DeserializeOwned>(
                 &mut on_note,
                 &mut |n| placed = Some(n),
             ) {
-                Ok(answer) => return Ok(answer),
+                Ok(answer) => match session.exchange_raw::<_, serde_json::Value>(
+                    received,
+                    &(),
+                    Some(ANSWER_TIMEOUT),
+                    Exit::Precondition,
+                    &mut |_| {},
+                    &mut |_| {},
+                ) {
+                    Ok(_) => return Ok(answer),
+                    Err(Ended::Refused(failure) | Ended::Lost(failure)) => {
+                        asked = true;
+                        failure
+                    }
+                },
                 Err(Ended::Refused(failure)) => return Err(failure),
                 Err(Ended::Lost(failure)) => {
                     asked = true;

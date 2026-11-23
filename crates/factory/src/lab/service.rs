@@ -28,8 +28,8 @@ use super::host;
 use super::lease::base_name;
 use super::store::{self, Store};
 use super::wire::{
-    AcquireParams, Board, FindParams, GC, Granted, LEASE, Lease, RELEASE, ReleaseParams, SLOT,
-    STATUS, STOPPING, SlotParams, StopParams, Waiter,
+    AcquireParams, Board, FindParams, GC, Granted, LEASE, Lease, RECEIVED, RELEASE, ReleaseParams,
+    SLOT, STATUS, STOPPING, SlotParams, StopParams, Waiter,
 };
 use crate::protocol::{ErrorBody, Outcome, Request, Response};
 
@@ -39,6 +39,8 @@ const RECHECK: Duration = Duration::from_secs(3);
 /// How long past its deadline a waiter whose caller is away keeps its place, so a caller that
 /// lost the daemon as its wait ran out still hears that it gave up.
 const AWAY_GRACE_MS: i64 = 30_000;
+/// How long a caller may take to say it has its grant before the grant is given back.
+const RECEIVED_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a wait with no end of its own lasts.
 const FOREVER: Duration = Duration::from_secs(365 * 86400);
 
@@ -116,18 +118,19 @@ impl Lab {
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
-    /// Ends a granted request once its answer is sent, or couldn't be: `unanswered` is the lease
-    /// to give back, which its caller never learned of.
-    fn settle(&self, waiter: i64, unanswered: Option<&Lease>) {
-        let wrote = self.write(|c, now| {
+    /// Ends a granted request once its caller said it has the answer, or can't: `unanswered` is
+    /// the lease to give back, which its caller never learned of.
+    fn settle(&self, waiter: i64, unanswered: Option<&Lease>) -> Answer<()> {
+        self.write(|c, now| {
             if let Some(lease) = unanswered {
                 store::drop_lease(c, lease, now)?;
             }
             store::delete_waiter(c, waiter)
-        });
-        if unanswered.is_some() && wrote.is_ok() {
+        })?;
+        if unanswered.is_some() {
             self.notify();
         }
+        Ok(())
     }
 
     fn remove_waiter(&self, id: i64) {
@@ -293,7 +296,7 @@ enum Queued {
 /// The caller counts as attached from here.
 fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<Queued> {
     lab.write(|c, now| {
-        let kept = store::place(c, p.resume, p.client.as_ref(), &p.owner.key(), &p.worktree)?;
+        let kept = store::place(c, p)?;
         let queued = match kept {
             Some(store::Place {
                 waiter,
@@ -485,7 +488,7 @@ where
             granted,
         }) => {
             let _attached = Attached(Arc::clone(&lab), waiter);
-            answer(&lab, writer, id, waiter, granted, true).await;
+            answer(&lab, writer, lines, id, waiter, granted, true).await;
             return;
         }
         Err(body) => {
@@ -548,7 +551,7 @@ where
         let why = match tried {
             Ok(Ok((granted, fresh))) => {
                 lab.notify();
-                answer(&lab, writer, id, waiter, granted, fresh).await;
+                answer(&lab, writer, lines, id, waiter, granted, fresh).await;
                 return;
             }
             Ok(Err(why)) => why,
@@ -606,19 +609,24 @@ where
     }
 }
 
-/// Sends the grant, then lets the waiter go. A caller gone before its answer never learns of a
-/// `fresh` lease: it is given back.
-async fn answer<W: AsyncWrite + Unpin>(
+/// Sends the grant, then lets the waiter go once the caller says it has it ([`RECEIVED`]), and
+/// confirms. A caller gone before that never learns of a `fresh` lease: it is given back. Until
+/// the waiter goes, a daemon that restarts hands its caller the same grant.
+async fn answer<W, R>(
     lab: &Lab,
     writer: &mut W,
+    lines: &mut Lines<R>,
     id: Option<u64>,
     waiter: i64,
     granted: Granted,
     fresh: bool,
-) {
+) where
+    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+{
     let lease = granted.lease.clone();
     let value = serde_json::to_value(granted).unwrap_or(Value::Null);
-    let answered = send(
+    let sent = send(
         writer,
         Response {
             id,
@@ -626,7 +634,33 @@ async fn answer<W: AsyncWrite + Unpin>(
         },
     )
     .await;
-    lab.settle(waiter, (!answered && fresh).then_some(&lease));
+    let received = if sent {
+        tokio::time::timeout(RECEIVED_TIMEOUT, lines.next_line())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .and_then(|line| serde_json::from_str::<Request>(&line).ok())
+            .filter(|said| said.method == RECEIVED)
+    } else {
+        None
+    };
+    let Some(said) = received else {
+        let _ = lab.settle(waiter, fresh.then_some(&lease));
+        return;
+    };
+    let outcome = match lab.settle(waiter, None) {
+        Ok(()) => Outcome::Result(Value::Bool(true)),
+        Err(body) => Outcome::Error(body),
+    };
+    send(
+        writer,
+        Response {
+            id: Some(said.id),
+            outcome,
+        },
+    )
+    .await;
 }
 
 async fn blocking<T: Send + 'static>(

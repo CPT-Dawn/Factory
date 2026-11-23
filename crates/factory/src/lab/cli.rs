@@ -71,7 +71,7 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
                 );
                 return Ok(0);
             }
-            run::exec_in(&ctx, &granted, rest)
+            run::exec_in(&ctx, &granted, rest, None)
         }
         "exec" => {
             let ctx = context()?;
@@ -83,7 +83,7 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
                 return Err(Failure::usage("devlab exec -- <cmd...>"));
             }
             let held = lease::live(&ctx)?;
-            run::exec_in(&ctx, &held, rest)
+            run::exec_in(&ctx, &held, rest, None)
         }
         "env" => {
             let ctx = context()?;

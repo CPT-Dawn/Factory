@@ -6,8 +6,13 @@ use serde::{Deserialize, Serialize};
 
 /// Waits in the queue until a lease can be granted: [`AcquireParams`] in, its place in the
 /// queue (`{"id", "queued"}`), notes while it waits (`{"id", "note"}`), then [`Granted`] or an
-/// error. The queue outlives the daemon: a caller that lost it asks again with `resume`.
+/// error. The queue outlives the daemon: a caller that lost it asks again with `resume`. A
+/// caller sends [`RECEIVED`] on the same connection once it has its grant.
 pub const ACQUIRE: &str = "lab.acquire";
+/// The caller of [`ACQUIRE`] has its grant: no params, `true` out once the daemon let its place
+/// go. Until then a daemon that restarts hands the caller that grant again, and gives it back
+/// once the caller exits.
+pub const RECEIVED: &str = "lab.received";
 /// The caller's lease, touched: [`FindParams`] in, `Option<Lease>` out.
 pub const LEASE: &str = "lab.lease";
 /// Drops the caller's lease: [`ReleaseParams`] in, the lease it dropped (`Option<Lease>`) out.
