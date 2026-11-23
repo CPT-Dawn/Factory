@@ -23,6 +23,7 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use tempfile::TempDir;
 
 pub mod golden;
+pub mod herdr;
 pub mod world;
 
 /// External tools faked on every sandbox's PATH. Add a tool here when a command starts using it.

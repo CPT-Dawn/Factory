@@ -18,6 +18,9 @@ pub struct Paths {
     pub state: PathBuf,
     pub runtime: PathBuf,
     pub config: PathBuf,
+    /// herdr's socket: `$HERDR_SOCKET_PATH`, as herdr sets it in its panes, else herdr's
+    /// default `${XDG_CONFIG_HOME:-$HOME/.config}/herdr/herdr.sock`.
+    pub herdr: PathBuf,
 }
 
 impl Paths {
@@ -30,6 +33,11 @@ impl Paths {
             (None, Some(dir)) => Path::new(&dir).join("factory"),
             (None, None) => Path::new(&home()).join(".local/state/factory"),
         };
+        let herdr = match (var("HERDR_SOCKET_PATH"), var("XDG_CONFIG_HOME")) {
+            (Some(socket), _) => PathBuf::from(socket),
+            (None, Some(dir)) => Path::new(&dir).join("herdr/herdr.sock"),
+            (None, None) => Path::new(&home()).join(".config/herdr/herdr.sock"),
+        };
         let config = var("XDG_CONFIG_HOME")
             .map_or_else(|| Path::new(&home()).join(".config"), PathBuf::from)
             .join("factory");
@@ -40,6 +48,7 @@ impl Paths {
             state,
             runtime: Path::new(&runtime).join("factory"),
             config,
+            herdr,
         })
     }
 
@@ -55,6 +64,14 @@ impl Paths {
 
     pub fn config_file(&self) -> PathBuf {
         self.config.join("config.toml")
+    }
+
+    /// The final report of the lead `slug` working in `repo`, as lead.sh names it.
+    pub fn lead_report(&self, repo: &str, slug: &str) -> PathBuf {
+        self.state
+            .join("leads")
+            .join(repo)
+            .join(format!("{slug}.md"))
     }
 
     pub fn socket(&self) -> PathBuf {

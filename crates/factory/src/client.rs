@@ -42,6 +42,17 @@ pub fn call<P: Serialize, R: DeserializeOwned>(
     Session::open(paths)?.call(method, params)
 }
 
+/// Sends a request the daemon answers when an event fires, at most `limit` from now. The daemon
+/// keeps the time; past `limit` and a grace period the CLI gives up with exit 124 on its own.
+pub fn wait<P: Serialize, R: DeserializeOwned>(
+    paths: &Paths,
+    method: &str,
+    params: &P,
+    limit: Duration,
+) -> Result<R, Failure> {
+    Session::open(paths)?.exchange(method, params, Some(limit + ANSWER_TIMEOUT), Exit::Timeout)
+}
+
 /// One connection to the daemon, kept open across requests: what the daemon grants on it (a
 /// review slot) is held until the session drops.
 pub struct Session {
@@ -65,7 +76,7 @@ impl Session {
         method: &str,
         params: &P,
     ) -> Result<R, Failure> {
-        self.exchange(method, params, Some(ANSWER_TIMEOUT))
+        self.exchange(method, params, Some(ANSWER_TIMEOUT), Exit::Precondition)
     }
 
     /// Sends a request the daemon answers when what it waits on happens, however long that is.
@@ -74,14 +85,17 @@ impl Session {
         method: &str,
         params: &P,
     ) -> Result<R, Failure> {
-        self.exchange(method, params, None)
+        self.exchange(method, params, None, Exit::Precondition)
     }
 
+    /// Sends a request and reads its answer, giving up with `impatient` once `patience` (if
+    /// any) has passed without one.
     fn exchange<P: Serialize, R: DeserializeOwned>(
         &mut self,
         method: &str,
         params: &P,
-        timeout: Option<Duration>,
+        patience: Option<Duration>,
+        impatient: Exit,
     ) -> Result<R, Failure> {
         let paths = &self.paths;
         let broken = |e: &dyn std::fmt::Display| {
@@ -103,17 +117,20 @@ impl Session {
         (&*stream)
             .write_all(line.as_bytes())
             .map_err(|e| broken(&e))?;
-        stream.set_read_timeout(timeout).map_err(|e| broken(&e))?;
+        stream.set_read_timeout(patience).map_err(|e| broken(&e))?;
         let mut answer = String::new();
         match self.reader.read_line(&mut answer) {
             Ok(0) => return Err(broken(&"it closed the connection without answering")),
             Ok(_) => {}
             Err(e) if is_timeout(&e) => {
-                return Err(Failure::precondition(format!(
-                    "the daemon did not answer within {}s; see {}",
-                    ANSWER_TIMEOUT.as_secs(),
-                    paths.daemon_log().display()
-                )));
+                return Err(Failure::new(
+                    impatient,
+                    format!(
+                        "the daemon did not answer within {}s; see {}",
+                        patience.unwrap_or_default().as_secs(),
+                        paths.daemon_log().display()
+                    ),
+                ));
             }
             Err(e) => return Err(broken(&e)),
         }
