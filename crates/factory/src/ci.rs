@@ -20,9 +20,7 @@ pub fn wait(pr: &str, timeout: Duration) -> Result<Done, Failure> {
     let params = WaitCiParams {
         pr: pr.to_owned(),
         cwd: cwd()?,
-        waiter: env::var("HERDR_PANE_ID")
-            .ok()
-            .filter(|pane| !pane.is_empty()),
+        waiter: client::waiter(),
         timeout_secs: timeout.as_secs(),
         poll_secs: poll.as_secs(),
     };

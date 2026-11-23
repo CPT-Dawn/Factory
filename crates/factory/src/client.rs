@@ -34,6 +34,13 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 /// The next step when the daemon fails to start for no reason it gave.
 const RUN_IT: &str = "run `factory daemon` to see why";
 
+/// The herdr pane this CLI runs in, which a wait names as its waiter; none outside herdr.
+pub fn waiter() -> Option<String> {
+    env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|pane| !pane.is_empty())
+}
+
 /// Sends one request on a connection of its own and returns its result, or the daemon's error
 /// as a [`Failure`].
 pub fn call<P: Serialize, R: DeserializeOwned>(

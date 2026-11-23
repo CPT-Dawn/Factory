@@ -1,7 +1,6 @@
 //! `factory lead list|status` and `factory wait lead`: what the leads in herdr are doing, from
 //! the daemon, which follows herdr's events.
 
-use std::env;
 use std::time::Duration;
 
 use factory_core::exit::Exit;
@@ -42,9 +41,7 @@ pub fn status(lead: &str) -> Result<Done, Failure> {
 pub fn wait(lead: &str, timeout: Duration) -> Result<Done, Failure> {
     let params = WaitLeadParams {
         lead: lead_name(lead).map_err(|e| Failure::usage(e.to_string()))?,
-        waiter: env::var("HERDR_PANE_ID")
-            .ok()
-            .filter(|pane| !pane.is_empty()),
+        waiter: client::waiter(),
         timeout_secs: timeout.as_secs(),
     };
     let paths = Paths::from_env()?;

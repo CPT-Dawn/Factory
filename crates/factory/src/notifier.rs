@@ -90,7 +90,11 @@ impl<I: InboxApi> Notifier<I> {
             return Err(config::notify_off(&config));
         }
         let limit = Duration::from_secs(params.timeout_secs);
+        // Both clocks from one moment, so a resumed wait keeps the deadline it was given.
         let deadline = Instant::now() + limit;
+        let deadline_ms = clock::now()
+            .unix_millis()
+            .saturating_add(i64::try_from(limit.as_millis()).unwrap_or(i64::MAX));
         let (on, running) = self
             .start(&params.on, params.waiter.clone(), deadline, limit)
             .await?;
@@ -99,9 +103,7 @@ impl<I: InboxApi> Notifier<I> {
             on,
             waiter: params.waiter,
             session: params.session,
-            deadline_ms: clock::now()
-                .unix_millis()
-                .saturating_add(i64::try_from(limit.as_millis()).unwrap_or(i64::MAX)),
+            deadline_ms,
             limit_secs: params.timeout_secs,
         };
         row.id = self.lock().add_notify(&row).map_err(|e| {
@@ -191,7 +193,7 @@ impl<I: InboxApi> Notifier<I> {
                 });
                 let ended = async move {
                     let answer = watch.finished(deadline, limit).await?;
-                    let exit = Exit::from_code(answer.exit).unwrap_or(Exit::NeedsAttention);
+                    let exit = exit_of(answer.exit);
                     Ok((ci::line(&answer), exit))
                 };
                 let on = NotifyOn::Ci {
@@ -211,7 +213,7 @@ impl<I: InboxApi> Notifier<I> {
                 let named = name.clone();
                 let ended = async move {
                     let answer = leads.settled(&named, deadline, limit).await?;
-                    let exit = Exit::from_code(answer.exit).unwrap_or(Exit::NeedsAttention);
+                    let exit = exit_of(answer.exit);
                     Ok((lead::line(&answer.lead), exit))
                 };
                 Ok((on.clone(), running(registered, ended)))
@@ -404,4 +406,9 @@ impl Drop for ExitWatch {
     fn drop(&mut self) {
         let _ = rustix::io::write(&self.stop, &1u64.to_ne_bytes());
     }
+}
+
+/// The exit a daemon answer names; one this binary doesn't know needs attention.
+fn exit_of(code: u8) -> Exit {
+    Exit::from_code(code).unwrap_or(Exit::NeedsAttention)
 }

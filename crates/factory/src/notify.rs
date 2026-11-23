@@ -33,9 +33,7 @@ pub fn register(on: NotifyOn, limit: Duration) -> Result<Done, Failure> {
     }
     let params = NotifyParams {
         on,
-        waiter: env::var("HERDR_PANE_ID")
-            .ok()
-            .filter(|pane| !pane.is_empty()),
+        waiter: client::waiter(),
         timeout_secs: limit.as_secs(),
         session: session()?,
     };
