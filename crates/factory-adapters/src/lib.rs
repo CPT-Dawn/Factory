@@ -10,6 +10,7 @@
 //! too, and those tests run a fake of it (`crates/factory/tests/cli/support/inbox.rs`).
 
 pub mod adb;
+pub mod devlab;
 pub mod docker;
 pub mod emulator;
 pub mod gh;
