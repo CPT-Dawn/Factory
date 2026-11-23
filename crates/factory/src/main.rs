@@ -7,6 +7,7 @@ mod log;
 mod output;
 mod paths;
 mod protocol;
+mod review;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -26,6 +27,19 @@ fn main() -> ExitCode {
 fn run(command: Command, json: bool) -> Result<Done, Failure> {
     match command {
         Command::Log { kind, pairs } => log::run(&kind, &pairs),
+        Command::Review {
+            base,
+            label,
+            spec,
+            previous,
+            timeout,
+        } => review::run(&review::Args {
+            base,
+            label,
+            spec,
+            previous,
+            timeout: std::time::Duration::from_secs(timeout),
+        }),
         Command::Daemon => daemon::run(json),
     }
 }

@@ -137,6 +137,7 @@ name = "factory"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "factory-adapters",
  "factory-core",
  "rustix",
  "serde",
@@ -148,6 +149,9 @@ dependencies = [
 [[package]]
 name = "factory-adapters"
 version = "0.1.0"
+dependencies = [
+ "rustix",
+]
 
 [[package]]
 name = "factory-core"
