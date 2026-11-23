@@ -13,7 +13,7 @@ fn state(agent: Option<&str>, reported: bool, waiting_on: Option<&str>) -> LeadS
 }
 
 #[test]
-fn the_state_follows_the_report_then_herdr_then_the_wait() {
+fn a_prompt_outranks_the_report_which_outranks_the_wait() {
     let b = Some("lead-b");
     let cases = [
         // agent, reported, waiting on, state
