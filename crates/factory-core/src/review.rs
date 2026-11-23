@@ -46,20 +46,18 @@ pub fn round(label: &str, has_previous: bool) -> u32 {
     }
 }
 
-/// The issue number a spec names when it is an issue ref: `#12`, `12` or
-/// `https://github.com/<owner>/<repo>/issues/12`.
-pub fn issue_number(spec: &str) -> Option<u64> {
-    let number = |s: &str| {
-        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| s.parse().ok())
-            .flatten()
-    };
+/// The issue `gh issue view` should fetch when a spec is an issue ref: the number of `#12` or
+/// `12`, or a whole `https://github.com/<owner>/<repo>/issues/12`, which may name another repo.
+pub fn issue_ref(spec: &str) -> Option<&str> {
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     match spec.strip_prefix("https://github.com/") {
         Some(rest) => match rest.split('/').collect::<Vec<_>>()[..] {
-            [owner, repo, "issues", n] if !owner.is_empty() && !repo.is_empty() => number(n),
+            [owner, repo, "issues", n] if !owner.is_empty() && !repo.is_empty() && number(n) => {
+                Some(spec)
+            }
             _ => None,
         },
-        None => number(spec.strip_prefix('#').unwrap_or(spec)),
+        None => Some(spec.strip_prefix('#').unwrap_or(spec)).filter(|n| number(n)),
     }
 }
 
@@ -376,10 +374,11 @@ impl Reading {
     }
 }
 
-/// The words after the report's first `FINDINGS:`.
+/// The words after the report's last `FINDINGS:`, the one beside its VERDICT line.
 fn findings_line(report: &str) -> Vec<String> {
     report
         .lines()
+        .rev()
         .find_map(|line| line.strip_prefix("FINDINGS:"))
         .map(|rest| rest.split_whitespace().map(str::to_owned).collect())
         .unwrap_or_default()
@@ -539,10 +538,13 @@ mod tests {
 
     #[test]
     fn an_issue_ref_is_a_number_a_hash_number_or_an_issue_url() {
-        for (spec, number) in [
-            ("12", Some(12)),
-            ("#12", Some(12)),
-            ("https://github.com/o/r/issues/12", Some(12)),
+        for (spec, issue) in [
+            ("12", Some("12")),
+            ("#12", Some("12")),
+            (
+                "https://github.com/o/r/issues/12",
+                Some("https://github.com/o/r/issues/12"),
+            ),
             ("spec.md", None),
             ("#", None),
             ("", None),
@@ -553,7 +555,7 @@ mod tests {
             ("https://github.com//r/issues/12", None),
             ("https://example.com/o/r/issues/12", None),
         ] {
-            assert_eq!(issue_number(spec), number, "{spec}");
+            assert_eq!(issue_ref(spec), issue, "{spec}");
         }
     }
 
@@ -675,7 +677,12 @@ mod tests {
         ] {
             assert!(pairs.iter().any(|p| p == pair), "{pair} in {pairs:?}");
         }
-        assert!(!pairs.iter().any(|p| p == "junk"), "{pairs:?}");
+        for dropped in ["junk", "=x", "outcome=lie", "Bad=1", "standards_hard=9"] {
+            assert!(
+                !pairs.iter().any(|p| p == dropped),
+                "{dropped} in {pairs:?}"
+            );
+        }
     }
 
     #[test]

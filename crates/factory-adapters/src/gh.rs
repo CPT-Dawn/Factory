@@ -25,17 +25,18 @@ impl std::error::Error for GhError {}
 
 /// The issue tracker of the repository in the working directory.
 pub trait Issues {
-    /// Issue `number` as Markdown: `# #<number> <title>`, a blank line, then its body.
-    fn issue(&self, number: u64) -> Result<String, GhError>;
+    /// The issue `issue` names (a number, or an issue URL) as Markdown: `# #<number> <title>`,
+    /// a blank line, then its body.
+    fn issue(&self, issue: &str) -> Result<String, GhError>;
 }
 
 /// The issues `gh` on PATH sees from the working directory.
 pub struct Gh;
 
 impl Issues for Gh {
-    fn issue(&self, number: u64) -> Result<String, GhError> {
+    fn issue(&self, issue: &str) -> Result<String, GhError> {
         let mut cmd = Command::new("gh");
-        cmd.args(["issue", "view", &number.to_string()])
+        cmd.args(["issue", "view", issue])
             .args(["--json", "number,title,body", "--template", TEMPLATE])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -58,16 +59,16 @@ impl Issues for Gh {
 /// Issues held in memory, for tests of code that fetches them.
 #[derive(Clone, Debug, Default)]
 pub struct FakeIssues {
-    /// Each known issue's number and its Markdown.
-    pub issues: Vec<(u64, String)>,
+    /// Each known issue, as the caller names it, and its Markdown.
+    pub issues: Vec<(String, String)>,
 }
 
 impl Issues for FakeIssues {
-    fn issue(&self, number: u64) -> Result<String, GhError> {
+    fn issue(&self, issue: &str) -> Result<String, GhError> {
         self.issues
             .iter()
-            .find(|(known, _)| *known == number)
+            .find(|(known, _)| known == issue)
             .map(|(_, text)| text.clone())
-            .ok_or_else(|| GhError(format!("no issue {number}")))
+            .ok_or_else(|| GhError(format!("no issue {issue}")))
     }
 }

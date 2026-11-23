@@ -216,17 +216,23 @@ fn an_issue_ref_as_the_spec_is_fetched_with_gh_and_saved_as_a_file() {
             "{spec}: {prompt}"
         );
     }
+    // A URL goes to gh whole, so an issue of another repo is fetched from that repo.
     let template = r#"# #{{.number}} {{.title}}{{"\n\n"}}{{.body}}{{"\n"}}"#;
-    let expected = [
-        "issue",
-        "view",
-        "12",
-        "--json",
-        "number,title,body",
-        "--template",
-        template,
-    ];
-    assert_eq!(sandbox.calls("gh"), vec![expected; 3]);
+    let expected: Vec<Vec<&str>> = ["12", "12", "https://github.com/o/r/issues/12"]
+        .into_iter()
+        .map(|issue| {
+            vec![
+                "issue",
+                "view",
+                issue,
+                "--json",
+                "number,title,body",
+                "--template",
+                template,
+            ]
+        })
+        .collect();
+    assert_eq!(sandbox.calls("gh"), expected);
 }
 
 #[test]
@@ -484,4 +490,58 @@ fn a_rerun_under_the_same_label_does_not_read_the_last_runs_report() {
         "{out:?}"
     );
     assert!(!sandbox.reviews().join("t1.findings.json").exists());
+}
+
+#[test]
+fn a_run_that_fails_before_the_reviewer_starts_logs_no_report_or_stream() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    fs::create_dir(sandbox.path("home/.codex")).unwrap();
+    fs::write(
+        sandbox.path("home/.codex/config.toml"),
+        "model = \"gpt-test\"\n",
+    )
+    .unwrap();
+
+    let out = sandbox.factory_in(&repo, &["review", "nope", "t1"]);
+
+    assert_eq!(out.code, 2, "{out:?}");
+    let lines = sandbox.ledger_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let event: Value = serde_json::from_str(&lines[0]).unwrap();
+    assert_eq!(event["outcome"], "error", "{event}");
+    assert!(
+        event["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("unknown ref: nope"),
+        "{event}"
+    );
+    assert_eq!(event["backend"], "codex", "{event}");
+    assert_eq!(event["model"], "gpt-test", "{event}");
+    for absent in ["report", "stream", "findings", "verdict"] {
+        assert_eq!(event.get(absent), None, "{absent} in {event}");
+    }
+}
+
+#[test]
+fn an_event_that_cannot_be_logged_fails_the_run_in_one_line_naming_the_report() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+    fs::create_dir_all(sandbox.ledger()).unwrap();
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(out.stdout, "", "{out:?}");
+    assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
+    let report = sandbox.reviews().join("t1.md");
+    assert!(
+        out.stderr.starts_with(&format!(
+            "factory: review t1: clean (0 blocking, 1 advisory, 0 question) → {}; but its event was not logged: ",
+            report.display()
+        )),
+        "{out:?}"
+    );
 }

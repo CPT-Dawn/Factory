@@ -16,15 +16,13 @@ use std::time::{Duration, Instant};
 use factory_adapters::gh::{Gh, Issues};
 use factory_adapters::git::{GitError, GitRepo, Repo};
 use factory_adapters::reviewer::{Codex, Job, Reviewer, ReviewerError};
-use factory_core::event::Event;
 use factory_core::exit::Exit;
 use factory_core::review::{self, Bundle, Finding, Part, Reading, Record, Verdict};
 use serde_json::json;
 
-use crate::client;
+use crate::log;
 use crate::output::{Done, Failure};
 use crate::paths::Paths;
-use crate::protocol::{LOG, LogParams, LogResult};
 
 /// Lines of context around each change in the bundle's diff, so the reviewer rarely opens a
 /// file to see what surrounds a hunk.
@@ -46,8 +44,9 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
     review::check_label(&args.label).map_err(|e| Failure::usage(e.to_string()))?;
     let paths = Paths::from_env()?;
     let started = Instant::now();
+    let codex = Codex::configured_in(&codex_home());
     let mut run = Run::default();
-    let result = review(args, &paths, &mut run);
+    let result = review(args, &paths, &codex, &mut run);
     let failed = result.as_ref().err().map(|failure| failure.message.clone());
     let record = Record {
         repo: &run.repo,
@@ -56,9 +55,9 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         base: &args.base,
         head: &run.head,
         spec: &run.spec,
-        backend: &run.backend,
-        model: run.model.as_deref(),
-        effort: run.effort.as_deref(),
+        backend: codex.name(),
+        model: codex.model(),
+        effort: codex.effort(),
         duration_s: started.elapsed().as_secs(),
         report: &run.report,
         stream: &run.stream,
@@ -70,28 +69,37 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
                 .unwrap_or("the run ended without a reading")),
         },
     };
-    if let Err(e) = log_event(&paths, &record) {
-        eprintln!("factory: the review event was not logged: {}", e.message);
+    let logged = log::land(&paths, "review", &record.pairs());
+    match (result, logged) {
+        (result, Ok(_)) => result,
+        (Ok(done), Err(e)) => Err(Failure::precondition(format!(
+            "{}; but its event was not logged: {}",
+            done.line, e.message
+        ))),
+        (Err(failure), Err(e)) => Err(Failure::new(
+            failure.exit,
+            format!(
+                "{}; its event was not logged either: {}",
+                failure.message, e.message
+            ),
+        )),
     }
-    result
 }
 
-/// What a run learned on its way, for its event.
+/// What a run learned on its way, for its event. The report, stream and findings ledger are
+/// named once the reviewer starts, as before then they hold nothing of this run.
 #[derive(Default)]
 struct Run {
     repo: String,
     head: String,
     spec: String,
-    backend: String,
-    model: Option<String>,
-    effort: Option<String>,
     report: String,
     stream: String,
     findings: String,
     reading: Option<Reading>,
 }
 
-fn review(args: &Args, paths: &Paths, run: &mut Run) -> Result<Done, Failure> {
+fn review(args: &Args, paths: &Paths, codex: &Codex, run: &mut Run) -> Result<Done, Failure> {
     let cwd = env::current_dir().map_err(|e| {
         Failure::precondition(format!(
             "cannot read the working directory: {e}; cd into the repo under review"
@@ -104,9 +112,6 @@ fn review(args: &Args, paths: &Paths, run: &mut Run) -> Result<Done, Failure> {
         ))
     })?;
     let files = Files::new(paths, &run.repo, &args.label)?;
-    run.report = files.report.display().to_string();
-    run.stream = files.stream.display().to_string();
-    run.findings = files.findings.display().to_string();
     let inputs = Inputs::gather(&repo, args, &files)?;
     run.head = inputs.head.clone();
     let spec = inputs.spec.as_ref().map_or("none", |(name, _)| name);
@@ -119,10 +124,6 @@ fn review(args: &Args, paths: &Paths, run: &mut Run) -> Result<Done, Failure> {
         inputs.previous.as_ref().map(|(name, _)| name.as_str()),
     );
     write(&files.prompt, &prompt)?;
-    let codex = Codex::configured_in(&codex_home());
-    run.backend = codex.name().to_owned();
-    run.model = codex.model().map(str::to_owned);
-    run.effort = codex.effort().map(str::to_owned);
     let job = Job {
         cwd,
         prompt: files.prompt.clone(),
@@ -131,9 +132,11 @@ fn review(args: &Args, paths: &Paths, run: &mut Run) -> Result<Done, Failure> {
         timeout: args.timeout,
     };
     files.clear_outputs()?;
+    run.report = files.report.display().to_string();
+    run.stream = files.stream.display().to_string();
     codex
         .review(&job)
-        .map_err(|e| reviewer_failed(&codex, &e, &files.stream))?;
+        .map_err(|e| reviewer_failed(codex, &e, &files.stream))?;
     let text = fs::read_to_string(&files.report).unwrap_or_default();
     if text.trim().is_empty() {
         return Err(Failure::precondition(format!(
@@ -162,6 +165,7 @@ fn review(args: &Args, paths: &Paths, run: &mut Run) -> Result<Done, Failure> {
             .map(|findings| findings.iter().map(Finding::to_value).collect::<Vec<_>>()),
     });
     write(&files.findings, &format!("{ledger:#}\n"))?;
+    run.findings = files.findings.display().to_string();
     let mut done = Done::new(
         reading.summary(&args.label, &run.report),
         json!({
@@ -187,21 +191,6 @@ fn review(args: &Args, paths: &Paths, run: &mut Run) -> Result<Done, Failure> {
     }
     run.reading = Some(reading);
     Ok(done)
-}
-
-/// Lands the run's `review` event in the ledger, through the daemon.
-fn log_event(paths: &Paths, record: &Record<'_>) -> Result<(), Failure> {
-    let session = env::var("CLAUDE_CODE_SESSION_ID")
-        .ok()
-        .filter(|id| !id.is_empty());
-    let event = Event::from_args("review", &record.pairs(), session.as_deref())
-        .map_err(|e| Failure::usage(e.to_string()))?;
-    let params = LogParams {
-        kind: event.kind().to_owned(),
-        fields: event.fields().clone(),
-    };
-    let _: LogResult = client::call(paths, LOG, &params)?;
-    Ok(())
 }
 
 /// What the bundle holds, read from the repo and the files the caller named. A text the
@@ -350,10 +339,10 @@ fn codex_home() -> PathBuf {
 /// The spec's name for the prompt and its text. An issue ref is fetched with gh and saved to
 /// `saved`, since the reviewer's sandbox has no network; anything else names a file.
 fn fetch_spec(spec: &str, saved: &Path) -> Result<(String, String), Failure> {
-    let Some(number) = review::issue_number(spec) else {
+    let Some(issue) = review::issue_ref(spec) else {
         return Ok((spec.to_owned(), read_given("spec", Path::new(spec))?));
     };
-    let text = Gh.issue(number).map_err(|e| {
+    let text = Gh.issue(issue).map_err(|e| {
         Failure::usage(format!(
             "could not fetch spec {spec} with gh: {e}; check gh auth status, or pass the spec as a file"
         ))

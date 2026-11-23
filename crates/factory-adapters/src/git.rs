@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 use crate::process;
@@ -52,25 +52,35 @@ impl GitRepo {
         }
     }
 
-    fn git(&self, args: &[&str]) -> Result<String, GitError> {
+    /// Runs git to its end, whatever its exit status.
+    fn output(&self, args: &[&str]) -> Result<Output, GitError> {
         let mut cmd = Command::new("git");
         cmd.args(args)
             .current_dir(&self.dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let shown = args.join(" ");
-        let output =
-            process::run(cmd, TIMEOUT).map_err(|e| GitError(format!("git {shown}: {e}")))?;
+        process::run(cmd, TIMEOUT).map_err(|e| GitError(format!("git {}: {e}", args.join(" "))))
+    }
+
+    /// Runs git and returns its stdout, failing when it exits non-zero.
+    fn git(&self, args: &[&str]) -> Result<String, GitError> {
+        let output = self.output(args)?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GitError(format!(
-                "git {shown} failed: {}",
-                stderr.lines().next().unwrap_or_default()
-            )));
+            return Err(failed(args, &output));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
+}
+
+/// The error a git command that exited non-zero is: its first stderr line.
+fn failed(args: &[&str], output: &Output) -> GitError {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    GitError(format!(
+        "git {} failed: {}",
+        args.join(" "),
+        stderr.lines().next().unwrap_or_default()
+    ))
 }
 
 impl Repo for GitRepo {
@@ -85,9 +95,17 @@ impl Repo for GitRepo {
     }
 
     fn commit(&self, rev: &str) -> Result<Option<String>, GitError> {
-        match self.git(&["rev-parse", "-q", "--verify", &format!("{rev}^{{commit}}")]) {
-            Ok(sha) => Ok(Some(sha.trim_end().to_owned())),
-            Err(_) => Ok(None),
+        let args = ["rev-parse", "-q", "--verify", &format!("{rev}^{{commit}}")];
+        let output = self.output(&args)?;
+        match output.status.code() {
+            Some(0) => Ok(Some(
+                String::from_utf8_lossy(&output.stdout)
+                    .trim_end()
+                    .to_owned(),
+            )),
+            // `--verify -q` exits 1, silently, for a rev that names no commit.
+            Some(1) => Ok(None),
+            _ => Err(failed(&args, &output)),
         }
     }
 
