@@ -68,6 +68,12 @@ pub enum Command {
     },
     /// Stop the daemon and remove the binary and units install put in place; state stays
     Uninstall,
+    /// Lease this PC's local stack slots, in devlab's words: factory lab help (or run it as devlab)
+    #[command(disable_help_flag = true)]
+    Lab {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

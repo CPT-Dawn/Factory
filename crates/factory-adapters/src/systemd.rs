@@ -1,5 +1,6 @@
 //! The user's systemd manager, through `systemctl --user`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -9,6 +10,8 @@ use crate::process;
 
 /// How long one systemctl call may take; stopping a unit waits for it to stop.
 const TIMEOUT: Duration = Duration::from_secs(90);
+/// How long asking a unit's state may take.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why a systemctl call failed: the call and what systemctl said.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +37,13 @@ pub trait UserManager {
     fn stop(&self, units: &[&str]) -> Result<(), SystemdError>;
 }
 
+/// What the lab asks of the user's units.
+pub trait Units {
+    /// What `systemctl --user is-active <unit>` says (`active`, `inactive`, ...); empty when
+    /// it can't be asked.
+    fn is_active(&self, unit: &str) -> String;
+}
+
 /// The manager `systemctl --user` on PATH reaches.
 pub struct Systemctl;
 
@@ -57,6 +67,19 @@ impl Systemctl {
             .find(|line| !line.trim().is_empty())
             .unwrap_or("it failed and said nothing");
         Err(SystemdError(format!("{call} failed: {said}")))
+    }
+}
+
+impl Units for Systemctl {
+    fn is_active(&self, unit: &str) -> String {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["--user", "is-active", unit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        process::run(cmd, QUERY_TIMEOUT)
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .unwrap_or_default()
     }
 }
 
@@ -120,5 +143,19 @@ impl UserManager for FakeManager {
 
     fn stop(&self, units: &[&str]) -> Result<(), SystemdError> {
         self.record(format!("stop {}", units.join(" ")))
+    }
+}
+/// Units in the states the map gives; any other is `inactive`.
+#[derive(Debug, Default, Clone)]
+pub struct FakeUnits {
+    pub states: BTreeMap<String, String>,
+}
+
+impl Units for FakeUnits {
+    fn is_active(&self, unit: &str) -> String {
+        self.states
+            .get(unit)
+            .cloned()
+            .unwrap_or_else(|| "inactive".to_owned())
     }
 }

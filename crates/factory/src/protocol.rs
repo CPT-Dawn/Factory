@@ -2,7 +2,8 @@
 //!
 //! A client writes one request per line, `{"id", "method", "params"}`, and reads one response
 //! line per request, `{"id", "result"}` or `{"id", "error": {"code", "message"}}`, where
-//! `code` is an exit code from [`factory_core::exit`].
+//! `code` is an exit code from [`factory_core::exit`]. A request that waits (`lab.acquire`) may
+//! send `{"id", "note"}` lines before its answer.
 
 use factory_core::event::Fields;
 use factory_core::exit::Exit;
@@ -51,6 +52,8 @@ pub struct Response {
 pub enum Outcome {
     Result(Value),
     Error(ErrorBody),
+    /// Progress before the result, `{"id", "note"}`: a request that waits may send any number.
+    Note(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

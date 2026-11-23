@@ -13,11 +13,11 @@ factory-core.workspace = true
 factory-adapters.workspace = true
 clap.workspace = true
 listenfd.workspace = true
+rusqlite.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-rusqlite.workspace = true
 toml.workspace = true
 jiff.workspace = true
 

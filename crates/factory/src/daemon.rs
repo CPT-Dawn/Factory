@@ -30,6 +30,8 @@ use factory_adapters::herdr::Herdr;
 use listenfd::ListenFd;
 
 use crate::clock;
+use crate::lab::service::{self, Lab};
+use crate::lab::wire::ACQUIRE;
 use crate::leads::Leads;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
@@ -40,12 +42,13 @@ use crate::protocol::{
 use crate::router::Router;
 use crate::store::Store;
 
-/// What every connection answers from: the ledger, the picture of the leads, and the reviewer
-/// router.
+/// What every connection answers from: the ledger, the picture of the leads, the reviewer
+/// router and the lab's lease store.
 struct Daemon {
     ledger: Arc<Ledger>,
     leads: Arc<Leads>,
     router: Arc<Router>,
+    lab: Arc<Lab>,
 }
 
 /// How long a stopping daemon gives the connections it holds to finish their requests.
@@ -71,6 +74,10 @@ pub fn run(json: bool) -> Result<(), Failure> {
     let leads = Leads::new(paths.clone(), Herdr::new(paths.herdr.clone()));
     let _lock = take_daemon_lock(&paths)?;
     let router = Arc::new(Router::open(Store::open(&paths.database())?)?);
+    // Opened under the lock: it forgets the waiters a dead daemon left.
+    let lab = Lab::open(&paths.lab_db()).map_err(|e| {
+        Failure::precondition(format!("{e}; check FACTORY_STATE and XDG_STATE_HOME"))
+    })?;
     let listener = match activated {
         Some(listener) => listener,
         None => bind(&paths)?,
@@ -114,6 +121,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
             ledger,
             leads,
             router,
+            lab: Arc::new(lab),
         };
         serve(listener, Arc::new(daemon), stop).await;
         Ok(())
@@ -147,6 +155,10 @@ fn stop_on_signal() -> Result<Stop, Failure> {
 struct Stop(watch::Receiver<bool>);
 
 impl Stop {
+    fn is_stopping(&self) -> bool {
+        *self.0.borrow()
+    }
+
     /// Resolves once the daemon is stopping.
     async fn stopping(mut self) {
         if self.0.wait_for(|&stopping| stopping).await.is_err() {
@@ -232,10 +244,12 @@ async fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Stop) {
     }
 }
 
-/// Answers each request line on one connection until the client hangs up. A client sends one
-/// request at a time; one that hangs up, or sends more, before its answer abandons the request,
-/// so a wait whose CLI is gone stops waiting. A stopping daemon still answers the first request
-/// of a connection it took, then hangs up.
+/// Answers each request line on one connection until the client hangs up, then frees the
+/// review slot the connection holds. A client sends one request at a time; one that hangs up,
+/// or sends more, before its answer abandons the request, so a wait whose CLI is gone stops
+/// waiting. A `lab.acquire` holds the connection while it waits, writing notes before its
+/// answer. A stopping daemon still answers the first request of a connection it took, then
+/// hangs up.
 async fn answer(stream: UnixStream, daemon: Arc<Daemon>, stop: Stop) {
     let mut held = None;
     converse(stream, &daemon, &stop, &mut held).await;
@@ -260,6 +274,13 @@ async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut O
             return;
         };
         first = false;
+        if let Ok(request) = serde_json::from_str::<Request>(&line)
+            && request.method == ACQUIRE
+        {
+            // Not cut short by a stop: a lease granted as it was dropped would go unanswered.
+            service::acquire(Arc::clone(&daemon.lab), request, &mut writer, &mut lines).await;
+            continue;
+        }
         let response = tokio::select! {
             response = respond(&line, daemon, stop, held) => response,
             _ = lines.next_line() => return,
@@ -320,12 +341,23 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
                 )),
             }
         }
-        // Biased: a stopping daemon grants no slot, even one a stopped connection just freed.
-        REVIEW_ACQUIRE => tokio::select! {
-            biased;
-            () = stop.clone().stopping() => stopped("review"),
-            granted = daemon.router.acquire(request.params, held) => granted,
-        },
+        REVIEW_ACQUIRE => {
+            let granted = tokio::select! {
+                biased;
+                () = stop.clone().stopping() => None,
+                granted = daemon.router.acquire(request.params, held) => Some(granted),
+            };
+            match granted {
+                // Checked again after the grant: a connection the stop hung up may have freed
+                // the slot while this acquire ran on another thread.
+                Some(granted) if !stop.is_stopping() => granted,
+                // A stopping daemon grants no slot; one it just granted goes back.
+                _ => {
+                    daemon.router.release(held);
+                    stopped("review")
+                }
+            }
+        }
         REVIEW_QUOTA => {
             let router = Arc::clone(&daemon.router);
             let params = request.params;
@@ -337,10 +369,13 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
                 )),
             }
         }
-        other => Outcome::Error(refusal(
-            Exit::Usage,
-            format!("unknown method {other:?}; {MISMATCH}"),
-        )),
+        other => match service::respond(&daemon.lab, other, request.params).await {
+            Some(outcome) => outcome,
+            None => Outcome::Error(refusal(
+                Exit::Usage,
+                format!("unknown method {other:?}; {MISMATCH}"),
+            )),
+        },
     };
     Response {
         id: Some(request.id),

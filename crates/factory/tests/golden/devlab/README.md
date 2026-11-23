@@ -15,7 +15,8 @@ GOLDEN_DEVLAB=$HOME/.local/bin/devlab cargo test --test cli transcript
 GOLDEN_DEVLAB=target/debug/factory cargo test --test cli transcript::slots_
 ```
 
-Without `GOLDEN_DEVLAB` the transcript tests pass with a note that they were skipped. A failure
+Without `GOLDEN_DEVLAB`, the `slots-*` and `cli-*` transcripts replay against the built
+`factory` (`factory lab`, #14), and the rest pass with a note that they were skipped. A failure
 names the transcript line, the step, the stream and the first byte that differs, and shows both
 outputs. `GOLDEN_RECORD=1` rewrites the transcripts with what the binary showed instead.
 
