@@ -634,12 +634,19 @@ where
     }
     let waited = async {
         match &asked {
-            Asked::Lead(p) => answered(
-                daemon
-                    .leads
-                    .resettled(&p.lead, pane, report, deadline, limit)
-                    .await,
-            ),
+            Asked::Lead(p) => answered(match p.resume {
+                // The link that found the lead is the one a new wait watches: losing it after
+                // the wait is held fails the wait, as losing it later does, where checking the
+                // link again here would bring it back up and wait on.
+                None => daemon.leads.settled(&p.lead, deadline, limit).await,
+                // A resumed wait's daemon is new: its link may not be up yet.
+                Some(_) => {
+                    daemon
+                        .leads
+                        .resettled(&p.lead, pane, report, deadline, limit)
+                        .await
+                }
+            }),
             Asked::Ci(p) => answered(wait_ci(daemon, p, &registered, deadline, limit).await),
             Asked::Review(p) => answered(
                 daemon
