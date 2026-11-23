@@ -7,6 +7,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use factory_core::hook::{Patch, Push, PushRef};
+
 use crate::process;
 
 /// How long one git command may take.
@@ -60,6 +62,12 @@ pub trait Repo {
     fn staged_diff(&self, tracked: bool, added: Option<&[String]>) -> Result<String, GitError>;
     /// The git dir its worktrees share, which holds their objects and refs.
     fn common_dir(&self) -> Result<PathBuf, GitError>;
+    /// The commits `push` would send, oldest first, each with its patch (a merge's as a
+    /// combined diff), worked out from the refs here, with no call to the remote. A branch the
+    /// remote has, as its remote-tracking ref says, sends the commits that ref lacks; a new
+    /// branch, and a tag, every commit that no remote-tracking ref has. A ref that names no
+    /// commit sends nothing, as git refuses to push it.
+    fn sent(&self, push: &Push) -> Result<Vec<Patch>, GitError>;
     /// A detached checkout of `rev` at `dir`, outside this repository, in a worktree of its
     /// own: what is done in it leaves this repository's working tree alone. Whatever an earlier
     /// checkout left at `dir` is removed first. The checkout is removed when it is dropped.
@@ -338,6 +346,10 @@ impl Repo for GitRepo {
         Ok(PathBuf::from(dir.trim_end()))
     }
 
+    fn sent(&self, push: &Push) -> Result<Vec<Patch>, GitError> {
+        self.sent_commits(push)
+    }
+
     fn staged_diff(&self, tracked: bool, added: Option<&[String]>) -> Result<String, GitError> {
         // What a commit made now takes: the index, or with `tracked` every tracked file as it is
         // in the working tree. An earlier `git add` puts its paths' working tree in the index
@@ -439,6 +451,115 @@ impl GitRepo {
     }
 }
 
+impl GitRepo {
+    fn sent_commits(&self, push: &Push) -> Result<Vec<Patch>, GitError> {
+        let mut sent: Vec<Patch> = Vec::new();
+        for (src, dst) in self.updates(push)? {
+            // Git refuses to push a ref that names no commit, so it sends nothing. A commit made
+            // earlier in the same line is checked as a commit.
+            let Some(local) = self.commit(&src)? else {
+                continue;
+            };
+            let remote = match self.remote_branch(push.remote.as_deref(), &src, dst.as_deref())? {
+                Some(remote) => vec![local, format!("^{remote}")],
+                None => vec![local, "--not".to_owned(), "--remotes".to_owned()],
+            };
+            let mut args = vec![
+                "log",
+                "--reverse",
+                "-p",
+                "--cc",
+                "--no-color",
+                "--no-ext-diff",
+                "--format=%x00%h",
+            ];
+            args.extend(as_strs(&remote));
+            for chunk in self.git(&args)?.split('\0').skip(1) {
+                let (commit, diff) = chunk.split_once('\n').unwrap_or((chunk, ""));
+                // Two updates can send the same commit.
+                if !sent.iter().any(|patch| patch.commit == commit) {
+                    sent.push(Patch {
+                        commit: commit.to_owned(),
+                        diff: diff.to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(sent)
+    }
+
+    /// Each ref the push updates: what it sends, and the remote ref it goes to when the line
+    /// names one.
+    fn updates(&self, push: &Push) -> Result<Vec<(String, Option<String>)>, GitError> {
+        let mut updates = Vec::new();
+        for pushed in &push.refs {
+            match pushed {
+                PushRef::Current => updates.push((HEAD.to_owned(), None)),
+                PushRef::Ref { src, dst } => updates.push((src.clone(), dst.clone())),
+                PushRef::Branches | PushRef::Tags => {
+                    let under = if *pushed == PushRef::Branches {
+                        "refs/heads"
+                    } else {
+                        "refs/tags"
+                    };
+                    // A tag goes to the remote under its own name, which no remote-tracking ref
+                    // follows.
+                    let format = "--format=%(refname)%00%(*objecttype)%(objecttype)";
+                    for line in self.git(&["for-each-ref", format, under])?.lines() {
+                        let (name, kind) = line.split_once('\0').unwrap_or((line, ""));
+                        // A tag of a tree or blob sends no commit.
+                        if kind.starts_with("commit") {
+                            let dst = (*pushed == PushRef::Tags).then(|| name.to_owned());
+                            updates.push((name.to_owned(), dst));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(updates)
+    }
+
+    /// The remote-tracking commit of the branch an update of `src` (to `dst` when named)
+    /// goes to on `remote`: none for a branch the remote does not have, or a ref that is no
+    /// branch.
+    fn remote_branch(
+        &self,
+        remote: Option<&str>,
+        src: &str,
+        dst: Option<&str>,
+    ) -> Result<Option<String>, GitError> {
+        let branch = match dst {
+            Some(dst) if dst.starts_with("refs/") && !dst.starts_with("refs/heads/") => {
+                return Ok(None);
+            }
+            Some(dst) => dst.trim_start_matches("refs/heads/").to_owned(),
+            None => {
+                let full = self.output(&["rev-parse", "--symbolic-full-name", src])?;
+                let full = String::from_utf8_lossy(&full.stdout);
+                match full.trim().strip_prefix("refs/heads/") {
+                    Some(branch) => branch.to_owned(),
+                    None => return Ok(None),
+                }
+            }
+        };
+        // With no remote named, the branch's push ref says where it goes, else origin.
+        let remote = match remote {
+            Some(remote) => remote,
+            None => {
+                if dst.is_none() {
+                    // A branch with nowhere to push to fails here; origin is where git push goes then.
+                    let pushes_to = format!("{branch}@{{push}}");
+                    if let Ok(Some(commit)) = self.commit(&pushes_to) {
+                        return Ok(Some(commit));
+                    }
+                }
+                "origin"
+            }
+        };
+        self.commit(&format!("refs/remotes/{remote}/{branch}"))
+    }
+}
+
 /// Appends the untracked files `ls-files -z --full-name` listed under `top` as the diff
 /// `git add` would stage: each file's lines added, a symlink's target as its content.
 fn untracked_diff(top: &Path, listing: &str, text: &mut String) -> Result<(), GitError> {
@@ -501,6 +622,8 @@ pub struct FakeRepo {
     pub toplevel: PathBuf,
     pub git_dir: PathBuf,
     pub staged_diff: String,
+    /// What any push sends.
+    pub sent: Vec<Patch>,
     pub common_dir: PathBuf,
     /// The checkouts made and not yet dropped, by directory; each is an empty directory.
     pub checkouts: Arc<Mutex<Vec<PathBuf>>>,
@@ -581,6 +704,10 @@ impl Repo for FakeRepo {
 
     fn common_dir(&self) -> Result<PathBuf, GitError> {
         Ok(self.common_dir.clone())
+    }
+
+    fn sent(&self, _push: &Push) -> Result<Vec<Patch>, GitError> {
+        Ok(self.sent.clone())
     }
 
     fn staged_diff(&self, _tracked: bool, _added: Option<&[String]>) -> Result<String, GitError> {

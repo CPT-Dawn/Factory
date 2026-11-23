@@ -5,7 +5,8 @@
 //! must; only stop-failure, which runs when a turn ends on an API error, tells the daemon. It
 //! prints nothing and exits 0 to let a call through, and one JSON line to refuse it.
 //! A hook that cannot read its input exits 3: Claude Code shows that line and carries on, where
-//! exit 2 would block the call.
+//! exit 2 would block the call. A commit or push in a repository the hook cannot work out exits
+//! 2: it cannot be checked, so it must not run.
 
 use std::env;
 use std::fs::{self, DirBuilder};
@@ -15,6 +16,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use factory_adapters::git::{GitRepo, Repo};
+use factory_core::exit::Exit;
 use factory_core::hook::{self, GitAction, PreTool};
 use serde_json::{Value, json};
 
@@ -41,11 +43,13 @@ fn answer(command: &HookCommand) -> Result<Option<Value>, Failure> {
         HookCommand::PreTool => match hook::pre_tool(&input, escape_set()) {
             PreTool::Allow => None,
             PreTool::Block(reason) => Some(deny(&reason)),
-            PreTool::CheckStaged(actions) => {
+            PreTool::Check(actions) => {
                 // A config that can't be read refuses the call: a leak must not slip by on a typo.
                 match leak(&input, &actions) {
                     Ok(None) => None,
                     Ok(Some(reason)) => Some(deny(&reason)),
+                    // A call the hook cannot place is blocked outright, with the line that says why.
+                    Err(failure) if failure.exit == Exit::Usage => return Err(failure),
                     Err(failure) => Some(deny(&failure.message)),
                 }
             }
@@ -110,44 +114,84 @@ fn deny(reason: &str) -> Value {
     }})
 }
 
-/// The refusal for a commit or push, in any of its repositories, whose diff adds a private
-/// address from the config. A diff that cannot be read is refused too: the hook cannot say it is
-/// clean, and the line says how to look.
+/// The refusal for a commit, in any of its repositories, whose staged diff adds a private
+/// address from the config, or a push whose commits do. A diff that cannot be read is refused
+/// too: the hook cannot say it is clean, and the line says how to look. A call in a repository
+/// the hook cannot work out fails with exit 2, which blocks it.
 fn leak(input: &Value, actions: &[GitAction]) -> Result<Option<String>, Failure> {
     let addresses = config::hook_settings(&paths::config_dir())?.private_addresses;
     if addresses.is_empty() {
         return Ok(None);
     }
     let cwd = match input.get("cwd").and_then(Value::as_str) {
-        Some(cwd) => PathBuf::from(cwd),
-        None => env::current_dir().unwrap_or_default(),
+        Some(cwd) => Some(PathBuf::from(cwd)),
+        None => env::current_dir().ok(),
     };
     for action in actions {
+        let verb = if action.push.is_some() {
+            "push"
+        } else {
+            "commit"
+        };
+        if let Some(path) = action.unresolved() {
+            return Err(Failure::usage(format!(
+                "the hook cannot tell which repository this git {verb} is in, as {path} is only known when it runs: name it as it is, as in git -C <path> {verb}, then run it again."
+            )));
+        }
+        let Some(cwd) = &cwd else {
+            return Err(Failure::usage(format!(
+                "the hook cannot tell which repository this git {verb} is in, as the call has no working directory: name it, as in git -C <path> {verb}, then run it again."
+            )));
+        };
         let dir = match &action.dir {
             Some(dir) => cwd.join(expand_home(dir)),
             None => cwd.clone(),
         };
         let at = |path: &Option<String>| path.as_deref().map(|p| cwd.join(expand_home(p)));
-        let diff = GitRepo::at(&dir)
-            .pointed_at(at(&action.git_dir), at(&action.work_tree))
-            .staged_diff(action.tracked, action.added.as_deref())
-            .map_err(|e| {
-                // What git said goes along unless it carries an address.
-                let why = e.to_string();
-                let why = if hook::mentions_private(&why, &addresses) {
-                    String::new()
-                } else {
-                    format!(" ({})", why.lines().next().unwrap_or_default())
-                };
-                Failure::precondition(format!(
-                    "The hook could not read what would be committed{why}: run git -C <the repository> status to see why, then commit again."
-                ))
-            })?;
-        if let Some(reason) = hook::private_address(&diff, &addresses) {
-            return Ok(Some(reason));
+        let repo = GitRepo::at(&dir).pointed_at(at(&action.git_dir), at(&action.work_tree));
+        let reason = match &action.push {
+            Some(push) => repo
+                .sent(push)
+                .map(|sent| hook::pushed_address(&sent, &addresses)),
+            None => repo
+                .staged_diff(action.tracked, action.added.as_deref())
+                .map(|diff| hook::private_address(&diff, &addresses)),
+        };
+        let reason = reason.map_err(|e| {
+            // Only once git has failed: the check costs a call that a clean commit need not make.
+            if repo.git_dir().is_err() {
+                let place = redacted(&dir.display().to_string(), &addresses);
+                return Failure::usage(format!(
+                    "the hook found no repository for this git {verb} at {place}: run it in the repository, or name it, as in git -C <path> {verb}."
+                ));
+            }
+            // What git said goes along unless it carries an address.
+            let why = e.to_string();
+            let why = format!(" ({})", why.lines().next().unwrap_or_default());
+            let why = redacted(&why, &addresses);
+            let what = if action.push.is_some() {
+                "this push would send"
+            } else {
+                "would be committed"
+            };
+            Failure::precondition(format!(
+                "The hook could not read what {what}{why}: run git -C <the repository> status to see why, then {verb} again."
+            ))
+        })?;
+        if reason.is_some() {
+            return Ok(reason);
         }
     }
     Ok(None)
+}
+
+/// `text`, or nothing in its place when it carries one of the private `addresses`.
+fn redacted(text: &str, addresses: &[String]) -> String {
+    if hook::mentions_private(text, addresses) {
+        String::new()
+    } else {
+        text.to_owned()
+    }
 }
 
 /// `~` and `~/x` the way the shell the command runs in would.

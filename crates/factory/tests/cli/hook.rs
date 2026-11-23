@@ -293,15 +293,184 @@ fn pre_tool_denies_a_commit_whose_staged_diff_has_the_private_address() {
     denied_for_the_address(&out);
 }
 
+/// A repo whose branches are on a bare remote, `origin`, as they are now.
+fn repo_with_a_remote(sandbox: &Sandbox) -> std::path::PathBuf {
+    let repo = sandbox.repo();
+    let remote = sandbox.path("remote.git");
+    let remote = remote.to_str().unwrap();
+    sandbox.git(&repo, &["init", "-q", "--bare", remote]);
+    sandbox.git(&repo, &["remote", "add", "origin", remote]);
+    sandbox.git(&repo, &["push", "-q", "origin", "main", "work"]);
+    repo
+}
+
+/// Commits `file` with `content` on the branch checked out; the commit's short sha.
+fn commit_file(sandbox: &Sandbox, repo: &std::path::Path, file: &str, content: &str) -> String {
+    std::fs::write(repo.join(file), content).unwrap();
+    sandbox.git(repo, &["add", file]);
+    sandbox.git(repo, &["commit", "-q", "-m", &format!("feat: {file}")]);
+    sandbox
+        .git(repo, &["rev-parse", "--short", "HEAD"])
+        .trim()
+        .to_owned()
+}
+
+/// The refusal names the commit that leaks, and its file, never the address.
+fn denied_naming(out: &Run, commit: &str) {
+    let reason = reason_of(out);
+    assert!(
+        reason.contains(commit) && reason.contains("notes.txt"),
+        "{reason}"
+    );
+    assert!(!reason.contains(OWNER), "{reason}");
+}
+
 #[test]
-fn pre_tool_denies_a_push_whose_staged_diff_has_the_private_address() {
+fn a_push_is_refused_naming_the_commit_that_adds_the_address() {
     let sandbox = Sandbox::new();
     leak_config(&sandbox);
-    let repo = repo_staging_the_address(&sandbox);
+    let repo = repo_with_a_remote(&sandbox);
+    // The commit before the last one leaks; the last one is clean.
+    let leak = commit_file(&sandbox, &repo, "notes.txt", &format!("mail {OWNER}\n"));
+    let clean = commit_file(&sandbox, &repo, "clean.txt", "fine\n");
+
+    for command in [
+        "git push origin work",
+        "git push",
+        "git push origin HEAD:work",
+    ] {
+        let out = pre_tool(&sandbox, &bash_in(&repo, command));
+        denied_naming(&out, &leak);
+        assert!(!reason_of(&out).contains(&clean), "{command}");
+    }
+    // With an upstream, a bare push goes where it says.
+    sandbox.git(&repo, &["branch", "-q", "-u", "origin/work"]);
+    denied_naming(&pre_tool(&sandbox, &bash_in(&repo, "git push")), &leak);
+}
+
+#[test]
+fn a_push_to_an_existing_branch_checks_only_what_the_remote_branch_lacks() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = repo_with_a_remote(&sandbox);
+    commit_file(&sandbox, &repo, "notes.txt", &format!("mail {OWNER}\n"));
+    // Already on the remote: this push does not send it.
+    sandbox.git(&repo, &["push", "-q", "origin", "work"]);
+    commit_file(&sandbox, &repo, "clean.txt", "fine\n");
+
+    allowed(&pre_tool(&sandbox, &bash_in(&repo, "git push origin work")));
+}
+
+#[test]
+fn a_bare_push_goes_where_the_branch_pushes_to() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = repo_with_a_remote(&sandbox);
+    commit_file(&sandbox, &repo, "notes.txt", &format!("mail {OWNER}\n"));
+    // work pushes to elsewhere, which has the leak already; origin/work does not.
+    sandbox.git(&repo, &["push", "-q", "origin", "work:elsewhere"]);
+    sandbox.git(&repo, &["branch", "-q", "-u", "origin/elsewhere"]);
+    sandbox.git(&repo, &["config", "push.default", "upstream"]);
+    commit_file(&sandbox, &repo, "clean.txt", "fine\n");
+
+    allowed(&pre_tool(&sandbox, &bash_in(&repo, "git push")));
+    // Named, the remote branch is work's own name.
+    let out = pre_tool(&sandbox, &bash_in(&repo, "git push origin"));
+    assert!(reason_of(&out).contains("notes.txt"), "{out:?}");
+}
+
+#[test]
+fn a_new_branch_push_checks_every_commit_on_no_remote_ref() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = repo_with_a_remote(&sandbox);
+    // The leak is on work, which has not been pushed since; feature starts after it.
+    let leak = commit_file(&sandbox, &repo, "notes.txt", &format!("mail {OWNER}\n"));
+    sandbox.git(&repo, &["checkout", "-q", "-b", "feature"]);
+    commit_file(&sandbox, &repo, "clean.txt", "fine\n");
+
+    let out = pre_tool(&sandbox, &bash_in(&repo, "git push -u origin feature"));
+    denied_naming(&out, &leak);
+
+    // Once a remote ref has the leak, a new branch on top of it does not send it.
+    sandbox.git(&repo, &["push", "-q", "origin", "work:elsewhere"]);
+    allowed(&pre_tool(
+        &sandbox,
+        &bash_in(&repo, "git push -u origin feature"),
+    ));
+}
+
+#[test]
+fn a_push_of_every_branch_checks_each_of_them() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = repo_with_a_remote(&sandbox);
+    sandbox.git(&repo, &["checkout", "-q", "-b", "other"]);
+    let leak = commit_file(&sandbox, &repo, "notes.txt", &format!("mail {OWNER}\n"));
+    sandbox.git(&repo, &["checkout", "-q", "work"]);
+    sandbox.git(&repo, &["tag", "-a", "-m", "v1", "v1", "other"]);
+
+    allowed(&pre_tool(&sandbox, &bash_in(&repo, "git push origin work")));
+    for command in [
+        "git push --all origin",
+        "git push origin \"$BRANCH\"",
+        "git push --tags origin",
+        "git push origin v1",
+    ] {
+        denied_naming(&pre_tool(&sandbox, &bash_in(&repo, command)), &leak);
+    }
+}
+
+#[test]
+fn a_push_that_deletes_a_branch_checks_nothing() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = repo_with_a_remote(&sandbox);
+    commit_file(&sandbox, &repo, "notes.txt", &format!("mail {OWNER}\n"));
+
+    for command in [
+        "git push origin --delete work",
+        "git push origin :work",
+        "git push -d origin work",
+    ] {
+        allowed(&pre_tool(&sandbox, &bash_in(&repo, command)));
+    }
+}
+
+#[test]
+fn a_push_whose_commits_cannot_be_read_is_denied_with_what_to_do() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = repo_with_a_remote(&sandbox);
+    commit_file(&sandbox, &repo, "notes.txt", "fine\n");
+    // The file's content is gone from the object store.
+    let blob = sandbox.git(&repo, &["rev-parse", "HEAD:notes.txt"]);
+    let (dir, file) = blob.trim().split_at(2);
+    std::fs::remove_file(repo.join(".git/objects").join(dir).join(file)).unwrap();
 
     let out = pre_tool(&sandbox, &bash_in(&repo, "git push origin work"));
 
-    denied_for_the_address(&out);
+    let reason = reason_of(&out);
+    assert!(
+        reason.starts_with("The hook could not read what this push would send"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_push_sends_commits_and_not_what_is_staged() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = repo_with_a_remote(&sandbox);
+    std::fs::write(repo.join("notes.txt"), format!("mail {OWNER}\n")).unwrap();
+    sandbox.git(&repo, &["add", "notes.txt"]);
+
+    allowed(&pre_tool(&sandbox, &bash_in(&repo, "git push origin work")));
+    // The commit before it still checks what it takes along.
+    denied_for_the_address(&pre_tool(
+        &sandbox,
+        &bash_in(&repo, "git commit -m x && git push origin work"),
+    ));
 }
 
 #[test]
@@ -523,12 +692,54 @@ fn pre_tool_checks_every_repo_a_command_commits_in() {
     ));
 }
 
+/// Claude Code's blocking error: exit 2, and one line on stderr that says why.
+fn refused_with_one_line(out: &Run) -> String {
+    assert_eq!((out.code, out.stdout.as_str()), (2, ""), "{out:?}");
+    assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
+    out.stderr.clone()
+}
+
+#[test]
+fn a_commit_whose_repository_cannot_be_worked_out_is_refused_with_one_line() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = repo_staging_the_address(&sandbox);
+
+    let why = refused_with_one_line(&pre_tool(
+        &sandbox,
+        &bash_in(&repo, "cd \"$REPO\" && git commit -m x"),
+    ));
+    assert!(why.contains("$REPO") && why.contains("git -C"), "{why}");
+    let why = refused_with_one_line(&pre_tool(
+        &sandbox,
+        &bash_in(&repo, "git -C $(git rev-parse --show-toplevel) push"),
+    ));
+    assert!(why.contains("push"), "{why}");
+    // The working directory is in no repository.
+    let home = sandbox.path("home");
+    let why = refused_with_one_line(&pre_tool(&sandbox, &bash_in(&home, "git commit -m x")));
+    assert!(why.contains(home.to_str().unwrap()), "{why}");
+    for push in ["git push", "git push origin work", "git push --all origin"] {
+        let why = refused_with_one_line(&pre_tool(&sandbox, &bash_in(&home, push)));
+        assert!(why.contains("push"), "{push}: {why}");
+    }
+
+    // With no address to look for, there is nothing to check.
+    config(&sandbox, "");
+    allowed(&pre_tool(
+        &sandbox,
+        &bash_in(&repo, "cd \"$REPO\" && git commit -m x"),
+    ));
+}
+
 #[test]
 fn a_commit_whose_diff_cannot_be_read_is_denied_with_what_to_do() {
     let sandbox = Sandbox::new();
     leak_config(&sandbox);
-    // The working directory is no repository.
-    let out = pre_tool(&sandbox, &bash_in(&sandbox.path("home"), "git commit -m x"));
+    let repo = sandbox.repo();
+    std::fs::write(repo.join(".git/index"), "not an index").unwrap();
+
+    let out = pre_tool(&sandbox, &bash_in(&repo, "git commit -m x"));
 
     let reason = reason_of(&out);
     assert!(
