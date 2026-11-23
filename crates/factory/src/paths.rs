@@ -31,6 +31,24 @@ pub struct Paths {
     pub units: PathBuf,
 }
 
+/// The config dir, `${XDG_CONFIG_HOME:-$HOME/.config}/factory`: all a hook needs of the paths, since
+/// it never talks to the daemon.
+pub fn config_dir() -> PathBuf {
+    let var = |key: &str| env::var_os(key).filter(|value| !value.is_empty());
+    var("XDG_CONFIG_HOME")
+        .map_or_else(
+            || Path::new(&var("HOME").unwrap_or_else(|| OsString::from("/"))).join(".config"),
+            PathBuf::from,
+        )
+        .join("factory")
+}
+
+/// The runtime dir, `$XDG_RUNTIME_DIR/factory`, when the variable is set.
+pub fn runtime_dir() -> Option<PathBuf> {
+    let dir = env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty())?;
+    Some(Path::new(&dir).join("factory"))
+}
+
 impl Paths {
     pub fn from_env() -> Result<Paths, Failure> {
         // An empty variable counts as unset, as in factory-stats.
@@ -45,13 +63,13 @@ impl Paths {
             .map_or_else(|| Path::new(&home()).join(".config"), PathBuf::from);
         let herdr = var("HERDR_SOCKET_PATH")
             .map_or_else(|| config_home.join("herdr/herdr.sock"), PathBuf::from);
-        let config = config_home.join("factory");
-        let runtime = var("XDG_RUNTIME_DIR").ok_or_else(|| {
+        let config = config_dir();
+        let runtime = runtime_dir().ok_or_else(|| {
             Failure::precondition("XDG_RUNTIME_DIR is not set; run factory inside a user session")
         })?;
         Ok(Paths {
             state,
-            runtime: Path::new(&runtime).join("factory"),
+            runtime,
             config,
             herdr,
             bin: Path::new(&home()).join(".local/bin"),
