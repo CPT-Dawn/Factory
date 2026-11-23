@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::wire::{Lease, Owner, SlotRow, Waiter};
+use super::wire::{Lease, Owner, Process, SlotRow, Waiter};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS leases (
@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS slots (
   last_worktree TEXT,
   stack_ours INTEGER NOT NULL DEFAULT 0,
   idle_since INTEGER,
+  stopper_pid INTEGER,
+  stopper_start TEXT,
   PRIMARY KEY (project, slot)
 );
 CREATE TABLE IF NOT EXISTS waiters (
@@ -35,11 +37,17 @@ CREATE TABLE IF NOT EXISTS waiters (
   label TEXT NOT NULL,
   owner TEXT NOT NULL,
   owner_label TEXT NOT NULL,
+  worktree TEXT NOT NULL,
+  lease INTEGER,
   project TEXT,
   slot_cap INTEGER,
   max_slots INTEGER NOT NULL
 );
 ";
+
+/// The schema's version, in `PRAGMA user_version`. Version 0 kept waiters only while the
+/// daemon that queued them ran, so their table is rebuilt; its slots gain their stopper.
+const VERSION: i64 = 1;
 
 pub struct Store {
     conn: Connection,
@@ -52,7 +60,18 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(15))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 1 {
+            conn.execute_batch("DROP TABLE IF EXISTS waiters")?;
+        }
         conn.execute_batch(SCHEMA)?;
+        if version < 1 {
+            add_column(&conn, "slots", "stopper_pid", "INTEGER")?;
+            add_column(&conn, "slots", "stopper_start", "TEXT")?;
+        }
+        if version < VERSION {
+            conn.pragma_update(None, "user_version", VERSION)?;
+        }
         conn.execute("DELETE FROM waiters", [])?;
         Ok(Store { conn })
     }
@@ -69,6 +88,18 @@ impl Store {
         tx.commit()?;
         Ok(out)
     }
+}
+
+/// Adds `column` to `table` unless it has it.
+fn add_column(conn: &Connection, table: &str, column: &str, decl: &str) -> rusqlite::Result<()> {
+    let mut q = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names: Vec<String> = q
+        .query_map([], |row| row.get::<_, String>("name"))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !names.iter().any(|name| name == column) {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    Ok(())
 }
 
 fn lease_row(row: &Row<'_>) -> rusqlite::Result<Lease> {
@@ -104,6 +135,7 @@ pub fn slots(c: &Connection) -> rusqlite::Result<Vec<SlotRow>> {
             last_worktree: row.get("last_worktree")?,
             stack_ours: row.get("stack_ours")?,
             idle_since: row.get("idle_since")?,
+            stopping: row.get::<_, Option<i64>>("stopper_pid")?.is_some(),
         })
     })?
     .collect()
@@ -118,6 +150,8 @@ pub fn waiters(c: &Connection) -> rusqlite::Result<Vec<Waiter>> {
             label: row.get("label")?,
             owner: row.get("owner")?,
             owner_label: row.get("owner_label")?,
+            worktree: row.get("worktree")?,
+            lease: row.get("lease")?,
             project: row.get("project")?,
             slot_cap: row.get("slot_cap")?,
             max_slots: row.get("max_slots")?,
@@ -185,13 +219,15 @@ pub fn touch(c: &Connection, id: i64, now: i64) -> rusqlite::Result<()> {
 
 pub fn insert_waiter(c: &Connection, w: &Waiter) -> rusqlite::Result<i64> {
     c.execute(
-        "INSERT INTO waiters (created, label, owner, owner_label, project, slot_cap, max_slots)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO waiters (created, label, owner, owner_label, worktree, lease, project, slot_cap, max_slots)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             w.created,
             w.label,
             w.owner,
             w.owner_label,
+            w.worktree,
+            w.lease,
             w.project,
             w.slot_cap,
             w.max_slots
@@ -253,6 +289,52 @@ pub fn claim_slot(
         params![project, slot, worktree],
     )?;
     Ok(previous)
+}
+
+/// Holds the slot for `stopper` while it stops the slot's stack.
+pub fn mark_stopping(
+    c: &Connection,
+    project: &str,
+    slot: u32,
+    stopper: &Process,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE slots SET stopper_pid = ?3, stopper_start = ?4 WHERE project = ?1 AND slot = ?2",
+        params![project, slot, stopper.pid, stopper.start],
+    )?;
+    Ok(())
+}
+
+/// Lets go of the slots `stopper` held; how many it held.
+pub fn clear_stopping(c: &Connection, stopper: &Process) -> rusqlite::Result<usize> {
+    c.execute(
+        "UPDATE slots SET stopper_pid = NULL, stopper_start = NULL
+         WHERE stopper_pid = ?1 AND stopper_start = ?2",
+        params![stopper.pid, stopper.start],
+    )
+}
+
+/// Lets go of the slots held by stoppers that exited; how many there were.
+pub fn clear_dead_stoppers(
+    c: &Connection,
+    alive: &dyn Fn(i64, &str) -> bool,
+) -> rusqlite::Result<usize> {
+    let mut q = c.prepare(
+        "SELECT DISTINCT stopper_pid, stopper_start FROM slots WHERE stopper_pid IS NOT NULL",
+    )?;
+    let stoppers: Vec<Process> = q
+        .query_map([], |row| {
+            Ok(Process {
+                pid: row.get(0)?,
+                start: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut cleared = 0;
+    for stopper in stoppers.iter().filter(|s| !alive(s.pid, &s.start)) {
+        cleared += clear_stopping(c, stopper)?;
+    }
+    Ok(cleared)
 }
 
 pub fn set_stack_ours(

@@ -14,9 +14,34 @@ pub struct QueueEntry {
     /// The owner's key, `<pid>:<start>`.
     pub owner: String,
     pub owner_label: String,
+    /// The worktree it asks from: with the owner, it finds the lease that serves it.
+    pub worktree: String,
+    /// `DEVLAB_LEASE`: the lease it asks for instead of its worktree and owner's.
+    pub lease: Option<i64>,
     pub project: Option<String>,
     pub cap: Option<u32>,
     pub max_slots: u32,
+}
+
+/// Whether `e` is served by a lease that exists, so it asks for no new slot: the one it names,
+/// else its worktree and owner's.
+pub fn has_lease(e: &QueueEntry, leases: &[Holding]) -> bool {
+    leases.iter().any(|l| match e.lease {
+        Some(id) => l.id == id,
+        None => l.owner == e.owner && l.worktree == e.worktree,
+    })
+}
+
+/// The queue as it stands now: an entry a lease already serves is held to no cap. Every
+/// decision reads it afresh, so a grant changes what the requests behind it see.
+pub fn live_queue(queue: &[QueueEntry], leases: &[Holding]) -> Vec<QueueEntry> {
+    queue
+        .iter()
+        .map(|e| QueueEntry {
+            cap: if has_lease(e, leases) { None } else { e.cap },
+            ..e.clone()
+        })
+        .collect()
 }
 
 /// Why a waiter's owner may not take another slot yet, given how many it holds; none when it
@@ -67,8 +92,10 @@ pub fn queue_turn(
 /// A lease as the queue counts it: which slot it holds, and for whom.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Holding {
+    pub id: i64,
     pub project: Option<String>,
     pub slot: Option<u32>,
+    pub worktree: String,
     /// The owner's key, `<pid>:<start>`.
     pub owner: String,
     pub owner_label: String,
@@ -129,6 +156,8 @@ mod tests {
             created: 0,
             owner: "100:a".to_owned(),
             owner_label: "claude:100".to_owned(),
+            worktree: format!("s5-t{id}"),
+            lease: None,
             project: Some("peekabus".to_owned()),
             cap: Some(2),
             max_slots: 3,
@@ -142,6 +171,8 @@ mod tests {
             created: 0,
             owner: "200:b".to_owned(),
             owner_label: "codex:200".to_owned(),
+            worktree: "main".to_owned(),
+            lease: None,
             project: Some("peekabus".to_owned()),
             cap: Some(2),
             max_slots: 3,
@@ -220,8 +251,10 @@ mod tests {
     #[test]
     fn counts_per_owner_against_the_cap_for_status() {
         let lease = |project: Option<&str>, slot: Option<u32>, owner: &str, label: &str| Holding {
+            id: 0,
             project: project.map(str::to_owned),
             slot,
+            worktree: "wt".to_owned(),
             owner: owner.to_owned(),
             owner_label: label.to_owned(),
         };

@@ -50,11 +50,16 @@ fn stop_daemon(sandbox: &Sandbox) {
         .parse()
         .expect("a pid");
     kill_group(pid, Signal::TERM);
+    // A zombie leader can outlast its other threads, which still hold the socket and the lock:
+    // the daemon is gone once the leader is all that is left of it.
     let gone = poll_until(|| {
+        let threads = fs::read_dir(format!("/proc/{pid}/task")).map_or(0, Iterator::count);
         fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-            stat.rsplit(')')
-                .next()
-                .is_some_and(|s| s.trim_start().starts_with('Z'))
+            threads <= 1
+                && stat
+                    .rsplit(')')
+                    .next()
+                    .is_some_and(|s| s.trim_start().starts_with('Z'))
         })
     });
     assert!(gone, "daemon {pid} outlived its TERM");
@@ -252,4 +257,134 @@ fn docker_and_systemctl_run_while_the_store_is_unlocked() {
         );
     }
     assert!(!seen.contains("held"), "{seen}");
+}
+
+/// `devlab` run in `dir` for the owner process `pid`.
+fn for_owner(sandbox: &Sandbox, dir: &Path, pid: u32, args: &[&str]) -> Command {
+    let mut cmd = devlab(sandbox, dir, args);
+    cmd.env("DEVLAB_OWNER_PID", pid.to_string());
+    cmd
+}
+
+/// A stand-in agent: a live process to own leases, killed when dropped.
+struct Agent(std::process::Child);
+
+impl Agent {
+    fn start() -> Agent {
+        Agent(
+            Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("start an owner"),
+        )
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    fn exit(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        self.exit();
+    }
+}
+
+/// Fakes the project's supabase CLI as the world does, except that `stop` first marks
+/// `began`, then holds until `gate` exists (for at most the test deadline).
+fn hold_stops(sandbox: &Sandbox, began: &Path, gate: &Path) {
+    let body = fs::read_to_string(fixtures().join("fakes/supabase.sh"))
+        .expect("read a fake")
+        .replace("@WORLD@", &sandbox.path("world").display().to_string());
+    let hold = format!(
+        "if [ \"$1\" = stop ]; then\n  : > '{began}'\n  i=0\n  while [ ! -e '{gate}' ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done\nfi\n",
+        began = began.display(),
+        gate = gate.display()
+    );
+    sandbox.fake("supabase", &(hold + &body));
+}
+
+/// Owner a holds demo's slot 0 with its stack up and b holds slot 1. While a's
+/// `release --stop-stack` is still stopping the stack, `free` drops a's lease some other way:
+/// slot 0 stays held until the stack is down, then goes to the next owner.
+fn a_slot_stays_held_while_its_stack_stops(free: impl FnOnce(&Sandbox, &Path, &mut Agent)) {
+    let (sandbox, world) = lab();
+    let (mut a, b, c) = (Agent::start(), Agent::start(), Agent::start());
+    let (wa, wb, wc) = (
+        world.worktree("demo-a"),
+        world.worktree("demo-b"),
+        world.worktree("demo-c"),
+    );
+    let up = run(for_owner(
+        &sandbox,
+        &wa,
+        a.pid(),
+        &["acquire", "--no-device", "--stack"],
+    ));
+    assert!(up.stdout.contains("DEVLAB_SLOT=0"), "{up:?}");
+    let other = run(for_owner(
+        &sandbox,
+        &wb,
+        b.pid(),
+        &["acquire", "--no-device"],
+    ));
+    assert!(other.stdout.contains("DEVLAB_SLOT=1"), "{other:?}");
+    let (began, gate) = (sandbox.path("stop-began"), sandbox.path("stop-gate"));
+    hold_stops(&sandbox, &began, &gate);
+    let stopping = spawn(for_owner(
+        &sandbox,
+        &wa,
+        a.pid(),
+        &["release", "--stop-stack"],
+    ));
+    assert!(poll_until(|| began.exists()), "supabase stop never ran");
+
+    free(&sandbox, &wa, &mut a);
+    let mid_stop = run(for_owner(
+        &sandbox,
+        &wc,
+        c.pid(),
+        &["acquire", "--no-device", "--wait", "0"],
+    ));
+    fs::write(&gate, "").expect("open the gate");
+    let stopped = finish(stopping);
+    let after = run(for_owner(
+        &sandbox,
+        &wc,
+        c.pid(),
+        &["acquire", "--no-device", "--wait", "0"],
+    ));
+
+    assert_eq!(
+        (mid_stop.code, mid_stop.stderr.as_str()),
+        (
+            75,
+            "devlab: gave up after 0 s: all 2 stack slots of demo are held\n"
+        ),
+        "{mid_stop:?}"
+    );
+    assert_eq!(stopped.code, 0, "{stopped:?}");
+    assert!(after.stdout.contains("DEVLAB_SLOT=0"), "{after:?}");
+}
+
+#[test]
+fn a_plain_release_mid_stop_leaves_the_slot_held_until_the_stack_is_down() {
+    a_slot_stays_held_while_its_stack_stops(|sandbox, wa, a| {
+        let plain = run(for_owner(sandbox, wa, a.pid(), &["release"]));
+        assert_eq!(plain.stderr, "devlab: released lease 1\n", "{plain:?}");
+    });
+}
+
+#[test]
+fn an_owner_that_exits_mid_stop_leaves_the_slot_held_until_the_stack_is_down() {
+    a_slot_stays_held_while_its_stack_stops(|sandbox, wa, a| {
+        a.exit();
+        let gc = run(devlab(sandbox, wa, &["gc"]));
+        assert!(gc.stdout.starts_with("released lease 1 "), "{gc:?}");
+    });
 }

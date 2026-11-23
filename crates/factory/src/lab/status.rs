@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use factory_adapters::systemd::{Systemctl, Units};
 use factory_core::lab::ago;
 use factory_core::lab::config::MachineConfig;
-use factory_core::lab::queue::{Holding, held_by, owner_slot_counts, waiter_capped};
+use factory_core::lab::queue::{Holding, held_by, live_queue, owner_slot_counts, waiter_capped};
 use factory_core::lab::slots::slot_project_id;
 use serde::Serialize;
 
@@ -13,7 +13,7 @@ use super::context::{self, project_config};
 use super::host::mem_available_mb;
 use super::lease::base_name;
 use super::stack;
-use super::wire::{Board, Lease, STATUS};
+use super::wire::{Board, Lease, STATUS, Waiter};
 use crate::client;
 use crate::output::Failure;
 use crate::paths::Paths;
@@ -186,11 +186,13 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
         })
         .collect();
     let held = held_by(&holdings);
+    let queue: Vec<_> = board.waiters.iter().map(Waiter::entry).collect();
     let waiting = board
         .waiters
         .iter()
-        .map(|w| {
-            let capped = if waiter_capped(&w.entry(), &held).is_some() {
+        .zip(live_queue(&queue, &holdings))
+        .map(|(w, entry)| {
+            let capped = if waiter_capped(&entry, &held).is_some() {
                 " (owner at its slot cap)"
             } else {
                 ""

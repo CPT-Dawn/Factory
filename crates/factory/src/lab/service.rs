@@ -28,8 +28,8 @@ use super::host;
 use super::lease::base_name;
 use super::store::{self, Store};
 use super::wire::{
-    AcquireParams, Board, FindParams, GC, Granted, LEASE, Lease, RELEASE, SLOT, STATUS, SlotParams,
-    Waiter,
+    AcquireParams, Board, FindParams, GC, Granted, LEASE, Lease, RELEASE, ReleaseParams, SLOT,
+    STATUS, STOPPING, SlotParams, StopParams, Waiter,
 };
 use crate::protocol::{ErrorBody, Outcome, Request, Response};
 
@@ -72,16 +72,17 @@ impl Lab {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = now();
-        let (freed, out) = store
+        let (freed, unstopped, out) = store
             .write(|c| {
                 let freed = store::gc(c, now, &host::alive)?;
-                Ok((freed, work(c, now)?))
+                let unstopped = store::clear_dead_stoppers(c, &host::alive)?;
+                Ok((freed, unstopped, work(c, now)?))
             })
             .map_err(|e| ErrorBody {
                 code: Exit::Precondition.code(),
                 message: format!("lab store {}: {e}; retry", self.path.display()),
             })?;
-        if !freed.is_empty() {
+        if !freed.is_empty() || unstopped > 0 {
             self.notify();
         }
         Ok((freed, out))
@@ -112,6 +113,7 @@ pub async fn respond(lab: &Arc<Lab>, method: &str, params: Value) -> Option<Outc
     let work: fn(&Lab, Value) -> Answer<Value> = match method {
         LEASE => |lab, p| reply(lab_lease(lab, parse(p)?)),
         RELEASE => |lab, p| reply(release(lab, parse(p)?)),
+        STOPPING => |lab, p| reply(stopping(lab, parse(p)?)),
         GC => |lab, _| reply(lab.write_gc(|_, _| Ok(())).map(|(freed, ())| freed)),
         STATUS => |lab, _| reply(status(lab)),
         SLOT => |lab, p| reply(slot(lab, parse(p)?)),
@@ -157,18 +159,40 @@ fn lab_lease(lab: &Lab, p: FindParams) -> Answer<Option<Lease>> {
     })
 }
 
-fn release(lab: &Lab, p: FindParams) -> Answer<Option<Lease>> {
-    let dropped = lab.write(|c, now| {
-        let lease = store::find_lease(c, &p.worktree, &p.owner, p.lease)?;
+fn release(lab: &Lab, p: ReleaseParams) -> Answer<Option<Lease>> {
+    let (dropped, unstopped) = lab.write(|c, now| {
+        let f = &p.find;
+        let lease = store::find_lease(c, &f.worktree, &f.owner, f.lease)?;
         if let Some(lease) = &lease {
             store::drop_lease(c, lease, now)?;
         }
-        Ok(lease)
+        let unstopped = match &p.stopper {
+            Some(stopper) => store::clear_stopping(c, stopper)?,
+            None => 0,
+        };
+        Ok((lease, unstopped))
     })?;
-    if dropped.is_some() {
+    if dropped.is_some() || unstopped > 0 {
         lab.notify();
     }
     Ok(dropped)
+}
+
+/// The caller's lease, its slot marked as stopping for `p.stopper`.
+fn stopping(lab: &Lab, p: StopParams) -> Answer<Option<Lease>> {
+    lab.write(|c, _| {
+        let f = &p.find;
+        let lease = store::find_lease(c, &f.worktree, &f.owner, f.lease)?;
+        if let Some(Lease {
+            project: Some(project),
+            slot: Some(slot),
+            ..
+        }) = &lease
+        {
+            store::mark_stopping(c, project, *slot, &p.stopper)?;
+        }
+        Ok(lease)
+    })
 }
 
 fn status(lab: &Lab) -> Answer<Board> {
@@ -216,8 +240,6 @@ fn gather(p: &AcquireParams) -> Facts {
 
 fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<i64> {
     lab.write(|c, now| {
-        let existing = store::find_lease(c, &p.worktree, &p.owner, p.lease)?;
-        let ask = project_ask(p);
         let name = base_name(&p.worktree);
         store::insert_waiter(
             c,
@@ -227,8 +249,10 @@ fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<i64> {
                 label: format!("{} @ {name}", p.owner.label),
                 owner: p.owner.key(),
                 owner_label: p.owner.label.clone(),
+                worktree: p.worktree.clone(),
+                lease: p.lease,
                 project: p.project.as_ref().map(|project| project.name.clone()),
-                slot_cap: grant::request_cap(ask.as_ref(), existing.is_some()),
+                slot_cap: p.project.as_ref().map(|project| project.cap),
                 max_slots: p.project.as_ref().map_or(0, |project| project.max_slots),
             },
         )
@@ -268,7 +292,9 @@ fn try_grant(
                             project.stack.as_ref().map(|s| s.ports.as_slice()),
                         );
                         SlotView {
-                            held: false,
+                            held: rows
+                                .iter()
+                                .any(|r| r.project == project.name && r.slot == slot && r.stopping),
                             last_is_mine: rows.iter().any(|r| {
                                 r.project == project.name
                                     && r.slot == slot

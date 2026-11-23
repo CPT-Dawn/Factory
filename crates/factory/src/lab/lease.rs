@@ -10,10 +10,11 @@ use factory_core::lab::slots::{Env, slot_env};
 
 use super::cli::note;
 use super::context::Ctx;
+use super::host::proc;
 use super::stack;
 use super::wire::{
-    ACQUIRE, AcquireParams, GC, Granted, LEASE, Lease, ProjectAsk, RELEASE, SLOT, SlotParams,
-    StackAsk,
+    ACQUIRE, AcquireParams, GC, Granted, LEASE, Lease, Process, ProjectAsk, RELEASE, ReleaseParams,
+    SLOT, STOPPING, SlotParams, StackAsk, StopParams,
 };
 use crate::client;
 use crate::output::Failure;
@@ -120,8 +121,38 @@ pub fn live(ctx: &Ctx) -> Result<Lease, Failure> {
     })
 }
 
+/// Drops the caller's lease, and lets go of any slot this call held while stopping its stack.
 pub fn release(ctx: &Ctx) -> Result<Option<Lease>, Failure> {
-    client::call(&paths()?, RELEASE, &ctx.find())
+    client::call(
+        &paths()?,
+        RELEASE,
+        &ReleaseParams {
+            find: ctx.find(),
+            stopper: Some(me()),
+        },
+    )
+}
+
+/// The caller's lease, its slot held for this call until its [`release`] while it stops
+/// the slot's stack.
+pub fn stopping(ctx: &Ctx) -> Result<Option<Lease>, Failure> {
+    client::call(
+        &paths()?,
+        STOPPING,
+        &StopParams {
+            find: ctx.find(),
+            stopper: me(),
+        },
+    )
+}
+
+/// This devlab call, as a stopper.
+fn me() -> Process {
+    let pid = i64::from(std::process::id());
+    Process {
+        pid,
+        start: proc(pid).map(|p| p.start).unwrap_or_default(),
+    }
 }
 
 /// Drops the leases of owners that exited; a line for each.

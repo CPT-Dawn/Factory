@@ -111,10 +111,15 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
     }
 }
 
-/// Gives the lease back. With `--stop-stack` the stack stops first, while the lease still keeps
-/// the slot from the next in the queue; a stop that fails still gives the lease back.
+/// Gives the lease back. With `--stop-stack` the stack stops first, its slot held for this
+/// call meanwhile, whatever ends the lease, so the next in the queue never gets a stack being
+/// torn down; a stop that fails still gives the lease back.
 fn release(ctx: &Ctx, stop_stack: bool) -> Result<u8, Failure> {
-    let held = if stop_stack { lease::find(ctx)? } else { None };
+    let held = if stop_stack {
+        lease::stopping(ctx)?
+    } else {
+        None
+    };
     let stopped = match (&held, &ctx.project) {
         (
             Some(Lease {
