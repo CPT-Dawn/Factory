@@ -7,6 +7,9 @@ mod agy;
 mod ci;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
+mod claude;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
 mod cutover;
 mod devlab_golden;
 mod harness;

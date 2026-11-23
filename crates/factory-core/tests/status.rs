@@ -2,8 +2,8 @@
 //! ticket names (three slots, three backends, five leads) fits one terminal screen.
 
 use factory_core::status::{
-    Backend, COLUMNS, Lab, Lead, Leads, Lease, Queued, QuotaState, ROWS, Reservation, Slot, Status,
-    Subagent, Wait, screen,
+    Backend, COLUMNS, Claude, Lab, Lead, Leads, Lease, Queued, QuotaState, ROWS, Reservation, Slot,
+    Status, Subagent, Wait, screen,
 };
 use factory_core::timestamp::Timestamp;
 
@@ -17,6 +17,7 @@ fn idle() -> Status {
         now: now() * 1000,
         lab: Lab::default(),
         review: Vec::new(),
+        claude: Claude::default(),
         waits: Vec::new(),
         leads: Leads {
             error: None,
@@ -92,6 +93,7 @@ fn an_idle_factory_has_a_dated_title_and_one_line_per_section() {
             "factory status 2026-11-23 04:13Z",
             "lab: idle",
             "review: no backends configured",
+            "claude: no plan window seen",
             "waits: none",
             "leads: none, monitor off",
         ]
@@ -222,7 +224,7 @@ fn a_wait_names_who_waits_and_what_for() {
     ];
 
     assert_eq!(
-        &rows(&status)[3..7],
+        &rows(&status)[4..8],
         [
             "waits: 3",
             "  lead-pay -> ci o/r#12",
@@ -264,7 +266,7 @@ fn a_lead_shows_its_state_context_and_subagents() {
     status.leads.leads = vec![cart, pay, ship, lead("lead-docs", "finished", None)];
 
     assert_eq!(
-        &rows(&status)[4..9],
+        &rows(&status)[5..10],
         [
             "leads: 4, monitor on",
             "  lead-cart  working             212k  3 subs, most 170k",
@@ -281,7 +283,7 @@ fn leads_that_herdr_cannot_tell_are_one_line() {
     status.leads.error = Some("herdr unreachable at /x/herdr.sock: no such file".to_owned());
 
     assert_eq!(
-        rows(&status)[4],
+        rows(&status)[5],
         "leads: herdr unavailable, see factory lead list"
     );
 }
@@ -464,5 +466,29 @@ fn a_reservation_holds_its_slot_and_is_listed_with_its_lead() {
             "  reserved demo/1 demo-lead claude:77 3m",
             "  demo/2 free",
         ]
+    );
+}
+
+#[test]
+fn the_claude_row_shows_the_window_or_the_hold() {
+    let mut status = idle();
+    let at = |t: &str| Timestamp::parse(t).map(Timestamp::unix_millis);
+    status.claude = Claude {
+        verdict: "go".to_owned(),
+        used_percent: Some(41),
+        resets: at("2026-11-23T07:00:00Z"),
+        until: None,
+    };
+    assert_eq!(rows(&status)[3], "claude: 41% of 5h used, resets 07:00Z");
+
+    status.claude = Claude {
+        verdict: "hold".to_owned(),
+        used_percent: None,
+        resets: None,
+        until: at("2026-11-24T01:30:00Z"),
+    };
+    assert_eq!(
+        rows(&status)[3],
+        "claude: holding dispatches until 11-24 01:30Z, its limit hit"
     );
 }

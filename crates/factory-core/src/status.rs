@@ -19,6 +19,8 @@ pub struct Status {
     pub lab: Lab,
     /// The configured review backends, in the order they are tried.
     pub review: Vec<Backend>,
+    /// The Claude plan's 5-hour window, and whether a lead may dispatch.
+    pub claude: Claude,
     pub waits: Vec<Wait>,
     pub leads: Leads,
 }
@@ -115,6 +117,19 @@ pub enum QuotaState {
     Cooling,
 }
 
+/// The Claude plan's quota as `factory quota claude` judges it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Claude {
+    /// `unknown` (no window seen, or it has reset), `go` or `hold`.
+    pub verdict: String,
+    /// The window's spent share, rounded; none when no current window was seen.
+    pub used_percent: Option<u32>,
+    /// When the window resets, in milliseconds since the epoch.
+    pub resets: Option<i64>,
+    /// When a hold ends, in milliseconds since the epoch.
+    pub until: Option<i64>,
+}
+
 /// A registered wait.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Wait {
@@ -170,8 +185,8 @@ pub const ROWS: usize = 24;
 pub const COLUMNS: usize = 80;
 
 /// The most rows each section lists before it says how many it left out. The lab the ticket
-/// names (three slots, three backends, five leads) takes at most 22 rows with every section at
-/// its cap.
+/// names (three slots, three backends, five leads) takes at most 23 rows with every section at
+/// its cap, the Claude plan's row included.
 const LAB_ROWS: usize = 5;
 const QUEUE_ROWS: usize = 2;
 const WAIT_ROWS: usize = 3;
@@ -182,6 +197,7 @@ pub fn screen(status: &Status) -> Vec<String> {
     let mut rows = vec![format!("factory status {}", minute(status.now))];
     lab(status, &mut rows);
     review(status, &mut rows);
+    claude(status, &mut rows);
     waits(status, &mut rows);
     leads(status, &mut rows);
     rows.iter().map(|row| fit(row)).collect()
@@ -296,6 +312,25 @@ fn review(status: &Status, rows: &mut Vec<String>) {
     }
 }
 
+fn claude(status: &Status, rows: &mut Vec<String>) {
+    let claude = &status.claude;
+    let used = claude
+        .used_percent
+        .map(|used| format!("{used}% of 5h used"));
+    let row = match (claude.verdict.as_str(), claude.until, claude.resets, used) {
+        ("hold", Some(until), _, used) => format!(
+            "claude: holding dispatches until {}, {}",
+            moment(until, status.now),
+            used.unwrap_or_else(|| "its limit hit".to_owned())
+        ),
+        ("go", _, Some(resets), Some(used)) => {
+            format!("claude: {used}, resets {}", moment(resets, status.now))
+        }
+        _ => "claude: no plan window seen".to_owned(),
+    };
+    rows.push(row);
+}
+
 fn waits(status: &Status, rows: &mut Vec<String>) {
     if status.waits.is_empty() {
         rows.push("waits: none".to_owned());
@@ -312,7 +347,7 @@ fn waits(status: &Status, rows: &mut Vec<String>) {
                 (None, None) => "outside herdr".to_owned(),
             };
             let on = match wait.kind.as_str() {
-                kind @ ("ci" | "review" | "lease") => format!("{kind} {}", wait.on),
+                kind @ ("ci" | "review" | "lease" | "claude") => format!("{kind} {}", wait.on),
                 _ => wait.on.clone(),
             };
             format!("  {waiter} -> {on}")

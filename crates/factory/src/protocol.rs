@@ -53,6 +53,18 @@ pub const MONITOR_STOP: &str = "monitor.stop";
 /// Whether the context steward runs, and what it watches: no params, [`MonitorStatus`] out.
 pub const MONITOR_STATUS: &str = "monitor.status";
 
+/// Records the Claude plan's 5-hour window a statusline saw: [`ClaudeWindowParams`] in,
+/// [`ClaudeVerdict`] out.
+pub const CLAUDE_WINDOW: &str = "claude.window";
+/// Records that a turn ended on the plan's limit: [`ClaudeLimitParams`] in, [`ClaudeVerdict`]
+/// out.
+pub const CLAUDE_LIMIT: &str = "claude.limit";
+/// Whether a lead may dispatch now: [`ClaudeQuotaParams`] in, [`ClaudeVerdict`] out.
+pub const CLAUDE_QUOTA: &str = "claude.quota";
+/// Answered once a lead may dispatch: [`WaitClaudeParams`] in, [`ClaudeVerdict`] out; an error
+/// with exit 124 when the time runs out first.
+pub const WAIT_CLAUDE: &str = "wait.claude";
+
 /// What the daemon holds, as one record, read from its own state and running no command:
 /// [`StatusParams`] in, [`factory_core::status::Status`] out.
 pub const STATUS: &str = "status";
@@ -121,6 +133,53 @@ pub struct StatusParams {
     /// The configured review backends, in the order they are tried: the daemon holds quotas, the
     /// config says which backends there are.
     pub backends: Vec<BackendSlots>,
+    /// The config's mark for holding Claude dispatches, in percent of the 5-hour window.
+    #[serde(default = "hold_at_default")]
+    pub claude_hold_at: f64,
+}
+
+fn hold_at_default() -> f64 {
+    factory_core::claude::HOLD_AT_PERCENT
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaudeWindowParams {
+    pub used_percent: f64,
+    /// When the window resets, in milliseconds since the epoch.
+    pub resets: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaudeLimitParams {
+    /// The reset the limit's message names, in milliseconds since the epoch; none when it names
+    /// none.
+    pub reset: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaudeQuotaParams {
+    /// Hold once this share of the window is spent, in percent.
+    pub hold_at: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WaitClaudeParams {
+    pub hold_at: f64,
+    /// The herdr pane the wait comes from, so the lead in it shows as waiting.
+    pub waiter: Option<String>,
+    pub timeout_secs: u64,
+}
+
+/// Whether a lead may dispatch: `unknown`, `go` or `hold`, with the window and the hold.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaudeVerdict {
+    pub verdict: String,
+    pub used_percent: Option<f64>,
+    /// When the window resets, in milliseconds since the epoch.
+    pub resets: Option<i64>,
+    /// When a hold ends, in milliseconds since the epoch.
+    pub until: Option<i64>,
+    pub hold_at: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -1,6 +1,7 @@
 //! `factory`: the CLI and the daemon of the agent software factory (spec #1).
 
 mod ci;
+mod claude;
 mod cli;
 mod client;
 mod clock;
@@ -35,7 +36,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use cli::{Cli, Command, LeadCommand, MonitorCommand, WaitCommand};
+use cli::{Cli, Command, LeadCommand, MonitorCommand, QuotaCommand, WaitCommand};
 use output::{Done, Failure};
 
 /// How long a `factory wait` blocks without `--timeout`.
@@ -58,6 +59,10 @@ fn main() -> ExitCode {
             command: Command::Hook { command },
             json,
         }) => hook::run(&command, json),
+        Ok(Cli {
+            command: Command::Statusline,
+            ..
+        }) => claude::statusline(),
         Ok(cli::Cli {
             command: Command::Lab { args },
             json,
@@ -105,6 +110,14 @@ fn run(command: Command, json: bool) -> ExitCode {
             command: LeadCommand::Status { lead },
         } => lead::status(&lead),
         Command::Status => status::run(),
+        Command::Quota {
+            command: QuotaCommand::Claude,
+        } => claude::quota(),
+        // Handled in main, before the output contract: its line is Claude Code's.
+        Command::Statusline => return claude::statusline(),
+        Command::Wait {
+            command: WaitCommand::Claude { timeout },
+        } => claude::wait(timeout),
         Command::Monitor { command } => match command {
             MonitorCommand::Start => monitor::start(),
             MonitorCommand::Stop => monitor::stop(),

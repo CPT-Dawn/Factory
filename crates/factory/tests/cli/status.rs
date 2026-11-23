@@ -54,7 +54,7 @@ fn an_idle_factory_says_so_in_every_section() {
         .collect();
     assert_eq!(
         sections,
-        ["factory", "lab", "review", "waits", "leads"],
+        ["factory", "lab", "review", "claude", "waits", "leads"],
         "{out:?}"
     );
     assert!(lines.contains(&"lab: idle"), "{out:?}");
@@ -72,7 +72,15 @@ fn json_gives_every_field_of_every_section() {
         keys.sort();
         keys
     };
-    assert_eq!(keys(&shown), ["lab", "leads", "now", "review", "waits"]);
+    assert_eq!(
+        keys(&shown),
+        ["claude", "lab", "leads", "now", "review", "waits"]
+    );
+    assert_eq!(
+        keys(&shown["claude"]),
+        ["resets", "until", "used_percent", "verdict"]
+    );
+    assert_eq!(shown["claude"]["verdict"], "unknown", "{shown}");
     assert_eq!(
         keys(&shown["lab"]),
         ["leases", "queue", "reservations", "slots"]
