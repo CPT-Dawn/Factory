@@ -155,6 +155,17 @@ pub fn lease(c: &Connection, id: i64) -> rusqlite::Result<Option<Lease>> {
         .transpose()
 }
 
+/// The highest lease id ever granted; 0 before the first.
+pub fn last_lease_id(c: &Connection) -> rusqlite::Result<i64> {
+    Ok(c.query_row(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'leases'",
+        [],
+        |row| row.get(0),
+    )
+    .optional()?
+    .unwrap_or(0))
+}
+
 /// The devices lease `id` holds, in the order they were granted.
 pub fn lease_devices(c: &Connection, id: i64) -> rusqlite::Result<Vec<LeaseDevice>> {
     let mut q = c.prepare(

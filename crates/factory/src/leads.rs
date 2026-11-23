@@ -242,6 +242,7 @@ impl<H: HerdrApi> Leads<H> {
                     WaitOn::Lead(name) => ("lead", name.clone()),
                     WaitOn::Ci(pr) => ("ci", pr.clone()),
                     WaitOn::Review(label) => ("review", label.clone()),
+                    WaitOn::Lease(id) => ("lease", id.to_string()),
                 };
                 status::Wait {
                     pane: wait.waiter.clone(),

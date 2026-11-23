@@ -51,6 +51,14 @@ pub fn ago(now: i64, then: i64) -> String {
     }
 }
 
+/// The last component of a path, as Node's `path.basename` gives it: `/a/wt/` is `wt`.
+pub fn base_name(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::ago;

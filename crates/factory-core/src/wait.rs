@@ -15,6 +15,8 @@ pub enum WaitOn {
     Ci(String),
     /// A review, by its label.
     Review(String),
+    /// A lab lease, by its id.
+    Lease(i64),
 }
 
 impl fmt::Display for WaitOn {
@@ -23,6 +25,7 @@ impl fmt::Display for WaitOn {
             WaitOn::Lead(name) => f.write_str(name),
             WaitOn::Ci(pr) => write!(f, "ci {pr}"),
             WaitOn::Review(label) => write!(f, "review {label}"),
+            WaitOn::Lease(id) => write!(f, "lease {id}"),
         }
     }
 }

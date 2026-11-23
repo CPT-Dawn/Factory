@@ -5,8 +5,7 @@
 //! its cap is refused at once (exit 75, naming the cap and an ETA); one that waits for a free slot
 //! prints one line when it starts to wait and one when it is answered.
 
-use std::time::Duration;
-
+use factory_core::lab::args::wait_span;
 use factory_core::lab::reserve::{ReserveOpts, parse_reserve};
 use serde_json::json;
 
@@ -17,7 +16,7 @@ use super::wire::{RESERVE, ReserveParams, Reserved, UNRESERVE, UnreserveParams};
 use crate::client;
 use crate::output::Failure;
 
-const USAGE: &str = "usage: factory lab reserve [--slots N] [--wait SEC] [--json]\n       factory lab reserve --release [--json]\n\nreserve sets N stack slots of this project aside for implementers (up to your per-owner cap)\nand prints their ids; give each implementer one as DEVLAB_RESERVATION=<id> and its devlab\nacquire takes the slot at once. An owner with no room under its cap exits 75 with an ETA.\n--release gives every reservation of yours back.\n";
+pub(super) const USAGE: &str = "usage: factory lab reserve [--slots N] [--wait SEC] [--json]\n       factory lab reserve --release [--json]\n\nreserve sets N stack slots of this project aside for implementers (up to your per-owner cap)\nand prints their ids; give each implementer one as DEVLAB_RESERVATION=<id> and its devlab\nacquire takes the slot at once. An owner with no room under its cap exits 75 with an ETA.\n--release gives every reservation of yours back.\n";
 
 pub fn main(args: &[String]) -> Result<u8, Failure> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -78,9 +77,7 @@ fn run(ctx: &Ctx, opts: &ReserveOpts) -> Result<(String, serde_json::Value), Fai
         slots: opts.slots,
         wait_sec,
     };
-    let listen = Duration::try_from_secs_f64(wait_sec)
-        .ok()
-        .and_then(|wait| wait.checked_add(ANSWER_GRACE));
+    let listen = wait_span(wait_sec).checked_add(ANSWER_GRACE);
     let reserved: Reserved =
         client::call_streaming(&paths()?, RESERVE, &params, listen, &mut note)?;
     let value = json!({

@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::lab::{ago, base_name};
+use crate::steward::kilo;
 use crate::timestamp::Timestamp;
 
 /// Everything `factory status` shows.
@@ -310,7 +312,7 @@ fn waits(status: &Status, rows: &mut Vec<String>) {
                 (None, None) => "outside herdr".to_owned(),
             };
             let on = match wait.kind.as_str() {
-                kind @ ("ci" | "review") => format!("{kind} {}", wait.on),
+                kind @ ("ci" | "review" | "lease") => format!("{kind} {}", wait.on),
                 _ => wait.on.clone(),
             };
             format!("  {waiter} -> {on}")
@@ -384,35 +386,6 @@ fn listed(rows: &mut Vec<String>, each: Vec<String>, cap: usize, what: &str) {
     if left > 0 {
         rows.push(format!("  +{left} more {what}"));
     }
-}
-
-/// How long ago `then` was, or how far `then` is from `now`, in seconds: `3m`, then `1.5h`
-/// from an hour on.
-fn ago(now: i64, then: i64) -> String {
-    let minutes = (now - then + 30).div_euclid(60);
-    if minutes < 60 {
-        format!("{minutes}m")
-    } else {
-        let tenths = (minutes + 3).div_euclid(6);
-        if tenths % 10 == 0 {
-            format!("{}h", tenths / 10)
-        } else {
-            format!("{}.{}h", tenths / 10, tenths % 10)
-        }
-    }
-}
-
-/// Context in thousands of tokens, as the steward says it: `312k`.
-fn kilo(tokens: u64) -> String {
-    format!("{}k", tokens / 1000)
-}
-
-/// The last component of a path.
-fn base_name(path: &str) -> &str {
-    path.trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or(path)
 }
 
 /// `2026-11-23 04:13Z`.

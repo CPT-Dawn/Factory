@@ -11,12 +11,12 @@ use serde::Serialize;
 
 use super::context::{self, project_config};
 use super::host::mem_available_mb;
-use super::lease::base_name;
 use super::stack;
 use super::wire::{Board, DeviceLine, Lease, Reservation, STATUS, SlotRow, Waiter};
 use crate::client;
 use crate::output::Failure;
 use crate::paths::Paths;
+use factory_core::lab::base_name;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

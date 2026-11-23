@@ -45,8 +45,8 @@ use crate::protocol::{
     ErrorBody, LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH,
     MONITOR_START, MONITOR_STATUS, MONITOR_STOP, NotifyParams, Outcome, REVIEW_ACQUIRE,
     REVIEW_QUOTA, Request, Response, ReviewRef, STATUS, SpawnParams, StatusParams, WAIT_CI,
-    WAIT_LEAD, WAIT_NOTIFY, WAIT_REVIEW, WaitCiParams, WaitCiResult, WaitLeadParams,
-    WaitReviewParams,
+    WAIT_LEAD, WAIT_LEASE, WAIT_NOTIFY, WAIT_REVIEW, WaitCiParams, WaitCiResult, WaitLeadParams,
+    WaitLeaseParams, WaitReviewParams,
 };
 use crate::reviews::Reviews;
 use crate::router::Router;
@@ -422,6 +422,21 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
                     biased;
                     () = stop.clone().stopping() => stopped("wait"),
                     waited = daemon.reviews.wait(&daemon.ledger, &params) => answered(waited),
+                }
+            }
+            Err(refused) => refused,
+        },
+        WAIT_LEASE => match params::<WaitLeaseParams>(WAIT_LEASE, request.params) {
+            // Biased, as a lead wait: a stopping daemon answers no wait.
+            Ok(params) => {
+                let _wait = daemon.leads.register(Wait {
+                    waiter: params.waiter.clone(),
+                    on: WaitOn::Lease(params.lease),
+                });
+                tokio::select! {
+                    biased;
+                    () = stop.clone().stopping() => stopped("wait"),
+                    waited = service::wait_lease(&daemon.lab, &params) => answered(waited),
                 }
             }
             Err(refused) => refused,

@@ -6,7 +6,7 @@ One binary, `factory`:
 
 - `factory lab` (also answers to `devlab`): leases phones, emulators and local stack slots between agents.
 - `factory review`: routes a code review to the first reviewer with quota left (Antigravity, then Codex, then Claude).
-- `factory wait`: blocks on CI, a review, a lead or a lease, silently, then prints one line. With `--notify` it returns at once, and the daemon posts the line into the asking Claude Code session when the wait ends; that event delivery stays off until `[notify] enabled = true` in the config.
+- `factory wait ci|review|lead|lease`: blocks on the daemon, silently, until a PR's checks finish, a review ends, a lead finishes or needs attention, or a lab lease is held no more, then prints one line. `wait ci` and `wait lead` take `--notify`: the command returns at once, and the daemon posts the line into the asking Claude Code session when the wait ends. That event delivery stays off until `[notify] enabled = true` in the config.
 - `factory cutover`: hands the `devlab` name from today's TypeScript devlab to factory lab, and `--rollback` gives it back ([docs/cutover.md](docs/cutover.md)).
 - `factory lead`, `factory monitor`, `factory log`, `factory hook`, `factory status`.
 
@@ -14,7 +14,7 @@ One binary, `factory`:
 
 Every command prints one line by default, `--json` on request, and uses fixed exit codes.
 
-Status: being built; `factory log` works, through the daemon, and so does `factory review` on Codex, falling back to Claude, with its backends in `~/.config/factory/config.toml`. The spec is issue #1.
+Status: every command above works through the daemon, which `factory install` sets up as a systemd user socket. `factory review` tries its backends in the order `~/.config/factory/config.toml` gives them. The spec is issue #1.
 
 ## Licence
 

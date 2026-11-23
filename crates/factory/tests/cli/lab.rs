@@ -316,24 +316,19 @@ fn a_shell_with_no_agent_above_it_gets_a_lease_and_a_warning() {
     );
 }
 
-/// Fakes `tool` as the world does, after it records whether lab.db's write lock was free.
+/// Fakes `tool` as the world does, after it records whether the lab could write meanwhile: a
+/// `devlab gc`, which writes to the store, that answers within its deadline finds no write
+/// transaction open around `tool`.
 fn probe_lock(sandbox: &Sandbox, tool: &str, probes: &Path) {
-    let db = sandbox.path("state/factory/lab.db");
     let body = fs::read_to_string(fixtures().join(format!("fakes/{tool}.sh")))
         .expect("read a fake")
         .replace("@WORLD@", &sandbox.path("world").display().to_string());
-    let probe = r#"python3 - '@DB@' <<'PY' >> '@PROBES@'
-import sqlite3, sys
-try:
-    c = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)
-    c.execute('BEGIN IMMEDIATE')
-    c.execute('ROLLBACK')
-    print('@TOOL@ free')
-except sqlite3.OperationalError as e:
-    print('@TOOL@ held:', e)
-PY
+    let probe = r#"if timeout 3 devlab gc >/dev/null 2>&1; then
+  echo '@TOOL@ free' >> '@PROBES@'
+else
+  echo "@TOOL@ held: devlab gc exited $?" >> '@PROBES@'
+fi
 "#
-    .replace("@DB@", &db.display().to_string())
     .replace("@PROBES@", &probes.display().to_string())
     .replace("@TOOL@", tool);
     sandbox.fake(tool, &(probe + &body));
@@ -344,8 +339,6 @@ fn docker_runs_while_the_store_is_unlocked() {
     let (sandbox, world) = lab();
     let probes: PathBuf = sandbox.path("probes");
     let wt = world.worktree("demo-lock");
-    // The daemon makes lab.db on its first call; probe once it is there.
-    assert_eq!(owned(&sandbox, &wt, &["status"]).code, 0);
     probe_lock(&sandbox, "docker", &probes);
     let other = world.worktree("demo-other");
     // A second owner, so its lease takes the other slot instead of queueing behind the cap.
@@ -957,6 +950,78 @@ fn factory_lab_says_one_line_per_verb_and_json_with_the_flag() {
             "",
             "factory: unknown command frobnicate; factory lab help\n"
         )
+    );
+}
+
+#[test]
+fn factory_lab_preps_and_watches_as_devlab_does_in_one_line_each() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-prep");
+    let me = std::process::id();
+    let lab = |args: &[&str]| native(&sandbox, &wt, me, &[&["lab"], args].concat());
+    for phone in ["FAKEPHONE01", "FAKEPHONE03"] {
+        world
+            .apply(&format!("plug {phone} device usb:1-1 model:Pixel_7"))
+            .unwrap();
+    }
+    world.apply("lock FAKEPHONE03").unwrap();
+
+    assert_eq!(
+        one_line(&lab(&["prep", "FAKEPHONE01"])),
+        "FAKEPHONE01: ready"
+    );
+    let both = one_line(&lab(&["prep"])).to_owned();
+    assert!(
+        both.starts_with("prepped 2 devices, 1 with a warning; list in "),
+        "{both}"
+    );
+    assert_eq!(
+        named_file(&both),
+        "FAKEPHONE01: ready\nFAKEPHONE03: lock screen still showing: set the phone's screen lock to None or Swipe\n"
+    );
+    let json = one_json(&lab(&["prep", "--json", "FAKEPHONE03"]));
+    assert_eq!(json["devices"][0]["serial"], "FAKEPHONE03", "{json}");
+    assert!(
+        json["devices"][0]["warning"]
+            .as_str()
+            .is_some_and(|w| w.starts_with("lock screen")),
+        "{json}"
+    );
+
+    assert_eq!(
+        one_line(&lab(&["watch"])),
+        "the factory daemon frees leases and stops idle emulators and stacks now; nothing to start"
+    );
+    assert_eq!(one_json(&lab(&["watch", "--json"]))["watcher"], "daemon");
+}
+
+#[test]
+fn factory_lab_reserve_help_is_there_where_its_refusal_points() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-lead");
+    let lab = |args: &[&str]| {
+        native(
+            &sandbox,
+            &wt,
+            std::process::id(),
+            &[&["lab"], args].concat(),
+        )
+    };
+
+    let refused = lab(&["reserve", "--soon"]);
+    assert_eq!(
+        (refused.code, refused.stderr.as_str()),
+        (
+            2,
+            "factory: unknown option --soon; factory lab reserve --help\n"
+        ),
+        "{refused:?}"
+    );
+    let help = one_line(&lab(&["reserve", "--help"])).to_owned();
+    assert!(help.starts_with("factory lab reserve: usage in "), "{help}");
+    assert!(
+        named_file(&help).starts_with("usage: factory lab reserve [--slots N]"),
+        "{help}"
     );
 }
 
@@ -1802,4 +1867,105 @@ fn status_names_the_daemon_as_the_watcher_and_devlab_watch_starts_no_poller() {
         ),
         "{watch:?}"
     );
+}
+
+/// Whether the daemon holds a wait on lease `id`, as `factory status --json` lists its waits.
+fn lease_waited_on(sandbox: &Sandbox, id: &str) -> bool {
+    let out = sandbox.factory(&["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_str(&out.stdout).unwrap_or_default();
+    status["waits"]
+        .as_array()
+        .is_some_and(|waits| waits.iter().any(|w| w["kind"] == "lease" && w["on"] == id))
+}
+
+#[test]
+fn factory_wait_lease_returns_once_the_lease_is_released() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-wait-lease");
+    let me = std::process::id();
+    let acquired = native(&sandbox, &wt, me, &["lab", "acquire", "--no-device"]);
+    assert!(one_line(&acquired).starts_with("lease 1,"), "{acquired:?}");
+    let waiter = spawn(sandbox.factory_command(&["wait", "lease", "1"]));
+
+    assert!(
+        poll_until(|| lease_waited_on(&sandbox, "1")),
+        "the daemon never held the wait"
+    );
+    let released = native(&sandbox, &wt, me, &["lab", "release"]);
+    assert_eq!(released.code, 0, "{released:?}");
+    let out = finish(waiter);
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "lease 1 ended\n", ""),
+        "{out:?}"
+    );
+    // An ended lease is answered at once, in JSON too.
+    let again = one_json(&sandbox.factory(&["wait", "lease", "1", "--json"]));
+    assert_eq!(again, serde_json::json!({"lease": 1, "held": false}));
+    assert!(!lease_waited_on(&sandbox, "1"));
+}
+
+#[test]
+fn factory_wait_lease_returns_once_the_owner_exits() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-wait-owner");
+    let mut owner = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn the owner");
+    let acquired = native(
+        &sandbox,
+        &wt,
+        owner.id(),
+        &["lab", "acquire", "--no-device"],
+    );
+    assert!(one_line(&acquired).starts_with("lease 1,"), "{acquired:?}");
+    let waiter = spawn(sandbox.factory_command(&["wait", "lease", "1"]));
+    assert!(
+        poll_until(|| lease_waited_on(&sandbox, "1")),
+        "the daemon never held the wait"
+    );
+
+    owner.kill().expect("kill the owner");
+    owner.wait().expect("reap the owner");
+    let out = finish(waiter);
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "lease 1 ended\n", ""),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn factory_wait_lease_refuses_an_id_never_granted_and_times_out_on_a_held_one() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-wait-refused");
+    let me = std::process::id();
+    let acquired = native(&sandbox, &wt, me, &["lab", "acquire", "--no-device"]);
+    assert_eq!(acquired.code, 0, "{acquired:?}");
+
+    let never = sandbox.factory(&["wait", "lease", "7"]);
+    assert_eq!(
+        (never.code, never.stdout.as_str(), never.stderr.as_str()),
+        (
+            4,
+            "",
+            "factory: no lease 7 was ever granted; see factory lab status\n"
+        ),
+        "{never:?}"
+    );
+    let held = sandbox.factory(&["wait", "lease", "1", "--timeout", "1s"]);
+    assert_eq!(
+        (held.code, held.stdout.as_str(), held.stderr.as_str()),
+        (
+            124,
+            "",
+            "factory: lease 1 still held after 1s; wait again\n"
+        ),
+        "{held:?}"
+    );
+    let bad = sandbox.factory(&["wait", "lease", "one"]);
+    assert_eq!(bad.code, 2, "{bad:?}");
 }

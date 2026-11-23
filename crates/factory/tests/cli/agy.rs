@@ -872,11 +872,12 @@ fn a_cached_usage_whose_empty_bucket_has_reset_is_asked_again() {
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
     let first = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
     assert_eq!(shown(&first.stdout)["backend"], "codex", "{first:?}");
-    // Wait, on the clock, for the reset the cached answer names to pass.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while now_millis() <= reset.unix_millis() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(20));
-    }
+    // The daemon cools agy down until the reset the cached answer names; wait until it no
+    // longer does.
+    assert!(
+        until_it(|| agy_quota(&sandbox) != "cooling"),
+        "agy cools down for good"
+    );
 
     let later = sandbox.factory_in(&repo, &["review", "--json", "main", "t2"]);
 
@@ -952,6 +953,18 @@ fn a_timeout_longer_than_a_week_is_refused_before_any_backend_runs() {
     );
 }
 
+/// agy's quota as `factory status` shows it: `unknown`, `available` or `cooling`.
+fn agy_quota(sandbox: &Sandbox) -> String {
+    let out = sandbox.factory(&["status", "--json"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    shown(&out.stdout)["review"]
+        .as_array()
+        .and_then(|backends| backends.iter().find(|b| b["name"] == "agy"))
+        .and_then(|agy| agy["quota"].as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// Waits, within a deadline, for `done` to hold.
 fn until_it(done: impl Fn() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -996,9 +1009,15 @@ fn agy_out_of_quota_is_not_granted_again_while_the_review_waits_for_codex() {
         until_it(|| reviews_run(&sandbox).len() == 2),
         "t2 tries agy"
     );
-    // Past the second cooldown: a router that still offered agy would have granted it.
-    let resumed = Instant::now() + Duration::from_millis(2500);
-    assert!(until_it(|| Instant::now() > resumed));
+    // Past the second cooldown, t2's own: a router that still offered agy would grant it now.
+    assert!(
+        until_it(|| agy_quota(&sandbox) == "cooling"),
+        "t2's try cools agy down"
+    );
+    assert!(
+        until_it(|| agy_quota(&sandbox) != "cooling"),
+        "agy's second cooldown ends"
+    );
     fs::write(sandbox.path("bin/codex.gate"), "").unwrap();
 
     let (holder, waiter) = (finish(holder), finish(waiter));

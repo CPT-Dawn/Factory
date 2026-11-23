@@ -6,9 +6,9 @@
 
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Duration;
 
 use factory_core::exit::Exit;
+use factory_core::lab::args::wait_span;
 use factory_core::lab::js_number;
 use factory_core::lab::reserve::{Plan, Reserve, eta_secs, over_cap_line, plan};
 use rusqlite::Connection;
@@ -19,11 +19,11 @@ use super::{
     Answer, Facts, Lab, Present, RECHECK, blocking, gather_stack, grant_board, grant_project,
     lock_ignoring_poison, parse, send,
 };
-use crate::lab::lease::base_name;
 use crate::lab::reservations;
 use crate::lab::store;
 use crate::lab::wire::{ReserveParams, Reserved, UnreserveParams};
 use crate::protocol::{ErrorBody, Outcome, Request, Response};
+use factory_core::lab::base_name;
 
 /// What one look at the board came to.
 enum Tried {
@@ -175,13 +175,8 @@ where
     };
     let _attached = Present(Arc::clone(&lab), waiter);
     lab.notify();
-    let year = Duration::from_secs(365 * 86400);
-    let wait = Duration::try_from_secs_f64(p.wait_sec).unwrap_or(year);
     let now = Instant::now();
-    let deadline = now
-        .checked_add(wait)
-        .or_else(|| now.checked_add(year))
-        .unwrap_or(now);
+    let deadline = now.checked_add(wait_span(p.wait_sec)).unwrap_or(now);
     let mut said = false;
     loop {
         let mut changed = lab.changed.subscribe();
