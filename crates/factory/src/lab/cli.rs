@@ -52,8 +52,8 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
             Ok(0)
         }
         "acquire" | "run" => {
-            let ctx = context()?;
             let (mut opts, rest, flags) = parse_opts(args).map_err(Failure::usage)?;
+            let ctx = context()?;
             if opts.wait_sec.is_none() {
                 opts.wait_sec = Some(ctx.cfg.wait_sec);
             }
