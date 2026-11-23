@@ -10,8 +10,14 @@ if [ "$1" = --user ]; then
   reset-failed)
     exit 0 ;;
   stop)
+    # The unit's emulator ends with it: adb no longer lists it.
+    port=$(awk -v u="$3" '$1 == u { print $2 }' "$w/unit-ports" | tail -1)
     grep -vxF "$3" "$w/units" > "$w/units.new"
     mv "$w/units.new" "$w/units"
+    if [ -n "$port" ]; then
+      awk -v s="emulator-$port" '$1 != s' "$w/devices" > "$w/devices.new"
+      mv "$w/devices.new" "$w/devices"
+    fi
     exit 0 ;;
   esac
 fi

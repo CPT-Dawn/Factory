@@ -5,13 +5,19 @@
 //! Antigravity's Gemini 4 Neon at high effort, then Codex on its own config, then Claude Opus at
 //! high effort.
 //!
-//! Its `[ci]` table sets how often a wait on CI polls GitHub when it can't listen for events.
+//! Its `[ci]` table sets how often a wait on CI polls GitHub when it can't listen for events,
+//! and its `[monitor]` table the context steward's thresholds.
 //! Its `[notify]` table is the switch for event delivery: whether `factory wait --notify` may
 //! post into the sessions that ask. It is off unless the owner switches it on.
 //!
 //! ```toml
 //! [ci]
 //! poll = "30s"             # a duration: 90s, 9m, 2h
+//!
+//! [monitor]
+//! ask = 300000             # context at which an idle lead is asked to stop, then compacted
+//! grace = "2m"             # how long an asked lead stays idle before it is compacted
+//! subagent = 200000        # context at which a subagent is told about to its lead
 //!
 //! [notify]
 //! enabled = false          # true lets the daemon post into Claude Code sessions
@@ -27,7 +33,10 @@
 //!
 //! [[review.backend]]
 //! cli = "agy"
-//! model = "gemini-4-neon"
+//! model = "gemini-4-neon"  # default: the model chosen with agy's /model (the label kept
+//!                          # under "model" in ~/.gemini/antigravity-cli/settings.json),
+//!                          # else agy's default, Gemini 4 Neon; either way its quota is
+//!                          # that model's group in agy's /usage
 //! auth = "subscription"    # agy only: its "subscription" login, or an "api-key" in
 //!                          # GEMINI_API_KEY (default: subscription)
 //! ```
@@ -45,6 +54,16 @@
 //! [hook.report.agent.implementer]  # an agent type's own limits, over the ones above
 //! max_lines = 5
 //! ```
+//!
+//! Its `[lead]` table sets how `factory lead spawn` starts Claude:
+//!
+//! ```toml
+//! [lead]
+//! model = "opus"                                # default: opus
+//! effort = "medium"                             # default: medium
+//! disable_plugins = ["expo@claude-plugins-official", "cloudflare@cloudflare"]  # the default
+//! retry_pause = 2                               # seconds between tries to submit the prompt
+//! ```
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -55,6 +74,7 @@ use std::time::Duration;
 use factory_adapters::reviewer::AgyAuth;
 use factory_core::hook::{Template, Templates};
 use factory_core::quota::WhenBusy;
+use factory_core::steward::Policy;
 use serde::Deserialize;
 
 use crate::output::Failure;
@@ -63,6 +83,11 @@ use crate::paths::Paths;
 const DEFAULT_TIMEOUT_S: u64 = 1800;
 const DEFAULT_CONCURRENCY: u32 = 2;
 const DEFAULT_POLL: Duration = Duration::from_secs(30);
+/// Today's ctx-monitor.sh threshold; Claude Code's own auto-compact near 380k is the backstop.
+const DEFAULT_ASK: u64 = 300_000;
+const DEFAULT_GRACE: Duration = Duration::from_secs(120);
+/// Below the spec's target for the largest subagent context, 250k.
+const DEFAULT_SUBAGENT: u64 = 200_000;
 
 /// The CLI a backend runs on, which picks its adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -93,7 +118,11 @@ struct ConfigFile {
     #[serde(default)]
     review: Review,
     #[serde(default)]
+    lead: LeadSection,
+    #[serde(default)]
     ci: CiSection,
+    #[serde(default)]
+    monitor: MonitorSection,
     #[serde(default)]
     notify: NotifySection,
 }
@@ -103,6 +132,14 @@ struct ConfigFile {
 struct NotifySection {
     #[serde(default)]
     enabled: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct MonitorSection {
+    ask: Option<u64>,
+    grace: Option<String>,
+    subagent: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -196,6 +233,37 @@ pub fn hook_settings(config_dir: &Path) -> Result<HookSettings, Failure> {
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+struct LeadSection {
+    model: Option<String>,
+    effort: Option<String>,
+    disable_plugins: Option<Vec<String>>,
+    retry_pause: Option<u64>,
+}
+
+/// How a lead's Claude is started, as configured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeadSetup {
+    pub model: String,
+    pub effort: String,
+    /// Plugins (`name@marketplace`) the lead starts with turned off: the ones the factory never
+    /// uses, whose skills would otherwise ride along on every request.
+    pub disable_plugins: Vec<String>,
+    /// How long to wait between tries to get the lead's prompt submitted.
+    pub retry_pause: Duration,
+}
+
+const DEFAULT_LEAD_MODEL: &str = "opus";
+const DEFAULT_LEAD_EFFORT: &str = "medium";
+const DEFAULT_RETRY_PAUSE_S: u64 = 2;
+/// The most a pause may be: a spawn tries the prompt up to five times, and the CLI waits for
+/// all of them, so a longer pause only keeps a lead that needs one enter from its work.
+const MAX_RETRY_PAUSE_S: u64 = 30;
+/// The plugins the 2026-11-23 retro measured at about 6.3k tokens of skill listings per request.
+const DEFAULT_DISABLED_PLUGINS: [&str; 2] =
+    ["expo@claude-plugins-official", "cloudflare@cloudflare"];
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct Review {
     #[serde(default)]
     backend: Vec<Entry>,
@@ -253,6 +321,26 @@ pub fn notify_off(config: &Path) -> Failure {
          [notify] enabled = true in {}; wait without --notify",
         config.display()
     ))
+}
+
+/// The context steward's thresholds.
+pub fn monitor_policy(paths: &Paths) -> Result<Policy, Failure> {
+    let (path, file) = load_config(paths)?;
+    let monitor = file.monitor;
+    let grace = match monitor.grace {
+        None => DEFAULT_GRACE,
+        Some(grace) => factory_core::duration::parse(&grace).map_err(|e| {
+            Failure::precondition(format!(
+                "{}: monitor.grace: {e}; fix the config",
+                path.display()
+            ))
+        })?,
+    };
+    Ok(Policy {
+        ask_at: monitor.ask.unwrap_or(DEFAULT_ASK),
+        grace,
+        subagent_at: monitor.subagent.unwrap_or(DEFAULT_SUBAGENT),
+    })
 }
 
 /// The config file's path and contents; an absent file is an empty config.
@@ -320,6 +408,33 @@ fn read(path: &Path) -> Result<String, Failure> {
         }
     };
     Ok(text)
+}
+
+/// How `factory lead spawn` starts Claude.
+pub fn lead_setup(paths: &Paths) -> Result<LeadSetup, Failure> {
+    let (path, file) = load_config(paths)?;
+    let lead = file.lead;
+    let pause = lead.retry_pause.unwrap_or(DEFAULT_RETRY_PAUSE_S);
+    if pause > MAX_RETRY_PAUSE_S {
+        return Err(Failure::usage(format!(
+            "{}: [lead] retry_pause is {pause}s, more than the {MAX_RETRY_PAUSE_S}s a stalled \
+             prompt is worth; lower it",
+            path.display()
+        )));
+    }
+    Ok(LeadSetup {
+        model: lead.model.unwrap_or_else(|| DEFAULT_LEAD_MODEL.to_owned()),
+        effort: lead
+            .effort
+            .unwrap_or_else(|| DEFAULT_LEAD_EFFORT.to_owned()),
+        disable_plugins: lead.disable_plugins.unwrap_or_else(|| {
+            DEFAULT_DISABLED_PLUGINS
+                .iter()
+                .map(|plugin| (*plugin).to_owned())
+                .collect()
+        }),
+        retry_pause: Duration::from_secs(pause),
+    })
 }
 
 fn backend(entry: Entry) -> Backend {

@@ -9,7 +9,9 @@
 //! a fake herdr server (`crates/factory/tests/cli/support/herdr.rs`). A session inbox is a socket
 //! too, and those tests run a fake of it (`crates/factory/tests/cli/support/inbox.rs`).
 
+pub mod adb;
 pub mod docker;
+pub mod emulator;
 pub mod gh;
 pub mod git;
 pub mod herdr;

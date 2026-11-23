@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use super::queue::{Holding, QueueEntry, held_by, queue_turn};
+use super::queue::{Holding, QueueEntry, held_by, live_queue, queue_turn};
 use super::slots::{SlotView, pick_slot};
 
 /// The project a request asks a slot of.
@@ -26,6 +26,9 @@ pub struct Ask {
     /// The slot of the lease this worktree and owner already hold, when they hold one: it asks
     /// for no new slot.
     pub existing: Option<Option<u32>>,
+    /// Why the devices it asks for are not to be had now, when they are not: it waits once its
+    /// turn in the queue comes, before any slot is looked at.
+    pub devices_wait: Option<String>,
 }
 
 /// The board as the request sees it.
@@ -34,8 +37,8 @@ pub struct Board {
     pub leases: Vec<Holding>,
     /// Every waiter, oldest first, the asker among them.
     pub queue: Vec<QueueEntry>,
-    /// The asker's project's slots by index, as far as they are known; whether each is held is
-    /// read from `leases`.
+    /// The asker's project's slots by index, as far as they are known. A slot is held when a
+    /// lease in `leases` holds it, or when its view says so (its stack is still stopping).
     pub slots: Vec<SlotView>,
     /// TCP ports something listens on.
     pub listening: BTreeSet<u32>,
@@ -60,25 +63,28 @@ pub fn request_cap(project: Option<&ProjectAsk>, existing: bool) -> Option<u32> 
 
 /// Serves `ask` now, or says why it waits. `now` is seconds since the epoch.
 pub fn decide(ask: &Ask, board: &Board, now: i64) -> Decision {
-    // The asker's own entry is read live: a lease that exists by now asks for no new slot.
-    let queue: Vec<QueueEntry> = board
-        .queue
-        .iter()
+    // Every entry is read live: one a lease serves by now asks for no new slot, the asker's
+    // own entry as the request itself sees it.
+    let queue: Vec<QueueEntry> = live_queue(&board.queue, &board.leases)
+        .into_iter()
         .map(|e| {
             if e.id != ask.waiter {
-                return e.clone();
+                return e;
             }
             QueueEntry {
                 project: ask.project.as_ref().map(|p| p.name.clone()),
                 cap: request_cap(ask.project.as_ref(), ask.existing.is_some()),
                 max_slots: ask.project.as_ref().map_or(0, |p| p.max_slots),
-                ..e.clone()
+                ..e
             }
         })
         .collect();
     let held = held_by(&board.leases);
     if let Some(why) = queue_turn(&queue, ask.waiter, &held, now) {
         return Decision::Wait(why);
+    }
+    if let Some(why) = &ask.devices_wait {
+        return Decision::Wait(why.clone());
     }
     if let Some(slot) = ask.existing {
         return Decision::Grant { slot, new: false };
@@ -95,10 +101,14 @@ pub fn decide(ask: &Ask, board: &Board, now: i64) -> Decision {
         .filter(|l| l.project.as_deref() == Some(&project.name))
         .filter_map(|l| l.slot)
         .collect();
+    // A slot is held by a lease on it, or while its stack is still being stopped.
     let slots: Vec<SlotView> = (0..project.max_slots)
-        .map(|slot| SlotView {
-            held: taken.contains(&slot),
-            ..board.slots.get(slot as usize).cloned().unwrap_or_default()
+        .map(|slot| {
+            let view = board.slots.get(slot as usize).cloned().unwrap_or_default();
+            SlotView {
+                held: view.held || taken.contains(&slot),
+                ..view
+            }
         })
         .collect();
     match pick_slot(&project.name, &slots, &board.listening, project.has_stack) {
@@ -136,16 +146,21 @@ mod tests {
             created: 0,
             owner: owner(o),
             owner_label: format!("claude:{o}"),
+            worktree: format!("wt{wt}"),
+            lease: None,
             project: Some(PROJECT.to_owned()),
             cap: Some(cap),
             max_slots,
         }
     }
 
-    fn holding(o: usize, slot: u32) -> Holding {
+    /// Owner `o`'s lease from worktree `wt` on `slot`; its id is the slot's.
+    fn holding(o: usize, wt: usize, slot: u32) -> Holding {
         Holding {
+            id: i64::from(slot) + 1,
             project: Some(PROJECT.to_owned()),
             slot: Some(slot),
+            worktree: format!("wt{wt}"),
             owner: owner(o),
             owner_label: format!("claude:{o}"),
         }
@@ -161,6 +176,7 @@ mod tests {
                 has_stack: false,
             }),
             existing,
+            devices_wait: None,
         }
     }
 
@@ -180,7 +196,7 @@ mod tests {
 
     #[test]
     fn the_head_of_the_queue_takes_the_lowest_free_slot() {
-        let b = board(vec![holding(0, 0)], vec![entry(1, 1, 1, 1, 2)], 2);
+        let b = board(vec![holding(0, 0, 0)], vec![entry(1, 1, 1, 1, 2)], 2);
         assert_eq!(
             decide(&ask(1, 2, 1, None), &b, 0),
             Decision::Grant {
@@ -202,7 +218,7 @@ mod tests {
     #[test]
     fn an_owner_at_its_cap_waits_and_steps_aside_for_the_next() {
         let b = board(
-            vec![holding(0, 0)],
+            vec![holding(0, 0, 0)],
             vec![entry(1, 0, 1, 1, 2), entry(2, 1, 2, 1, 2)],
             2,
         );
@@ -224,7 +240,7 @@ mod tests {
 
     #[test]
     fn a_lease_that_exists_is_served_again_over_the_cap() {
-        let b = board(vec![holding(0, 0)], vec![entry(1, 0, 0, 1, 2)], 2);
+        let b = board(vec![holding(0, 0, 0)], vec![entry(1, 0, 0, 1, 2)], 2);
         assert_eq!(
             decide(&ask(1, 2, 1, Some(Some(0))), &b, 0),
             Decision::Grant {
@@ -235,9 +251,41 @@ mod tests {
     }
 
     #[test]
+    fn a_request_its_own_lease_now_serves_keeps_its_place_ahead_of_later_owners() {
+        // Owner 0 queued twice from wt0 at cap 1. The first was served with slot 0, so the
+        // second asks for no new slot and is the head: owner 1 behind it waits its turn.
+        let b = board(
+            vec![holding(0, 0, 0)],
+            vec![entry(2, 0, 0, 1, 2), entry(3, 1, 1, 1, 2)],
+            2,
+        );
+        assert_eq!(
+            decide(&ask(3, 2, 1, None), &b, 0),
+            Decision::Wait("queued behind claude:0 @ wt0 (waiting since 0 min)".to_owned())
+        );
+        assert_eq!(
+            decide(&ask(2, 2, 1, Some(Some(0))), &b, 0),
+            Decision::Grant {
+                slot: Some(0),
+                new: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_slot_whose_stack_is_still_stopping_is_held_with_no_lease_on_it() {
+        let mut b = board(vec![holding(0, 1, 1)], vec![entry(1, 1, 2, 1, 2)], 2);
+        b.slots[0].held = true;
+        assert_eq!(
+            decide(&ask(1, 2, 1, None), &b, 0),
+            Decision::Wait("all 2 stack slots of demo are held".to_owned())
+        );
+    }
+
+    #[test]
     fn every_slot_held_is_a_wait_that_says_so() {
         let b = board(
-            vec![holding(0, 0), holding(1, 1)],
+            vec![holding(0, 0, 0), holding(1, 1, 1)],
             vec![entry(1, 2, 2, 1, 2)],
             2,
         );
@@ -254,6 +302,7 @@ mod tests {
             waiter: 1,
             project: None,
             existing: None,
+            devices_wait: None,
         };
         assert_eq!(
             decide(&no_project, &b, 0),
@@ -261,6 +310,19 @@ mod tests {
                 slot: None,
                 new: true
             }
+        );
+    }
+
+    #[test]
+    fn devices_to_be_waited_for_hold_a_request_after_its_turn_and_before_its_slot() {
+        let b = board(vec![], vec![entry(1, 0, 0, 1, 2)], 2);
+        let no_phone = Ask {
+            devices_wait: Some("no free phone: 1 phone(s) busy".to_owned()),
+            ..ask(1, 2, 1, None)
+        };
+        assert_eq!(
+            decide(&no_phone, &b, 0),
+            Decision::Wait("no free phone: 1 phone(s) busy".to_owned())
         );
     }
 
@@ -292,7 +354,10 @@ mod tests {
     impl Sim {
         fn board(&self) -> Board {
             let mut b = board(
-                self.leases.iter().map(|&(o, _, s)| holding(o, s)).collect(),
+                self.leases
+                    .iter()
+                    .map(|&(o, wt, s)| holding(o, wt, s))
+                    .collect(),
                 self.waiters
                     .iter()
                     .map(|&(id, o, wt)| entry(id, o, wt, self.cap, self.max_slots))

@@ -75,6 +75,14 @@ pub fn forced_lease() -> Option<i64> {
         .filter(|id| *id != 0)
 }
 
+/// `DEVLAB_RESERVATION`, when it names a reservation a lead made for this process.
+pub fn reserved() -> Option<i64> {
+    std::env::var("DEVLAB_RESERVATION")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|id| *id > 0)
+}
+
 pub fn machine_config() -> Result<MachineConfig, Failure> {
     let file = var("XDG_CONFIG_HOME")
         .map_or_else(|| home().join(".config"), PathBuf::from)

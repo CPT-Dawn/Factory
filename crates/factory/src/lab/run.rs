@@ -1,4 +1,5 @@
-//! Running a command inside a lease: its env on top of the caller's, its stdio the caller's.
+//! Running a command inside a lease: its env on top of the caller's, its stdio the caller's
+//! (or, for `factory lab`, its output in a file).
 //!
 //! The command is a child of this process, which stays alive until it ends: target-repo scripts
 //! find the `devlab run` above them by walking their ancestors. It gets no time limit; it ends
@@ -11,11 +12,13 @@
 //! acquire's connection and records how it ended in the ledger, `lost` when the connection
 //! closes without a word.
 
+use std::fs::File;
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Child, Command, ExitStatus};
+use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,8 +32,8 @@ use signal_hook::iterator::Signals;
 
 use super::cli::note;
 use super::context::Ctx;
-use super::lease::{self, lease_env};
-use super::wire::{ACQUIRE, Granted, Lease, RUN_END, RUN_START, RunAsk, RunEnd};
+use super::lease::{self, apply_reverses, lease_env, wake};
+use super::wire::{ACQUIRE, Granted, Lease, RECEIVED, RUN_END, RUN_START, RunAsk, RunEnd};
 use crate::client::Session;
 use crate::output::Failure;
 use crate::protocol::Request;
@@ -41,7 +44,8 @@ const CANNOT_RUN: u8 = 127;
 /// it exits anyway.
 const LEAVE_GRACE: Duration = Duration::from_millis(500);
 
-/// `devlab run`: queues for the lease, takes it, runs `argv` in it and returns its exit code
+/// `devlab run`: queues for the lease, takes it, runs `argv` in it (its devices woken and the
+/// project's ports reversed onto them) and returns its exit code
 /// (128 + the signal that ended it, or that stopped devlab).
 pub fn run(ctx: &Ctx, opts: &Opts, quiet: bool, argv: &[String]) -> Result<u8, Failure> {
     let Some(program) = argv.first() else {
@@ -63,8 +67,12 @@ pub fn run(ctx: &Ctx, opts: &Opts, quiet: bool, argv: &[String]) -> Result<u8, F
         }
     });
     let taken = asked.and_then(|granted| {
-        watch.lock().reason = format!("lease {} granted, not started yet", granted.lease.id);
-        lease::take(ctx, opts, granted)
+        let mut state = watch.lock();
+        state.reason = format!("lease {} granted, not started yet", granted.lease.id);
+        // The grant reached this run: the daemon may let its place go.
+        notify(state.link.as_ref(), RECEIVED, &());
+        drop(state);
+        lease::take(ctx, opts, granted, &mut note)
     });
     let lease = match taken {
         Ok(lease) => lease,
@@ -79,6 +87,8 @@ pub fn run(ctx: &Ctx, opts: &Opts, quiet: bool, argv: &[String]) -> Result<u8, F
     if !quiet {
         note(&lease::summary(&lease, ctx.project.as_ref())?);
     }
+    wake(&lease);
+    apply_reverses(&lease, ctx.project.as_ref(), &mut |why| note(why))?;
     let env = lease_env(&lease, ctx.project.as_ref())?;
     let child = {
         let mut state = watch.lock();
@@ -88,7 +98,7 @@ pub fn run(ctx: &Ctx, opts: &Opts, quiet: bool, argv: &[String]) -> Result<u8, F
         // Said before the spawn: a devlab killed the moment its command starts is a lost run
         // that was running, not one still queued.
         notify(state.link.as_ref(), RUN_START, &());
-        match spawn(argv, &env) {
+        match spawn(argv, &env, None) {
             Ok(child) => {
                 state.child = Some(Running {
                     pidfd: child_pidfd(&child),
@@ -130,36 +140,69 @@ pub fn run(ctx: &Ctx, opts: &Opts, quiet: bool, argv: &[String]) -> Result<u8, F
     Ok(code)
 }
 
-/// Runs `argv` in the lease and returns its exit code (128 + the signal that ended it);
-/// [`CANNOT_RUN`] when it can't be run. `devlab exec`, which neither queues nor is followed.
-pub fn exec_in(ctx: &Ctx, lease: &Lease, argv: &[String]) -> Result<u8, Failure> {
+/// Runs `argv` in the lease, its devices woken and the project's ports reversed onto them, and
+/// returns its exit code (128 + the signal that ended it); [`CANNOT_RUN`] when it can't be
+/// run. Its stdout and stderr, and why it couldn't run, go to `output` when given, else they
+/// are the caller's. `devlab exec` and `factory lab`'s run and exec, which are not followed.
+pub fn exec_in(
+    ctx: &Ctx,
+    lease: &Lease,
+    argv: &[String],
+    output: Option<&Path>,
+) -> Result<u8, Failure> {
     let env = lease_env(lease, ctx.project.as_ref())?;
     let Some(program) = argv.first() else {
         return Err(Failure::usage("devlab exec -- <cmd...>"));
     };
-    match spawn(argv, &env) {
-        Ok(child) => match wait_for(child) {
-            Ok(status) => Ok(exit_code(&status)),
-            Err(e) => {
-                note(&format!("cannot wait for {program}: {e}"));
-                Ok(CANNOT_RUN)
-            }
-        },
-        Err(e) => {
-            note(&format!("cannot run {program}: {e}"));
-            Ok(CANNOT_RUN)
+    let mut log = match output {
+        Some(path) => Some(File::create(path).map_err(|e| {
+            Failure::precondition(format!(
+                "cannot write {}: {e}; check XDG_RUNTIME_DIR",
+                path.display()
+            ))
+        })?),
+        None => None,
+    };
+    wake(lease);
+    apply_reverses(lease, ctx.project.as_ref(), &mut |why| match log.as_mut() {
+        Some(file) => {
+            let _ = writeln!(file, "{why}");
         }
+        None => note(why),
+    })?;
+    let ended = match spawn(argv, &env, log.as_ref()) {
+        Ok(child) => wait_for(child)
+            .map(|status| exit_code(&status))
+            .map_err(|e| format!("cannot wait for {program}: {e}")),
+        Err(e) => Err(format!("cannot run {program}: {e}")),
+    };
+    let why = match ended {
+        Ok(code) => return Ok(code),
+        Err(why) => why,
+    };
+    match log.as_mut() {
+        Some(file) => {
+            let _ = writeln!(file, "{why}");
+        }
+        None => note(&why),
     }
+    Ok(CANNOT_RUN)
 }
 
-fn spawn(argv: &[String], env: &[(String, String)]) -> std::io::Result<Child> {
+/// Starts `argv` with `env` on top of this process's, its stdout and stderr in `log` if given.
+fn spawn(argv: &[String], env: &[(String, String)], log: Option<&File>) -> std::io::Result<Child> {
     let Some((program, args)) = argv.split_first() else {
         return Err(std::io::ErrorKind::InvalidInput.into());
     };
-    Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
-        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .spawn()
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    if let Some(file) = log {
+        command.stdout(Stdio::from(file.try_clone()?));
+        command.stderr(Stdio::from(file.try_clone()?));
+    }
+    command.spawn()
 }
 
 /// A handle that signals the child itself even once its pid is reused; the child is not

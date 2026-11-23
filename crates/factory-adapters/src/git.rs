@@ -1,6 +1,7 @@
 //! The repository under review, through `git`.
 
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -34,10 +35,14 @@ pub trait Repo {
     fn commit(&self, rev: &str) -> Result<Option<String>, GitError>;
     /// The full diff of `base...HEAD`, with `context` lines around each change.
     fn diff(&self, base: &str, context: u32) -> Result<String, GitError>;
+    /// Whether the commit `rev` names is an ancestor of HEAD (or HEAD itself).
+    fn is_ancestor(&self, rev: &str) -> Result<bool, GitError>;
     /// The diff stat of `base...HEAD`.
     fn diff_stat(&self, base: &str) -> Result<String, GitError>;
     /// The commits of `base..HEAD`, newest first: short sha, subject and body.
     fn commits(&self, base: &str) -> Result<String, GitError>;
+    /// Whether a local branch called `branch` exists.
+    fn branch_exists(&self, branch: &str) -> Result<bool, GitError>;
     /// The top of the working tree.
     fn toplevel(&self) -> Result<PathBuf, GitError>;
     /// The git dir of this worktree, where the implementer leaves its evidence.
@@ -51,6 +56,7 @@ pub trait Repo {
 }
 
 /// The repository at a directory, through the `git` on PATH.
+#[derive(Debug)]
 pub struct GitRepo {
     dir: PathBuf,
     /// `GIT_DIR` and `GIT_WORK_TREE` for every call, when the repository is not found from `dir`.
@@ -97,6 +103,69 @@ impl GitRepo {
             return Err(failed(args, &output));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+impl GitRepo {
+    /// A detached checkout of `rev` at `dir`, outside this repository, in a worktree of its
+    /// own: what is done in it leaves this repository's working tree alone. Whatever an earlier
+    /// checkout left at `dir` is removed first. The checkout is removed when it is dropped.
+    pub fn checkout(&self, rev: &str, dir: &Path) -> Result<Checkout, GitError> {
+        let path = dir
+            .to_str()
+            .ok_or_else(|| GitError(format!("{} is not UTF-8", dir.display())))?;
+        let checkout = Checkout {
+            repo: GitRepo {
+                dir: self.dir.clone(),
+                git_dir: self.git_dir.clone(),
+                work_tree: self.work_tree.clone(),
+            },
+            dir: dir.to_owned(),
+        };
+        checkout.remove();
+        if let Some(parent) = dir.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| GitError(format!("cannot create {}: {e}", parent.display())))?;
+        }
+        self.git(&["worktree", "add", "--detach", "--quiet", path, rev])?;
+        Ok(checkout)
+    }
+
+    /// Forgets the worktrees whose directory is gone.
+    pub fn prune_worktrees(&self) -> Result<(), GitError> {
+        self.git(&["worktree", "prune"]).map(drop)
+    }
+}
+
+/// A throwaway checkout, from [`GitRepo::checkout`]: removed, worktree and directory, when
+/// dropped, however the work in it ended.
+#[derive(Debug)]
+pub struct Checkout {
+    repo: GitRepo,
+    dir: PathBuf,
+}
+
+impl Checkout {
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Removes the worktree and whatever is left of its directory, and has the repository
+    /// forget it. Nothing to remove is not a failure.
+    fn remove(&self) {
+        if let Some(path) = self.dir.to_str() {
+            let _ = self
+                .repo
+                .output(&["worktree", "remove", "--force", "--force", path]);
+        }
+        let _ = fs::remove_dir_all(&self.dir);
+        let _ = self.repo.prune_worktrees();
+    }
+}
+
+impl Drop for Checkout {
+    fn drop(&mut self) {
+        self.remove();
     }
 }
 
@@ -149,6 +218,16 @@ impl Repo for GitRepo {
         self.git(&["diff", "--no-color", "--stat", &format!("{base}...HEAD")])
     }
 
+    fn is_ancestor(&self, rev: &str) -> Result<bool, GitError> {
+        let args = ["merge-base", "--is-ancestor", rev, HEAD];
+        let output = self.output(&args)?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(failed(&args, &output)),
+        }
+    }
+
     fn commits(&self, base: &str) -> Result<String, GitError> {
         self.git(&[
             "log",
@@ -156,6 +235,22 @@ impl Repo for GitRepo {
             "--format=%h %s%n%n%b",
             &format!("{base}..HEAD"),
         ])
+    }
+
+    fn branch_exists(&self, branch: &str) -> Result<bool, GitError> {
+        let args = [
+            "rev-parse",
+            "-q",
+            "--verify",
+            &format!("refs/heads/{branch}"),
+        ];
+        let output = self.output(&args)?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            // `--verify -q` exits 1, silently, for a ref that doesn't exist.
+            Some(1) => Ok(false),
+            _ => Err(failed(&args, &output)),
+        }
     }
 
     fn toplevel(&self) -> Result<PathBuf, GitError> {
@@ -325,7 +420,11 @@ pub struct FakeRepo {
     pub revs: Vec<(String, String)>,
     pub diff: String,
     pub diff_stat: String,
+    /// The revs that are ancestors of HEAD.
+    pub ancestors: Vec<String>,
     pub commits: String,
+    /// The local branches that exist.
+    pub branches: Vec<String>,
     pub toplevel: PathBuf,
     pub git_dir: PathBuf,
     pub staged_diff: String,
@@ -353,8 +452,16 @@ impl Repo for FakeRepo {
         Ok(self.diff_stat.clone())
     }
 
+    fn is_ancestor(&self, rev: &str) -> Result<bool, GitError> {
+        Ok(self.ancestors.iter().any(|known| known == rev))
+    }
+
     fn commits(&self, _base: &str) -> Result<String, GitError> {
         Ok(self.commits.clone())
+    }
+
+    fn branch_exists(&self, branch: &str) -> Result<bool, GitError> {
+        Ok(self.branches.iter().any(|known| known == branch))
     }
 
     fn toplevel(&self) -> Result<PathBuf, GitError> {

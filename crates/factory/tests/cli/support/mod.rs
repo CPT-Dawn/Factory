@@ -123,7 +123,8 @@ impl Sandbox {
         let calls = self.path("calls").join(tool);
         let script = format!(
             "#!/bin/sh\n# Fake {tool}, written by the factory test harness.\n\
-             {{ for a in \"$@\"; do printf '%s\\037' \"$a\"; done; printf '\\036'; }} >> '{calls}'\n\
+             us=$(printf '\\037'); call=''; for a in \"$@\"; do call=\"$call$a$us\"; done\n\
+             printf '%s\\036' \"$call\" >> '{calls}'\n\
              {body}\n",
             calls = calls.display()
         );

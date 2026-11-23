@@ -12,12 +12,12 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::net::UnixListener as StdListener;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use factory_adapters::gh::Gh;
 use factory_core::duration;
-use factory_core::event::{Event, Fields};
+use factory_core::event::Event;
 use factory_core::exit::Exit;
 use factory_core::wait::{Wait, WaitOn};
 use serde::Serialize;
@@ -33,20 +33,23 @@ use factory_adapters::herdr::Herdr;
 use factory_adapters::inbox::Inbox;
 use listenfd::ListenFd;
 
-use crate::clock;
 use crate::lab::service::{self, Lab};
-use crate::lab::wire::ACQUIRE;
+use crate::lab::wire::{ACQUIRE, RESERVE};
 use crate::leads::Leads;
+use crate::ledger::Ledger;
 use crate::notifier::Notifier;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::pollers::Pollers;
 use crate::protocol::{
-    ErrorBody, LEAD_LIST, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH,
-    NotifyParams, Outcome, REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, WAIT_CI, WAIT_LEAD,
+    ErrorBody, LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH,
+    MONITOR_START, MONITOR_STATUS, MONITOR_STOP, NotifyParams, Outcome, REVIEW_ACQUIRE,
+    REVIEW_QUOTA, Request, Response, STATUS, SpawnParams, StatusParams, WAIT_CI, WAIT_LEAD,
     WAIT_NOTIFY, WaitCiParams, WaitCiResult, WaitLeadParams,
 };
 use crate::router::Router;
+use crate::status;
+use crate::steward::Steward;
 use crate::store::Store;
 
 /// What every connection answers from: the ledger, the picture of the leads, the reviewer
@@ -57,6 +60,7 @@ struct Daemon {
     router: Arc<Router>,
     lab: Arc<Lab>,
     pollers: Arc<Pollers>,
+    steward: Arc<Steward>,
     notifier: Arc<Notifier>,
 }
 
@@ -80,10 +84,20 @@ pub fn run(json: bool) -> Result<(), Failure> {
         ))
     })?;
     let ledger = Arc::new(Ledger::open(paths.ledger())?);
-    let leads = Leads::new(paths.clone(), Herdr::new(paths.herdr.clone()));
-    let pollers = Arc::new(Pollers::new(paths.clone(), Gh));
     let _lock = take_daemon_lock(&paths)?;
+    let leads = Leads::new(
+        paths.clone(),
+        Herdr::new(paths.herdr.clone()),
+        Arc::clone(&ledger),
+        Store::open(&paths.database())?,
+    )?;
+    let pollers = Arc::new(Pollers::new(paths.clone(), Gh));
     let router = Arc::new(Router::open(Store::open(&paths.database())?)?);
+    let steward = Steward::new(
+        paths.clone(),
+        Arc::clone(&leads),
+        Store::open(&paths.database())?,
+    );
     let notifier = Notifier::new(
         paths.clone(),
         Store::open(&paths.database())?,
@@ -134,13 +148,17 @@ pub fn run(json: bool) -> Result<(), Failure> {
             json,
         );
         tokio::spawn(Arc::clone(&leads).start());
+        tokio::spawn(Arc::clone(&steward).resume());
+        let lab = Arc::new(lab);
+        lab.recover();
         notifier.resume();
         let daemon = Daemon {
             ledger,
             leads,
             router,
-            lab: Arc::new(lab),
+            lab,
             pollers,
+            steward,
             notifier,
         };
         serve(listener, Arc::new(daemon), stop).await;
@@ -295,6 +313,12 @@ async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut O
         };
         first = false;
         if let Ok(request) = serde_json::from_str::<Request>(&line)
+            && request.method == RESERVE
+        {
+            service::reserve(Arc::clone(&daemon.lab), request, &mut writer, &mut lines).await;
+            continue;
+        }
+        if let Ok(request) = serde_json::from_str::<Request>(&line)
             && request.method == ACQUIRE
         {
             // Not cut short by a stop: a lease granted as it was dropped would go unanswered.
@@ -342,6 +366,21 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
             Ok(params) => answered(daemon.leads.status(&params.lead).await),
             Err(refused) => refused,
         },
+        LEAD_SPAWN => match params::<SpawnParams>(LEAD_SPAWN, request.params) {
+            // Its own task, so a CLI that hangs up mid-spawn doesn't leave a worktree without
+            // its lead: the spawn runs to its end either way.
+            Ok(params) => {
+                let leads = Arc::clone(&daemon.leads);
+                match tokio::spawn(async move { leads.spawn(params).await }).await {
+                    Ok(result) => answered(result),
+                    Err(e) => Outcome::Error(refusal(
+                        Exit::Precondition,
+                        format!("spawning a lead failed in the daemon: {e}; see factory lead list"),
+                    )),
+                }
+            }
+            Err(refused) => refused,
+        },
         WAIT_LEAD => match params::<WaitLeadParams>(WAIT_LEAD, request.params) {
             Ok(params) => {
                 let wait = daemon.leads.wait(
@@ -374,6 +413,22 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
                 () = stop.clone().stopping() => stopped("wait"),
                 registered = daemon.notifier.register(params) => answered(registered),
             },
+            Err(refused) => refused,
+        },
+        MONITOR_START => answered(daemon.steward.start().await),
+        MONITOR_STOP => answered(daemon.steward.stop().await),
+        MONITOR_STATUS => answered(Ok::<_, Failure>(daemon.steward.status())),
+        STATUS => match params::<StatusParams>(STATUS, request.params) {
+            Ok(params) => answered(
+                status::gather(
+                    &params,
+                    &daemon.router,
+                    &daemon.lab,
+                    &daemon.leads,
+                    &daemon.steward,
+                )
+                .await,
+            ),
             Err(refused) => refused,
         },
         LOG => {
@@ -514,43 +569,5 @@ fn refusal(exit: Exit, message: String) -> ErrorBody {
     ErrorBody {
         code: exit.code(),
         message,
-    }
-}
-
-/// The append-only event ledger. Each event is stamped and written as one line under one lock,
-/// so lines never interleave.
-pub(crate) struct Ledger {
-    path: PathBuf,
-    file: Mutex<File>,
-}
-
-impl Ledger {
-    fn open(path: PathBuf) -> Result<Ledger, Failure> {
-        let file = File::options()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| {
-                Failure::precondition(format!(
-                    "cannot open {}: {e}; check FACTORY_STATE and XDG_STATE_HOME",
-                    path.display()
-                ))
-            })?;
-        Ok(Ledger {
-            path,
-            file: Mutex::new(file),
-        })
-    }
-
-    pub(crate) fn append(&self, event: &Event) -> io::Result<Fields> {
-        let mut file = self
-            .file
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let landed = event.stamped(clock::now());
-        let mut line = Value::Object(landed.clone()).to_string();
-        line.push('\n');
-        file.write_all(line.as_bytes())?;
-        Ok(landed)
     }
 }
