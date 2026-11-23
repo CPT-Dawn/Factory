@@ -107,6 +107,12 @@ pub fn pick(candidates: &[Candidate], now: Timestamp) -> Pick {
 pub enum Reset {
     /// At this local time of day (24-hour), its next occurrence.
     At { hour: u32, minute: u32 },
+    /// At this local time of this weekday (0 is Sunday), its next occurrence.
+    Weekly {
+        weekday: u32,
+        hour: u32,
+        minute: u32,
+    },
     /// This long after the message.
     In { millis: i64 },
     /// At this moment.
@@ -121,21 +127,42 @@ impl Reset {
     pub fn until(self, now: Timestamp, utc_offset: i32) -> Timestamp {
         let now = now.unix_millis();
         match self {
-            Reset::At { hour, minute } => {
-                let offset = i64::from(utc_offset) * 1000;
-                let local_midnight = (now + offset).div_euclid(MILLIS_PER_DAY) * MILLIS_PER_DAY;
-                let minutes = i64::from(hour) * 60 + i64::from(minute);
-                let mut until = local_midnight + minutes * MILLIS_PER_MINUTE - offset;
-                if until <= now {
-                    until += MILLIS_PER_DAY;
-                }
-                Timestamp::from_unix_millis(until)
-            }
+            Reset::At { hour, minute } => next_local(now, utc_offset, None, hour, minute),
+            Reset::Weekly {
+                weekday,
+                hour,
+                minute,
+            } => next_local(now, utc_offset, Some(weekday), hour, minute),
             Reset::In { millis } => Timestamp::from_unix_millis(now.saturating_add(millis)),
             Reset::On(moment) => moment,
             Reset::Unknown => Timestamp::from_unix_millis(now + UNKNOWN_RESET_MILLIS),
         }
     }
+}
+
+/// The next local `hour`:`minute` after `now` (unix millis) in a zone `utc_offset` seconds east
+/// of UTC: today's or tomorrow's, or with a `weekday` (0 is Sunday) that weekday's this week or
+/// next.
+fn next_local(
+    now: i64,
+    utc_offset: i32,
+    weekday: Option<u32>,
+    hour: u32,
+    minute: u32,
+) -> Timestamp {
+    let offset = i64::from(utc_offset) * 1000;
+    let day = (now + offset).div_euclid(MILLIS_PER_DAY);
+    let (ahead, period) = match weekday {
+        None => (0, 1),
+        // 1970-01-01 was a Thursday.
+        Some(weekday) => ((i64::from(weekday) - (day + 4)).rem_euclid(7), 7),
+    };
+    let minutes = i64::from(hour) * 60 + i64::from(minute);
+    let mut until = (day + ahead) * MILLIS_PER_DAY + minutes * MILLIS_PER_MINUTE - offset;
+    if until <= now {
+        until += period * MILLIS_PER_DAY;
+    }
+    Timestamp::from_unix_millis(until)
 }
 
 /// Codex's out-of-quota signature in its event stream: an error that says "usage limit", with
