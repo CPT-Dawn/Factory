@@ -18,6 +18,7 @@ mod paths;
 mod pollers;
 mod protocol;
 mod review;
+mod reviews;
 mod router;
 mod spawn;
 mod store;
@@ -94,6 +95,9 @@ fn run(command: Command, json: bool) -> ExitCode {
         Command::Wait {
             command: WaitCommand::Ci { pr, timeout },
         } => ci::wait(&pr, timeout),
+        Command::Wait {
+            command: WaitCommand::Review { label, timeout },
+        } => reviews::wait(&label, timeout),
         Command::Review {
             base,
             label,

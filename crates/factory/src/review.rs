@@ -34,7 +34,7 @@ use crate::output::{Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{
     AcquireParams, AcquireResult, BackendSlots, QuotaParam, QuotaParams, REVIEW_ACQUIRE,
-    REVIEW_QUOTA,
+    REVIEW_QUOTA, ReviewRef,
 };
 
 /// Lines of context around each change in the bundle's diff, so the reviewer rarely opens a
@@ -206,6 +206,10 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
     let mut daemon = client::Session::open(paths)?;
     let text = loop {
         let slots = AcquireParams {
+            review: Some(ReviewRef {
+                repo: run.repo.clone(),
+                label: args.label.clone(),
+            }),
             backends: candidates(routes, run)
                 .into_iter()
                 .map(|Route { backend, .. }| BackendSlots {

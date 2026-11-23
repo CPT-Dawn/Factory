@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::support::Sandbox;
 
-const CLEAN_REPORT: &str = r#"## Standards
+pub(crate) const CLEAN_REPORT: &str = r#"## Standards
 
 Nothing hard.
 
@@ -20,7 +20,7 @@ FINDINGS: standards_hard=0 standards_judgement=1 spec_findings=0 spec_advisory=0
 VERDICT: clean
 "#;
 
-const FINDINGS_REPORT: &str = r#"## Spec
+pub(crate) const FINDINGS_REPORT: &str = r#"## Spec
 
 Two things.
 
@@ -41,7 +41,7 @@ VERDICT: findings
 
 /// A fake `codex` body that keeps the prompt it reads on stdin beside itself, as
 /// `bin/codex.stdin`, and writes `report` as its final message, to the file after `-o`.
-fn codex_writes(report: &str) -> String {
+pub(crate) fn codex_writes(report: &str) -> String {
     format!(
         "out=\nwhile [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n\
          cat > \"$0.stdin\"\n\

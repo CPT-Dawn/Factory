@@ -7,6 +7,7 @@ pub mod ci;
 pub mod duration;
 pub mod event;
 pub mod exit;
+pub mod finished;
 pub mod hook;
 pub mod lab;
 pub mod lead;

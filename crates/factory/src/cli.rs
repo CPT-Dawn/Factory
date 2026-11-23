@@ -139,6 +139,14 @@ pub enum WaitCommand {
         #[arg(long, default_value = "9m", value_parser = duration)]
         timeout: Duration,
     },
+    /// Until the review of a label has ended: clean (exit 0), with findings or failed (exit 10)
+    Review {
+        /// The review's label, as factory review was given it
+        label: String,
+        /// Give up after this long with exit 124, such as 90s, 9m or 2h
+        #[arg(long, default_value = "9m", value_parser = duration)]
+        timeout: Duration,
+    },
 }
 
 fn duration(text: &str) -> Result<Duration, String> {

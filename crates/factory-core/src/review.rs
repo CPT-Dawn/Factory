@@ -372,15 +372,7 @@ impl Reading {
 
     /// The line a caller sees: `review <label>: <verdict> (n blocking, n advisory, n question) → <report>`.
     pub fn summary(&self, label: &str, report: &str) -> String {
-        let Counts {
-            blocking,
-            advisory,
-            question,
-        } = self.counts;
-        format!(
-            "review {label}: {} ({blocking} blocking, {advisory} advisory, {question} question) → {report}",
-            self.verdict
-        )
+        crate::finished::summary(label, &self.verdict.to_string(), self.counts, report)
     }
 }
 

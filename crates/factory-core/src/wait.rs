@@ -13,6 +13,8 @@ pub enum WaitOn {
     Lead(String),
     /// A pull request's checks, by `<owner>/<repo>#<number>`.
     Ci(String),
+    /// A review, by its label.
+    Review(String),
 }
 
 impl fmt::Display for WaitOn {
@@ -20,6 +22,7 @@ impl fmt::Display for WaitOn {
         match self {
             WaitOn::Lead(name) => f.write_str(name),
             WaitOn::Ci(pr) => write!(f, "ci {pr}"),
+            WaitOn::Review(label) => write!(f, "review {label}"),
         }
     }
 }
