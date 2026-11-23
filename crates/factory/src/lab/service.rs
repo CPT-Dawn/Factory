@@ -10,7 +10,7 @@
 
 mod keeper;
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -86,13 +86,7 @@ pub struct Lab {
     watched: Mutex<HashSet<String>>,
     /// What the keeper is stopping because it idled; no grant hands it out meanwhile.
     stopping: Mutex<keeper::Stopping>,
-    /// A line for each lease dropped because its owner exited, until `devlab gc` tells it: the
-    /// keeper usually drops it first. The newest [`UNREPORTED`].
-    unreported: Mutex<VecDeque<String>>,
 }
-
-/// How many dropped leases wait for `devlab gc` to tell them.
-const UNREPORTED: usize = 64;
 
 /// The lock, whether or not a thread panicked while it held it.
 fn lock_ignoring_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -115,7 +109,6 @@ impl Lab {
             tracking: Once::new(),
             watched: Mutex::new(HashSet::new()),
             stopping: Mutex::new(keeper::Stopping::default()),
-            unreported: Mutex::new(VecDeque::new()),
             callers: Mutex::new(HashSet::new()),
         })
     }
@@ -187,9 +180,19 @@ impl Lab {
     }
 
     /// One write transaction; dead owners' leases, dead stoppers' holds and waiters that can't
-    /// come back are dropped first, telling waiters and `devlab gc`. The reverses the dropped
-    /// leases' devices were given are taken back beside it, after the transaction.
+    /// come back are dropped first, telling waiters. The reverses the dropped leases' devices
+    /// were given are taken back beside it, after the transaction.
     fn write<T>(&self, work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>) -> Answer<T> {
+        self.write_telling(work).map(|(out, _)| out)
+    }
+
+    /// [`Lab::write`], and a line for each lease and reservation this very write dropped
+    /// because its owner exited: what `devlab gc` reports. One the keeper dropped earlier is
+    /// not told again.
+    fn write_telling<T>(
+        &self,
+        work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>,
+    ) -> Answer<(T, Vec<String>)> {
         let mut store = self
             .store
             .lock()
@@ -219,24 +222,13 @@ impl Lab {
             .map(|l| format!("lease {} ({}, owner exited)", l.id, l.owner_label))
             .chain(unreserved)
             .collect();
-        if !lines.is_empty() {
-            let mut unreported = lock_ignoring_poison(&self.unreported);
-            for line in lines {
-                if unreported.len() == UNREPORTED {
-                    unreported.pop_front();
-                }
-                unreported.push_back(line);
-            }
-            drop(unreported);
-            self.notify();
-        }
-        if unstopped > 0 {
+        if !lines.is_empty() || unstopped > 0 {
             self.notify();
         }
         if !freed.is_empty() {
             keeper::take_back_reverses_on_thread(self.attached.borrow().clone(), freed);
         }
-        Ok(out)
+        Ok((out, lines))
     }
 
     fn callers(&self) -> std::sync::MutexGuard<'_, HashSet<i64>> {
@@ -336,13 +328,7 @@ pub async fn respond(lab: &Arc<Lab>, method: &str, params: Value) -> Option<Outc
         LEASE => |lab, p, seen| reply(lab_lease(lab, parse(p)?, seen)),
         RELEASE => |lab, p, _| reply(release(lab, parse(p)?)),
         STOPPING => |lab, p, _| reply(stopping(lab, parse(p)?)),
-        GC => |lab, _, _| {
-            reply(lab.write(|_, _| Ok(())).map(|()| {
-                lock_ignoring_poison(&lab.unreported)
-                    .drain(..)
-                    .collect::<Vec<_>>()
-            }))
-        },
+        GC => |lab, _, _| reply(lab.write_telling(|_, _| Ok(())).map(|((), freed)| freed)),
         STATUS => |lab, _, seen| reply(status(lab, seen)),
         SLOT => |lab, p, _| reply(slot(lab, parse(p)?)),
         UNRESERVE => |lab, p, _| reply(reserve::unreserve(lab, parse(p)?)),
@@ -942,7 +928,7 @@ fn emulator_device(serial: &str) -> LeaseDevice {
 /// The device work after a grant, none of it in a transaction: the new phones' ABIs, the
 /// emulators to boot, then each device readied. Notes go to the caller as it goes. An emulator
 /// that won't boot is exit 77, and the request gets none of its devices: the lease keeps only
-/// what it held before. A device the lease holds that is gone by the end is exit 76. Else the
+/// what it held before (the caller of a fresh lease gives it back). A device the lease holds that is gone by the end is exit 76. Else the
 /// lease as it is then, with its devices' states.
 async fn settle<W: AsyncWrite + Unpin>(
     lab: &Arc<Lab>,
@@ -1339,11 +1325,16 @@ pub async fn acquire<W, R, S>(
                         deliver(&lab, writer, lines, id, place, run, stopping.as_mut()).await;
                     }
                     Err(body) => {
-                        // The lease is kept, its request failed: only a caller that never hears
-                        // so loses a fresh one.
+                        // The request failed. A fresh lease is given back when its caller never
+                        // hears so, and when an emulator would not boot (exit 77): it holds
+                        // nothing. A lease the caller already had is kept.
+                        let unbootable = body.code == Exit::Emulator.code();
                         let outcome = Outcome::Error(body);
                         let answered = send(writer, Response { id, outcome }).await;
-                        let _ = lab.settle(waiter, (!answered && fresh).then_some(&lease));
+                        let _ = lab.settle(
+                            waiter,
+                            ((!answered || unbootable) && fresh).then_some(&lease),
+                        );
                         if let Some(mut run) = run {
                             run.granted = Some(Instant::now());
                             if answered {

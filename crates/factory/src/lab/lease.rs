@@ -34,8 +34,9 @@ pub fn paths() -> Result<Paths, Failure> {
 
 /// Queues for a lease and takes it: the daemon grants its devices (booting emulators as needed)
 /// and readies them, then the slot's workdir is prepared and, with `--stack`, its stack
-/// started, and the project's ports reversed onto each device. A stack that fails to start, or
-/// an emulator that fails to boot (exit 77), keeps the lease. Each new reason it waits goes
+/// started, and the project's ports reversed onto each device. A stack that fails to start keeps
+/// the lease; an emulator that fails to boot (exit 77) gives a fresh lease back (one the
+/// caller already held stays). Each new reason it waits goes
 /// to `waiting`, a warning about the slot to `warn`.
 pub fn acquire(
     ctx: &Ctx,

@@ -1,5 +1,6 @@
-# Leases end: by release, which a second time finds nothing held, and by gc once their owner has
-# exited.
+# Leases end: by release, which a second time finds nothing held, and by the daemon once their
+# owner has exited. A status call frees it at the latest; gc then reports only what it freed itself,
+# which is nothing.
 $ a@demo-a devlab acquire --no-device --quiet
 1> export DEVLAB_PROJECT=demo
 1> export DEVLAB_SLOT=0
@@ -41,13 +42,12 @@ $ a@demo-a devlab env
 2> devlab: no lease for <sandbox>/wt/demo-a (claude:<a>): run devlab acquire
 ? 4
 kill b
-$ a@demo-a devlab gc
-1> released lease 2 (claude:<b>, owner exited)
-? 0
 $ a@demo-a devlab status
 1> devices: none attached
 1> stack slots
 1>   demo 0   down                         free (last: demo-a)
 1>   demo 1   down                         free (last: demo-b)
 1> memory <mem> GB free; watcher active
+? 0
+$ a@demo-a devlab gc
 ? 0
