@@ -961,6 +961,78 @@ fn factory_lab_says_one_line_per_verb_and_json_with_the_flag() {
 }
 
 #[test]
+fn factory_lab_preps_and_watches_as_devlab_does_in_one_line_each() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-prep");
+    let me = std::process::id();
+    let lab = |args: &[&str]| native(&sandbox, &wt, me, &[&["lab"], args].concat());
+    for phone in ["FAKEPHONE01", "FAKEPHONE03"] {
+        world
+            .apply(&format!("plug {phone} device usb:1-1 model:Pixel_7"))
+            .unwrap();
+    }
+    world.apply("lock FAKEPHONE03").unwrap();
+
+    assert_eq!(
+        one_line(&lab(&["prep", "FAKEPHONE01"])),
+        "FAKEPHONE01: ready"
+    );
+    let both = one_line(&lab(&["prep"])).to_owned();
+    assert!(
+        both.starts_with("prepped 2 devices, 1 with a warning; list in "),
+        "{both}"
+    );
+    assert_eq!(
+        named_file(&both),
+        "FAKEPHONE01: ready\nFAKEPHONE03: lock screen still showing: set the phone's screen lock to None or Swipe\n"
+    );
+    let json = one_json(&lab(&["prep", "--json", "FAKEPHONE03"]));
+    assert_eq!(json["devices"][0]["serial"], "FAKEPHONE03", "{json}");
+    assert!(
+        json["devices"][0]["warning"]
+            .as_str()
+            .is_some_and(|w| w.starts_with("lock screen")),
+        "{json}"
+    );
+
+    assert_eq!(
+        one_line(&lab(&["watch"])),
+        "the factory daemon frees leases and stops idle emulators and stacks now; nothing to start"
+    );
+    assert_eq!(one_json(&lab(&["watch", "--json"]))["watcher"], "daemon");
+}
+
+#[test]
+fn factory_lab_reserve_help_is_there_where_its_refusal_points() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-lead");
+    let lab = |args: &[&str]| {
+        native(
+            &sandbox,
+            &wt,
+            std::process::id(),
+            &[&["lab"], args].concat(),
+        )
+    };
+
+    let refused = lab(&["reserve", "--soon"]);
+    assert_eq!(
+        (refused.code, refused.stderr.as_str()),
+        (
+            2,
+            "factory: unknown option --soon; factory lab reserve --help\n"
+        ),
+        "{refused:?}"
+    );
+    let help = one_line(&lab(&["reserve", "--help"])).to_owned();
+    assert!(help.starts_with("factory lab reserve: usage in "), "{help}");
+    assert!(
+        named_file(&help).starts_with("usage: factory lab reserve [--slots N]"),
+        "{help}"
+    );
+}
+
+#[test]
 fn a_failed_boot_takes_back_nothing_another_lease_was_granted_since() {
     let (sandbox, world) = lab();
     let (a, b) = (world.worktree("plain-a"), world.worktree("plain-b"));
