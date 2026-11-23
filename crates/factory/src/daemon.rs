@@ -11,9 +11,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use factory_adapters::gh::Gh;
 use factory_adapters::herdr::Herdr;
 use factory_core::event::{Event, Fields};
 use factory_core::exit::Exit;
+use factory_core::wait::{Wait, WaitOn};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -24,19 +26,22 @@ use crate::clock;
 use crate::leads::Leads;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
+use crate::pollers::Pollers;
 use crate::protocol::{
     ErrorBody, LEAD_LIST, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH, Outcome,
-    REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, WAIT_LEAD, WaitLeadParams,
+    REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, WAIT_CI, WAIT_LEAD, WaitCiParams,
+    WaitCiResult, WaitLeadParams,
 };
 use crate::router::Router;
 use crate::store::Store;
 
-/// What every connection answers from: the ledger, the picture of the leads, and the reviewer
-/// router.
+/// What every connection answers from: the ledger, the picture of the leads, the reviewer
+/// router and the CI pollers.
 struct Daemon {
     ledger: Arc<Ledger>,
     leads: Arc<Leads>,
     router: Arc<Router>,
+    pollers: Pollers,
 }
 
 pub fn run(json: bool) -> Result<Done, Failure> {
@@ -50,6 +55,7 @@ pub fn run(json: bool) -> Result<Done, Failure> {
     })?;
     let ledger = Arc::new(Ledger::open(paths.ledger())?);
     let leads = Leads::new(paths.clone(), Herdr::new(paths.herdr.clone()));
+    let pollers = Pollers::new(paths.clone(), Gh);
     let _lock = take_daemon_lock(&paths)?;
     let router = Router::open(Store::open(&paths.database())?)?;
     let listener = bind(&paths)?;
@@ -87,6 +93,7 @@ pub fn run(json: bool) -> Result<Done, Failure> {
                 ledger,
                 leads,
                 router,
+                pollers,
             }),
         )
         .await {}
@@ -205,6 +212,10 @@ async fn respond(line: &str, daemon: &Daemon, held: &mut Option<String>) -> Resp
             ),
             Err(refused) => refused,
         },
+        WAIT_CI => match params::<WaitCiParams>(WAIT_CI, request.params) {
+            Ok(params) => answered(wait_ci(daemon, params).await),
+            Err(refused) => refused,
+        },
         LOG => {
             let ledger = Arc::clone(&daemon.ledger);
             let params = request.params;
@@ -237,6 +248,23 @@ async fn respond(line: &str, daemon: &Daemon, held: &mut Option<String>) -> Resp
         id: Some(request.id),
         outcome,
     }
+}
+
+/// Joins the pull request's poller, then shows the waiter's lead as waiting on it until the
+/// checks finish.
+async fn wait_ci(daemon: &Daemon, params: WaitCiParams) -> Result<WaitCiResult, Failure> {
+    let poll = Duration::from_secs(params.poll_secs.max(1));
+    let watch = daemon
+        .pollers
+        .watch(&params.pr, PathBuf::from(params.cwd), poll)
+        .await?;
+    let _wait = daemon.leads.register(Wait {
+        waiter: params.waiter,
+        on: WaitOn::Ci(watch.pr().to_string()),
+    });
+    watch
+        .finished(Duration::from_secs(params.timeout_secs))
+        .await
 }
 
 fn log(params: Value, ledger: &Ledger) -> Outcome {

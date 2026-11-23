@@ -83,6 +83,14 @@ pub enum WaitCommand {
         #[arg(long, default_value = "9m", value_parser = duration)]
         timeout: Duration,
     },
+    /// Until every check on a PR's head finished: all passed (exit 0) or some failed (exit 10)
+    Ci {
+        /// The PR: its number (from its repo's checkout), URL or branch
+        pr: String,
+        /// Give up after this long with exit 124, such as 90s, 9m or 2h
+        #[arg(long, default_value = "9m", value_parser = duration)]
+        timeout: Duration,
+    },
 }
 
 fn duration(text: &str) -> Result<Duration, String> {

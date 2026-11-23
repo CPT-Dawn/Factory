@@ -4,7 +4,12 @@
 //! written (spec #1, "Reviewer router"). Without the file, or without entries, the backends are
 //! Codex on its own config, then Claude Opus at high effort.
 //!
+//! Its `[ci]` table sets how often a wait on CI polls GitHub when it can't listen for events.
+//!
 //! ```toml
+//! [ci]
+//! poll = "30s"             # a duration: 90s, 9m, 2h
+//!
 //! [[review.backend]]
 //! cli = "codex"            # which adapter runs it: codex or claude
 //! name = "codex"           # its quota's name in the ledger and the daemon (default: cli)
@@ -18,7 +23,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use factory_core::quota::WhenBusy;
@@ -29,6 +34,7 @@ use crate::paths::Paths;
 
 const DEFAULT_TIMEOUT_S: u64 = 1800;
 const DEFAULT_CONCURRENCY: u32 = 2;
+const DEFAULT_POLL: Duration = Duration::from_secs(30);
 
 /// The CLI a backend runs on, which picks its adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -55,6 +61,14 @@ pub struct Backend {
 struct ConfigFile {
     #[serde(default)]
     review: Review,
+    #[serde(default)]
+    ci: CiSection,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct CiSection {
+    poll: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -83,8 +97,27 @@ enum Busy {
     Next,
 }
 
-/// The review backends in the order they are tried.
-pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
+/// How often a wait on CI polls GitHub when it can't listen for events.
+pub fn ci_poll(paths: &Paths) -> Result<Duration, Failure> {
+    let (path, file) = load(paths)?;
+    let Some(poll) = file.ci.poll else {
+        return Ok(DEFAULT_POLL);
+    };
+    match factory_core::duration::parse(&poll) {
+        Ok(poll) if !poll.is_zero() => Ok(poll),
+        Ok(_) => Err(Failure::precondition(format!(
+            "{}: ci.poll is 0s; give it 1s or more",
+            path.display()
+        ))),
+        Err(e) => Err(Failure::precondition(format!(
+            "{}: ci.poll: {e}; fix the config",
+            path.display()
+        ))),
+    }
+}
+
+/// The config file's path and contents; an absent file is an empty config.
+fn load(paths: &Paths) -> Result<(PathBuf, ConfigFile), Failure> {
     let path = paths.config_file();
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -96,7 +129,13 @@ pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
             )));
         }
     };
-    let file: ConfigFile = toml::from_str(&text).map_err(|e| bad(&path, &text, &e))?;
+    let file = toml::from_str(&text).map_err(|e| bad(&path, &text, &e))?;
+    Ok((path, file))
+}
+
+/// The review backends in the order they are tried.
+pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
+    let (path, file) = load(paths)?;
     if file.review.backend.is_empty() {
         return Ok(defaults());
     }

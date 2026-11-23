@@ -11,6 +11,8 @@ use std::fs::DirBuilder;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
+use factory_core::ci::PullRequest;
+
 use crate::output::Failure;
 
 #[derive(Clone, Debug)]
@@ -60,6 +62,15 @@ impl Paths {
     /// The daemon's database: reviewer quotas, and later leases and waits.
     pub fn database(&self) -> PathBuf {
         self.state.join("factory.db")
+    }
+
+    /// The failed checks of a pull request, with their URLs and log tails.
+    pub fn ci_failures(&self, pr: &PullRequest) -> PathBuf {
+        self.state
+            .join("ci")
+            .join(&pr.owner)
+            .join(&pr.repo)
+            .join(format!("{}.md", pr.number))
     }
 
     pub fn config_file(&self) -> PathBuf {

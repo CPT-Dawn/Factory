@@ -1,0 +1,188 @@
+//! A fake GitHub behind the fake `gh`: one pull request, its head, its check runs and their
+//! logs, kept in files under the sandbox's `github` dir that a test rewrites as CI moves on.
+//!
+//! The fake answers `gh pr view <pr> --json url --jq .url`, `gh api -i` on the pull request
+//! and its head's check runs (with an ETag of the body, and `304 Not Modified` when the request
+//! sends it back, as GitHub does), `gh api` on a job's logs, and `gh event listen`, which
+//! refuses as an account without event subscriptions does unless a test scripts it. Each read
+//! of the check runs is logged with its time and status in `github/polls`.
+
+use std::fs;
+use std::path::PathBuf;
+
+use serde_json::{Value, json};
+
+use super::Sandbox;
+
+/// The pull request every fake GitHub serves.
+pub const PR_URL: &str = "https://github.com/acme/shop/pull/12";
+/// The head commit of that pull request until a test pushes another.
+pub const HEAD: &str = "c0ffee1234567890c0ffee1234567890c0ffee12";
+
+/// What `gh event listen` says on an account without event subscriptions.
+const NOT_ENABLED: &str = "event subscriptions are in preview and not enabled for this account: \
+     HTTP 403: Event subscriptions are not enabled for this account \
+     (https://api.github.com/event-subscriptions)";
+
+pub struct FakeGitHub {
+    dir: PathBuf,
+}
+
+/// One read of the check runs: when (nanoseconds since the epoch) and the HTTP status served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Poll {
+    pub at_ns: u128,
+    pub status: u16,
+}
+
+impl FakeGitHub {
+    /// Scripts the sandbox's `gh` to serve [`PR_URL`] at [`HEAD`], with no check runs yet.
+    pub fn install(sandbox: &Sandbox) -> FakeGitHub {
+        let github = FakeGitHub {
+            dir: sandbox.path("github"),
+        };
+        fs::create_dir_all(github.dir.join("logs")).expect("create the github dir");
+        fs::write(github.dir.join("url"), format!("{PR_URL}\n")).expect("write the PR url");
+        github.push(HEAD);
+        github.checks(&[]);
+        sandbox.fake("gh", &script(&github.dir));
+        github
+    }
+
+    /// Moves the pull request's head to `sha`.
+    pub fn push(&self, sha: &str) {
+        self.put(
+            "pull.json",
+            &json!({"number": 12, "html_url": PR_URL, "head": {"sha": sha}}),
+        );
+    }
+
+    /// Sets the head's check runs: each is `(id, name, status, conclusion)`.
+    pub fn checks(&self, runs: &[(u64, &str, &str, Option<&str>)]) {
+        let runs: Vec<Value> = runs
+            .iter()
+            .map(|(id, name, status, conclusion)| {
+                let url = format!("https://github.com/acme/shop/actions/runs/7/job/{id}");
+                json!({
+                    "id": id,
+                    "name": name,
+                    "status": status,
+                    "conclusion": conclusion,
+                    "html_url": url,
+                    "details_url": url,
+                    "app": {"slug": "github-actions"},
+                })
+            })
+            .collect();
+        self.put(
+            "checks.json",
+            &json!({"total_count": runs.len(), "check_runs": runs}),
+        );
+    }
+
+    /// Stages the check runs a listen script moves in place with `mv "$G/next.json" "$G/checks.json"`.
+    pub fn stage_checks(&self, runs: &[(u64, &str, &str, Option<&str>)]) {
+        self.checks(runs);
+        fs::rename(self.dir.join("checks.json"), self.dir.join("next.json"))
+            .expect("stage the check runs");
+        self.checks(&[]);
+    }
+
+    /// Sets the log of the job `id`.
+    pub fn log(&self, id: u64, text: &str) {
+        fs::write(self.dir.join("logs").join(id.to_string()), text).expect("write a job log");
+    }
+
+    /// Scripts `gh event listen`: `body` is shell run in place of the refusal, with the fake's
+    /// dir in `$G`.
+    pub fn listen(&self, body: &str) {
+        fs::write(self.dir.join("listen.sh"), body).expect("write the listen script");
+    }
+
+    /// Makes `gh pr view` find no pull request.
+    pub fn forget_pr(&self) {
+        fs::remove_file(self.dir.join("url")).expect("remove the PR url");
+    }
+
+    /// Every read of the check runs so far, oldest first.
+    pub fn polls(&self) -> Vec<Poll> {
+        fs::read_to_string(self.dir.join("polls"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let (at, status) = line.split_once(' ').expect("a poll line has two words");
+                Poll {
+                    at_ns: at.parse().expect("a poll time"),
+                    status: status.parse().expect("a poll status"),
+                }
+            })
+            .collect()
+    }
+
+    /// Replaces `file` whole, so the fake never reads half of it.
+    fn put(&self, file: &str, body: &Value) {
+        let tmp = self.dir.join(format!("{file}.tmp"));
+        fs::write(&tmp, body.to_string()).expect("write a github file");
+        fs::rename(tmp, self.dir.join(file)).expect("replace a github file");
+    }
+}
+
+fn script(dir: &std::path::Path) -> String {
+    format!(
+        r#"G='{dir}'
+case "$1" in
+pr)
+    if [ -f "$G/url" ]; then cat "$G/url"; else echo 'no pull requests found for branch "work"' >&2; exit 1; fi ;;
+api)
+    shift
+    etag_in=''; path=''
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        -H) shift; case "$1" in "If-None-Match: "*) etag_in="${{1#If-None-Match: }}" ;; esac ;;
+        --hostname) shift ;;
+        -i) ;;
+        *) path="$1" ;;
+        esac
+        shift
+    done
+    case "$path" in
+    repos/acme/shop/pulls/12) file="$G/pull.json" ;;
+    repos/acme/shop/commits/*/check-runs*) file="$G/checks.json" ;;
+    repos/acme/shop/actions/jobs/*/logs)
+        id="${{path%/logs}}"; id="${{id##*/}}"
+        if [ -f "$G/logs/$id" ]; then cat "$G/logs/$id"; exit 0; fi
+        echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
+    *) echo "fake gh: no route for $path" >&2; exit 1 ;;
+    esac
+    etag="\"$(cksum < "$file" | cut -d' ' -f1)\""
+    if [ "${{etag_in#W/}}" = "$etag" ]; then code=304; else code=200; fi
+    # A read is logged once it is served, so a test that saw it can change the checks.
+    served() {{ case "$path" in *check-runs*) echo "$at $code" >> "$G/polls" ;; esac; }}
+    at="$(date +%s%N)"
+    if [ "$code" = 304 ]; then
+        printf 'HTTP/2.0 304 Not Modified
+Etag: %s
+
+' "$etag"
+        echo 'gh: HTTP 304' >&2
+        served
+        exit 1
+    fi
+    printf 'HTTP/2.0 200 OK
+Content-Type: application/json; charset=utf-8
+Etag: W/%s
+
+' "$etag"
+    cat "$file"
+    served ;;
+event)
+    if [ -f "$G/listen.sh" ]; then . "$G/listen.sh"; exit $?; fi
+    echo '{NOT_ENABLED}' >&2
+    exit 1 ;;
+*)
+    echo "fake gh: no script for: $*" >&2
+    exit 127 ;;
+esac"#,
+        dir = dir.display()
+    )
+}
