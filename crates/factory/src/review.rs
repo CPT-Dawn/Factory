@@ -1,7 +1,9 @@
 //! `factory review <base> <label> [spec] [prev]`: review.sh's arguments, a prepared review
 //! bundle, a run on the first configured backend the daemon's router grants, and one line back.
 //! A backend that runs out of quota partway is cooled down until its reset, and the same review
-//! re-runs on the next one.
+//! re-runs on the next one. A backend's preflight runs before the review is prepared for it: one
+//! out of quota is cooled down the same way, and one that can't review now (agy without a usage
+//! answer or an active sandbox) is skipped for this run.
 //!
 //! Every file of a review is kept in `<state>/reviews/<repo>/`, named by its label: the
 //! bundle (`.bundle.md`), the prompt (`.prompt`), the report (`.md`) and Codex's event
@@ -17,9 +19,10 @@ use std::time::{Duration, Instant};
 
 use factory_adapters::gh::{Gh, Issues};
 use factory_adapters::git::{GitError, GitRepo, Repo};
-use factory_adapters::reviewer::{Claude, Codex, Job, Reviewer, ReviewerError, home_of};
+use factory_adapters::reviewer::{Agy, Claude, Codex, Job, Reviewer, ReviewerError, home_of};
 use factory_core::exit::Exit;
-use factory_core::review::{self, Bundle, Finding, Part, Reading, Record, Verdict};
+use factory_core::quota::Reset;
+use factory_core::review::{self, Bundle, Finding, Fix, Part, Previous, Reading, Record, Verdict};
 use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
 
@@ -31,7 +34,7 @@ use crate::output::{Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{
     AcquireParams, AcquireResult, BackendSlots, QuotaParam, QuotaParams, REVIEW_ACQUIRE,
-    REVIEW_QUOTA,
+    REVIEW_QUOTA, ReviewRef,
 };
 
 /// Lines of context around each change in the bundle's diff, so the reviewer rarely opens a
@@ -41,6 +44,8 @@ const DIFF_CONTEXT: u32 = 15;
 const STANDARDS: [&str; 2] = ["CODING_STANDARDS.md", "CONTRIBUTING.md"];
 /// Where the implementer leaves its evidence, in the git dir so it is never committed.
 const EVIDENCE: &str = "factory-evidence.md";
+/// The longest a review may run, in seconds: a week.
+const MAX_TIMEOUT_S: u64 = 7 * 24 * 60 * 60;
 
 pub struct Args {
     pub base: String,
@@ -49,6 +54,9 @@ pub struct Args {
     pub previous: Option<PathBuf>,
     /// Overrides every backend's configured timeout.
     pub timeout: Option<Duration>,
+    /// The ticket's tier, as the caller named it; only recorded, backends are tried in the
+    /// configured order whatever it is.
+    pub tier: Option<String>,
 }
 
 pub fn run(args: &Args) -> Result<Done, Failure> {
@@ -59,7 +67,7 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         backends
             .into_iter()
             .map(|backend| Route {
-                reviewer: reviewer(&backend),
+                reviewer: reviewer(&backend, &paths),
                 backend,
             })
             .collect::<Vec<_>>()
@@ -69,6 +77,14 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         Ok(routes) => review(args, &paths, routes, &mut run),
         Err(failure) => Err(Failure::new(failure.exit, failure.message.clone())),
     };
+    // A skip the spec has reported (an inactive sandbox) stays in the line of a run that fails.
+    let result = result.map_err(|failure| match run.notes.is_empty() {
+        true => failure,
+        false => Failure::new(
+            failure.exit,
+            format!("{}; {}", failure.message, run.notes.join("; ")),
+        ),
+    });
     let failed = result.as_ref().err().map(|failure| failure.message.clone());
     let chosen = routes
         .as_ref()
@@ -77,6 +93,8 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
     let reviewer = chosen.map(|route| &route.reviewer);
     let fallback_from: Vec<&str> = run.cooled.iter().map(|(name, _)| name.as_str()).collect();
     let fallback_from = fallback_from.join(",");
+    let skipped: Vec<&str> = run.skipped.iter().map(|(name, _)| name.as_str()).collect();
+    let skipped = skipped.join(",");
     let record = Record {
         repo: &run.repo,
         label: &args.label,
@@ -89,9 +107,11 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         effort: reviewer.and_then(|reviewer| reviewer.effort()),
         duration_s: started.elapsed().as_secs(),
         fallback_from: &fallback_from,
+        skipped: &skipped,
         report: &run.report,
         stream: &run.stream,
         findings: &run.findings,
+        from: &run.from,
         result: match (&run.reading, &failed) {
             (Some(reading), None) => Ok(reading),
             _ => Err(failed
@@ -99,7 +119,9 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
                 .unwrap_or("the run ended without a reading")),
         },
     };
-    let logged = log::land(&paths, "review", &record.pairs());
+    let mut pairs = record.pairs();
+    pairs.extend(args.tier.iter().map(|tier| format!("tier={tier}")));
+    let logged = log::land(&paths, "review", &pairs);
     match (result, logged) {
         (result, Ok(_)) => result,
         (Ok(done), Err(e)) => Err(Failure::precondition(format!(
@@ -123,9 +145,16 @@ struct Route {
 }
 
 /// The adapter that runs a configured backend.
-fn reviewer(backend: &Backend) -> Box<dyn Reviewer> {
+fn reviewer(backend: &Backend, paths: &Paths) -> Box<dyn Reviewer> {
     let (model, effort) = (backend.model.clone(), backend.effort.clone());
     match backend.cli {
+        Cli::Agy => Box::new(Agy::new(
+            model,
+            effort,
+            backend.auth,
+            paths.state.join("agy-usage.json"),
+            paths.state.join("checkouts"),
+        )),
         Cli::Codex => Box::new(Codex::new(model, effort, &home_of("CODEX_HOME", ".codex"))),
         Cli::Claude => Box::new(Claude::new(
             model,
@@ -146,13 +175,20 @@ struct Run {
     backend: usize,
     /// The backends that ran out of quota on the way, with their reset.
     cooled: Vec<(String, Timestamp)>,
+    /// The backends passed over for this run, with why.
+    skipped: Vec<(String, String)>,
+    /// What the run reports besides its result: a backend whose sandbox is not active.
+    notes: Vec<String>,
     report: String,
     stream: String,
     findings: String,
+    /// On a fix round, the head the previous round reviewed.
+    from: String,
     reading: Option<Reading>,
 }
 
 fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result<Done, Failure> {
+    bounded(args.timeout, routes)?;
     let cwd = env::current_dir().map_err(|e| {
         Failure::precondition(format!(
             "cannot read the working directory: {e}; cd into the repo under review"
@@ -167,22 +203,42 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
     let files = Files::new(paths, &run.repo, &args.label)?;
     let inputs = Inputs::gather(&repo, args, &files)?;
     run.head = inputs.head.clone();
+    run.notes.extend(inputs.notes.iter().cloned());
+    run.from = inputs
+        .fix
+        .as_ref()
+        .map_or_else(String::new, |fix| fix.head.clone());
     let spec = inputs.spec.as_ref().map_or("none", |(name, _)| name);
     run.spec = spec.to_owned();
     write(&files.bundle, &inputs.bundle(args).render())?;
     // The daemon holds the backend's slot for as long as this session lives.
     let mut daemon = client::Session::open(paths)?;
-    let slots = AcquireParams {
-        backends: routes
-            .iter()
-            .map(|Route { backend, .. }| BackendSlots {
-                name: backend.name.clone(),
-                concurrency: backend.concurrency,
-                when_busy: backend.when_busy.into(),
-            })
-            .collect(),
-    };
     let text = loop {
+        let slots = AcquireParams {
+            review: Some(ReviewRef {
+                repo: run.repo.clone(),
+                label: args.label.clone(),
+            }),
+            backends: candidates(routes, run)
+                .into_iter()
+                .map(|Route { backend, .. }| BackendSlots {
+                    name: backend.name.clone(),
+                    concurrency: backend.concurrency,
+                    when_busy: backend.when_busy.into(),
+                })
+                .collect(),
+        };
+        if slots.backends.is_empty() && !run.skipped.is_empty() {
+            let why: Vec<String> = run
+                .skipped
+                .iter()
+                .map(|(name, why)| format!("{name} {why}"))
+                .collect();
+            return Err(Failure::precondition(format!(
+                "no review backend can take the review: {}; fix that or configure another backend",
+                why.join(", ")
+            )));
+        }
         let granted: AcquireResult = daemon.wait(REVIEW_ACQUIRE, &slots)?;
         let index = routes
             .iter()
@@ -194,23 +250,55 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
                 ))
             })?;
         let Route { backend, reviewer } = &routes[index];
-        if run.cooled.iter().any(|(name, _)| *name == backend.name) {
+        // Granted again only once its reset has come and no other backend is left; a backend
+        // that runs out twice in one review is not tried a third time.
+        if run
+            .cooled
+            .iter()
+            .filter(|(name, _)| *name == backend.name)
+            .count()
+            > 1
+        {
             return Err(Failure::precondition(format!(
-                "the daemon granted {} again although it ran out of quota; restart the daemon",
+                "{} ran out of quota twice in this review; retry after its reset",
                 backend.name
             )));
         }
         run.backend = index;
+        match reviewer.preflight() {
+            Ok(()) => {}
+            Err(ReviewerError::OutOfQuota(reset)) => {
+                cool(&mut daemon, run, &backend.name, reset)?;
+                continue;
+            }
+            Err(ReviewerError::NoSandbox(why)) => {
+                run.notes.push(format!("{} skipped: {why}", backend.name));
+                run.skipped.push((backend.name.clone(), why));
+                continue;
+            }
+            Err(ReviewerError::Unready(why)) => {
+                run.skipped.push((backend.name.clone(), why));
+                continue;
+            }
+            Err(e) => return Err(reviewer_failed(reviewer.as_ref(), &e, &files.prompt)),
+        }
         let prompt = review::prompt(
-            &reviewer.opening(&args.base),
+            &reviewer.opening(
+                inputs
+                    .fix
+                    .as_ref()
+                    .map_or(args.base.as_str(), |fix| short(&fix.head)),
+            ),
             &files.bundle.display().to_string(),
             spec,
             inputs.previous.as_ref().map(|(name, _)| name.as_str()),
+            inputs.fix.as_ref().is_some_and(|fix| fix.open.is_some()),
         );
         write(&files.prompt, &prompt)?;
         let stream = files.stream(reviewer.stream_extension());
         let job = Job {
             cwd: cwd.clone(),
+            head: inputs.head.clone(),
             prompt: files.prompt.clone(),
             report: files.report.clone(),
             stream: stream.clone(),
@@ -222,16 +310,13 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
         match reviewer.review(&job) {
             Ok(()) => {}
             Err(ReviewerError::OutOfQuota(reset)) => {
-                let now = clock::now();
-                let until = reset.until(now, clock::utc_offset(now));
-                let cooling = QuotaParams {
-                    backend: backend.name.clone(),
-                    quota: QuotaParam::Cooling {
-                        until: until.unix_millis(),
-                    },
-                };
-                let _: QuotaParams = daemon.call(REVIEW_QUOTA, &cooling)?;
-                run.cooled.push((backend.name.clone(), until));
+                cool(&mut daemon, run, &backend.name, reset)?;
+                continue;
+            }
+            // Its review ran without the sandbox, so it is not kept: the next backend reviews.
+            Err(ReviewerError::NoSandbox(why)) => {
+                run.notes.push(format!("{} skipped: {why}", backend.name));
+                run.skipped.push((backend.name.clone(), why));
                 continue;
             }
             Err(e) => return Err(reviewer_failed(reviewer.as_ref(), &e, &stream)),
@@ -258,6 +343,11 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
     let reading = Reading::of(&text).map_err(|e| {
         Failure::precondition(format!("{e}: {}; read it there", files.report.display()))
     })?;
+    // A fix round is held to its rules: old findings marked, new ones only on the fix's lines.
+    let reading = match inputs.fix.as_ref().and_then(|fix| fix.open.as_deref()) {
+        Some(open) => reading.within(open, &Fix::of_diff(&inputs.diff)),
+        None => reading,
+    };
     let ledger = json!({
         "label": args.label,
         "round": review::round(&args.label, args.previous.is_some()),
@@ -273,6 +363,14 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
             .as_ref()
             .map(|findings| findings.iter().map(Finding::to_value).collect::<Vec<_>>()),
     });
+    let mut ledger = ledger;
+    if !run.from.is_empty() {
+        ledger["from"] = run.from.clone().into();
+        ledger["fixed"] = reading.fixed.into();
+        ledger["still_present"] = reading.still_present.into();
+        ledger["dropped"] = reading.dropped.len().into();
+        ledger["dropped_findings"] = reading.dropped.iter().map(Finding::to_value).collect();
+    }
     write(&files.findings, &format!("{ledger:#}\n"))?;
     run.findings = files.findings.display().to_string();
     let cooled: Vec<Value> = run
@@ -280,22 +378,34 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
         .iter()
         .map(|(name, until)| json!({"backend": name, "until": until.to_string()}))
         .collect();
+    let skipped: Vec<Value> = run
+        .skipped
+        .iter()
+        .map(|(name, why)| json!({"backend": name, "reason": why}))
+        .collect();
     let mut done = Done::new(
         reading.summary(&args.label, &run.report),
         json!({
             "label": args.label,
             "backend": backend.name,
             "cooled": cooled,
+            "skipped": skipped,
             "verdict": reading.verdict.to_string(),
             "blocking": reading.counts.blocking,
             "advisory": reading.counts.advisory,
             "question": reading.counts.question,
+            "fixed": reading.fixed,
+            "still_present": reading.still_present,
+            "dropped": reading.dropped.len(),
             "report": run.report,
             "findings": run.findings,
             "blocking_findings": reading.blocking_lines(),
         }),
     );
+    // Whole: the line names the report, and a shim reads that path.
+    done.whole = true;
     done.more = reading.blocking_lines();
+    done.notes = std::mem::take(&mut run.notes);
     if reading.verdict == Verdict::Findings {
         done.exit = Exit::NeedsAttention;
         if reading.findings.is_none() {
@@ -309,6 +419,65 @@ fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result
     Ok(done)
 }
 
+/// The routes a run may still be granted: none it skipped, and none it cooled down while
+/// another is left. The daemon decides whether a cooled one's reset has come.
+fn candidates<'a>(routes: &'a [Route], run: &Run) -> Vec<&'a Route> {
+    let skipped = |route: &Route| {
+        run.skipped
+            .iter()
+            .any(|(name, _)| *name == route.backend.name)
+    };
+    let cooled = |route: &Route| {
+        run.cooled
+            .iter()
+            .any(|(name, _)| *name == route.backend.name)
+    };
+    let open: Vec<&Route> = routes.iter().filter(|route| !skipped(route)).collect();
+    if open.iter().all(|route| cooled(route)) {
+        return open;
+    }
+    open.into_iter().filter(|route| !cooled(route)).collect()
+}
+
+/// Refuses a timeout too long to wait on: the wait would have no deadline.
+fn bounded(timeout: Option<Duration>, routes: &[Route]) -> Result<(), Failure> {
+    let limit = Duration::from_secs(MAX_TIMEOUT_S);
+    if let Some(timeout) = timeout.filter(|timeout| *timeout > limit) {
+        return Err(Failure::usage(format!(
+            "--timeout {} is longer than a week; give at most {MAX_TIMEOUT_S}",
+            timeout.as_secs()
+        )));
+    }
+    match routes.iter().find(|route| route.backend.timeout > limit) {
+        Some(route) if timeout.is_none() => Err(Failure::precondition(format!(
+            "backend {} has a timeout of {}s, longer than a week; set at most {MAX_TIMEOUT_S} in the factory config",
+            route.backend.name,
+            route.backend.timeout.as_secs()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Cools `backend` down until its `reset`, in the daemon and in the run's record.
+fn cool(
+    daemon: &mut client::Session,
+    run: &mut Run,
+    backend: &str,
+    reset: Reset,
+) -> Result<(), Failure> {
+    let now = clock::now();
+    let until = reset.until(now, clock::utc_offset(now));
+    let cooling = QuotaParams {
+        backend: backend.to_owned(),
+        quota: QuotaParam::Cooling {
+            until: until.unix_millis(),
+        },
+    };
+    let _: QuotaParams = daemon.call(REVIEW_QUOTA, &cooling)?;
+    run.cooled.push((backend.to_owned(), until));
+    Ok(())
+}
+
 /// What the bundle holds, read from the repo and the files the caller named. A text the
 /// bundle names comes with its name.
 struct Inputs {
@@ -317,6 +486,11 @@ struct Inputs {
     commits: String,
     diff_stat: String,
     diff: String,
+    /// On a fix round, what the previous round's ledger gave: the head it reviewed, where the
+    /// diff starts, and its open findings.
+    fix: Option<Previous>,
+    /// Why this fix round reviews the whole diff after all.
+    notes: Vec<String>,
     spec: Option<(String, String)>,
     previous: Option<(String, String)>,
     standards: Vec<(String, String)>,
@@ -330,11 +504,21 @@ impl Inputs {
         let base_commit = repo.commit(base).map_err(git_failed)?.ok_or_else(|| {
             Failure::usage(format!("unknown ref: {base}; name a branch, tag or commit"))
         })?;
-        let diff = repo.diff(base, DIFF_CONTEXT).map_err(git_failed)?;
+        let mut notes = Vec::new();
+        let fix = match &args.previous {
+            Some(previous) => fix_start(repo, args, previous, &mut notes)?,
+            None => None,
+        };
+        let since = fix.as_ref().map_or(base.as_str(), |fix| fix.head.as_str());
+        let diff = repo.diff(since, DIFF_CONTEXT).map_err(git_failed)?;
         if diff.is_empty() {
-            return Err(Failure::usage(format!(
-                "no committed changes since {base} (commit first)"
-            )));
+            return Err(Failure::usage(match &fix {
+                Some(fix) => format!(
+                    "no committed changes since the previous review's head {} (commit the fix first)",
+                    short(&fix.head)
+                ),
+                None => format!("no committed changes since {base} (commit first)"),
+            }));
         }
         let spec = args
             .spec
@@ -365,9 +549,11 @@ impl Inputs {
         Ok(Inputs {
             base_commit,
             head: repo.commit("HEAD").map_err(git_failed)?.unwrap_or_default(),
-            commits: repo.commits(base).map_err(git_failed)?,
-            diff_stat: repo.diff_stat(base).map_err(git_failed)?,
+            commits: repo.commits(since).map_err(git_failed)?,
+            diff_stat: repo.diff_stat(since).map_err(git_failed)?,
             diff,
+            fix,
+            notes,
             spec,
             previous,
             standards,
@@ -383,6 +569,8 @@ impl Inputs {
             base: &args.base,
             base_commit: &self.base_commit,
             head: &self.head,
+            fix_from: self.fix.as_ref().map(|fix| fix.head.as_str()),
+            open: self.fix.as_ref().and_then(|fix| fix.open.as_deref()),
             commits: &self.commits,
             diff_stat: &self.diff_stat,
             diff: &self.diff,
@@ -392,6 +580,42 @@ impl Inputs {
             evidence: self.evidence.as_ref().map(part),
         }
     }
+}
+
+/// Where a fix round's diff starts: the head the previous report's findings ledger says it
+/// reviewed, when that is on this branch. Otherwise the round reviews the whole diff, and
+/// says why in `notes`.
+fn fix_start(
+    repo: &impl Repo,
+    args: &Args,
+    previous: &Path,
+    notes: &mut Vec<String>,
+) -> Result<Option<Previous>, Failure> {
+    let ledger = previous.with_extension("findings.json");
+    let named = fs::read_to_string(&ledger)
+        .ok()
+        .and_then(|text| Previous::of_ledger(&text));
+    let on_branch = match named {
+        Some(named) => match repo.commit(&named.head).map_err(git_failed)? {
+            Some(head) if repo.is_ancestor(&head).map_err(git_failed)? => {
+                Some(Previous { head, ..named })
+            }
+            _ => None,
+        },
+        None => None,
+    };
+    if on_branch.is_none() {
+        notes.push(format!(
+            "no reviewed head for {} on this branch; round {} reviews the whole diff",
+            previous.display(),
+            review::round(&args.label, true)
+        ));
+    }
+    Ok(on_branch)
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(8)]
 }
 
 /// The files of one review, in `<state>/reviews/<repo>/`.
@@ -497,6 +721,7 @@ fn reviewer_failed(reviewer: &dyn Reviewer, e: &ReviewerError, stream: &Path) ->
         ReviewerError::Start(_) => {
             format!("check that {} is installed and on PATH", reviewer.name())
         }
+        ReviewerError::Checkout(_) => "check the repository and its worktrees".to_owned(),
         ReviewerError::TimedOut(_) => format!(
             "its process group was killed; see {}, then retry or raise --timeout",
             stream.display()

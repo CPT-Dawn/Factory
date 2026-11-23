@@ -11,12 +11,21 @@ use std::fmt;
 pub enum WaitOn {
     /// A lead, by its herdr agent name.
     Lead(String),
+    /// A pull request's checks, by `<owner>/<repo>#<number>`.
+    Ci(String),
+    /// A review, by its label.
+    Review(String),
+    /// A lab lease, by its id.
+    Lease(i64),
 }
 
 impl fmt::Display for WaitOn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WaitOn::Lead(name) => f.write_str(name),
+            WaitOn::Ci(pr) => write!(f, "ci {pr}"),
+            WaitOn::Review(label) => write!(f, "review {label}"),
+            WaitOn::Lease(id) => write!(f, "lease {id}"),
         }
     }
 }
@@ -49,6 +58,11 @@ impl Waits {
 
     pub fn clear(&mut self, id: WaitId) {
         self.waits.remove(&id);
+    }
+
+    /// Every registered wait, oldest first.
+    pub fn all(&self) -> impl Iterator<Item = &Wait> {
+        self.waits.values()
     }
 
     /// What the oldest wait registered from `pane` is on, if any wait is.

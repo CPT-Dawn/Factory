@@ -11,6 +11,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -22,8 +23,11 @@ use std::time::Duration;
 use rustix::process::{Pid, Signal, kill_process_group};
 use tempfile::TempDir;
 
+pub mod github;
 pub mod golden;
 pub mod herdr;
+pub mod inbox;
+pub mod socket_unit;
 pub mod world;
 
 /// External tools faked on every sandbox's PATH. Add a tool here when a command starts using it.
@@ -40,6 +44,7 @@ pub const FAKED_TOOLS: &[&str] = &[
     "avdmanager",
     "emulator",
     "notify-send",
+    "unshare",
 ];
 
 /// How long any one process a test runs may take before the test fails.
@@ -118,7 +123,8 @@ impl Sandbox {
         let calls = self.path("calls").join(tool);
         let script = format!(
             "#!/bin/sh\n# Fake {tool}, written by the factory test harness.\n\
-             {{ for a in \"$@\"; do printf '%s\\037' \"$a\"; done; printf '\\036'; }} >> '{calls}'\n\
+             us=$(printf '\\037'); call=''; for a in \"$@\"; do call=\"$call$a$us\"; done\n\
+             printf '%s\\036' \"$call\" >> '{calls}'\n\
              {body}\n",
             calls = calls.display()
         );
@@ -162,6 +168,20 @@ impl Sandbox {
     /// Runs the built `factory` binary to completion.
     pub fn factory(&self, args: &[&str]) -> Run {
         run(self.factory_command(args))
+    }
+
+    /// Runs the built `factory` binary to completion with `input` on its stdin.
+    pub fn factory_stdin(&self, args: &[&str], input: &str) -> Run {
+        let mut cmd = self.factory_command(args);
+        cmd.stdin(Stdio::piped());
+        let mut child = spawn(cmd);
+        child
+            .stdin
+            .take()
+            .expect("the child's stdin")
+            .write_all(input.as_bytes())
+            .expect("write the child's stdin");
+        finish(child)
     }
 
     /// Runs the built `factory` binary to completion with `dir` as its working directory.

@@ -107,6 +107,10 @@ pub fn pick(candidates: &[Candidate], now: Timestamp) -> Pick {
 pub enum Reset {
     /// At this local time of day (24-hour), its next occurrence.
     At { hour: u32, minute: u32 },
+    /// This long after the message.
+    In { millis: i64 },
+    /// At this moment.
+    On(Timestamp),
     /// The message names no time it can be read by.
     Unknown,
 }
@@ -127,6 +131,8 @@ impl Reset {
                 }
                 Timestamp::from_unix_millis(until)
             }
+            Reset::In { millis } => Timestamp::from_unix_millis(now.saturating_add(millis)),
+            Reset::On(moment) => moment,
             Reset::Unknown => Timestamp::from_unix_millis(now + UNKNOWN_RESET_MILLIS),
         }
     }
@@ -164,6 +170,133 @@ fn codex_error(line: &str) -> Option<String> {
         _ => None,
     };
     message.and_then(Value::as_str).map(str::to_owned)
+}
+
+/// What agy's free usage query (`agy -p /usage --output-format json`) says of one model
+/// group's quota.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgyUsage {
+    /// Every bucket of the group has some left.
+    Left,
+    /// A bucket is empty; the group has quota again once the last empty one resets.
+    Empty { until: Timestamp },
+    /// The answer names no buckets for the group, or none it can read: why.
+    Unreadable(String),
+}
+
+/// Reads agy's usage for the model `group` (`Gemini Models`): each of its buckets (five-hour,
+/// weekly) has a `remaining_fraction` and a `reset_time`.
+pub fn agy_usage(usage: &str, group: &str) -> AgyUsage {
+    let Ok(usage) = serde_json::from_str::<Value>(usage) else {
+        return AgyUsage::Unreadable("its answer is not JSON".to_owned());
+    };
+    let buckets = usage
+        .pointer("/command/data/groups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|candidate| candidate.get("name").and_then(Value::as_str) == Some(group))
+        .filter_map(|group| group.get("buckets")?.as_array())
+        .flatten()
+        .collect::<Vec<_>>();
+    if buckets.is_empty() {
+        return AgyUsage::Unreadable(format!("it shows no {group} quota"));
+    }
+    let mut until = None;
+    for bucket in buckets {
+        let left = bucket.get("remaining_fraction").and_then(Value::as_f64);
+        let reset = bucket
+            .get("reset_time")
+            .and_then(Value::as_str)
+            .and_then(Timestamp::parse);
+        match (left, reset) {
+            (Some(left), _) if left > 0.0 => {}
+            (Some(_), Some(reset)) => until = until.max(Some(reset)),
+            _ => {
+                return AgyUsage::Unreadable(format!(
+                    "a {group} bucket has no quota or reset it can read"
+                ));
+            }
+        }
+    }
+    until.map_or(AgyUsage::Left, |until| AgyUsage::Empty { until })
+}
+
+/// The model agy runs when none is chosen, in the factory's config or in agy: its log names it
+/// `Gemini 4 Neon (High)` (agy 1.5).
+pub const AGY_DEFAULT_MODEL: &str = "gemini-4-neon";
+
+/// The group of agy's models whose quota `model` draws on, as its usage names them: its
+/// Claude and GPT models share one, Gemini 4 Argon has its own, and the other Gemini models
+/// share the rest. `model` is an ID such as `claude-opus-5-5` or a label as agy's `/model`
+/// saves it, such as `Claude Opus 5.5 (Thinking)`.
+pub fn agy_group(model: &str) -> &'static str {
+    let model = model.trim().to_lowercase().replace(' ', "-");
+    if model.starts_with("claude-") || model.starts_with("gpt-") {
+        "Claude and GPT models"
+    } else if model.starts_with("gemini-4-argon") {
+        "Gemini 4 Argon"
+    } else {
+        "Gemini Models"
+    }
+}
+
+/// The model a review draws on when the factory's config names none: the one chosen with
+/// agy's `/model`, which its `settings` (`~/.gemini/antigravity-cli/settings.json`) keep by
+/// its label under `model`, else agy's default. Settings that can't be read choose none.
+pub fn agy_chosen_model(settings: Option<&str>) -> String {
+    settings
+        .and_then(|settings| serde_json::from_str::<Value>(settings).ok())
+        .and_then(|settings| Some(settings.get("model")?.as_str()?.trim().to_owned()))
+        .filter(|model| !model.is_empty())
+        .unwrap_or_else(|| AGY_DEFAULT_MODEL.to_owned())
+}
+
+/// agy's out-of-quota signature: an error of its own that says "Individual quota reached" and
+/// "Resets in 2h13m5s". Its errors are the `error` of its JSON `result` and the `AGY_ERROR:`
+/// lines of its `stderr`, not what it read while reviewing. None when no error says so.
+pub fn agy_limit(result: &str, stderr: &str) -> Option<Reset> {
+    let result_error = serde_json::from_str::<Value>(result)
+        .ok()
+        .and_then(|result| match result.get("error")? {
+            Value::String(error) => Some(error.clone()),
+            Value::Null => None,
+            error => Some(error.to_string()),
+        });
+    let errors = stderr
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("AGY_ERROR:"))
+        .map(str::to_owned)
+        .chain(result_error);
+    errors
+        .filter(|error| error.contains("Individual quota reached"))
+        .filter_map(|error| {
+            let (_, after) = error.split_once("Resets in ")?;
+            Some(span(after).map_or(Reset::Unknown, |millis| Reset::In { millis }))
+        })
+        .next_back()
+}
+
+/// A span such as `2h13m5s` or `1d2h` at the start of `text`, in milliseconds.
+fn span(text: &str) -> Option<i64> {
+    let mut total = 0_i64;
+    let mut number = String::new();
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            number.push(c);
+            continue;
+        }
+        let unit = match c {
+            'd' => MILLIS_PER_DAY,
+            'h' => 3_600_000,
+            'm' => MILLIS_PER_MINUTE,
+            's' => 1000,
+            _ => break,
+        };
+        total = total.checked_add(number.parse::<i64>().ok()?.checked_mul(unit)?)?;
+        number.clear();
+    }
+    (total > 0 && number.is_empty()).then_some(total)
 }
 
 /// A 12-hour clock time at the start of `text`, such as `12:39 PM`.

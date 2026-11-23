@@ -49,5 +49,5 @@ $ a@demo-a devlab status
 1> stack slots
 1>   demo 0   down                         free (last: demo-a)
 1>   demo 1   down                         free (last: demo-b)
-1> memory <mem> GB free; watcher inactive (systemctl --user enable --now devlab-watch)
+1> memory <mem> GB free; watcher active
 ? 0

@@ -1,7 +1,7 @@
 //! The quota state machine, the router's pick and the out-of-quota readers (spec #1,
 //! "Reviewer router").
 
-use factory_core::quota::{self, Candidate, Pick, Quota, Reset, WhenBusy};
+use factory_core::quota::{self, AgyUsage, Candidate, Pick, Quota, Reset, WhenBusy};
 use factory_core::timestamp::Timestamp;
 
 /// Seconds since the epoch, from `date -u -d <moment> +%s`.
@@ -209,4 +209,195 @@ fn a_reset_time_of_day_is_its_next_occurrence_in_local_time() {
 #[test]
 fn an_unreadable_reset_cools_the_backend_down_for_an_hour() {
     assert_eq!(Reset::Unknown.until(at(T10_00), 3600), at(T11_00));
+}
+
+/// What `agy -p /usage --output-format json` printed on 2026-11-23, with 14% of the Gemini
+/// five-hour bucket left.
+const AGY_USAGE: &str = include_str!("fixtures/agy-usage.json");
+
+/// The real usage with these buckets' `remaining_fraction` set to 0.
+fn agy_usage_with_empty(ids: &[&str]) -> String {
+    let mut usage: serde_json::Value = serde_json::from_str(AGY_USAGE).unwrap_or_default();
+    let groups = usage
+        .pointer_mut("/command/data/groups")
+        .and_then(serde_json::Value::as_array_mut);
+    let buckets = groups
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get_mut("buckets")?.as_array_mut())
+        .flatten();
+    for bucket in buckets {
+        let id = bucket.get("id").and_then(serde_json::Value::as_str);
+        if id.is_some_and(|id| ids.contains(&id)) {
+            bucket["remaining_fraction"] = 0.into();
+        }
+    }
+    usage.to_string()
+}
+
+#[test]
+fn agys_usage_says_whether_a_model_groups_buckets_have_quota_left() {
+    let gemini = "Gemini Models";
+    let cases = [
+        ("14% left", AGY_USAGE.to_owned(), gemini, AgyUsage::Left),
+        (
+            "five-hour empty",
+            agy_usage_with_empty(&["gemini-5h"]),
+            gemini,
+            AgyUsage::Empty {
+                until: Timestamp::parse("2026-11-23T05:21:20Z").unwrap(),
+            },
+        ),
+        (
+            "both empty: the later reset",
+            agy_usage_with_empty(&["gemini-5h", "gemini-weekly"]),
+            gemini,
+            AgyUsage::Empty {
+                until: Timestamp::parse("2026-11-30T00:21:20Z").unwrap(),
+            },
+        ),
+        (
+            "another group's empty bucket",
+            agy_usage_with_empty(&["gemini-5h"]),
+            "Claude and GPT models",
+            AgyUsage::Left,
+        ),
+    ];
+    for (case, usage, group, said) in cases {
+        assert_eq!(quota::agy_usage(&usage, group), said, "{case}");
+    }
+}
+
+#[test]
+fn agys_usage_that_names_no_buckets_for_the_group_is_unreadable() {
+    let failed = r#"{"conversation_id":"","status":"ERROR","response":"","error":"Eligibility check failed"}"#;
+    for (case, usage) in [
+        ("no such group", AGY_USAGE),
+        ("not json", "Eligibility check failed"),
+        ("an error", failed),
+        (
+            "no reset",
+            r#"{"command":{"data":{"groups":[{"name":"G","buckets":[{"remaining_fraction":0}]}]}}}"#,
+        ),
+    ] {
+        let group = if case == "no reset" {
+            "G"
+        } else {
+            "Gemini 4 Carbon"
+        };
+        assert!(
+            matches!(quota::agy_usage(usage, group), AgyUsage::Unreadable(_)),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn an_agy_model_draws_on_its_groups_quota() {
+    let cases = [
+        ("gemini-4-neon", "Gemini Models"),
+        ("gemini-4-neon-high", "Gemini Models"),
+        ("gemini-3.8-flash-low", "Gemini Models"),
+        ("gemini-4-argon-high", "Gemini 4 Argon"),
+        ("claude-opus-5-5-thinking", "Claude and GPT models"),
+        ("gpt-oss-120b-medium", "Claude and GPT models"),
+        // Labels, as agy's `/model` saves them in its settings.
+        ("Gemini 4 Neon (High)", "Gemini Models"),
+        ("Gemini 4 Argon (Low)", "Gemini 4 Argon"),
+        ("Claude Opus 5.5 (Thinking)", "Claude and GPT models"),
+        ("GPT-OSS 120B (Medium)", "Claude and GPT models"),
+    ];
+    for (model, group) in cases {
+        assert_eq!(quota::agy_group(model), group, "{model}");
+    }
+}
+
+#[test]
+fn with_no_model_configured_agy_draws_on_the_model_its_settings_chose_else_its_default() {
+    let cases = [
+        (
+            Some(r#"{"model": "Claude Opus 5.5 (Thinking)"}"#),
+            "Claude Opus 5.5 (Thinking)",
+        ),
+        (
+            Some(r#"{"model": " Gemini 4 Argon (High) "}"#),
+            "Gemini 4 Argon (High)",
+        ),
+        (Some(r#"{"model": ""}"#), "gemini-4-neon"),
+        (Some(r#"{"trustedWorkspaces": ["~"]}"#), "gemini-4-neon"),
+        (Some(r#"{"model": 4}"#), "gemini-4-neon"),
+        (Some("not json"), "gemini-4-neon"),
+        (None, "gemini-4-neon"),
+    ];
+    for (settings, model) in cases {
+        assert_eq!(quota::agy_chosen_model(settings), model, "{settings:?}");
+    }
+    assert_eq!(quota::agy_group(quota::AGY_DEFAULT_MODEL), "Gemini Models");
+}
+
+#[test]
+fn agys_individual_quota_error_is_read_with_the_time_until_it_resets() {
+    let agy_error = |message: &str| {
+        format!(
+            "[agy] turn failed\nAGY_ERROR: {}\n",
+            serde_json::json!({"status": "RESOURCE_EXHAUSTED", "code": 429, "retryable": false, "message": message})
+        )
+    };
+    let reached =
+        "Individual quota reached. Please upgrade your subscription to increase your limits.";
+    let failed = |error: &str| {
+        serde_json::json!({"status": "ERROR", "response": "", "error": error, "finished_reason": "error"}).to_string()
+    };
+    let cases = [
+        (
+            "stderr",
+            String::new(),
+            agy_error(&format!("{reached} Resets in 2h13m5s.")),
+            Some(Reset::In { millis: 7_985_000 }),
+        ),
+        (
+            "result json",
+            failed(&format!("{reached} Resets in 45m.")),
+            String::new(),
+            Some(Reset::In { millis: 2_700_000 }),
+        ),
+        (
+            "days",
+            String::new(),
+            agy_error(&format!("{reached} Resets in 1d2h.")),
+            Some(Reset::In { millis: 93_600_000 }),
+        ),
+        (
+            "no time it can read",
+            String::new(),
+            agy_error(&format!("{reached} Resets in a while.")),
+            Some(Reset::Unknown),
+        ),
+        ("no reset named", String::new(), agy_error(reached), None),
+        (
+            "another error",
+            failed("INTERNAL: stream closed"),
+            agy_error("stream closed"),
+            None,
+        ),
+        // What agy reviewed is not its own error.
+        (
+            "in the response",
+            serde_json::json!({"status": "ERROR", "response": format!("{reached} Resets in 1h."), "error": "boom"}).to_string(),
+            format!("[agy] read {reached} Resets in 1h.\n"),
+            None,
+        ),
+    ];
+    for (case, result, stderr, limit) in cases {
+        assert_eq!(quota::agy_limit(&result, &stderr), limit, "{case}");
+    }
+}
+
+#[test]
+fn a_reset_after_a_while_or_at_a_moment_is_that_moment() {
+    assert_eq!(
+        Reset::In { millis: 3_600_000 }.until(at(T10_00), 3600),
+        at(T11_00)
+    );
+    assert_eq!(Reset::On(at(T13_00)).until(at(T10_00), -18_000), at(T13_00));
 }

@@ -1,0 +1,14 @@
+[Unit]
+Description=factory daemon: the waiting, polling and bookkeeping of the agent factory
+Requires=factory.socket
+After=factory.socket
+
+[Service]
+ExecStart=%h/.local/bin/factory daemon
+# The daemon runs gh, git, herdr and the reviewers; systemd's default PATH has no ~/.local/bin.
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin
+# SIGTERM lets the daemon answer the requests it holds; calls that arrive meanwhile wait in
+# the socket for the next daemon.
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2

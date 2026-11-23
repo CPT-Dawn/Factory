@@ -6,12 +6,15 @@ One binary, `factory`:
 
 - `factory lab` (also answers to `devlab`): leases phones, emulators and local stack slots between agents.
 - `factory review`: routes a code review to the first reviewer with quota left (Antigravity, then Codex, then Claude).
-- `factory wait`: blocks on CI, a review, a lead or a lease, silently, then prints one line.
+- `factory wait ci|review|lead|lease`: blocks on the daemon, silently, until a PR's checks finish, a review ends, a lead finishes or needs attention, or a lab lease is held no more, then prints one line. `wait ci` and `wait lead` take `--notify`: the command returns at once, and the daemon posts the line into the asking Claude Code session when the wait ends. That event delivery stays off until `[notify] enabled = true` in the config.
+- `factory cutover`: hands the `devlab` name from today's TypeScript devlab to factory lab, and `--rollback` gives it back ([docs/cutover.md](docs/cutover.md)).
 - `factory lead`, `factory monitor`, `factory log`, `factory hook`, `factory status`.
+
+`factory hook pre-tool|post-tool|subagent-stop` answers Claude Code's hooks in about 2 ms, without the daemon. Wire them in `~/.claude/settings.json` (`PreToolUse` on `Bash|REPL`, `PostToolUse`, `SubagentStop`, each a `command` hook running `factory hook <event>`). They block npm, npx, yarn and pnpm (`FACTORY_ALLOW_NPM=1` is the escape), a commit or push adding an address from `[hook] private_addresses`, and a REPL script using `process`, `require` or `BASH_REMATCH`; they flag a tool result over 12k characters, and send back a subagent report longer than its `[hook.report]` template. A hook prints nothing to let a call through, and one protocol JSON line otherwise, so it keeps to its own protocol, not the one-line rule below.
 
 Every command prints one line by default, `--json` on request, and uses fixed exit codes.
 
-Status: being built; `factory log` works, through the daemon, and so does `factory review` on Codex, falling back to Claude, with its backends in `~/.config/factory/config.toml`. The spec is issue #1.
+Status: every command above works through the daemon, which `factory install` sets up as a systemd user socket. `factory review` tries its backends in the order `~/.config/factory/config.toml` gives them. The spec is issue #1.
 
 ## Licence
 

@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::support::golden;
-use crate::support::world::World;
+use crate::support::world::{World, poll_until};
 use crate::support::{Sandbox, run};
 
 /// A stand-in devlab: a shell script, so the replay itself can be tested without today's devlab.
@@ -24,6 +24,42 @@ fn fixture(dir: &Path, text: &str) -> PathBuf {
     let path = dir.join("scenario.golden");
     fs::write(&path, text).expect("write the transcript");
     path
+}
+
+/// Owners were once `sleep` linked as `claude`; where sleep is one multicall binary (Ubuntu 26.04's
+/// uutils coreutils) it ran as `claude`, found no such applet and exited, and every lease it held
+/// went with it. An owner now needs no program but the shell.
+#[test]
+fn an_owner_is_a_live_process_named_claude_that_needs_no_program_but_the_shell() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut owner = golden::start_owner(dir.path()).unwrap();
+    let comm = format!("/proc/{}/comm", owner.id());
+    // Named claude and asleep in its read: a process that had exited would show as a zombie.
+    let waiting = poll_until(|| {
+        let stat = fs::read_to_string(format!("/proc/{}/stat", owner.id())).unwrap_or_default();
+        let state = stat.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
+        fs::read_to_string(&comm).is_ok_and(|name| name.trim() == "claude")
+            && state == Some(Some('S'))
+    });
+    // Closing its stdin ends it, cleanly.
+    drop(owner.stdin.take());
+    let mut status = None;
+    let ended = poll_until(|| {
+        status = owner.try_wait().unwrap();
+        status.is_some()
+    });
+    if !ended {
+        let _ = owner.kill();
+        let _ = owner.wait();
+    }
+
+    assert!(
+        waiting,
+        "the owner never showed as claude, asleep in its read"
+    );
+    assert!(ended, "the owner outlived its stdin");
+    assert_eq!(status.and_then(|s| s.code()), Some(0));
 }
 
 #[test]
@@ -251,11 +287,11 @@ fn the_replay_reports_a_different_exit_code_and_a_missing_newline() {
 }
 
 #[test]
-fn the_replay_hides_the_sandbox_path_owner_pids_and_free_memory() {
+fn the_replay_hides_the_sandbox_path_owner_pids_free_memory_and_signal_seconds() {
     let dir = tempfile::tempdir().unwrap();
     let devlab = stand_in(
         dir.path(),
-        "pwd; echo \"lease 1 (claude:$DEVLAB_OWNER_PID)\"; echo 'memory 12.3 GB free'; echo '  \"memAvailableMB\": 12617'",
+        "pwd; echo \"lease 1 (claude:$DEVLAB_OWNER_PID)\"; echo 'memory 12.3 GB free'; echo '  \"memAvailableMB\": 12617'; echo 'devlab: sh killed by SIGKILL after 12 s'; echo 'gave up after 3 s'",
     );
     let scenario = fixture(
         dir.path(),
@@ -264,6 +300,8 @@ fn the_replay_hides_the_sandbox_path_owner_pids_and_free_memory() {
          1> lease 1 (claude:<b>)\n\
          1> memory <mem> GB free\n\
          1>   \"memAvailableMB\": <mem>\n\
+         1> devlab: sh killed by SIGKILL after <n> s\n\
+         1> gave up after 3 s\n\
          ? 0\n",
     );
 
@@ -389,9 +427,9 @@ fn a_relative_devlab_path_is_read_from_the_workspace_root() {
     );
 }
 
-/// One test per transcript, replayed against [`golden::devlab_under_test`]; skipped when there is
-/// none. Run one group with `cargo test transcript::slots_` (or `devices_`, `cli_`).
-mod transcript {
+/// One test per transcript, replayed against [`golden::devlab_under_test`]: the built `factory`
+/// unless `GOLDEN_DEVLAB` names another; skipped when there is none. Run one group with `cargo test transcript::slots_` (or `devices_`, `cli_`).
+pub(crate) mod transcript {
     use crate::support::golden;
 
     macro_rules! transcripts {
@@ -416,12 +454,18 @@ mod transcript {
         slots_owner_cap => "slots-owner-cap.golden",
         slots_queue => "slots-queue.golden",
         slots_release => "slots-release.golden",
+        slots_run_exit => "slots-run-exit.golden",
+        slots_run_killed => "slots-run-killed.golden",
+        slots_run_stopped_queued => "slots-run-stopped-queued.golden",
+        slots_run_stopped_running => "slots-run-stopped-running.golden",
         slots_stack_failure => "slots-stack-failure.golden",
     }
 
     fn replay(file: &str) {
-        let Some(devlab) = golden::devlab_under_test() else {
-            eprintln!("skipped {file}: GOLDEN_DEVLAB names no devlab to replay against");
+        let Some(devlab) = golden::devlab_under_test(file) else {
+            eprintln!(
+                "skipped {file}: GOLDEN_DEVLAB names no devlab, and factory lab has none of its group yet"
+            );
             return;
         };
         let fixture = golden::fixtures().join(file);

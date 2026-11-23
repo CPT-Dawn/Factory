@@ -9,34 +9,47 @@
 //!   (see [`World::worktree`]) on behalf of owner `<owner>`: a live process named `claude` that
 //!   the call names in `DEVLAB_OWNER_PID`. `devlab` on its PATH is the binary under test.
 //! - `& <tag> <owner>@<worktree> <shell>` starts such a call in the background;
-//!   `until <tag> <text>` waits until its output shows `<text>`; `wait <tag>` waits for it to end.
+//!   `until <tag> <text>` waits until its output shows `<text>`; `wait <tag>` waits for it to end;
+//!   `signal <tag> <TERM|INT|HUP|KILL>` sends its process (the shell, or what it `exec`s) a signal.
 //! - `kill <owner>` ends the owner's process.
 //! - Anything else is a world step ([`World::apply`]): `plug`, `unplug`, `lock`, `break`, `mend`.
 //!
 //! After a `$` or `wait` step come the lines it showed: `1> ` for each stdout line, `2> ` for
 //! each stderr line, `1~ ` or `2~ ` for a last line with no newline, and `? <exit code>`.
-//! The sandbox's path shows as `<sandbox>`, owner `a`'s pid as `claude:<a>`, and free memory,
-//! which no fake controls, as `<mem>`.
+//! The sandbox's path shows as `<sandbox>`, owner `a`'s pid as `claude:<a>`, free memory,
+//! which no fake controls, as `<mem>`, and the seconds a run lasted before a signal ended it
+//! (`killed by SIGKILL after <n> s`) as `<n>`.
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use rustix::process::Signal;
+use rustix::process::{Pid, Signal, kill_process};
 
 pub use super::world::fixtures;
 use super::world::{World, poll_until};
 use super::{DEADLINE, Sandbox, kill_group};
 
-/// The devlab the transcripts replay against: the path in `GOLDEN_DEVLAB`, or none, which skips
-/// them. Today's devlab is `GOLDEN_DEVLAB=$HOME/.local/bin/devlab`; see `tests/golden/devlab/README.md`. The binary is linked as
-/// `devlab` in the sandbox, so a multicall binary sees that name; once `factory lab` answers to
-/// it, this returns the built `factory` binary when the variable is unset.
-pub fn devlab_under_test() -> Option<PathBuf> {
-    std::env::var_os("GOLDEN_DEVLAB").map(|path| resolve_devlab(Path::new(&path)))
+/// The devlab transcript `file` replays against: the path in `GOLDEN_DEVLAB`, else the built
+/// `factory`, which answers to the name `devlab`, for the groups it serves (`slots-*`, `cli-*`);
+/// none skips it. Today's devlab is `GOLDEN_DEVLAB=$HOME/.local/bin/devlab`; see
+/// `tests/golden/devlab/README.md`. The binary is linked as `devlab` in the sandbox, so a
+/// multicall binary sees that name.
+pub fn devlab_under_test(file: &str) -> Option<PathBuf> {
+    match std::env::var_os("GOLDEN_DEVLAB") {
+        Some(path) => Some(resolve_devlab(Path::new(&path))),
+        None => SERVED
+            .iter()
+            .any(|group| file.starts_with(group))
+            .then(|| PathBuf::from(env!("CARGO_BIN_EXE_factory"))),
+    }
 }
+
+/// The transcript groups the built `factory` replays.
+const SERVED: [&str; 3] = ["slots-", "devices-", "cli-"];
 
 /// `path` as given, or read from the workspace root when relative: `cargo test` runs in the
 /// crate's directory, but `GOLDEN_DEVLAB=target/debug/factory` is written from the root.
@@ -281,8 +294,6 @@ impl Stage {
         for dir in ["owners", "background"] {
             fs::create_dir(sandbox.path(dir)).expect("create a stage dir");
         }
-        std::os::unix::fs::symlink(sleep_binary(), sandbox.path("owners/claude"))
-            .expect("link the owner binary");
         Ok(Stage {
             background: BTreeMap::new(),
             owners: BTreeMap::new(),
@@ -357,6 +368,27 @@ impl Stage {
                 code,
             }));
         }
+        if let Some(rest) = step.strip_prefix("signal ") {
+            let (tag, name) = rest
+                .split_once(' ')
+                .ok_or("signal needs a tag and a signal")?;
+            let signal = match name {
+                "TERM" => Signal::TERM,
+                "INT" => Signal::INT,
+                "HUP" => Signal::HUP,
+                "KILL" => Signal::KILL,
+                other => return Err(format!("signal knows TERM, INT, HUP and KILL, not {other}")),
+            };
+            let pid = self
+                .background
+                .get(tag)
+                .and_then(|call| call.child.as_ref())
+                .and_then(|child| i32::try_from(child.id()).ok())
+                .and_then(Pid::from_raw)
+                .ok_or(format!("no background call {tag} is running"))?;
+            kill_process(pid, signal).map_err(|e| format!("signal {tag}: {e}"))?;
+            return Ok(None);
+        }
         if let Some(name) = step.strip_prefix("kill ") {
             let owner = self.owner(name)?;
             if let Some(mut child) = owner.child.take() {
@@ -391,13 +423,7 @@ impl Stage {
             ));
         }
         if !self.owners.contains_key(name) {
-            let child = Command::new(self.sandbox.path("owners/claude"))
-                .arg("infinity")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .process_group(0)
-                .spawn()
+            let child = start_owner(&self.sandbox.path("owners"))
                 .map_err(|e| format!("start owner {name}: {e}"))?;
             self.owners.insert(
                 name.to_owned(),
@@ -430,7 +456,8 @@ impl Stage {
                 );
             }
             text = hide_memory(&text, "memory ", " GB free");
-            hide_memory(&text, "\"memAvailableMB\": ", "")
+            text = hide_memory(&text, "\"memAvailableMB\": ", "");
+            hide_signal_seconds(&text)
         };
         Shown {
             stdout: clean(shown.stdout),
@@ -493,6 +520,33 @@ fn replace_number(text: &str, from: &str, to: &str) -> String {
     out
 }
 
+/// Shows the seconds in `by SIG<NAME> after <n> s` as `<n>`: how long a run took before a
+/// signal ended it depends on how busy the machine is.
+fn hide_signal_seconds(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(" after ") {
+        let head = &rest[..at];
+        let tail = &rest[at + " after ".len()..];
+        let by_signal = head
+            .rsplit_once(" by ")
+            .is_some_and(|(_, name)| name.starts_with("SIG") && !name.contains(' '));
+        let len = tail
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(tail.len());
+        out.push_str(head);
+        out.push_str(" after ");
+        if by_signal && len > 0 && tail[len..].starts_with(" s") {
+            out.push_str("<n>");
+            rest = &tail[len..];
+        } else {
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Shows a number that follows `before` and precedes `after` as `<mem>`.
 fn hide_memory(text: &str, before: &str, after: &str) -> String {
     let mut out = String::new();
@@ -520,11 +574,32 @@ fn on_path(program: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// A binary that waits forever; linked as `claude`, its process is an owner devlab recognises.
-fn sleep_binary() -> PathBuf {
-    ["/usr/bin/sleep", "/bin/sleep"]
-        .iter()
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
-        .expect("a sleep binary")
+/// Starts an owner in its own process group: a shell script named `claude`, so that the kernel
+/// names its process so, which waits until its stdin closes, and devlab recognises as an owner.
+/// It is a script of its own rather than `sleep` linked as `claude`: where sleep is one multicall
+/// binary, it picks its applet from the name it runs as and a `claude` would exit at once. The
+/// owner needs nothing from its environment, and ends with the child that holds its stdin.
+pub fn start_owner(dir: &Path) -> std::io::Result<Child> {
+    let path = dir.join("claude");
+    fs::write(&path, "#!/bin/sh\nread _\nexit 0\n")?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+    // A parallel test's fork may hold the script open for writing a moment longer than this
+    // thread did: that is ETXTBSY, and passes.
+    let mut tries = 0;
+    loop {
+        let started = Command::new(&path)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn();
+        match started {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
 }

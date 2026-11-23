@@ -1,0 +1,64 @@
+# A run stopped while it waits for its lease says so with why it waited, leaves the queue at once,
+# and ends as 128 plus the signal's number (#24; today's devlab died without a word). Both of
+# demo's slots are held, so c's and then d's run queue.
+$ a@demo-a devlab acquire --no-device --quiet
+1> export DEVLAB_PROJECT=demo
+1> export DEVLAB_SLOT=0
+1> export API_PORT=27787
+1> export SUPABASE_API_PORT=27321
+1> export SUPABASE_URL=http://127.0.0.1:27321
+1> export SUPABASE_DB_PORT=27322
+1> export SUPABASE_DB_URL=postgresql://postgres:postgres@127.0.0.1:27322/postgres
+1> export SUPABASE_STUDIO_PORT=27323
+1> export SUPABASE_MAIL_PORT=27324
+1> export SUPABASE_PROJECT_ID=demo
+1> export SUPABASE_DB_CONTAINER=supabase_db_demo
+1> export API_URL=http://127.0.0.1:27787
+1> export DEVLAB_LEASE=1
+? 0
+$ b@demo-b devlab acquire --no-device --quiet
+1> export DEVLAB_PROJECT=demo
+1> export DEVLAB_SLOT=1
+1> export API_PORT=27887
+1> export SUPABASE_API_PORT=27421
+1> export SUPABASE_URL=http://127.0.0.1:27421
+1> export SUPABASE_DB_PORT=27422
+1> export SUPABASE_DB_URL=postgresql://postgres:postgres@127.0.0.1:27422/postgres
+1> export SUPABASE_STUDIO_PORT=27423
+1> export SUPABASE_MAIL_PORT=27424
+1> export SUPABASE_PROJECT_ID=demo_s1
+1> export SUPABASE_DB_CONTAINER=supabase_db_demo_s1
+1> export SUPABASE_WORKDIR=<sandbox>/state/devlab/demo/slot-1
+1> export API_URL=http://127.0.0.1:27887
+1> export DEVLAB_LEASE=2
+? 0
+& q c@demo-c exec devlab run --no-device -- true
+until q devlab: waiting:
+signal q TERM
+wait q
+2> devlab: waiting: all 2 stack slots of demo are held
+2> devlab: stopped by SIGTERM after <n> s, while queued: all 2 stack slots of demo are held
+? 143
+$ c@demo-c devlab status
+1> devices: none attached
+1> stack slots
+1>   demo 0   down                         lease 1 demo-a
+1>   demo 1   down                         lease 2 demo-b
+1>   demo per owner (cap 1 of 2): claude:<a> 1/1 at cap, claude:<b> 1/1 at cap
+1> memory <mem> GB free; watcher active
+? 0
+& r d@demo-d exec devlab run --no-device --quiet -- true
+until r devlab: waiting:
+signal r HUP
+wait r
+2> devlab: waiting: all 2 stack slots of demo are held
+2> devlab: stopped by SIGHUP after <n> s, while queued: all 2 stack slots of demo are held
+? 129
+$ d@demo-d devlab status
+1> devices: none attached
+1> stack slots
+1>   demo 0   down                         lease 1 demo-a
+1>   demo 1   down                         lease 2 demo-b
+1>   demo per owner (cap 1 of 2): claude:<a> 1/1 at cap, claude:<b> 1/1 at cap
+1> memory <mem> GB free; watcher active
+? 0

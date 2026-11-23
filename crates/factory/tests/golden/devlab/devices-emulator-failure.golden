@@ -7,7 +7,7 @@ $ a@plain-a devlab acquire --emulator
 ? 77
 $ a@plain-a devlab status
 1> devices: none attached
-1> memory <mem> GB free; watcher inactive (systemctl --user enable --now devlab-watch)
+1> memory <mem> GB free; watcher active
 ? 0
 $ a@plain-a devlab env
 1> export DEVLAB_LEASE=1

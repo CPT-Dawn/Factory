@@ -2,7 +2,8 @@
 //!
 //! A client writes one request per line, `{"id", "method", "params"}`, and reads one response
 //! line per request, `{"id", "result"}` or `{"id", "error": {"code", "message"}}`, where
-//! `code` is an exit code from [`factory_core::exit`].
+//! `code` is an exit code from [`factory_core::exit`]. A request that waits (`lab.acquire`) may
+//! send `{"id", "note"}` and `{"id", "queued"}` lines before its answer.
 
 use factory_core::event::Fields;
 use factory_core::exit::Exit;
@@ -26,9 +27,35 @@ pub const REVIEW_QUOTA: &str = "review.quota";
 pub const LEAD_LIST: &str = "lead.list";
 /// One lead: [`LeadParams`] in, [`LeadReport`] out.
 pub const LEAD_STATUS: &str = "lead.status";
+/// Starts a lead in a new herdr workspace: [`SpawnParams`] in, [`SpawnResult`] out.
+pub const LEAD_SPAWN: &str = "lead.spawn";
 /// Answered once a lead finishes, blocks, asks or dies: [`WaitLeadParams`] in,
 /// [`WaitLeadResult`] out; an error with exit 124 when the time runs out first.
 pub const WAIT_LEAD: &str = "wait.lead";
+/// Answered once every check on a pull request's head has finished: [`WaitCiParams`] in,
+/// [`WaitCiResult`] out; an error with exit 124 when the time runs out first.
+pub const WAIT_CI: &str = "wait.ci";
+/// Answered once the review of a label has ended: [`WaitReviewParams`] in, the `review` event
+/// as it landed in the ledger out; an error with exit 124 when the time runs out first.
+pub const WAIT_REVIEW: &str = "wait.review";
+/// Answered once a lab lease is held no more (released, its owner exited, or expired):
+/// [`WaitLeaseParams`] in, [`WaitLeaseResult`] out; an error with exit 4 for an id never
+/// granted, and with exit 124 when the time runs out first.
+pub const WAIT_LEASE: &str = "wait.lease";
+/// Registers a wait that outlives its CLI (`--notify`) and answers at once: [`NotifyParams`]
+/// in, [`NotifyResult`] out. When the wait ends, the daemon posts one line into the session
+/// the params address; a refusal with exit 3 when event delivery is switched off.
+pub const WAIT_NOTIFY: &str = "wait.notify";
+/// Starts the context steward unless it runs: no params, [`MonitorSwitch`] out.
+pub const MONITOR_START: &str = "monitor.start";
+/// Stops the context steward if it runs: no params, [`MonitorSwitch`] out.
+pub const MONITOR_STOP: &str = "monitor.stop";
+/// Whether the context steward runs, and what it watches: no params, [`MonitorStatus`] out.
+pub const MONITOR_STATUS: &str = "monitor.status";
+
+/// What the daemon holds, as one record, read from its own state and running no command:
+/// [`StatusParams`] in, [`factory_core::status::Status`] out.
+pub const STATUS: &str = "status";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -51,6 +78,11 @@ pub struct Response {
 pub enum Outcome {
     Result(Value),
     Error(ErrorBody),
+    /// Progress before the result, `{"id", "note"}`: a request that waits may send any number.
+    Note(String),
+    /// `{"id", "queued": n}`: a request that waits in a queue the daemon keeps across restarts
+    /// (`lab.acquire`) holds place `n`, which it names to keep it when it asks again.
+    Queued(i64),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -85,9 +117,26 @@ pub struct LogResult {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct StatusParams {
+    /// The configured review backends, in the order they are tried: the daemon holds quotas, the
+    /// config says which backends there are.
+    pub backends: Vec<BackendSlots>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AcquireParams {
     /// The configured backends, in the order they are tried.
     pub backends: Vec<BackendSlots>,
+    /// The review asking, so the daemon can tell a wait on its label that it is still running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewRef>,
+}
+
+/// A review by the repo it runs in and its label.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReviewRef {
+    pub repo: String,
+    pub label: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -162,6 +211,36 @@ pub struct LeadParams {
     pub lead: String,
 }
 
+/// What the daemon needs to start a lead, checked by the CLI against the repo already.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SpawnParams {
+    /// The lead's herdr agent name, `lead-<slug>`.
+    pub lead: String,
+    /// The repository to cut the lead's worktree from.
+    pub repo_path: String,
+    pub repo_name: String,
+    pub base: String,
+    pub skill: String,
+    pub spec: String,
+    /// What Claude starts with, after its own name.
+    pub claude_args: Vec<String>,
+    pub model: String,
+    pub effort: String,
+    pub retry_pause_ms: u64,
+    /// The Claude Code session that asked, for the ledger.
+    pub session: Option<String>,
+}
+
+/// The lead a spawn started, as the night page takes it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SpawnResult {
+    pub lead: String,
+    pub workspace: String,
+    pub branch: String,
+    pub worktree: String,
+    pub report: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WaitLeadParams {
     pub lead: String,
@@ -197,4 +276,153 @@ pub struct WaitLeadResult {
     pub lead: LeadReport,
     /// 0 when the lead finished, 10 when it needs attention.
     pub exit: u8,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WaitReviewParams {
+    pub label: String,
+    /// The repo the caller works in; none when its working directory is no repo, which waits
+    /// for the label in any.
+    pub repo: Option<String>,
+    /// The herdr pane the wait comes from, so the lead in it shows as waiting.
+    pub waiter: Option<String>,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WaitLeaseParams {
+    pub lease: i64,
+    /// The herdr pane the wait comes from, so the lead in it shows as waiting.
+    pub waiter: Option<String>,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WaitLeaseResult {
+    pub lease: i64,
+    /// Always false: the wait is answered once the lease is held no more.
+    pub held: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WaitCiParams {
+    /// The pull request as the caller named it: a number, a URL or a branch.
+    pub pr: String,
+    /// The caller's working directory, where `gh` finds the repo a number belongs to.
+    pub cwd: String,
+    /// The herdr pane the wait comes from, so the lead in it shows as waiting.
+    pub waiter: Option<String>,
+    pub timeout_secs: u64,
+    /// How often to poll GitHub when it can't listen for events; the first wait on a pull
+    /// request sets it for all.
+    pub poll_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NotifyParams {
+    pub on: NotifyOn,
+    /// The herdr pane the wait comes from, so the lead in it shows as waiting.
+    pub waiter: Option<String>,
+    pub timeout_secs: u64,
+    pub session: SessionParam,
+}
+
+/// What a `--notify` wait waits on.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum NotifyOn {
+    /// A pull request's checks, as [`WaitCiParams`] names them.
+    Ci {
+        pr: String,
+        cwd: String,
+        poll_secs: u64,
+    },
+    /// A lead, by its herdr agent name.
+    Lead { lead: String },
+}
+
+/// The Claude Code session a `--notify` wait posts into when it ends.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionParam {
+    /// Its inbox socket, `CLAUDE_CODE_MESSAGING_SOCKET`.
+    pub socket: String,
+    /// The token its inbox takes, `CLAUDE_CODE_MESSAGING_TOKEN`.
+    pub token: String,
+    /// The session's process, `CLAUDE_PID`, and its start time (field 22 of
+    /// `/proc/<pid>/stat`): the daemon drops the wait when that process exits.
+    pub pid: Option<i64>,
+    pub start: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NotifyResult {
+    /// The wait's number, which its line names when it ends.
+    pub id: i64,
+    /// What it waits on, as `factory lead status` shows it: `ci acme/shop#12` or a lead.
+    pub on: String,
+    /// When it gives up, in milliseconds since the epoch.
+    pub deadline: i64,
+}
+
+/// A pull request whose checks all finished.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WaitCiResult {
+    /// `<owner>/<repo>#<number>`.
+    pub pr: String,
+    pub url: String,
+    /// The head commit the checks ran on.
+    pub head: String,
+    pub passed: usize,
+    pub skipped: usize,
+    /// The failed checks' names.
+    pub failed: Vec<String>,
+    /// The file holding each failure's URL and log tail; none when nothing failed.
+    pub file: Option<String>,
+    /// 0 when nothing failed, 10 when something did.
+    pub exit: u8,
+}
+
+/// What a start or stop of the context steward did.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MonitorSwitch {
+    pub running: bool,
+    /// False when the steward already ran (start) or already stood still (stop).
+    pub changed: bool,
+}
+
+/// The context steward and its context table.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct MonitorStatus {
+    pub running: bool,
+    /// Every lead it watches, by name.
+    pub leads: Vec<LeadContext>,
+}
+
+/// One lead's context, and its subagents'.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LeadContext {
+    pub lead: String,
+    /// The Claude Code session herdr reports for it.
+    pub session: Option<String>,
+    /// The session log the context is read from, once it is found.
+    pub log: Option<String>,
+    /// The latest context; none before the log has said.
+    pub tokens: Option<u64>,
+    /// Whether the steward has asked it to stop and not yet compacted it.
+    pub asked: bool,
+    /// Whether a compaction of it is under way.
+    pub compacting: bool,
+    pub subagents: Vec<SubagentContext>,
+}
+
+/// One subagent of a lead.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubagentContext {
+    /// Its session log's name, `agent-<id>`.
+    pub agent: String,
+    /// What it was started to do, when Claude Code recorded it.
+    pub description: Option<String>,
+    pub tokens: Option<u64>,
+    /// Whether its lead has been told it passed the threshold.
+    pub told: bool,
 }

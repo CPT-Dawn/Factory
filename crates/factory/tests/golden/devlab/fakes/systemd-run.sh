@@ -13,4 +13,5 @@ if grep -qxF systemd-run "$w/broken"; then
   exit 1
 fi
 echo "$unit" >> "$w/units"
+echo "$unit $port" >> "$w/unit-ports"
 echo "emulator-$port device product:sdk_gphone64_x86_64 model:sdk_gphone64_x86_64 device:emu64xa" >> "$w/devices"

@@ -19,6 +19,62 @@ impl Timestamp {
     pub const fn unix_millis(self) -> i64 {
         self.0
     }
+
+    /// Reads a UTC moment in ISO 8601, `2026-11-30T00:21:20Z`, with or without a fraction of a
+    /// second (kept to the millisecond). None for anything else, a local time included.
+    pub fn parse(text: &str) -> Option<Timestamp> {
+        let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
+        let mut date = date.splitn(3, '-').map(digits);
+        let (year, month, day) = (date.next()??, date.next()??, date.next()??);
+        let (time, fraction) = time.split_once('.').unwrap_or((time, ""));
+        let mut time = time.splitn(3, ':').map(digits);
+        let (hour, minute, second) = (time.next()??, time.next()??, time.next()??);
+        let millis = match fraction {
+            "" => 0,
+            _ => digits(format!("{fraction:0<3}").get(..3)?)?,
+        };
+        let valid = (1..=12).contains(&month)
+            && (1..=days_in_month(year, month)).contains(&day)
+            && hour < 24
+            && minute < 60
+            && second < 60
+            && (fraction.is_empty() || digits(fraction).is_some());
+        valid.then(|| {
+            let seconds =
+                days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second;
+            Timestamp(seconds * 1000 + millis)
+        })
+    }
+}
+
+/// The number written in `text`, which must be ASCII digits only.
+fn digits(text: &str) -> Option<i64> {
+    if text.is_empty() || text.len() > 9 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// The days from 1970-01-01 to this proleptic Gregorian date, by Howard Hinnant's
+/// `days_from_civil`.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year.rem_euclid(400);
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 impl fmt::Display for Timestamp {

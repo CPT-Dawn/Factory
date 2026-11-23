@@ -5,10 +5,11 @@ use std::process::Child;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rustix::process::Signal;
 use serde_json::Value;
 
 use crate::support::herdr::FakeHerdr;
-use crate::support::{DEADLINE, Sandbox, finish, spawn};
+use crate::support::{DEADLINE, Sandbox, finish, kill_group, spawn};
 
 #[test]
 fn a_herdr_on_another_protocol_is_reported_and_not_used() {
@@ -252,7 +253,8 @@ fn wait_answers_0_when_an_event_says_the_lead_finished() {
     assert_eq!(out.code, 0, "{out:?}");
     assert_eq!(out.stdout, format!("lead-cart finished: {shipped}\n"));
     assert_eq!(out.stderr, "");
-    assert_eq!(herdr.count("agent.list"), 1, "{:?}", herdr.methods());
+    // Nothing polls: the agents are listed to learn the panes, and once more after subscribing.
+    assert_eq!(herdr.count("agent.list"), 2, "{:?}", herdr.methods());
 }
 
 #[test]
@@ -275,7 +277,7 @@ fn wait_answers_10_with_the_screen_when_the_lead_blocks_or_asks() {
                 "1. Yes  2. No"
             ]
         );
-        assert_eq!(herdr.count("agent.list"), 1, "{:?}", herdr.methods());
+        assert_eq!(herdr.count("agent.list"), 2, "{:?}", herdr.methods());
     }
 }
 
@@ -324,7 +326,7 @@ fn wait_times_out_with_124_never_0() {
         "factory: lead-cart is still working after 1s; \
          wait again, or see factory lead status cart\n"
     );
-    assert_eq!(herdr.count("agent.list"), 1, "{:?}", herdr.methods());
+    assert_eq!(herdr.count("agent.list"), 2, "{:?}", herdr.methods());
 }
 
 #[test]
@@ -383,8 +385,21 @@ fn a_wait_whose_caller_is_gone_stops_waiting() {
 #[test]
 fn a_wait_that_loses_herdr_fails_and_the_next_command_reconnects() {
     let sandbox = Sandbox::new();
-    let herdr = shop(&sandbox, &[("lead-cart", "w1:p1", "working")]);
-    let child = waiting(&sandbox, &herdr, &["cart"], "w1:p1");
+    let herdr = shop(
+        &sandbox,
+        &[
+            ("lead-cart", "w1:p1", "working"),
+            ("lead-pay", "w2:p1", "working"),
+        ],
+    );
+    // The waiter names its own pane, so `lead status` shows once the daemon has the wait:
+    // a hang-up before that would only make the wait reconnect.
+    let mut cmd = sandbox.factory_command(&["wait", "lead", "cart"]);
+    cmd.env("HERDR_PANE_ID", "w2:p1");
+    let child = spawn(cmd);
+    await_status(&sandbox, "pay", "lead-pay waiting: lead-cart");
+    // And the daemon's subscription is live in the fake, which hangs up only on the ones it has.
+    herdr.await_watch("w1:p1");
 
     herdr.hang_up();
     let out = finish(child);
@@ -419,5 +434,23 @@ fn a_lead_that_appears_later_is_found() {
         (out.code, out.stdout_lines()[0]),
         (0, "lead-pay blocked"),
         "{out:?}"
+    );
+}
+
+#[test]
+fn a_wait_the_daemon_stops_under_says_to_wait_again() {
+    let sandbox = Sandbox::new();
+    let herdr = shop(&sandbox, &[("lead-cart", "w1:p1", "working")]);
+    let child = waiting(&sandbox, &herdr, &["cart"], "w1:p1");
+
+    // As systemd stops it for a restart or an upgrade.
+    let daemon = fs::read_to_string(sandbox.path("run/factory/daemon.pid")).unwrap();
+    kill_group(daemon.trim().parse().unwrap(), Signal::TERM);
+    let out = finish(child);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(
+        out.stderr,
+        "factory: the daemon stopped (a restart or an upgrade); run the wait again\n"
     );
 }
