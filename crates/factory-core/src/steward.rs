@@ -115,3 +115,8 @@ impl Policy {
         tokens >= self.subagent_at && !told
     }
 }
+
+/// Tokens in thousands, as the steward's messages give them: `312k`.
+pub fn kilo(tokens: u64) -> String {
+    format!("{}k", tokens / 1000)
+}

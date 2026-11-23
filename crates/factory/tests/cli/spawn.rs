@@ -465,7 +465,7 @@ fn a_repo_named_in_digits_still_gets_one_lead_end_after_a_restart() {
             "-c",
             "user.name=t",
             "-c",
-            "user.email=t@example.com",
+            "user.email=ping@cptdawn.dev",
             "commit",
             "-q",
             "--allow-empty",

@@ -41,7 +41,6 @@ use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt, Lines};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use super::lease::base_name;
 use super::reservations;
 use super::store::{self, Store};
 use super::wire::{
@@ -52,6 +51,7 @@ use super::wire::{
 use super::{android, host};
 use crate::ledger::Ledger;
 use crate::protocol::{ErrorBody, Outcome, Request, Response};
+use factory_core::lab::base_name;
 
 /// How often a waiting acquire looks again without a change to the board: a port that freed
 /// tells no one. An owner that exits does: the keeper watches each one.

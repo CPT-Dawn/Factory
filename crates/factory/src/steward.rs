@@ -15,13 +15,12 @@ use std::time::{Duration, Instant};
 
 use factory_adapters::herdr::{Herdr, HerdrApi, PromptWait};
 use factory_core::lead::AgentStatus;
-use factory_core::steward::{LeadNow, Policy, Step};
+use factory_core::steward::{LeadNow, Policy, Step, kilo};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 use crate::config;
 use crate::leads::{Leads, Seen};
-use crate::monitor::kilo;
 use crate::output::Failure;
 use crate::paths::Paths;
 use crate::protocol::{LeadContext, MonitorStatus, MonitorSwitch, SubagentContext};

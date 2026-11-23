@@ -1,5 +1,6 @@
 //! `factory monitor start|stop|status`: the context steward, which runs in the daemon.
 
+use factory_core::steward::kilo;
 use serde_json::{Value, json};
 
 use crate::client;
@@ -65,9 +66,4 @@ fn count(n: usize, what: &str) -> String {
     } else {
         format!("{n} {what}s")
     }
-}
-
-/// Tokens in thousands, as the steward's messages give them: `312k`.
-pub fn kilo(tokens: u64) -> String {
-    format!("{}k", tokens / 1000)
 }

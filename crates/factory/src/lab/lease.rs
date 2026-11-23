@@ -1,11 +1,11 @@
 //! The caller's side of a lease: what it asks the daemon for, and what it does once granted.
 
-use std::path::Path;
 use std::time::Duration;
 
 use factory_adapters::adb::{Adb, AdbCli};
 use factory_core::exit::Exit;
 use factory_core::lab::args::{Opts, wait_span};
+use factory_core::lab::base_name;
 use factory_core::lab::config::{MachineConfig, ProjectConfig, owner_cap};
 use factory_core::lab::devices::Mode;
 use factory_core::lab::emulator::BOOT_TIMEOUT_SEC;
@@ -30,13 +30,6 @@ const BOOT_GRACE: Duration = Duration::from_secs(BOOT_TIMEOUT_SEC + 300);
 
 pub fn paths() -> Result<Paths, Failure> {
     Paths::from_env()
-}
-
-pub fn base_name(path: &str) -> &str {
-    Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(path)
 }
 
 /// Queues for a lease and takes it: the daemon grants its devices (booting emulators as needed)
