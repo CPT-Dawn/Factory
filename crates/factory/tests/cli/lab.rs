@@ -165,6 +165,104 @@ fn a_wait_that_is_no_number_of_seconds_is_refused() {
     );
 }
 
+#[test]
+fn a_wait_that_is_no_number_of_seconds_stops_run_before_it_runs_anything() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-runwait");
+    let marker = sandbox.path("ran");
+    let script = format!("touch {}", marker.display());
+    let out = owned(
+        &sandbox,
+        &wt,
+        &[
+            "run",
+            "--no-device",
+            "--wait",
+            "soon",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ],
+    );
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (
+            2,
+            "",
+            "devlab: --wait takes a number of seconds (0 = do not wait)\n"
+        )
+    );
+    assert!(!marker.exists(), "the command ran");
+}
+
+/// Target-repo device runners walk their ancestors for a command line like `devlab run ...` to
+/// time their budget, so the command must be a child of the live `devlab`, not replace it.
+#[test]
+fn run_and_exec_keep_devlab_alive_as_the_parent_of_the_command() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-parent");
+    let walk = r#"pid=$PPID
+while [ "$pid" -gt 1 ]; do
+  line=$(tr '\0' ' ' < /proc/$pid/cmdline)
+  case "$line" in *"devlab run "*|*"devlab exec "*) echo "$pid $line"; exit 0;; esac
+  pid=$(sed -e 's/^.*) [A-Za-z] //' -e 's/ .*//' /proc/$pid/stat)
+done
+exit 9"#;
+    let ran = owned(
+        &sandbox,
+        &wt,
+        &["run", "--no-device", "--quiet", "--", "sh", "-c", walk],
+    );
+    let held = owned(&sandbox, &wt, &["exec", "--", "sh", "-c", walk]);
+
+    for (call, out) in [("run", ran), ("exec", held)] {
+        assert_eq!(out.code, 0, "{call}: {out:?}");
+        let (pid, line) = out.stdout.split_once(' ').expect("a pid and a line");
+        assert!(pid.parse::<u32>().is_ok(), "{call}: {out:?}");
+        assert!(
+            line.contains(&format!("bin/devlab {call} ")),
+            "{call}: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn the_command_runs_with_default_signal_dispositions_and_no_time_limit() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-signals");
+    let piped = owned(
+        &sandbox,
+        &wt,
+        &[
+            "run",
+            "--no-device",
+            "--quiet",
+            "--",
+            "sh",
+            "-c",
+            "kill -PIPE $$",
+        ],
+    );
+    let slow = owned(
+        &sandbox,
+        &wt,
+        &[
+            "run",
+            "--no-device",
+            "--quiet",
+            "--",
+            "sh",
+            "-c",
+            "sleep 1; exit 4",
+        ],
+    );
+
+    assert_eq!(piped.code, 141, "{piped:?}");
+    assert_eq!(slow.code, 4, "{slow:?}");
+}
+
 fn daemon_log(sandbox: &Sandbox) -> String {
     fs::read_to_string(sandbox.path("run/factory/daemon.log")).unwrap_or_default()
 }

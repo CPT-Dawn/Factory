@@ -20,7 +20,7 @@ Without `GOLDEN_DEVLAB`, the `slots-*` and `cli-*` transcripts replay against th
 names the transcript line, the step, the stream and the first byte that differs, and shows both
 outputs. `GOLDEN_RECORD=1` rewrites the transcripts with what the binary showed instead.
 
-Groups: `slots-*` (stack slots, #14), `devices-*` (phones and emulators, #16), `cli-*` (usage
+Groups: `slots-*` (stack slots, #14; `slots-run-exit` is run and exec passing codes and signals, #15), `devices-*` (phones and emulators, #16), `cli-*` (usage
 and help). Every transcript has a test in `tests/cli/devlab_golden.rs`.
 
 ## The sandbox
