@@ -15,7 +15,7 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// What the lab reads from the machine config; the emulator settings come with devices (#16).
+/// What the lab reads from the machine config.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MachineConfig {
     /// Process names that own a lease: the nearest such ancestor of the caller.
@@ -27,6 +27,20 @@ pub struct MachineConfig {
     /// RAM a stack is expected to take, and what the host must keep free after it.
     pub stack_ram_mb: i64,
     pub host_floor_mb: i64,
+    /// Emulators devlab runs at once.
+    pub max_emulators: u32,
+    /// The system image a new AVD is made from; empty picks the newest installed.
+    pub emulator_image: String,
+    pub emulator_device: String,
+    pub emulator_gpu: String,
+    /// Console port of emulator 0; emulator i uses base + 2i.
+    pub emulator_port_base: u32,
+    /// RAM an emulator is expected to take.
+    pub emulator_ram_mb: i64,
+    /// Keep the screen on while plugged in.
+    pub prep_stay_awake: bool,
+    /// Turn animations off, for steadier UI tests.
+    pub prep_animations_off: bool,
 }
 
 impl Default for MachineConfig {
@@ -37,6 +51,14 @@ impl Default for MachineConfig {
             max_slots_per_owner: None,
             stack_ram_mb: 2048,
             host_floor_mb: 5120,
+            max_emulators: 2,
+            emulator_image: String::new(),
+            emulator_device: "pixel_6".to_owned(),
+            emulator_gpu: "swiftshader_indirect".to_owned(),
+            emulator_port_base: 5580,
+            emulator_ram_mb: 3072,
+            prep_stay_awake: true,
+            prep_animations_off: true,
         }
     }
 }
@@ -61,7 +83,7 @@ pub struct ProjectConfig {
     pub slot_stride: u32,
     /// Host ports the project's own servers use in slot 0, exported under these names.
     pub ports: Vec<(String, u32)>,
-    /// Device port -> exported port name, for `adb reverse` (#16).
+    /// Device port -> exported port name (or a port), for `adb reverse`.
     pub reverse: Vec<(String, String)>,
     pub supabase: Option<Supabase>,
     /// Extra exports; `${NAME}` expands to any other exported value.
@@ -93,12 +115,51 @@ pub fn machine_config(file: &str, text: &str) -> Result<MachineConfig, ConfigErr
     for (key, at) in [
         ("stackRamMB", &mut cfg.stack_ram_mb),
         ("hostFloorMB", &mut cfg.host_floor_mb),
+        ("emulatorRamMB", &mut cfg.emulator_ram_mb),
     ] {
         if let Some(v) = raw.get(key) {
             *at = v
                 .as_f64()
                 .map(|n| n as i64)
                 .ok_or_else(|| ConfigError(format!("{file}: \"{key}\" must be a number")))?;
+        }
+    }
+    for (key, at) in [
+        ("maxEmulators", &mut cfg.max_emulators),
+        ("emulatorPortBase", &mut cfg.emulator_port_base),
+    ] {
+        if let Some(v) = raw.get(key) {
+            *at = v
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| ConfigError(format!("{file}: \"{key}\" must be a whole number")))?;
+        }
+    }
+    for (key, at) in [
+        ("emulatorImage", &mut cfg.emulator_image),
+        ("emulatorDevice", &mut cfg.emulator_device),
+        ("emulatorGpu", &mut cfg.emulator_gpu),
+    ] {
+        if let Some(v) = raw.get(key) {
+            *at = v
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| ConfigError(format!("{file}: \"{key}\" must be a string")))?;
+        }
+    }
+    if let Some(prep) = raw.get("prep") {
+        let prep = prep
+            .as_object()
+            .ok_or_else(|| ConfigError(format!("{file}: \"prep\" must be an object")))?;
+        for (key, at) in [
+            ("stayAwake", &mut cfg.prep_stay_awake),
+            ("animationsOff", &mut cfg.prep_animations_off),
+        ] {
+            if let Some(v) = prep.get(key) {
+                *at = v.as_bool().ok_or_else(|| {
+                    ConfigError(format!("{file}: \"prep.{key}\" must be true or false"))
+                })?;
+            }
         }
     }
     cfg.max_slots_per_owner = cap(&raw, file)?;
@@ -363,5 +424,33 @@ mod tests {
         assert_eq!(cfg.host_floor_mb, 0);
         assert_eq!(cfg.stack_ram_mb, 2048);
         assert_eq!(cfg.max_slots_per_owner, None);
+    }
+
+    #[test]
+    fn the_emulator_and_prep_settings_are_read_with_their_defaults() {
+        let cfg = machine_config(
+            "m",
+            r#"{"maxEmulators":1,"emulatorImage":"img","emulatorRamMB":0,"prep":{"animationsOff":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                cfg.max_emulators,
+                cfg.emulator_image.as_str(),
+                cfg.emulator_ram_mb
+            ),
+            (1, "img", 0)
+        );
+        assert_eq!(
+            (cfg.emulator_port_base, cfg.emulator_gpu.as_str()),
+            (5580, "swiftshader_indirect")
+        );
+        assert!(cfg.prep_stay_awake && !cfg.prep_animations_off);
+        assert_eq!(
+            machine_config("m", r#"{"maxEmulators":"two"}"#),
+            Err(ConfigError(
+                "m: \"maxEmulators\" must be a whole number".to_owned()
+            ))
+        );
     }
 }

@@ -26,14 +26,39 @@
 //! auth = "subscription"    # agy only: its "subscription" login, or an "api-key" in
 //!                          # GEMINI_API_KEY (default: subscription)
 //! ```
+//!
+//! The hooks (`factory hook`, spec #1, "Hooks") read the `[hook]` table:
+//!
+//! ```toml
+//! [hook]
+//! private_addresses = ["me@example.invalid"]  # a commit or push adding one is refused
+//!
+//! [hook.report]                # the template of a subagent's final report; no limit when absent
+//! max_lines = 40
+//! max_chars = 4000
+//!
+//! [hook.report.agent.implementer]  # an agent type's own limits, over the ones above
+//! max_lines = 5
+//! ```
+//!
+//! Its `[lead]` table sets how `factory lead spawn` starts Claude:
+//!
+//! ```toml
+//! [lead]
+//! model = "opus"                                # default: opus
+//! effort = "medium"                             # default: medium
+//! disable_plugins = ["expo@claude-plugins-official", "cloudflare@cloudflare"]  # the default
+//! retry_pause = 2                               # seconds between tries to submit the prompt
+//! ```
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use factory_adapters::reviewer::AgyAuth;
+use factory_core::hook::{Template, Templates};
 use factory_core::quota::WhenBusy;
 use serde::Deserialize;
 
@@ -73,6 +98,8 @@ struct ConfigFile {
     #[serde(default)]
     review: Review,
     #[serde(default)]
+    lead: LeadSection,
+    #[serde(default)]
     ci: CiSection,
 }
 
@@ -81,6 +108,120 @@ struct ConfigFile {
 struct CiSection {
     poll: Option<String>,
 }
+
+/// The file as the hooks read it: `[hook]` alone, so a mistake in `[review]` cannot stop a
+/// hook and a mistake in `[hook]` cannot stop a review.
+#[derive(Deserialize, Default)]
+struct HookConfigFile {
+    #[serde(default)]
+    hook: HookFile,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct HookFile {
+    #[serde(default)]
+    private_addresses: Vec<String>,
+    #[serde(default)]
+    report: ReportFile,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ReportFile {
+    max_lines: Option<usize>,
+    max_chars: Option<usize>,
+    #[serde(default)]
+    agent: BTreeMap<String, TemplateFile>,
+}
+
+#[derive(Clone, Copy, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct TemplateFile {
+    max_lines: Option<usize>,
+    max_chars: Option<usize>,
+}
+
+impl From<TemplateFile> for Template {
+    fn from(file: TemplateFile) -> Template {
+        Template {
+            max_lines: file.max_lines,
+            max_chars: file.max_chars,
+        }
+    }
+}
+
+/// What the hooks read from the config.
+#[derive(Debug, Default)]
+pub struct HookSettings {
+    /// Addresses a commit or push must not add.
+    pub private_addresses: Vec<String>,
+    pub templates: Templates,
+}
+
+/// The hooks' settings from the config file in `config_dir`; defaults without the file.
+pub fn hook_settings(config_dir: &Path) -> Result<HookSettings, Failure> {
+    let path = config_dir.join("config.toml");
+    let text = read(&path)?;
+    // The message is left out of the failure: toml quotes the value it choked on, and the value
+    // may be the private address the hook is there to keep out of the output.
+    let hook = toml::from_str::<HookConfigFile>(&text)
+        .map_err(|e| {
+            bad(
+                &path,
+                &text,
+                "a value is not what [hook] takes (see the docs in config.rs)",
+                &e,
+            )
+        })?
+        .hook;
+    Ok(HookSettings {
+        private_addresses: hook.private_addresses,
+        templates: Templates {
+            default: Template {
+                max_lines: hook.report.max_lines,
+                max_chars: hook.report.max_chars,
+            },
+            agents: hook
+                .report
+                .agent
+                .into_iter()
+                .map(|(agent, template)| (agent, template.into()))
+                .collect(),
+        },
+    })
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct LeadSection {
+    model: Option<String>,
+    effort: Option<String>,
+    disable_plugins: Option<Vec<String>>,
+    retry_pause: Option<u64>,
+}
+
+/// How a lead's Claude is started, as configured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeadSetup {
+    pub model: String,
+    pub effort: String,
+    /// Plugins (`name@marketplace`) the lead starts with turned off: the ones the factory never
+    /// uses, whose skills would otherwise ride along on every request.
+    pub disable_plugins: Vec<String>,
+    /// How long to wait between tries to get the lead's prompt submitted.
+    pub retry_pause: Duration,
+}
+
+const DEFAULT_LEAD_MODEL: &str = "opus";
+const DEFAULT_LEAD_EFFORT: &str = "medium";
+const DEFAULT_RETRY_PAUSE_S: u64 = 2;
+/// The most a pause may be: a spawn tries the prompt up to five times, and the CLI waits for
+/// all of them, so a longer pause only keeps a lead that needs one enter from its work.
+const MAX_RETRY_PAUSE_S: u64 = 30;
+/// The plugins the 2026-11-23 retro measured at about 6.3k tokens of skill listings per request.
+const DEFAULT_DISABLED_PLUGINS: [&str; 2] =
+    ["expo@claude-plugins-official", "cloudflare@cloudflare"];
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -111,7 +252,7 @@ enum Busy {
 
 /// How often a wait on CI polls GitHub when it can't listen for events.
 pub fn ci_poll(paths: &Paths) -> Result<Duration, Failure> {
-    let (path, file) = load(paths)?;
+    let (path, file) = load_config(paths)?;
     let Some(poll) = file.ci.poll else {
         return Ok(DEFAULT_POLL);
     };
@@ -129,25 +270,15 @@ pub fn ci_poll(paths: &Paths) -> Result<Duration, Failure> {
 }
 
 /// The config file's path and contents; an absent file is an empty config.
-fn load(paths: &Paths) -> Result<(PathBuf, ConfigFile), Failure> {
+fn load_config(paths: &Paths) -> Result<(PathBuf, ConfigFile), Failure> {
     let path = paths.config_file();
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(Failure::precondition(format!(
-                "cannot read {}: {e}; check its permissions",
-                path.display()
-            )));
-        }
-    };
-    let file = toml::from_str(&text).map_err(|e| bad(&path, &text, &e))?;
+    let file = load(&path)?;
     Ok((path, file))
 }
 
 /// The review backends in the order they are tried.
 pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
-    let (path, file) = load(paths)?;
+    let (path, file) = load_config(paths)?;
     if file.review.backend.is_empty() {
         return Ok(defaults());
     }
@@ -182,6 +313,54 @@ pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
             Ok(backend)
         })
         .collect()
+}
+
+/// Reads the config file at `path`; an absent file is an empty config.
+fn load(path: &Path) -> Result<ConfigFile, Failure> {
+    let text = read(path)?;
+    toml::from_str(&text).map_err(|e| bad(path, &text, e.message().trim(), &e))
+}
+
+/// The text of the config file at `path`; an absent file is empty.
+fn read(path: &Path) -> Result<String, Failure> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(Failure::precondition(format!(
+                "cannot read {}: {e}; check its permissions",
+                path.display()
+            )));
+        }
+    };
+    Ok(text)
+}
+
+/// How `factory lead spawn` starts Claude.
+pub fn lead_setup(paths: &Paths) -> Result<LeadSetup, Failure> {
+    let (path, file) = load_config(paths)?;
+    let lead = file.lead;
+    let pause = lead.retry_pause.unwrap_or(DEFAULT_RETRY_PAUSE_S);
+    if pause > MAX_RETRY_PAUSE_S {
+        return Err(Failure::usage(format!(
+            "{}: [lead] retry_pause is {pause}s, more than the {MAX_RETRY_PAUSE_S}s a stalled \
+             prompt is worth; lower it",
+            path.display()
+        )));
+    }
+    Ok(LeadSetup {
+        model: lead.model.unwrap_or_else(|| DEFAULT_LEAD_MODEL.to_owned()),
+        effort: lead
+            .effort
+            .unwrap_or_else(|| DEFAULT_LEAD_EFFORT.to_owned()),
+        disable_plugins: lead.disable_plugins.unwrap_or_else(|| {
+            DEFAULT_DISABLED_PLUGINS
+                .iter()
+                .map(|plugin| (*plugin).to_owned())
+                .collect()
+        }),
+        retry_pause: Duration::from_secs(pause),
+    })
 }
 
 fn backend(entry: Entry) -> Backend {
@@ -229,14 +408,10 @@ pub fn cli_name(cli: Cli) -> &'static str {
 }
 
 /// A config the file can't be read as: its path, line and toml's reason, in one line.
-fn bad(path: &Path, text: &str, e: &toml::de::Error) -> Failure {
+fn bad(path: &Path, text: &str, message: &str, e: &toml::de::Error) -> Failure {
     let line = e
         .span()
         .map(|span| text[..span.start.min(text.len())].lines().count().max(1));
     let at = line.map_or_else(String::new, |line| format!(" line {line}"));
-    Failure::precondition(format!(
-        "{}{at}: {}; fix the config",
-        path.display(),
-        e.message().trim()
-    ))
+    Failure::precondition(format!("{}{at}: {message}; fix the config", path.display()))
 }

@@ -29,7 +29,7 @@ use signal_hook::iterator::Signals;
 
 use super::cli::note;
 use super::context::Ctx;
-use super::lease::{self, lease_env};
+use super::lease::{self, apply_reverses, lease_env, wake};
 use super::wire::{ACQUIRE, Granted, Lease, RUN_END, RUN_START, RunAsk, RunEnd};
 use crate::client::Session;
 use crate::output::Failure;
@@ -41,7 +41,8 @@ const CANNOT_RUN: u8 = 127;
 /// it exits anyway.
 const LEAVE_GRACE: Duration = Duration::from_millis(500);
 
-/// `devlab run`: queues for the lease, takes it, runs `argv` in it and returns its exit code
+/// `devlab run`: queues for the lease, takes it, runs `argv` in it (its devices woken and the
+/// project's ports reversed onto them) and returns its exit code
 /// (128 + the signal that ended it, or that stopped devlab).
 pub fn run(ctx: &Ctx, opts: &Opts, quiet: bool, argv: &[String]) -> Result<u8, Failure> {
     let Some(program) = argv.first() else {
@@ -79,6 +80,8 @@ pub fn run(ctx: &Ctx, opts: &Opts, quiet: bool, argv: &[String]) -> Result<u8, F
     if !quiet {
         note(&lease::summary(&lease, ctx.project.as_ref())?);
     }
+    wake(&lease);
+    apply_reverses(&lease, ctx.project.as_ref())?;
     let env = lease_env(&lease, ctx.project.as_ref())?;
     let child = {
         let mut state = watch.lock();
@@ -130,13 +133,16 @@ pub fn run(ctx: &Ctx, opts: &Opts, quiet: bool, argv: &[String]) -> Result<u8, F
     Ok(code)
 }
 
-/// Runs `argv` in the lease and returns its exit code (128 + the signal that ended it);
+/// Runs `argv` in the lease, its devices woken and the project's ports reversed onto them, and
+/// returns its exit code (128 + the signal that ended it);
 /// [`CANNOT_RUN`] when it can't be run. `devlab exec`, which neither queues nor is followed.
 pub fn exec_in(ctx: &Ctx, lease: &Lease, argv: &[String]) -> Result<u8, Failure> {
     let env = lease_env(lease, ctx.project.as_ref())?;
     let Some(program) = argv.first() else {
         return Err(Failure::usage("devlab exec -- <cmd...>"));
     };
+    wake(lease);
+    apply_reverses(lease, ctx.project.as_ref())?;
     match spawn(argv, &env) {
         Ok(child) => match wait_for(child) {
             Ok(status) => Ok(exit_code(&status)),

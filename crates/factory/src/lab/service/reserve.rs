@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufRead, AsyncWrite, Lines};
 use tokio::time::Instant;
 
 use super::{
-    Answer, Facts, Lab, RECHECK, blocking, gather, grant_board, grant_project, parse, send,
+    Answer, Facts, Lab, RECHECK, blocking, gather_stack, grant_board, grant_project, parse, send,
 };
 use crate::lab::lease::base_name;
 use crate::lab::reservations;
@@ -177,7 +177,7 @@ where
         let tried = {
             let (lab, p) = (Arc::clone(&lab), Arc::clone(&p));
             blocking(move || {
-                let facts = gather(Some(&p.project));
+                let facts = gather_stack(Some(&p.project));
                 try_reserve(&lab, &p, waiter, &facts)
             })
             .await

@@ -4,7 +4,7 @@
 use rusqlite::{Connection, Row, params};
 
 use super::store;
-use super::wire::{Granted, Lease, Owner, Reservation};
+use super::wire::{Lease, Owner, Reservation};
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS reservations (
@@ -127,7 +127,7 @@ pub fn gc(
 }
 
 /// Turns reservation `id` of `project` into a lease of `worktree` for `owner`, when there is
-/// such a reservation: the slot it held, held by the new lease now.
+/// such a reservation: the slot it held, held by the new lease now. The caller claims the slot.
 pub fn claim(
     c: &Connection,
     id: i64,
@@ -135,7 +135,7 @@ pub fn claim(
     worktree: &str,
     owner: &Owner,
     now: i64,
-) -> rusqlite::Result<Option<Granted>> {
+) -> rusqlite::Result<Option<Lease>> {
     let Some(r) = all(c)?
         .into_iter()
         .find(|r| r.id == id && r.project == project)
@@ -143,9 +143,7 @@ pub fn claim(
         return Ok(None);
     };
     c.execute("DELETE FROM reservations WHERE id = ?1", [r.id])?;
-    let lease = store::insert_lease(c, Some(project), worktree, owner, Some(r.slot), now)?;
-    let previous = store::claim_slot(c, project, r.slot, worktree)?;
-    Ok(Some(Granted { lease, previous }))
+    store::insert_lease(c, Some(project), worktree, owner, Some(r.slot), now).map(Some)
 }
 
 /// Records how long a lease ran, for the ETAs of its project.

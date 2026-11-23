@@ -33,7 +33,15 @@ const WORLD_TOOLS: &[&str] = &[
 ];
 
 /// The files that hold a world's state, one entry per line.
-const STATE_FILES: &[&str] = &["devices", "containers", "units", "broken", "locked"];
+const STATE_FILES: &[&str] = &[
+    "devices",
+    "containers",
+    "units",
+    "unit-ports",
+    "broken",
+    "locked",
+    "stalled",
+];
 
 /// How often a wait on a file looks again.
 const POLL: Duration = Duration::from_millis(20);
@@ -73,6 +81,7 @@ impl World {
     /// - `plug <serial> <state> [<prop>...]`: adb lists the device (replacing its old line),
     /// - `unplug <serial>`: adb no longer lists it,
     /// - `lock <serial>`: its lock screen stays up,
+    /// - `stall <serial>`: the emulator never finishes booting,
     /// - `break <operation>` / `mend <operation>`: `supabase start` or `systemd-run` fails,
     ///   or works again.
     pub fn apply(&self, step: &str) -> Result<(), String> {
@@ -81,9 +90,14 @@ impl World {
             ["plug", serial, _state, ..] => {
                 self.remove("devices", |line| first_word(line) == *serial);
                 self.append("devices", &words[1..].join(" "));
+                self.settle_trackers();
             }
-            ["unplug", serial] => self.remove("devices", |line| first_word(line) == *serial),
+            ["unplug", serial] => {
+                self.remove("devices", |line| first_word(line) == *serial);
+                self.settle_trackers();
+            }
             ["lock", serial] => self.append("locked", serial),
+            ["stall", serial] => self.append("stalled", serial),
             ["break", what @ ..] if !what.is_empty() => self.append("broken", &what.join(" ")),
             ["mend", what @ ..] if !what.is_empty() => {
                 let what = what.join(" ");
@@ -92,6 +106,42 @@ impl World {
             _ => return Err(format!("unknown world step: {step}")),
         }
         Ok(())
+    }
+
+    /// Waits until every `adb track-devices -l` that runs on the world has streamed its device
+    /// list as it is now, so that a call after a plug or unplug finds the daemon's tracker up
+    /// to date. Each stream writes the list it streamed last to `tracked.<pid>`. The list is
+    /// read again on each look: a fake the daemon runs may change it meanwhile.
+    pub fn settle_trackers(&self) {
+        let settled = poll_until(|| {
+            let devices = fs::read_to_string(self.dir.join("devices")).unwrap_or_default();
+            let devices = devices.trim_end_matches('\n');
+            let Ok(entries) = fs::read_dir(&self.dir) else {
+                return true;
+            };
+            entries.flatten().all(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(pid) = name.strip_prefix("tracked.") else {
+                    return true;
+                };
+                !process_runs(pid)
+                    || fs::read_to_string(entry.path()).is_ok_and(|shown| shown == devices)
+            })
+        });
+        if !settled {
+            let streams: Vec<String> = fs::read_dir(&self.dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let pid = name.strip_prefix("tracked.")?.to_owned();
+                    let shown = fs::read_to_string(entry.path()).unwrap_or_default();
+                    Some(format!("{pid} (runs: {}): {shown:?}", process_runs(&pid)))
+                })
+                .collect();
+            panic!("adb track-devices never streamed the world's devices: {streams:?}");
+        }
     }
 
     /// A worktree named `name` under the sandbox, made on first use. One whose name starts
@@ -190,6 +240,16 @@ fn spawn_quiet(mut cmd: std::process::Command) -> Child {
     use std::os::unix::process::CommandExt;
     cmd.process_group(0).stderr(Stdio::null());
     cmd.spawn().expect("spawn the command")
+}
+
+/// Whether process `pid` runs and is not a zombie.
+fn process_runs(pid: &str) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        !stat
+            .rsplit(')')
+            .next()
+            .is_some_and(|s| s.trim_start().starts_with('Z'))
+    })
 }
 
 fn first_word(line: &str) -> &str {

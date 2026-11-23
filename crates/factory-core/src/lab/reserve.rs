@@ -68,6 +68,7 @@ pub fn plan(ask: &Reserve, board: &Board, now: i64) -> Plan {
             waiter: ask.waiter,
             project: Some(ask.project.clone()),
             existing: None,
+            devices_wait: None,
         };
         match decide(&one, &board, now) {
             Decision::Grant {

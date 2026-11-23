@@ -27,6 +27,8 @@ pub const REVIEW_QUOTA: &str = "review.quota";
 pub const LEAD_LIST: &str = "lead.list";
 /// One lead: [`LeadParams`] in, [`LeadReport`] out.
 pub const LEAD_STATUS: &str = "lead.status";
+/// Starts a lead in a new herdr workspace: [`SpawnParams`] in, [`SpawnResult`] out.
+pub const LEAD_SPAWN: &str = "lead.spawn";
 /// Answered once a lead finishes, blocks, asks or dies: [`WaitLeadParams`] in,
 /// [`WaitLeadResult`] out; an error with exit 124 when the time runs out first.
 pub const WAIT_LEAD: &str = "wait.lead";
@@ -166,6 +168,36 @@ impl From<QuotaParam> for Quota {
 pub struct LeadParams {
     /// The lead's herdr agent name, `lead-<slug>`.
     pub lead: String,
+}
+
+/// What the daemon needs to start a lead, checked by the CLI against the repo already.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SpawnParams {
+    /// The lead's herdr agent name, `lead-<slug>`.
+    pub lead: String,
+    /// The repository to cut the lead's worktree from.
+    pub repo_path: String,
+    pub repo_name: String,
+    pub base: String,
+    pub skill: String,
+    pub spec: String,
+    /// What Claude starts with, after its own name.
+    pub claude_args: Vec<String>,
+    pub model: String,
+    pub effort: String,
+    pub retry_pause_ms: u64,
+    /// The Claude Code session that asked, for the ledger.
+    pub session: Option<String>,
+}
+
+/// The lead a spawn started, as the night page takes it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SpawnResult {
+    pub lead: String,
+    pub workspace: String,
+    pub branch: String,
+    pub worktree: String,
+    pub report: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

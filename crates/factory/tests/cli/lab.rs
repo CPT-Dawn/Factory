@@ -1,5 +1,6 @@
 //! `factory lab` under the `devlab` name, beyond what the golden transcripts show: lease ids,
-//! owners, and the store's write lock while the fakes of docker and systemctl run.
+//! owners, the store's write lock while the fakes of docker and systemctl run, and the devices
+//! the daemon tracks and boots.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -372,6 +373,208 @@ fn docker_and_systemctl_run_while_the_store_is_unlocked() {
         );
     }
     assert!(!seen.contains("held"), "{seen}");
+}
+
+/// Runs `devlab status` and returns its stdout.
+fn status(sandbox: &Sandbox, dir: &Path) -> String {
+    let out = owned(sandbox, dir, &["status"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    out.stdout
+}
+
+/// Starts `devlab acquire --emulator` for the test's owner, and waits until status shows its
+/// emulator booting.
+fn boot_in_background(sandbox: &Sandbox, dir: &Path, ask: &str) -> std::process::Child {
+    let mut cmd = devlab(sandbox, dir, &["acquire", ask]);
+    cmd.env("DEVLAB_OWNER_PID", std::process::id().to_string());
+    let child = spawn(cmd);
+    // Booting shows from the grant; the emulator's unit starts a moment later.
+    let unit_ports = sandbox.path("world/unit-ports");
+    let booting = poll_until(|| {
+        status(sandbox, dir).contains(" booting ")
+            && fs::read_to_string(&unit_ports).is_ok_and(|u| u.contains("devlab-emu-0"))
+    });
+    assert!(
+        booting,
+        "the emulator never showed as booting: {}",
+        status(sandbox, dir)
+    );
+    child
+}
+
+#[test]
+fn a_phone_plugged_or_unplugged_is_known_from_one_stream_without_polling_adb() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("plain-a");
+    assert!(status(&sandbox, &wt).starts_with("devices: none attached\n"));
+
+    world
+        .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
+        .unwrap();
+    let plugged = poll_until(|| {
+        status(&sandbox, &wt).starts_with(
+            "devices\n  FAKEPHONE01        phone    Pixel 8        ready        free\n",
+        )
+    });
+    world.apply("unplug FAKEPHONE01").unwrap();
+    let unplugged = poll_until(|| status(&sandbox, &wt).starts_with("devices: none attached\n"));
+
+    assert!(plugged && unplugged, "{}", status(&sandbox, &wt));
+    let calls = sandbox.calls("adb");
+    let tracks = calls
+        .iter()
+        .filter(|c| *c == &["track-devices", "-l"])
+        .count();
+    assert_eq!(tracks, 1, "{calls:?}");
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.first().is_some_and(|a| a == "devices")),
+        "adb devices was polled: {calls:?}"
+    );
+}
+
+#[test]
+fn an_emulator_whose_unit_ends_while_it_boots_is_never_ready_and_is_forgotten() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("plain-a");
+    world.apply("stall emulator-5580").unwrap();
+    let child = boot_in_background(&sandbox, &wt, "--emulator");
+
+    // The emulator's process dies: its unit ends and adb no longer lists it.
+    let killed = run(sandbox.command("systemctl", &["--user", "stop", "devlab-emu-0"]));
+    assert_eq!(killed.code, 0, "{killed:?}");
+    let out = finish(child);
+
+    assert_eq!(out.code, 77, "{out:?}");
+    assert_eq!(
+        out.stderr,
+        "devlab: booting 1 emulator(s), about a minute (quick boot) or three (first boot)\n\
+         devlab: devlab-emu-0 exited while booting; see: journalctl --user -u devlab-emu-0 -n 50\n"
+    );
+    // Status shows what adb lists, which drops the emulator once its stream says so.
+    let gone = poll_until(|| status(&sandbox, &wt).starts_with("devices: none attached\n"));
+    assert!(gone, "{}", status(&sandbox, &wt));
+    // The lease stays, with no device in it.
+    let env = owned(&sandbox, &wt, &["env"]);
+    assert_eq!(
+        (env.code, env.stdout.as_str()),
+        (0, "export DEVLAB_LEASE=1\n")
+    );
+}
+
+#[test]
+fn an_emulator_a_dead_daemon_left_booting_is_stopped_and_forgotten_never_ready() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("plain-a");
+    world.apply("stall emulator-5580").unwrap();
+    let child = boot_in_background(&sandbox, &wt, "--emulator");
+    stop_daemon(&sandbox);
+    assert_ne!(finish(child).code, 0);
+
+    let settled = poll_until(|| status(&sandbox, &wt).starts_with("devices: none attached\n"));
+    assert!(
+        settled,
+        "the emulator was never forgotten: {}",
+        status(&sandbox, &wt)
+    );
+    assert!(
+        sandbox.calls("adb").contains(&vec![
+            "-s".to_owned(),
+            "emulator-5580".to_owned(),
+            "emu".to_owned(),
+            "kill".to_owned()
+        ]),
+        "the emulator was not stopped: {:?}",
+        sandbox.calls("adb")
+    );
+    // Never marked ready, it is not there to reuse: the next emulator asked for boots afresh.
+    fs::write(sandbox.path("world/stalled"), "").unwrap();
+    let again = owned(&sandbox, &wt, &["acquire", "--emulator", "--quiet"]);
+    assert_eq!(again.code, 0, "{again:?}");
+    assert_eq!(
+        again.stderr,
+        "devlab: booting 1 emulator(s), about a minute (quick boot) or three (first boot)\n"
+    );
+}
+
+#[test]
+fn a_pair_whose_emulator_fails_to_boot_gives_back_its_phone_too() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("plain-a");
+    world
+        .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
+        .unwrap();
+    world.apply("break systemd-run").unwrap();
+
+    let out = owned(&sandbox, &wt, &["acquire", "--pair"]);
+
+    assert_eq!(out.code, 77, "{out:?}");
+    assert!(
+        status(&sandbox, &wt).starts_with(
+            "devices\n  FAKEPHONE01        phone    Pixel 8        ready        free\n"
+        ),
+        "{}",
+        status(&sandbox, &wt)
+    );
+    let env = owned(&sandbox, &wt, &["env"]);
+    assert_eq!(
+        (env.code, env.stdout.as_str()),
+        (0, "export DEVLAB_LEASE=1\n")
+    );
+}
+
+#[test]
+fn a_phone_unplugged_while_its_pair_boots_gives_the_acquire_exit_76() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("plain-a");
+    world
+        .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
+        .unwrap();
+    world.apply("stall emulator-5580").unwrap();
+    let child = boot_in_background(&sandbox, &wt, "--pair");
+
+    world.apply("unplug FAKEPHONE01").unwrap();
+    let seen = poll_until(|| !status(&sandbox, &wt).contains("Pixel 8        ready"));
+    assert!(seen, "the unplug never showed: {}", status(&sandbox, &wt));
+    fs::write(sandbox.path("world/stalled"), "").unwrap();
+    let out = finish(child);
+
+    assert_eq!(out.code, 76, "{out:?}");
+    assert!(
+        out.stderr.ends_with(
+            "devlab: phone FAKEPHONE01 (Pixel 8) is unplugged: run devlab acquire to replace it\n"
+        ),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_failed_boot_takes_back_nothing_another_lease_was_granted_since() {
+    let (sandbox, world) = lab();
+    let (a, b) = (world.worktree("plain-a"), world.worktree("plain-b"));
+    world
+        .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
+        .unwrap();
+    world.apply("stall emulator-5580").unwrap();
+    let child = boot_in_background(&sandbox, &a, "--pair");
+    let released = owned(&sandbox, &a, &["release"]);
+    assert_eq!(released.code, 0, "{released:?}");
+    let taken = owned(&sandbox, &b, &["acquire", "--phone", "--quiet"]);
+    assert_eq!(taken.code, 0, "{taken:?}");
+
+    let killed = run(sandbox.command("systemctl", &["--user", "stop", "devlab-emu-0"]));
+    assert_eq!(killed.code, 0, "{killed:?}");
+    assert_eq!(finish(child).code, 77);
+
+    let env = owned(&sandbox, &b, &["env"]);
+    assert_eq!(env.code, 0, "{env:?}");
+    assert!(env.stdout.contains("ANDROID_SERIAL=FAKEPHONE01"), "{env:?}");
+    assert!(
+        !status(&sandbox, &b).contains("Pixel 8        ready        free"),
+        "{}",
+        status(&sandbox, &b)
+    );
 }
 
 /// The `lab-run` events in the ledger.

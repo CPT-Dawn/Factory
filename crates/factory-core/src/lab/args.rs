@@ -1,10 +1,14 @@
 //! The options devlab's `run` and `acquire` take, read as devlab read them.
 
+use super::devices::Mode;
+
 /// What `acquire` and `run` ask for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Opts {
-    /// Devices to hold (#16); 0 holds only a stack slot.
+    /// Devices to hold; 0 holds only a stack slot.
     pub want: u32,
+    /// Which kind of device: `--phone` or `--emulator`.
+    pub mode: Mode,
     /// Start the slot's stack too.
     pub stack: bool,
     /// How long to queue; none takes the machine's default.
@@ -15,6 +19,7 @@ impl Default for Opts {
     fn default() -> Opts {
         Opts {
             want: 1,
+            mode: Mode::Any,
             stack: false,
             wait_sec: None,
         }
@@ -39,8 +44,8 @@ pub fn parse_opts(args: &[String]) -> Result<(Opts, &[String], Vec<String>), Str
             }
             "--pair" => want = 2.0,
             "--no-device" => want = 0.0,
-            // Which devices to hold; read once devices are leased (#16).
-            "--phone" | "--emulator" => {}
+            "--phone" => opts.mode = Mode::Phone,
+            "--emulator" => opts.mode = Mode::Emulator,
             "--stack" => opts.stack = true,
             "--wait" => {
                 i += 1;
@@ -109,6 +114,9 @@ mod tests {
             )
         );
         let (o, rest, _) = opts(&["--pair", "--wait", "2.5", "true"]).unwrap();
+        assert_eq!(o.mode, Mode::Any);
+        assert_eq!(opts(&["--phone"]).unwrap().0.mode, Mode::Phone);
+        assert_eq!(opts(&["--emulator"]).unwrap().0.mode, Mode::Emulator);
         assert_eq!(
             (o.want, o.wait_sec, rest),
             (2, Some(2.5), vec!["true".to_owned()])
