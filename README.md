@@ -11,7 +11,7 @@ One binary, `factory`:
 
 Every command prints one line by default, `--json` on request, and uses fixed exit codes.
 
-Status: specified, not built yet. The spec is issue #1.
+Status: being built; `factory log` works, through the daemon. The spec is issue #1.
 
 ## Licence
 

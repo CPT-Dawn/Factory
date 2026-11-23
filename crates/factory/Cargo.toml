@@ -1,0 +1,23 @@
+[package]
+name = "factory"
+description = "The factory's CLI and daemon, also answering to devlab."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+factory-core.workspace = true
+clap.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
