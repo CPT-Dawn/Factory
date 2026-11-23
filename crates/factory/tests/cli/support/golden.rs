@@ -22,6 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -293,8 +294,6 @@ impl Stage {
         for dir in ["owners", "background"] {
             fs::create_dir(sandbox.path(dir)).expect("create a stage dir");
         }
-        std::os::unix::fs::symlink(sleep_binary(), sandbox.path("owners/claude"))
-            .expect("link the owner binary");
         Ok(Stage {
             background: BTreeMap::new(),
             owners: BTreeMap::new(),
@@ -424,13 +423,7 @@ impl Stage {
             ));
         }
         if !self.owners.contains_key(name) {
-            let child = Command::new(self.sandbox.path("owners/claude"))
-                .arg("infinity")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .process_group(0)
-                .spawn()
+            let child = start_owner(&self.sandbox.path("owners"))
                 .map_err(|e| format!("start owner {name}: {e}"))?;
             self.owners.insert(
                 name.to_owned(),
@@ -581,11 +574,32 @@ fn on_path(program: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// A binary that waits forever; linked as `claude`, its process is an owner devlab recognises.
-fn sleep_binary() -> PathBuf {
-    ["/usr/bin/sleep", "/bin/sleep"]
-        .iter()
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
-        .expect("a sleep binary")
+/// Starts an owner in its own process group: a shell script named `claude`, so that the kernel
+/// names its process so, which waits until its stdin closes, and devlab recognises as an owner.
+/// It is a script of its own rather than `sleep` linked as `claude`: where sleep is one multicall
+/// binary, it picks its applet from the name it runs as and a `claude` would exit at once. The
+/// owner needs nothing from its environment, and ends with the child that holds its stdin.
+pub fn start_owner(dir: &Path) -> std::io::Result<Child> {
+    let path = dir.join("claude");
+    fs::write(&path, "#!/bin/sh\nread _\nexit 0\n")?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+    // A parallel test's fork may hold the script open for writing a moment longer than this
+    // thread did: that is ETXTBSY, and passes.
+    let mut tries = 0;
+    loop {
+        let started = Command::new(&path)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn();
+        match started {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
 }
