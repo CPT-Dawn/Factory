@@ -2,7 +2,7 @@
 
 use factory_core::event::{Event, EventError};
 use factory_core::timestamp::Timestamp;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 const TS: Timestamp = Timestamp::from_unix_millis(1_795_142_838_365);
 
@@ -55,6 +55,45 @@ fn any_other_value_stays_the_string_it_was_given() {
         let expected = format!(r#"{{"ts":"2026-11-20T02:47:18.365Z","type":"review",{field}}}"#);
         assert_eq!(line("review", &[pair], None), expected, "{pair}");
     }
+}
+
+#[test]
+fn a_writer_that_types_its_own_values_lands_the_same_line_as_factory_log() {
+    let fields = json!({
+        "head": 4750048,
+        "from": "0475004",
+        "dur": 1.5,
+        "round": "2",
+        "fixed": "-3",
+        "duration_s": "1.50",
+        "tokens": 1426343,
+        "spec_findings": "x",
+        "standards_hard": "007",
+        "ok": true,
+    });
+    let Value::Object(fields) = fields else {
+        unreachable!()
+    };
+
+    let event = Event::from_fields("review", fields).unwrap();
+
+    assert_eq!(
+        Value::Object(event.stamped(TS)).to_string(),
+        concat!(
+            r#"{"ts":"2026-11-20T02:47:18.365Z","type":"review","head":"4750048","#,
+            r#""from":"0475004","dur":"1.5","round":2,"fixed":-3,"duration_s":1.5,"#,
+            r#""tokens":1426343,"spec_findings":"x","standards_hard":7,"ok":true}"#
+        )
+    );
+}
+
+#[test]
+fn a_typed_event_with_an_empty_key_or_a_bad_type_is_refused() {
+    let Value::Object(empty_key) = json!({"": 1}) else {
+        unreachable!()
+    };
+    assert!(Event::from_fields("review", empty_key).is_err());
+    assert!(Event::from_fields("Review", Default::default()).is_err());
 }
 
 #[test]

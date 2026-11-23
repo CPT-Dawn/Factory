@@ -521,8 +521,8 @@ impl Herdr {
         self.call_within(method, params, Duration::ZERO).await
     }
 
-    /// Like [`Herdr::call`] for a request herdr may hold for up to `patience` (a wait, or an
-    /// agent coming up) before it answers.
+    /// Like [`Herdr::call`] for a request herdr may hold for up to `patience` (a wait, or a
+    /// prompt waiting for the agent to start working) before it answers.
     async fn call_within<R: DeserializeOwned>(
         &self,
         method: &str,

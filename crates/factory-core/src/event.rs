@@ -1,8 +1,10 @@
 //! Ledger events: what `factory log <type> key=value…` appends.
 //!
 //! The format is the one factory-stats has always written and reads: one compact JSON object
-//! per line, `ts` first, then `type`, then the fields in the order given. Only the fields in
-//! [`NUMERIC_FIELDS`] hold numbers; every other value is a string.
+//! per line, `ts` first, then `type`, then the fields in the order given. In an event a writer
+//! logs ([`Event::from_args`], [`Event::from_fields`]) only the fields in [`NUMERIC_FIELDS`] hold
+//! numbers; every other value is a string. The daemon's own events, built with [`Event::new`],
+//! type their fields themselves.
 
 use std::fmt;
 
