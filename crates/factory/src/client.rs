@@ -138,7 +138,7 @@ fn connect(paths: &Paths) -> Result<UnixStream, Failure> {
 
 /// Takes the start lock, which a CLI holds while it starts the daemon. Dropping the file
 /// releases it.
-fn take_start_lock(paths: &Paths) -> Result<File, String> {
+pub(crate) fn take_start_lock(paths: &Paths) -> Result<File, String> {
     let path = paths.start_lock();
     let file = File::options()
         .create(true)
@@ -214,7 +214,7 @@ fn start_daemon(paths: &Paths) -> Result<(), String> {
 }
 
 /// Runs `work` on its own thread and returns its result, or none once `limit` has passed.
-fn within<T: Send + 'static>(
+pub(crate) fn within<T: Send + 'static>(
     limit: Duration,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {

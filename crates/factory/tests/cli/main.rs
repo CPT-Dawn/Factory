@@ -6,6 +6,7 @@
 mod devlab_golden;
 mod harness;
 mod help;
+mod install;
 mod lead;
 mod log;
 mod review;

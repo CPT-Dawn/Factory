@@ -3,6 +3,7 @@
 mod cli;
 mod client;
 mod daemon;
+mod install;
 mod lead;
 mod leads;
 mod log;
@@ -21,13 +22,20 @@ fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
     let json = args.iter().skip(1).any(|arg| arg == "--json");
     match cli::parse(args) {
-        Ok(cli) => output::finish(run(cli.command, cli.json), cli.json),
+        Ok(cli) => run(cli.command, cli.json),
         Err(refusal) => cli::refuse(refusal, json),
     }
 }
 
-fn run(command: Command, json: bool) -> Result<Done, Failure> {
-    match command {
+fn run(command: Command, json: bool) -> ExitCode {
+    let outcome: Result<Done, Failure> = match command {
+        // The daemon prints its ready line itself, and nothing when it stops.
+        Command::Daemon => {
+            return daemon::run(json).map_or_else(
+                |failure| output::finish(Err(failure), json),
+                |()| ExitCode::SUCCESS,
+            );
+        }
         Command::Log { kind, pairs } => log::run(&kind, &pairs),
         Command::Lead {
             command: LeadCommand::List,
@@ -51,6 +59,8 @@ fn run(command: Command, json: bool) -> Result<Done, Failure> {
             previous,
             timeout: std::time::Duration::from_secs(timeout),
         }),
-        Command::Daemon => daemon::run(json),
-    }
+        Command::Install { units } => install::install(units.as_deref()),
+        Command::Uninstall => install::uninstall(),
+    };
+    output::finish(outcome, json)
 }

@@ -1,9 +1,13 @@
 //! `factory daemon`: the one long-running process, and the ledger's only writer.
 //!
-//! It takes the daemon lock (so one runs), binds the socket, writes its pid, prints one ready
+//! It takes the daemon lock (so one runs), listens on the socket systemd passes it (socket
+//! activation, `LISTEN_FDS`) or else binds the socket itself, writes its pid, prints one ready
 //! line once it can answer, then answers requests until it is stopped.
+//!
+//! On SIGTERM (systemd stopping or restarting it) or SIGINT it stops accepting, answers every
+//! request it has taken, cuts short the waits it holds, and exits 0. Calls that arrive meanwhile
+//! wait in systemd's socket for the next daemon, so a restart loses no ledger line.
 
-use std::convert::Infallible;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::net::UnixListener as StdListener;
@@ -19,8 +23,12 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use factory_adapters::herdr::Herdr;
+use listenfd::ListenFd;
 
 use crate::leads::Leads;
 use crate::output::{self, Done, Failure};
@@ -39,7 +47,17 @@ struct Daemon {
 /// What to do when the CLI and the daemon don't speak the same protocol.
 const MISMATCH: &str = "the daemon may be older than this factory: restart it";
 
-pub fn run(json: bool) -> Result<Done, Failure> {
+/// How long a stopping daemon gives the connections it holds to finish their requests.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs the daemon until it is stopped; the ready line is all it prints.
+pub fn run(json: bool) -> Result<(), Failure> {
+    // First, while the daemon is one thread: taking the socket clears LISTEN_FDS.
+    let activated = ListenFd::from_env().take_unix_listener(0).map_err(|e| {
+        Failure::precondition(format!(
+            "the socket systemd passed is not a unix socket: {e}; check factory.socket"
+        ))
+    })?;
     let paths = Paths::from_env()?;
     paths.create_runtime()?;
     fs::create_dir_all(&paths.state).map_err(|e| {
@@ -51,7 +69,16 @@ pub fn run(json: bool) -> Result<Done, Failure> {
     let ledger = Arc::new(Ledger::open(paths.ledger())?);
     let leads = Leads::new(paths.clone(), Herdr::new(paths.herdr.clone()));
     let _lock = take_daemon_lock(&paths)?;
-    let listener = bind(&paths)?;
+    let listener = match activated {
+        Some(listener) => listener,
+        None => bind(&paths)?,
+    };
+    listener.set_nonblocking(true).map_err(|e| {
+        Failure::precondition(format!(
+            "cannot listen on {}: {e}; retry",
+            paths.socket().display()
+        ))
+    })?;
     let pid = std::process::id();
     fs::write(paths.daemon_pid(), format!("{pid}\n")).map_err(|e| {
         Failure::precondition(format!(
@@ -78,9 +105,46 @@ pub fn run(json: bool) -> Result<Done, Failure> {
             ),
             json,
         );
+        let stop = stop_on_signal()?;
         tokio::spawn(Arc::clone(&leads).start());
-        match serve(listener, Arc::new(Daemon { ledger, leads })).await {}
-    })
+        serve(listener, Arc::new(Daemon { ledger, leads }), stop).await;
+        Ok(())
+    })?;
+    // Nothing is left to answer; the herdr watcher and any stray task may go.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    Ok(())
+}
+
+/// A switch that flips once SIGTERM or SIGINT arrives.
+fn stop_on_signal() -> Result<Stop, Failure> {
+    let cannot =
+        |e: io::Error| Failure::precondition(format!("cannot watch for SIGTERM: {e}; retry"));
+    let mut term = signal(SignalKind::terminate()).map_err(cannot)?;
+    let mut int = signal(SignalKind::interrupt()).map_err(cannot)?;
+    let (flip, stop) = watch::channel(false);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        let _ = flip.send(true);
+        // Keep the sender, so the switch never reads as dropped.
+        std::future::pending::<()>().await;
+    });
+    Ok(Stop(stop))
+}
+
+/// Whether the daemon is stopping.
+#[derive(Clone)]
+struct Stop(watch::Receiver<bool>);
+
+impl Stop {
+    /// Resolves once the daemon is stopping.
+    async fn stopping(mut self) {
+        if self.0.wait_for(|&stopping| stopping).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 fn take_daemon_lock(paths: &Paths) -> Result<File, Failure> {
@@ -121,33 +185,63 @@ fn bind(paths: &Paths) -> Result<StdListener, Failure> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(cannot(e)),
     }
-    let listener = StdListener::bind(&socket).map_err(cannot)?;
-    listener.set_nonblocking(true).map_err(cannot)?;
-    Ok(listener)
+    StdListener::bind(&socket).map_err(cannot)
 }
 
-async fn serve(listener: UnixListener, daemon: Arc<Daemon>) -> Infallible {
+/// Answers connections until the daemon is stopping, then lets the ones it took finish, for
+/// up to [`DRAIN_TIMEOUT`]. Connections it never took stay queued in the socket.
+async fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Stop) {
+    let mut connections = JoinSet::new();
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                tokio::spawn(answer(stream, Arc::clone(&daemon)));
-            }
-            Err(e) => {
-                let _ = writeln!(io::stderr(), "factory: accept failed: {e}");
-            }
+        tokio::select! {
+            biased;
+            () = stop.clone().stopping() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    connections.spawn(answer(stream, Arc::clone(&daemon), stop.clone()));
+                }
+                Err(e) => {
+                    let _ = writeln!(io::stderr(), "factory: accept failed: {e}");
+                }
+            },
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
+    }
+    drop(listener);
+    let drained = async { while connections.join_next().await.is_some() {} };
+    if tokio::time::timeout(DRAIN_TIMEOUT, drained).await.is_err() {
+        let _ = writeln!(
+            io::stderr(),
+            "factory: stopped with {} connections unanswered after {}s",
+            connections.len(),
+            DRAIN_TIMEOUT.as_secs()
+        );
     }
 }
 
 /// Answers each request line on one connection until the client hangs up. A client sends one
 /// request at a time; one that hangs up, or sends more, before its answer abandons the request,
-/// so a wait whose CLI is gone stops waiting.
-async fn answer(stream: UnixStream, daemon: Arc<Daemon>) {
+/// so a wait whose CLI is gone stops waiting. A stopping daemon still answers the first request
+/// of a connection it took, then hangs up.
+async fn answer(stream: UnixStream, daemon: Arc<Daemon>, stop: Stop) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut first = true;
+    loop {
+        let next = if first {
+            lines.next_line().await
+        } else {
+            tokio::select! {
+                next = lines.next_line() => next,
+                () = stop.clone().stopping() => return,
+            }
+        };
+        let Ok(Some(line)) = next else {
+            return;
+        };
+        first = false;
         let response = tokio::select! {
-            response = respond(&line, &daemon) => response,
+            response = respond(&line, &daemon, &stop) => response,
             _ = lines.next_line() => return,
         };
         let Ok(mut out) = serde_json::to_string(&response) else {
@@ -160,7 +254,7 @@ async fn answer(stream: UnixStream, daemon: Arc<Daemon>) {
     }
 }
 
-async fn respond(line: &str, daemon: &Daemon) -> Response {
+async fn respond(line: &str, daemon: &Daemon, stop: &Stop) -> Response {
     let request: Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(e) => {
@@ -180,16 +274,20 @@ async fn respond(line: &str, daemon: &Daemon) -> Response {
             Err(refused) => refused,
         },
         WAIT_LEAD => match params::<WaitLeadParams>(WAIT_LEAD, request.params) {
-            Ok(params) => answered(
-                daemon
-                    .leads
-                    .wait(
-                        &params.lead,
-                        params.waiter,
-                        Duration::from_secs(params.timeout_secs),
-                    )
-                    .await,
-            ),
+            Ok(params) => {
+                let wait = daemon.leads.wait(
+                    &params.lead,
+                    params.waiter,
+                    Duration::from_secs(params.timeout_secs),
+                );
+                tokio::select! {
+                    waited = wait => answered(waited),
+                    () = stop.clone().stopping() => Outcome::Error(refusal(
+                        Exit::Precondition,
+                        "the daemon stopped (a restart or an upgrade); run the wait again".to_owned(),
+                    )),
+                }
+            }
             Err(refused) => refused,
         },
         LOG => {
