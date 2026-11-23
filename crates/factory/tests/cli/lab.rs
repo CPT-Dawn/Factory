@@ -477,3 +477,40 @@ fn a_queued_request_whose_caller_died_while_the_daemon_was_down_is_pruned() {
 
     assert_eq!(waiting(&sandbox, &wa), Vec::<String>::new());
 }
+
+#[test]
+fn a_lease_granted_after_its_caller_left_is_given_back() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-gone");
+    let (began, gate) = (sandbox.path("inspect-began"), sandbox.path("inspect-gate"));
+    let body = fs::read_to_string(fixtures().join("fakes/docker.sh"))
+        .expect("read a fake")
+        .replace("@WORLD@", &sandbox.path("world").display().to_string());
+    let hold = format!(
+        "if [ \"$1\" = inspect ]; then\n  : > '{began}'\n  i=0\n  while [ ! -e '{gate}' ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done\nfi\n",
+        began = began.display(),
+        gate = gate.display()
+    );
+    sandbox.fake("docker", &(hold + &body));
+    let agent = Agent::start();
+    let asking = spawn(for_owner(
+        &sandbox,
+        &wt,
+        agent.pid(),
+        &["acquire", "--no-device"],
+    ));
+    // The daemon looks at the stacks before it grants: the caller leaves meanwhile.
+    assert!(poll_until(|| began.exists()), "docker inspect never ran");
+    kill_group(asking.id(), Signal::KILL);
+    let _ = finish(asking);
+    fs::write(&gate, "").expect("open the gate");
+
+    let given_back = poll_until(|| {
+        let out = run(devlab(&sandbox, &wt, &["status", "--json"]));
+        let report: serde_json::Value = serde_json::from_str(&out.stdout).unwrap_or_default();
+        let slots = report["slots"].as_array().cloned().unwrap_or_default();
+        !slots.is_empty() && slots.iter().all(|s| s["holder"] == "free")
+    });
+    assert!(given_back, "the lease outlived its caller");
+    assert_eq!(waiting(&sandbox, &wt), Vec::<String>::new());
+}
