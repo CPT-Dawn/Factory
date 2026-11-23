@@ -682,6 +682,26 @@ fn rollback_force_skips_a_unit_that_is_a_dangling_link() {
 }
 
 #[test]
+fn rollback_force_skips_a_unit_linked_through_a_file() {
+    let (sandbox, _world) = machine();
+    cut_over(&sandbox);
+    let unit = watcher_unit(&sandbox);
+    fs::remove_file(&unit).unwrap();
+    // The link's target runs through a plain file, so it resolves to nothing.
+    fs::write(sandbox.path("plain"), "").unwrap();
+    symlink(sandbox.path("plain/devlab-watch.service"), &unit).unwrap();
+
+    let out = sandbox.factory(&["cutover", "--rollback", "--force"]);
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    assert!(
+        out.stdout.contains(&format!("skipped {}", unit.display())),
+        "{out:?}"
+    );
+    assert_rolled_back_without_watcher(&sandbox);
+}
+
+#[test]
 fn rollback_force_keeps_the_marker_when_systemd_will_not_start_a_unit_that_is_there() {
     let (sandbox, _world) = machine();
     cut_over(&sandbox);

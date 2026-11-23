@@ -305,7 +305,10 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
     // meanwhile is enabled, one that went again (or links to nothing) is skipped.
     let present = unit_present(&place)?;
     let dangles = present
-        && matches!(fs::metadata(&place.watcher), Err(e) if e.kind() == io::ErrorKind::NotFound);
+        && matches!(fs::metadata(&place.watcher), Err(e) if matches!(
+            e.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+        ));
     let retire = present && !(force && dangles);
     let skipped = force && !retire && (marker.watcher != Unit::Absent || !unit_gone || present);
     if retire {
