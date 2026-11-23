@@ -247,11 +247,11 @@ fn local_clock(at: Timestamp) -> String {
 /// limit, tells the daemon, with the reset its message names. Another error changes nothing.
 pub fn stop_failure(input: &Value) -> Result<(), Failure> {
     let now = clock::now();
-    let Some(reset) = claude::stop_failure(input, now, clock::utc_offset(now)) else {
+    let Some(hit) = claude::stop_failure(input, now, clock::utc_offset(now)) else {
         return Ok(());
     };
     let params = ClaudeLimitParams {
-        reset: reset.reset().map(Timestamp::unix_millis),
+        reset: hit.reset().map(Timestamp::unix_millis),
     };
     let _: Value = client::call(&Paths::from_env()?, CLAUDE_LIMIT, &params)?;
     Ok(())
