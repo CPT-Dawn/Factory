@@ -9,18 +9,32 @@ use std::io::{self, Write};
 use std::os::unix::net::UnixListener as StdListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use factory_core::event::{Event, Fields};
 use factory_core::exit::Exit;
 use factory_core::timestamp::Timestamp;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use factory_adapters::herdr::Herdr;
+
+use crate::leads::Leads;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
-use crate::protocol::{ErrorBody, LOG, LogParams, LogResult, Outcome, Request, Response};
+use crate::protocol::{
+    ErrorBody, LEAD_LIST, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, Outcome, Request,
+    Response, WAIT_LEAD, WaitLeadParams,
+};
+
+/// What every connection answers from: the ledger and the picture of the leads.
+struct Daemon {
+    ledger: Arc<Ledger>,
+    leads: Arc<Leads>,
+}
 
 /// What to do when the CLI and the daemon don't speak the same protocol.
 const MISMATCH: &str = "the daemon may be older than this factory: restart it";
@@ -34,7 +48,8 @@ pub fn run(json: bool) -> Result<Done, Failure> {
             paths.state.display()
         ))
     })?;
-    let ledger = Ledger::open(paths.ledger())?;
+    let ledger = Arc::new(Ledger::open(paths.ledger())?);
+    let leads = Leads::new(paths.clone(), Herdr::new(paths.herdr.clone()));
     let _lock = take_daemon_lock(&paths)?;
     let listener = bind(&paths)?;
     let pid = std::process::id();
@@ -45,7 +60,7 @@ pub fn run(json: bool) -> Result<Done, Failure> {
         ))
     })?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_io()
+        .enable_all()
         .build()
         .map_err(|e| {
             Failure::precondition(format!("cannot start the daemon's runtime: {e}; retry"))
@@ -63,7 +78,8 @@ pub fn run(json: bool) -> Result<Done, Failure> {
             ),
             json,
         );
-        match serve(listener, Arc::new(ledger)).await {}
+        tokio::spawn(Arc::clone(&leads).start());
+        match serve(listener, Arc::new(Daemon { ledger, leads })).await {}
     })
 }
 
@@ -110,11 +126,11 @@ fn bind(paths: &Paths) -> Result<StdListener, Failure> {
     Ok(listener)
 }
 
-async fn serve(listener: UnixListener, ledger: Arc<Ledger>) -> Infallible {
+async fn serve(listener: UnixListener, daemon: Arc<Daemon>) -> Infallible {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(answer(stream, Arc::clone(&ledger)));
+                tokio::spawn(answer(stream, Arc::clone(&daemon)));
             }
             Err(e) => {
                 let _ = writeln!(io::stderr(), "factory: accept failed: {e}");
@@ -123,12 +139,17 @@ async fn serve(listener: UnixListener, ledger: Arc<Ledger>) -> Infallible {
     }
 }
 
-/// Answers each request line on one connection until the client hangs up.
-async fn answer(stream: UnixStream, ledger: Arc<Ledger>) {
+/// Answers each request line on one connection until the client hangs up. A client sends one
+/// request at a time; one that hangs up, or sends more, before its answer abandons the request,
+/// so a wait whose CLI is gone stops waiting.
+async fn answer(stream: UnixStream, daemon: Arc<Daemon>) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        let response = respond(&line, &ledger).await;
+        let response = tokio::select! {
+            response = respond(&line, &daemon) => response,
+            _ = lines.next_line() => return,
+        };
         let Ok(mut out) = serde_json::to_string(&response) else {
             return;
         };
@@ -139,7 +160,7 @@ async fn answer(stream: UnixStream, ledger: Arc<Ledger>) {
     }
 }
 
-async fn respond(line: &str, ledger: &Arc<Ledger>) -> Response {
+async fn respond(line: &str, daemon: &Daemon) -> Response {
     let request: Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(e) => {
@@ -153,8 +174,26 @@ async fn respond(line: &str, ledger: &Arc<Ledger>) -> Response {
         }
     };
     let outcome = match request.method.as_str() {
+        LEAD_LIST => answered(daemon.leads.list().await),
+        LEAD_STATUS => match params::<LeadParams>(LEAD_STATUS, request.params) {
+            Ok(params) => answered(daemon.leads.status(&params.lead).await),
+            Err(refused) => refused,
+        },
+        WAIT_LEAD => match params::<WaitLeadParams>(WAIT_LEAD, request.params) {
+            Ok(params) => answered(
+                daemon
+                    .leads
+                    .wait(
+                        &params.lead,
+                        params.waiter,
+                        Duration::from_secs(params.timeout_secs),
+                    )
+                    .await,
+            ),
+            Err(refused) => refused,
+        },
         LOG => {
-            let ledger = Arc::clone(ledger);
+            let ledger = Arc::clone(&daemon.ledger);
             let params = request.params;
             match tokio::task::spawn_blocking(move || log(params, &ledger)).await {
                 Ok(outcome) => outcome,
@@ -176,14 +215,9 @@ async fn respond(line: &str, ledger: &Arc<Ledger>) -> Response {
 }
 
 fn log(params: Value, ledger: &Ledger) -> Outcome {
-    let params: LogParams = match serde_json::from_value(params) {
+    let params: LogParams = match self::params(LOG, params) {
         Ok(params) => params,
-        Err(e) => {
-            return Outcome::Error(refusal(
-                Exit::Usage,
-                format!("bad log params: {e}; {MISMATCH}"),
-            ));
-        }
+        Err(refused) => return refused,
     };
     let event = match Event::new(&params.kind, params.fields) {
         Ok(event) => event,
@@ -204,6 +238,23 @@ fn log(params: Value, ledger: &Ledger) -> Outcome {
                 ledger.path.display()
             ),
         )),
+    }
+}
+
+/// The params of a `method` request, or the refusal of params that don't fit it.
+fn params<P: DeserializeOwned>(method: &str, params: Value) -> Result<P, Outcome> {
+    serde_json::from_value(params).map_err(|e| {
+        Outcome::Error(refusal(
+            Exit::Usage,
+            format!("bad {method} params: {e}; {MISMATCH}"),
+        ))
+    })
+}
+
+fn answered<R: Serialize>(outcome: Result<R, Failure>) -> Outcome {
+    match outcome {
+        Ok(result) => Outcome::Result(serde_json::to_value(result).unwrap_or(Value::Null)),
+        Err(failure) => Outcome::Error(refusal(failure.exit, failure.message)),
     }
 }
 

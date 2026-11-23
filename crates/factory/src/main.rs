@@ -3,6 +3,8 @@
 mod cli;
 mod client;
 mod daemon;
+mod lead;
+mod leads;
 mod log;
 mod output;
 mod paths;
@@ -12,7 +14,7 @@ mod review;
 use std::ffi::OsString;
 use std::process::ExitCode;
 
-use cli::Command;
+use cli::{Command, LeadCommand, WaitCommand};
 use output::{Done, Failure};
 
 fn main() -> ExitCode {
@@ -27,6 +29,15 @@ fn main() -> ExitCode {
 fn run(command: Command, json: bool) -> Result<Done, Failure> {
     match command {
         Command::Log { kind, pairs } => log::run(&kind, &pairs),
+        Command::Lead {
+            command: LeadCommand::List,
+        } => lead::list(),
+        Command::Lead {
+            command: LeadCommand::Status { lead },
+        } => lead::status(&lead),
+        Command::Wait {
+            command: WaitCommand::Lead { lead, timeout },
+        } => lead::wait(&lead, timeout),
         Command::Review {
             base,
             label,

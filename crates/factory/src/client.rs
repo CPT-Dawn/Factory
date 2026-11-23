@@ -38,6 +38,27 @@ pub fn call<P: Serialize, R: DeserializeOwned>(
     method: &str,
     params: &P,
 ) -> Result<R, Failure> {
+    exchange(paths, method, params, ANSWER_TIMEOUT, Exit::Precondition)
+}
+
+/// Sends a request the daemon answers when an event fires, at most `limit` from now. The daemon
+/// keeps the time; past `limit` and a grace period the CLI gives up with exit 124 on its own.
+pub fn wait<P: Serialize, R: DeserializeOwned>(
+    paths: &Paths,
+    method: &str,
+    params: &P,
+    limit: Duration,
+) -> Result<R, Failure> {
+    exchange(paths, method, params, limit + ANSWER_TIMEOUT, Exit::Timeout)
+}
+
+fn exchange<P: Serialize, R: DeserializeOwned>(
+    paths: &Paths,
+    method: &str,
+    params: &P,
+    patience: Duration,
+    impatient: Exit,
+) -> Result<R, Failure> {
     let stream = connect(paths)?;
     let broken = |e: &dyn std::fmt::Display| {
         Failure::precondition(format!(
@@ -57,18 +78,21 @@ pub fn call<P: Serialize, R: DeserializeOwned>(
         .write_all(line.as_bytes())
         .map_err(|e| broken(&e))?;
     stream
-        .set_read_timeout(Some(ANSWER_TIMEOUT))
+        .set_read_timeout(Some(patience))
         .map_err(|e| broken(&e))?;
     let mut answer = String::new();
     match BufReader::new(&stream).read_line(&mut answer) {
         Ok(0) => return Err(broken(&"it closed the connection without answering")),
         Ok(_) => {}
         Err(e) if is_timeout(&e) => {
-            return Err(Failure::precondition(format!(
-                "the daemon did not answer within {}s; see {}",
-                ANSWER_TIMEOUT.as_secs(),
-                paths.daemon_log().display()
-            )));
+            return Err(Failure::new(
+                impatient,
+                format!(
+                    "the daemon did not answer within {}s; see {}",
+                    patience.as_secs(),
+                    paths.daemon_log().display()
+                ),
+            ));
         }
         Err(e) => return Err(broken(&e)),
     }
