@@ -16,6 +16,7 @@ use factory_adapters::docker::{Containers, Docker};
 use factory_adapters::emulator::{EmulatorSpec, Emulators, SystemdEmulators};
 use factory_core::event::{Event, Fields};
 use factory_core::exit::Exit;
+use factory_core::lab::args::wait_span;
 use factory_core::lab::devices::{
     Attached, EmulatorView, HeldBy, Mode, Plan, PlanInput, device_rows, plan_devices,
 };
@@ -950,13 +951,8 @@ pub async fn acquire<W, R, S>(
         }
     };
     lab.notify();
-    let year = Duration::from_secs(365 * 86400);
-    let wait = Duration::try_from_secs_f64(p.wait_sec).unwrap_or(year);
     let now = Instant::now();
-    let deadline = now
-        .checked_add(wait)
-        .or_else(|| now.checked_add(year))
-        .unwrap_or(now);
+    let deadline = now.checked_add(wait_span(p.wait_sec)).unwrap_or(now);
     let mut said = String::new();
     loop {
         let mut changed = lab.changed.subscribe();
