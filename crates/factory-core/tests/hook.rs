@@ -1,8 +1,8 @@
 //! The hook rules, as tables: each row is one tool call and what the hook says to it.
 
 use factory_core::hook::{
-    GitAction, PreTool, RESULT_LIMIT, Template, Templates, post_tool, pre_tool, private_address,
-    subagent_stop,
+    GitAction, PreTool, RESULT_LIMIT, Template, Templates, mentions_private, post_tool, pre_tool,
+    private_address, subagent_stop,
 };
 use serde_json::{Value, json};
 
@@ -404,6 +404,8 @@ fn git(command: &str) -> Vec<GitAction> {
 fn action(dir: Option<&str>, tracked: bool, added: Option<&[&str]>) -> GitAction {
     GitAction {
         dir: dir.map(str::to_owned),
+        git_dir: None,
+        work_tree: None,
         tracked,
         added: added.map(|paths| paths.iter().map(|p| (*p).to_owned()).collect()),
     }
@@ -588,6 +590,101 @@ fn a_cd_in_a_subshell_or_a_child_process_stays_there() {
 }
 
 #[test]
+fn a_directory_set_by_pushd_a_wrapper_or_git_itself_is_followed() {
+    let at = |dir: &str| action(Some(dir), false, None);
+    let repo = |dir: Option<&str>, git_dir: Option<&str>, work_tree: Option<&str>| GitAction {
+        git_dir: git_dir.map(str::to_owned),
+        work_tree: work_tree.map(str::to_owned),
+        ..action(dir, false, None)
+    };
+    for (command, expected) in [
+        ("pushd /b && git commit -m x", vec![at("/b")]),
+        (
+            "pushd /b; popd; git commit -m x",
+            vec![action(None, false, None)],
+        ),
+        ("pushd /a && pushd b && popd && git push", vec![at("/a")]),
+        ("env -C /b git commit -m x", vec![at("/b")]),
+        ("env --chdir=/b git commit -m x", vec![at("/b")]),
+        ("cd /a && env -C b git push", vec![at("/a/b")]),
+        ("sudo -D /b git commit -m x", vec![at("/b")]),
+        ("git -C a -C b commit -m x", vec![at("a/b")]),
+        (
+            "git --git-dir /b/.git --work-tree /b commit -m x",
+            vec![repo(None, Some("/b/.git"), Some("/b"))],
+        ),
+        (
+            "git --git-dir=/b/.git commit -m x",
+            vec![repo(None, Some("/b/.git"), None)],
+        ),
+        (
+            "GIT_DIR=/b/.git GIT_WORK_TREE=/b git push",
+            vec![repo(None, Some("/b/.git"), Some("/b"))],
+        ),
+        (
+            "cd /r && git --work-tree=w commit -m x",
+            vec![repo(Some("/r"), None, Some("/r/w"))],
+        ),
+        // A list sent to the background runs in a child as a whole.
+        (
+            "cd /b && sleep 1 & git commit -m x",
+            vec![action(None, false, None)],
+        ),
+        ("cd /b &&\ngit push", vec![at("/b")]),
+        ("cd /b\ngit push", vec![at("/b")]),
+    ] {
+        let mut actions = git(command);
+        actions.dedup();
+        assert_eq!(actions, expected, "{command:?}");
+    }
+}
+
+#[test]
+fn a_commit_that_names_paths_takes_their_working_tree_along() {
+    for (command, expected) in [
+        (
+            "git commit -m x notes.txt",
+            action(None, false, Some(&["notes.txt"])),
+        ),
+        (
+            "git commit -i -m x a b",
+            action(None, false, Some(&["a", "b"])),
+        ),
+        ("git commit -o a", action(None, false, Some(&["a"]))),
+        (
+            "git commit -am 'msg' -- a",
+            action(None, true, Some(&["a"])),
+        ),
+        ("git commit -mfix a", action(None, false, Some(&["a"]))),
+        (
+            "git commit --message x --author 'A <a>' a",
+            action(None, false, Some(&["a"])),
+        ),
+        (
+            "git commit --message=x a",
+            action(None, false, Some(&["a"])),
+        ),
+        ("git commit -F msg.txt", action(None, false, None)),
+        ("git commit -C HEAD --amend", action(None, false, None)),
+        ("git commit -S -s -m x", action(None, false, None)),
+        (
+            "git commit --pathspec-from-file=list -m x",
+            action(None, false, Some(&[])),
+        ),
+        (
+            "git add a && git commit -m x b",
+            action(None, false, Some(&["a", "b"])),
+        ),
+        (
+            "git add -A && git commit -m x b",
+            action(None, false, Some(&[])),
+        ),
+    ] {
+        assert_eq!(git(command), vec![expected], "{command:?}");
+    }
+}
+
+#[test]
 fn an_add_that_names_paths_stages_only_those_paths() {
     for (command, expected) in [
         (
@@ -625,6 +722,34 @@ fn a_wrappers_option_values_are_not_the_command() {
         assert!(blocked(&bash(command), false).is_some(), "{command:?}");
     }
     assert!(git("sudo -u me git push").len() == 1);
+}
+
+#[test]
+fn a_wrapper_that_takes_values_before_its_command_still_runs_it() {
+    for command in [
+        "timeout 60 npm test",
+        "timeout -s KILL 5m npx tsc",
+        "timeout --kill-after 5 60 yarn",
+        "ls | xargs npm i",
+        "xargs -n 1 -P 4 pnpm add",
+        "stdbuf -oL yarn build",
+        "stdbuf -o L npm test",
+        "ionice -c 3 npm i",
+        "setsid npm start",
+        "flock /tmp/lock npm i",
+        "flock -w 5 /tmp/lock npm i",
+        "chrt 10 npm i",
+        "taskset 0x1 npm i",
+    ] {
+        assert!(blocked(&bash(command), false).is_some(), "{command:?}");
+    }
+    for command in [
+        "timeout 60 bun test",
+        "xargs echo npm",
+        "flock /tmp/npm bun i",
+    ] {
+        assert!(blocked(&bash(command), false).is_none(), "{command:?}");
+    }
 }
 
 #[test]
@@ -748,4 +873,17 @@ fn a_wrappers_long_options_take_their_values_too() {
     ] {
         assert!(blocked(&bash(command), false).is_some(), "{command:?}");
     }
+}
+
+#[test]
+fn a_line_mentions_a_private_address_as_a_diff_would_add_it() {
+    let list = addresses(&["Owner@Example.invalid", " "]);
+    for (text, mentions) in [
+        ("cannot read notes-owner@example.invalid.txt: denied", true),
+        ("git diff failed: fatal: not a git repository", false),
+        ("", false),
+    ] {
+        assert_eq!(mentions_private(text, &list), mentions, "{text:?}");
+    }
+    assert!(!mentions_private("anything", &addresses(&[" "])));
 }

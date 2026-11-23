@@ -122,14 +122,21 @@ fn leak(input: &Value, actions: &[GitAction]) -> Result<Option<String>, Failure>
             Some(dir) => cwd.join(expand_home(dir)),
             None => cwd.clone(),
         };
+        let at = |path: &Option<String>| path.as_deref().map(|p| cwd.join(expand_home(p)));
         let diff = GitRepo::at(&dir)
+            .pointed_at(at(&action.git_dir), at(&action.work_tree))
             .staged_diff(action.tracked, action.added.as_deref())
             .map_err(|e| {
-                // Neither the path nor git's words: they may carry the address.
-                let _ = e;
-                Failure::precondition(
-                    "The hook could not read what would be committed: run git -C <the repository> status to see why, then commit again.",
-                )
+                // What git said goes along unless it carries an address.
+                let why = e.to_string();
+                let why = if hook::mentions_private(&why, &addresses) {
+                    String::new()
+                } else {
+                    format!(" ({})", why.lines().next().unwrap_or_default())
+                };
+                Failure::precondition(format!(
+                    "The hook could not read what would be committed{why}: run git -C <the repository> status to see why, then commit again."
+                ))
             })?;
         if let Some(reason) = hook::private_address(&diff, &addresses) {
             return Ok(Some(reason));

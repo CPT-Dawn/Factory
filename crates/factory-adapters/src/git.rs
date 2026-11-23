@@ -51,13 +51,26 @@ pub trait Repo {
 /// The repository at a directory, through the `git` on PATH.
 pub struct GitRepo {
     dir: PathBuf,
+    /// `GIT_DIR` and `GIT_WORK_TREE` for every call, when the repository is not found from `dir`.
+    git_dir: Option<PathBuf>,
+    work_tree: Option<PathBuf>,
 }
 
 impl GitRepo {
     pub fn at(dir: &Path) -> GitRepo {
         GitRepo {
             dir: dir.to_owned(),
+            git_dir: None,
+            work_tree: None,
         }
+    }
+
+    /// The repository at `git_dir` and the working tree at `work_tree`, as git's `--git-dir`
+    /// and `--work-tree` set them, each when given.
+    pub fn pointed_at(mut self, git_dir: Option<PathBuf>, work_tree: Option<PathBuf>) -> GitRepo {
+        self.git_dir = git_dir;
+        self.work_tree = work_tree;
+        self
     }
 
     /// Runs git to its end, whatever its exit status.
@@ -67,6 +80,8 @@ impl GitRepo {
             .current_dir(&self.dir)
             // A hook runs on every tool call; it must not take the index lock to refresh stat info.
             .env("GIT_OPTIONAL_LOCKS", "0")
+            .envs(self.git_dir.iter().map(|dir| ("GIT_DIR", dir)))
+            .envs(self.work_tree.iter().map(|dir| ("GIT_WORK_TREE", dir)))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -173,8 +188,17 @@ impl Repo for GitRepo {
             .map(|job| [&["diff", "--no-color", "--no-ext-diff"][..], &job].concat())
             .collect();
         if let Some(spec) = spec {
-            let listing = ["ls-files", "--others", "--exclude-standard", "-z", "--"];
+            let listing = [
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--full-name",
+                "--",
+            ];
             jobs.push([&listing[..], &as_strs(spec)].concat());
+            // The listing names files from the top of the working tree.
+            jobs.push(vec!["rev-parse", "--show-toplevel"]);
         }
         // A hook runs on every tool call: the git calls run side by side.
         let mut outputs = self.all(&jobs)?;
@@ -198,16 +222,21 @@ impl Repo for GitRepo {
             }
         }
         let mut text = String::new();
+        let mut untracked = None;
+        let mut top = None;
         for (job, out) in jobs.iter().zip(&outputs) {
             if !out.status.success() {
                 return Err(failed(job, out));
             }
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if job[0] == "ls-files" {
-                self.untracked_diff(&stdout, &mut text)?;
-            } else {
-                text.push_str(&stdout);
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            match job[0] {
+                "ls-files" => untracked = Some(stdout),
+                "rev-parse" => top = Some(PathBuf::from(stdout.trim_end())),
+                _ => text.push_str(&stdout),
             }
+        }
+        if let (Some(listing), Some(top)) = (untracked, top) {
+            untracked_diff(&top, &listing, &mut text)?;
         }
         Ok(text)
     }
@@ -237,51 +266,49 @@ impl GitRepo {
                 .collect()
         })
     }
+}
 
-    /// Appends the untracked files `ls-files -z` listed as the diff `git add` would stage: each
-    /// file's lines added, a symlink's target as its content.
-    fn untracked_diff(&self, listing: &str, text: &mut String) -> Result<(), GitError> {
-        // A nested repository is listed with a trailing slash; `git add` stages no content of it.
-        let files: Vec<&str> = listing
-            .split('\0')
-            .filter(|file| !file.is_empty() && !file.ends_with('/'))
-            .collect();
-        if files.len() > UNTRACKED_LIMIT {
-            return Err(GitError(format!(
-                "{} untracked files are to be added, more than the {UNTRACKED_LIMIT} it checks",
-                files.len()
-            )));
-        }
-        let mut read = 0;
-        for file in files {
-            let path = self.dir.join(file);
-            let unreadable = |e: std::io::Error| GitError(format!("cannot read {file}: {e}"));
-            let content = match std::fs::symlink_metadata(&path).map_err(unreadable)? {
-                meta if meta.file_type().is_symlink() => std::fs::read_link(&path)
-                    .map_err(unreadable)?
-                    .to_string_lossy()
-                    .into_owned(),
-                meta if meta.len() + read > UNTRACKED_BYTES => {
-                    return Err(GitError(format!(
-                        "the untracked files to be added hold more than the {UNTRACKED_BYTES} bytes it checks"
-                    )));
-                }
-                _ => {
-                    String::from_utf8_lossy(&std::fs::read(&path).map_err(unreadable)?).into_owned()
-                }
-            };
-            read += content.len() as u64;
-            text.push_str(&format!(
-                "diff --git a/{file} b/{file}\nnew file mode 100644\n--- /dev/null\n+++ b/{file}\n@@ -0,0 +1 @@\n"
-            ));
-            for line in content.lines() {
-                text.push('+');
-                text.push_str(line);
-                text.push('\n');
-            }
-        }
-        Ok(())
+/// Appends the untracked files `ls-files -z --full-name` listed under `top` as the diff
+/// `git add` would stage: each file's lines added, a symlink's target as its content.
+fn untracked_diff(top: &Path, listing: &str, text: &mut String) -> Result<(), GitError> {
+    // A nested repository is listed with a trailing slash; `git add` stages no content of it.
+    let files: Vec<&str> = listing
+        .split('\0')
+        .filter(|file| !file.is_empty() && !file.ends_with('/'))
+        .collect();
+    if files.len() > UNTRACKED_LIMIT {
+        return Err(GitError(format!(
+            "{} untracked files are to be added, more than the {UNTRACKED_LIMIT} it checks",
+            files.len()
+        )));
     }
+    let mut read = 0;
+    for file in files {
+        let path = top.join(file);
+        let unreadable = |e: std::io::Error| GitError(format!("cannot read {file}: {e}"));
+        let content = match std::fs::symlink_metadata(&path).map_err(unreadable)? {
+            meta if meta.file_type().is_symlink() => std::fs::read_link(&path)
+                .map_err(unreadable)?
+                .to_string_lossy()
+                .into_owned(),
+            meta if meta.len() + read > UNTRACKED_BYTES => {
+                return Err(GitError(format!(
+                    "the untracked files to be added hold more than the {UNTRACKED_BYTES} bytes it checks"
+                )));
+            }
+            _ => String::from_utf8_lossy(&std::fs::read(&path).map_err(unreadable)?).into_owned(),
+        };
+        read += content.len() as u64;
+        text.push_str(&format!(
+            "diff --git a/{file} b/{file}\nnew file mode 100644\n--- /dev/null\n+++ b/{file}\n@@ -0,0 +1 @@\n"
+        ));
+        for line in content.lines() {
+            text.push('+');
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    Ok(())
 }
 
 /// A repository held in memory, for tests of code that reads one.

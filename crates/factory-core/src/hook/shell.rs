@@ -17,8 +17,10 @@ pub enum Part {
     Leave,
     /// `|`: the commands on both sides each run in a child.
     Pipe,
-    /// `&`: the command before it runs in a child, in the background.
+    /// `&`: the and-or list before it runs in a child, in the background.
     Background,
+    /// `;` or a new line: the next and-or list starts.
+    Sequence,
 }
 
 /// The simple commands of `text`, in order, with where the children they run in start and end.
@@ -103,16 +105,22 @@ pub fn parts(text: &str) -> Vec<Part> {
                 heredocs.push((delimiter, strip_tabs));
             }
             '\n' => {
-                out.end_command();
+                // After `&&`, `||` or `|`, a new line carries on the list.
+                if out.joined {
+                    out.end_command();
+                } else {
+                    out.mark(Part::Sequence);
+                }
                 for (delimiter, strip_tabs) in heredocs.drain(..) {
                     at = skip_heredoc(&chars, at, &delimiter, strip_tabs);
                 }
             }
-            ';' => out.end_command(),
+            ';' => out.mark(Part::Sequence),
             // `&&` and `||` only join commands.
             '&' | '|' if chars.get(at) == Some(&c) => {
                 at += 1;
                 out.end_command();
+                out.joined = true;
             }
             // A redirection such as `2>&1` or `&>file`.
             '&' if at >= 2 && matches!(chars[at - 2], '>' | '<') => out.push(c),
@@ -122,6 +130,7 @@ pub fn parts(text: &str) -> Vec<Part> {
                 // `|&` pipes stderr too.
                 at += usize::from(chars.get(at) == Some(&'&'));
                 out.mark(Part::Pipe);
+                out.joined = true;
             }
             '(' => out.mark(Part::Enter),
             ')' => out.mark(Part::Leave),
@@ -173,16 +182,19 @@ struct Lexer {
     word: String,
     /// A quoted empty string is still a word.
     in_word: bool,
+    /// The last thing read was `&&`, `||` or `|`, which the next command continues.
+    joined: bool,
 }
 
 impl Lexer {
     fn push(&mut self, c: char) {
-        self.in_word = true;
+        self.open_word();
         self.word.push(c);
     }
 
     fn open_word(&mut self) {
         self.in_word = true;
+        self.joined = false;
     }
 
     fn word_is_empty(&self) -> bool {
@@ -208,14 +220,40 @@ impl Lexer {
     fn mark(&mut self, part: Part) {
         self.end_command();
         self.parts.push(part);
+        self.joined = false;
     }
 }
 
-/// Words that run what follows them, so the command is the next word that isn't an option or a
-/// variable assignment.
-const WRAPPERS: &[&str] = &[
-    "sudo", "env", "command", "exec", "time", "nohup", "nice", "builtin", "doas", "then", "do",
-    "else", "elif", "if", "while", "until", "!", "{",
+/// Words that run what follows them, with how many words of their own (after their options)
+/// come first, such as `timeout`'s duration; the command is the next word that isn't one of
+/// those, an option or a variable assignment.
+const WRAPPERS: &[(&str, usize)] = &[
+    ("sudo", 0),
+    ("env", 0),
+    ("command", 0),
+    ("exec", 0),
+    ("time", 0),
+    ("nohup", 0),
+    ("nice", 0),
+    ("builtin", 0),
+    ("doas", 0),
+    ("xargs", 0),
+    ("stdbuf", 0),
+    ("ionice", 0),
+    ("setsid", 0),
+    ("timeout", 1),
+    ("flock", 1),
+    ("chrt", 1),
+    ("taskset", 1),
+    ("then", 0),
+    ("do", 0),
+    ("else", 0),
+    ("elif", 0),
+    ("if", 0),
+    ("while", 0),
+    ("until", 0),
+    ("!", 0),
+    ("{", 0),
 ];
 
 /// The shells that run their `-c` argument.
@@ -229,35 +267,59 @@ pub struct Invocation<'a> {
     pub args: &'a [String],
     /// The leading `NAME=value` words, which set variables for this command alone.
     pub assignments: Vec<&'a str>,
+    /// The directories a wrapper changes to first (`env -C`, `sudo -D`), in order.
+    pub chdir: Vec<&'a str>,
 }
 
 /// The program a simple command runs, after its variable assignments and wrappers such as
 /// `sudo` and `env`.
 pub fn invocation(words: &[String]) -> Option<Invocation<'_>> {
     let mut assignments = Vec::new();
-    // The wrapper whose options come next, and how many words the last option still takes.
-    let mut wrapper = None;
-    let mut skip = 0;
+    let mut chdir = Vec::new();
+    // The wrapper whose options come next, and how many of its own words are still to come.
+    let mut wrapper: Option<(&str, usize)> = None;
+    // The wrapper option whose value is the next word.
+    let mut value_of: Option<(&str, &str)> = None;
     for (at, word) in words.iter().enumerate() {
-        if skip > 0 {
-            skip -= 1;
+        if let Some(option) = value_of.take() {
+            if CHDIR.contains(&option) {
+                chdir.push(word.as_str());
+            }
         } else if is_assignment(word) {
             assignments.push(word.as_str());
-        } else if let Some(name) = WRAPPERS.iter().find(|name| **name == word) {
-            wrapper = Some(*name);
-        } else if let (Some(name), true) = (wrapper, word.starts_with('-')) {
+        } else if let Some(&(name, own)) = WRAPPERS.iter().find(|(name, _)| *name == word) {
+            wrapper = Some((name, own));
+        } else if let (Some((name, _)), true) = (wrapper, word.starts_with('-')) {
             // An option of the wrapper, such as `sudo -E`, with its value when it takes one.
-            skip = usize::from(OPTIONS_WITH_VALUE.contains(&(name, word.as_str())));
+            match word.split_once('=') {
+                Some((option, value)) if CHDIR.contains(&(name, option)) => chdir.push(value),
+                Some(_) => {}
+                None if OPTIONS_WITH_VALUE.contains(&(name, word.as_str())) => {
+                    value_of = Some((name, word.as_str()));
+                }
+                None => {}
+            }
+        } else if let Some((name, own @ 1..)) = wrapper {
+            wrapper = Some((name, own - 1));
         } else {
             return Some(Invocation {
                 program: word.rsplit('/').next().unwrap_or(word),
                 args: &words[at + 1..],
                 assignments,
+                chdir,
             });
         }
     }
     None
 }
+
+/// The wrapper options that change directory before running the command.
+const CHDIR: &[(&str, &str)] = &[
+    ("env", "-C"),
+    ("env", "--chdir"),
+    ("sudo", "-D"),
+    ("sudo", "--chdir"),
+];
 
 /// Wrapper options that take the next word as their value.
 const OPTIONS_WITH_VALUE: &[(&str, &str)] = &[
@@ -270,21 +332,61 @@ const OPTIONS_WITH_VALUE: &[(&str, &str)] = &[
     ("sudo", "-R"),
     ("sudo", "-T"),
     ("sudo", "-U"),
-    ("doas", "-u"),
-    ("doas", "-C"),
-    ("env", "-u"),
-    ("env", "-C"),
-    ("env", "-S"),
-    ("nice", "-n"),
     ("sudo", "--user"),
     ("sudo", "--group"),
     ("sudo", "--host"),
     ("sudo", "--prompt"),
     ("sudo", "--chdir"),
+    ("doas", "-u"),
+    ("doas", "-C"),
+    ("env", "-u"),
+    ("env", "-C"),
+    ("env", "-S"),
     ("env", "--unset"),
     ("env", "--chdir"),
     ("env", "--split-string"),
+    ("nice", "-n"),
     ("nice", "--adjustment"),
+    ("timeout", "-s"),
+    ("timeout", "-k"),
+    ("timeout", "--signal"),
+    ("timeout", "--kill-after"),
+    ("xargs", "-I"),
+    ("xargs", "-n"),
+    ("xargs", "-P"),
+    ("xargs", "-d"),
+    ("xargs", "-E"),
+    ("xargs", "-L"),
+    ("xargs", "-s"),
+    ("xargs", "-a"),
+    ("xargs", "--max-args"),
+    ("xargs", "--max-procs"),
+    ("xargs", "--delimiter"),
+    ("xargs", "--max-lines"),
+    ("xargs", "--max-chars"),
+    ("xargs", "--arg-file"),
+    ("xargs", "--process-slot-var"),
+    ("stdbuf", "-i"),
+    ("stdbuf", "-o"),
+    ("stdbuf", "-e"),
+    ("stdbuf", "--input"),
+    ("stdbuf", "--output"),
+    ("stdbuf", "--error"),
+    ("ionice", "-c"),
+    ("ionice", "-n"),
+    ("ionice", "-p"),
+    ("ionice", "-P"),
+    ("ionice", "-u"),
+    ("ionice", "--class"),
+    ("ionice", "--classdata"),
+    ("ionice", "--pid"),
+    ("ionice", "--pgid"),
+    ("ionice", "--uid"),
+    ("flock", "-w"),
+    ("flock", "-E"),
+    ("flock", "--timeout"),
+    ("flock", "--wait"),
+    ("flock", "--conflict-exit-code"),
 ];
 
 fn is_assignment(word: &str) -> bool {

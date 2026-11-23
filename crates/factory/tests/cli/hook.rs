@@ -621,6 +621,57 @@ fn a_cd_inside_a_subshell_does_not_move_the_commit_after_it() {
     denied_for_the_address(&out);
 }
 
+#[test]
+fn a_commit_naming_a_path_checks_that_paths_working_tree() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = sandbox.repo();
+    // a.txt is tracked; the address is in its working tree only, which `commit a.txt` takes.
+    std::fs::write(repo.join("a.txt"), format!("mail {OWNER}\n")).unwrap();
+
+    let reason = reason_of(&pre_tool(
+        &sandbox,
+        &bash_in(&repo, "git commit -m x a.txt"),
+    ));
+
+    assert!(reason.contains("a.txt"), "{reason}");
+}
+
+#[test]
+fn pre_tool_follows_env_c_and_git_dir_to_the_repo_they_name() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = repo_staging_the_address(&sandbox);
+    let elsewhere = sandbox.path("home");
+    let repo = repo.display();
+
+    for command in [
+        format!("env -C {repo} git commit -m x"),
+        format!("git --git-dir {repo}/.git --work-tree {repo} commit -m x"),
+        format!("GIT_DIR={repo}/.git GIT_WORK_TREE={repo} git commit -m x"),
+    ] {
+        denied_for_the_address(&pre_tool(&sandbox, &bash_in(&elsewhere, &command)));
+    }
+}
+
+#[test]
+fn a_check_that_cannot_finish_says_why_when_no_address_is_in_the_why() {
+    let sandbox = Sandbox::new();
+    leak_config(&sandbox);
+    let repo = sandbox.repo();
+    for n in 0..201 {
+        std::fs::write(repo.join(format!("new-{n}.txt")), "x\n").unwrap();
+    }
+
+    let reason = reason_of(&pre_tool(
+        &sandbox,
+        &bash_in(&repo, "git add . && git commit -m x"),
+    ));
+
+    assert!(reason.contains("201 untracked files"), "{reason}");
+    assert!(!reason.contains('\n'), "{reason}");
+}
+
 /// Spec #1: "a hook call completes in under 5 ms on this machine". The fastest of a few runs is
 /// the call's own cost, free of the scheduler's noise.
 #[test]

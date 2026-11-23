@@ -32,12 +32,17 @@ pub enum PreTool {
 /// A commit or push in a command, and the diff to check for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitAction {
-    /// The directory it runs in, relative to the call's working directory (`cd` and `-C`).
+    /// The directory it runs in, relative to the call's working directory (`cd`, `pushd`,
+    /// `env -C` and `git -C`).
     pub dir: Option<String>,
+    /// The repository and working tree git was pointed at (`--git-dir`, `--work-tree`,
+    /// `GIT_DIR`, `GIT_WORK_TREE`), relative to the call's working directory too.
+    pub git_dir: Option<String>,
+    pub work_tree: Option<String>,
     /// It takes every tracked change along: `commit -a` or an earlier `git add -u`.
     pub tracked: bool,
-    /// An earlier `git add` in the command stages more, which is not staged yet when the hook
-    /// runs: the pathspecs it named, or none named for all of them.
+    /// An earlier `git add` in the command, or the commit's own pathspecs, take more along
+    /// than is staged when the hook runs: the pathspecs named, or none named for all of them.
     pub added: Option<Vec<String>>,
 }
 
@@ -170,96 +175,162 @@ pub fn subagent_stop(input: &Value, templates: &Templates, sent_back: bool) -> O
     ))
 }
 
+/// Where the shell that runs a command line is, as far as the line says: its directory (none
+/// for the call's own) and its `pushd` stack.
+#[derive(Clone, Default)]
+struct Place {
+    cwd: Option<String>,
+    pushed: Vec<Option<String>>,
+}
+
+/// Follows the directory each command of a command line runs in.
+#[derive(Default)]
+struct Directories {
+    here: Place,
+    /// Where the current and-or list started: `&` sends the whole list to a child.
+    list: Place,
+    /// Where each child that is still running started, and its and-or list.
+    outer: Vec<(Place, Place)>,
+    /// Where the shell was before the last command, when that moved it: a `|` after it puts it
+    /// in a child, so it moved nothing.
+    before_move: Option<Place>,
+    /// The command after a `|` runs in a child too.
+    piped: bool,
+}
+
+impl Directories {
+    /// Takes in a piece of the line that is no command.
+    fn part(&mut self, part: &Part) {
+        match part {
+            Part::Command(_) => return,
+            Part::Enter => {
+                self.outer.push((self.here.clone(), self.list.clone()));
+                self.list = self.here.clone();
+            }
+            Part::Leave => {
+                if let Some((here, list)) = self.outer.pop() {
+                    (self.here, self.list) = (here, list);
+                }
+            }
+            Part::Pipe => {
+                if let Some(before) = self.before_move.take() {
+                    self.here = before;
+                }
+                self.piped = true;
+                return;
+            }
+            Part::Background => {
+                self.here = self.list.clone();
+            }
+            Part::Sequence => self.list = self.here.clone(),
+        }
+        (self.before_move, self.piped) = (None, false);
+    }
+
+    /// Takes in a command, none for one that runs no program: true when it was `cd`, `pushd`
+    /// or `popd`.
+    fn command(&mut self, call: Option<&shell::Invocation>) -> bool {
+        let in_child = std::mem::take(&mut self.piped);
+        self.before_move = None;
+        let Some(call) = call else {
+            return false;
+        };
+        let before = self.here.clone();
+        let target = call
+            .args
+            .iter()
+            .find(|arg| !arg.starts_with(['-', '+']))
+            .map(|target| join(before.cwd.as_deref(), target));
+        let here = &mut self.here;
+        match call.program {
+            // A bare `cd` goes home; `cd -` somewhere the line doesn't say.
+            "cd" if call.args.is_empty() => here.cwd = Some("~".to_owned()),
+            "cd" => here.cwd = target,
+            "pushd" => match target {
+                Some(target) => here.pushed.push(here.cwd.replace(target)),
+                // A bare `pushd` swaps the top two.
+                None => {
+                    if let Some(top) = here.pushed.pop() {
+                        here.pushed.push(std::mem::replace(&mut here.cwd, top));
+                    }
+                }
+            },
+            "popd" => {
+                if let Some(top) = here.pushed.pop() {
+                    here.cwd = top;
+                }
+            }
+            _ => return false,
+        }
+        if in_child {
+            self.here = before;
+        } else {
+            self.before_move = Some(before);
+        }
+        true
+    }
+}
+
 /// The commits and pushes a command runs, each once.
 pub fn git_actions(command: &str) -> Vec<GitAction> {
-    /// What the command has staged so far in one directory.
+    /// What the command has staged so far in one repository.
     #[derive(Default)]
     struct Staged {
         tracked: bool,
         added: Option<Vec<String>>,
     }
-    let mut cwd: Option<String> = None;
-    // The directory each child that is still running started in.
-    let mut outer: Vec<Option<String>> = Vec::new();
-    // The directory before the last command, when that command was a `cd`: a `|` or `&` after
-    // it puts it in a child, so it moved nothing.
-    let mut before_cd: Option<Option<String>> = None;
-    // The command after a `|` runs in a child too.
-    let mut piped = false;
-    let mut staged: BTreeMap<Option<String>, Staged> = BTreeMap::new();
+    let mut dirs = Directories::default();
+    let mut staged: BTreeMap<[Option<String>; 3], Staged> = BTreeMap::new();
     let mut actions: Vec<GitAction> = Vec::new();
     for part in all_parts(command) {
-        let words = match part {
-            Part::Command(words) => words,
-            Part::Enter => {
-                outer.push(cwd.clone());
-                (before_cd, piped) = (None, false);
-                continue;
-            }
-            Part::Leave => {
-                if let Some(started) = outer.pop() {
-                    cwd = started;
-                }
-                (before_cd, piped) = (None, false);
-                continue;
-            }
-            Part::Pipe | Part::Background => {
-                if let Some(before) = before_cd.take() {
-                    cwd = before;
-                }
-                piped = part == Part::Pipe;
-                continue;
-            }
-        };
-        let in_child = std::mem::take(&mut piped);
-        before_cd = None;
-        let Some(call) = shell::invocation(&words) else {
+        let Part::Command(words) = &part else {
+            dirs.part(&part);
             continue;
         };
-        if call.program == "cd" {
-            if !in_child {
-                before_cd = Some(cwd.clone());
-                // A bare `cd` and `cd -` go somewhere the command line doesn't say.
-                cwd = call
-                    .args
-                    .iter()
-                    .find(|arg| !arg.starts_with('-'))
-                    .map(|target| join(cwd.as_deref(), target));
-            }
+        let call = shell::invocation(words);
+        if dirs.command(call.as_ref()) {
             continue;
         }
-        if call.program != "git" {
+        let Some(call) = call.filter(|call| call.program == "git") else {
             continue;
+        };
+        let mut dir = dirs.here.cwd.clone();
+        for next in &call.chdir {
+            dir = Some(join(dir.as_deref(), next));
         }
-        let (dash_c, rest) = git_subcommand(call.args);
-        let dir = match (dash_c, &cwd) {
-            (Some(dash_c), base) => Some(join(base.as_deref(), &dash_c)),
-            (None, base) => base.clone(),
-        };
-        let Some((sub, args)) = rest.split_first() else {
+        let git = GitGlobals::of(&call, dir);
+        let Some((sub, args)) = git.rest.split_first() else {
             continue;
         };
-        let here = staged.entry(dir.clone()).or_default();
+        let here = staged
+            .entry([git.dir.clone(), git.git_dir.clone(), git.work_tree.clone()])
+            .or_default();
         match sub.as_str() {
             "add" | "stage" => {
                 let (all, update, paths) = add_args(args);
                 // Pathspecs narrow `-u` and `-A` to themselves.
                 if update && !all && paths.is_empty() {
                     here.tracked = true;
-                } else if paths.is_empty() {
-                    here.added = Some(Vec::new());
-                } else if here.added.as_ref().is_none_or(|a| !a.is_empty()) {
-                    // (An empty list already means every path.)
-                    here.added.get_or_insert_with(Vec::new).extend(paths);
+                } else {
+                    stage_more(&mut here.added, paths);
                 }
             }
             "commit" | "push" => {
-                let own =
-                    sub == "commit" && args.iter().any(|a| a == "--all" || is_short_flag(a, 'a'));
+                let mut added = here.added.clone();
+                let mut tracked = here.tracked;
+                if sub == "commit" {
+                    let own = commit_args(args);
+                    tracked |= own.all;
+                    if let Some(paths) = own.paths {
+                        stage_more(&mut added, paths);
+                    }
+                }
                 let action = GitAction {
-                    dir,
-                    tracked: own || here.tracked,
-                    added: here.added.clone(),
+                    dir: git.dir,
+                    git_dir: git.git_dir,
+                    work_tree: git.work_tree,
+                    tracked,
+                    added,
                 };
                 if !actions.contains(&action) {
                     actions.push(action);
@@ -269,6 +340,15 @@ pub fn git_actions(command: &str) -> Vec<GitAction> {
         }
     }
     actions
+}
+
+/// Adds `paths` to what is staged, where no paths are all of them, and so is an empty list.
+fn stage_more(added: &mut Option<Vec<String>>, paths: Vec<String>) {
+    match added {
+        Some(have) if have.is_empty() => {}
+        _ if paths.is_empty() => *added = Some(Vec::new()),
+        _ => added.get_or_insert_with(Vec::new).extend(paths),
+    }
 }
 
 /// What `git add` was told: whether `-A`, whether `-u`, and the pathspecs.
@@ -290,6 +370,78 @@ fn add_args(args: &[String]) -> (bool, bool, Vec<String>) {
     (all, update, paths)
 }
 
+/// What `git commit` was told that changes what it takes along.
+struct CommitArgs {
+    /// `-a`: every tracked change.
+    all: bool,
+    /// The working tree of these pathspecs (`--only` or `--include`); none listed for
+    /// `--pathspec-from-file`, which could name any.
+    paths: Option<Vec<String>>,
+}
+
+/// The short options of `git commit` that take a value, attached or as the next word.
+const COMMIT_SHORT_VALUES: &[char] = &['m', 'F', 'C', 'c', 't'];
+/// Its short options whose value, if any, is attached.
+const COMMIT_SHORT_OPTIONAL: &[char] = &['S', 'u'];
+/// Its long options that take the next word as their value when no `=` gives it.
+const COMMIT_LONG_VALUES: &[&str] = &[
+    "--message",
+    "--file",
+    "--reuse-message",
+    "--reedit-message",
+    "--author",
+    "--date",
+    "--template",
+    "--fixup",
+    "--squash",
+    "--cleanup",
+    "--trailer",
+    "--pathspec-from-file",
+];
+
+fn commit_args(args: &[String]) -> CommitArgs {
+    let mut all = false;
+    let mut paths: Vec<String> = Vec::new();
+    let mut from_file = false;
+    let mut skip_next = false;
+    let mut options_end = false;
+    for arg in args {
+        if std::mem::take(&mut skip_next) {
+            continue;
+        }
+        if options_end || !arg.starts_with('-') || arg == "-" {
+            paths.push(arg.clone());
+        } else if arg == "--" {
+            options_end = true;
+        } else if let Some(long) = arg.strip_prefix("--") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            all |= name == "all";
+            from_file |= name == "pathspec-from-file";
+            skip_next = value.is_none() && COMMIT_LONG_VALUES.contains(&arg.as_str());
+        } else {
+            for (at, flag) in arg.char_indices().skip(1) {
+                all |= flag == 'a';
+                if COMMIT_SHORT_VALUES.contains(&flag) {
+                    // The rest of the word is the value, or else the next word is.
+                    skip_next = at + flag.len_utf8() == arg.len();
+                    break;
+                }
+                if COMMIT_SHORT_OPTIONAL.contains(&flag) {
+                    break;
+                }
+            }
+        }
+    }
+    let paths = if from_file {
+        Some(Vec::new())
+    } else {
+        (!paths.is_empty()).then_some(paths)
+    };
+    CommitArgs { all, paths }
+}
+
 /// `next` as seen from `base`: an absolute path stands alone.
 fn join(base: Option<&str>, next: &str) -> String {
     match base {
@@ -302,24 +454,66 @@ fn is_short_flag(word: &str, flag: char) -> bool {
     word.starts_with('-') && !word.starts_with("--") && word.contains(flag)
 }
 
-/// Splits git's own options (`-C dir`, `-c k=v`, `--no-pager`) from the subcommand and its
-/// arguments, and returns the `-C` directory.
-fn git_subcommand(args: &[String]) -> (Option<String>, &[String]) {
-    let mut dir = None;
-    let mut at = 0;
-    while let Some(arg) = args.get(at) {
-        match arg.as_str() {
-            "-C" => dir = args.get(at + 1).cloned(),
-            "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path" => {}
-            _ if arg.starts_with('-') => {
-                at += 1;
-                continue;
+/// Where a git invocation works, from git's own options (`-C dir`, `--git-dir`, `-c k=v`,
+/// `--no-pager`) and its variables, and the subcommand with its arguments after them.
+struct GitGlobals<'a> {
+    dir: Option<String>,
+    git_dir: Option<String>,
+    work_tree: Option<String>,
+    rest: &'a [String],
+}
+
+impl<'a> GitGlobals<'a> {
+    /// `call` runs git; `dir` is where the shell runs it.
+    fn of(call: &shell::Invocation<'a>, mut dir: Option<String>) -> GitGlobals<'a> {
+        let args = call.args;
+        let (mut git_dir, mut work_tree) = (None, None);
+        for assignment in &call.assignments {
+            match assignment.split_once('=') {
+                Some(("GIT_DIR", value)) => git_dir = Some(value.to_owned()),
+                Some(("GIT_WORK_TREE", value)) => work_tree = Some(value.to_owned()),
+                _ => {}
             }
-            _ => break,
         }
-        at += 2;
+        let mut at = 0;
+        while let Some(arg) = args.get(at) {
+            let value = args.get(at + 1).cloned();
+            match arg.split_once('=') {
+                _ if arg == "-C" => {
+                    if let Some(next) = &value {
+                        dir = Some(join(dir.as_deref(), next));
+                    }
+                }
+                _ if arg == "--git-dir" => git_dir = value,
+                _ if arg == "--work-tree" => work_tree = value,
+                _ if matches!(arg.as_str(), "-c" | "--namespace" | "--config-env") => {}
+                Some(("--git-dir", given)) => {
+                    git_dir = Some(given.to_owned());
+                    at += 1;
+                    continue;
+                }
+                Some(("--work-tree", given)) => {
+                    work_tree = Some(given.to_owned());
+                    at += 1;
+                    continue;
+                }
+                _ if arg.starts_with('-') => {
+                    at += 1;
+                    continue;
+                }
+                _ => break,
+            }
+            at += 2;
+        }
+        // git changes to `-C` first, so the others are seen from there.
+        let from_dir = |path: Option<String>| path.map(|p| join(dir.as_deref(), &p));
+        GitGlobals {
+            git_dir: from_dir(git_dir),
+            work_tree: from_dir(work_tree),
+            dir,
+            rest: args.get(at..).unwrap_or_default(),
+        }
     }
-    (dir, args.get(at..).unwrap_or_default())
 }
 
 /// Every piece of a command line, those inside `bash -c '…'` included, as a child of its own.
@@ -347,20 +541,11 @@ fn all_parts(command: &str) -> Vec<Part> {
 /// the address, since the line lands in the agent's transcript. Addresses match without case;
 /// an empty one matches nothing.
 pub fn private_address(diff: &str, addresses: &[String]) -> Option<String> {
-    let needles: Vec<String> = addresses
-        .iter()
-        .map(|a| a.trim().to_lowercase())
-        .filter(|a| !a.is_empty())
-        .collect();
+    let needles = needles(addresses);
     if needles.is_empty() {
         return None;
     }
-    let has = |text: &str| {
-        let lowered = text.to_lowercase();
-        needles
-            .iter()
-            .any(|needle| lowered.contains(needle.as_str()))
-    };
+    let has = |text: &str| contains_any(text, &needles);
     let refusal = |named: &str| {
         Some(format!(
             "The staged diff adds a private address in {named}: remove it, or unstage that file, then commit again."
@@ -401,6 +586,28 @@ pub fn private_address(diff: &str, addresses: &[String]) -> Option<String> {
         return refusal(&name_of(file));
     }
     None
+}
+
+/// Whether `text` holds one of the private `addresses`, matched as [`private_address`] matches
+/// them: a line that does must not reach the agent's transcript.
+pub fn mentions_private(text: &str, addresses: &[String]) -> bool {
+    contains_any(text, &needles(addresses))
+}
+
+/// The addresses as they are looked for: trimmed, lower case, none empty.
+fn needles(addresses: &[String]) -> Vec<String> {
+    addresses
+        .iter()
+        .map(|a| a.trim().to_lowercase())
+        .filter(|a| !a.is_empty())
+        .collect()
+}
+
+fn contains_any(text: &str, needles: &[String]) -> bool {
+    let lowered = text.to_lowercase();
+    needles
+        .iter()
+        .any(|needle| lowered.contains(needle.as_str()))
 }
 
 /// The JavaScript package managers bun replaces.
