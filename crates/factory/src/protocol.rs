@@ -42,6 +42,10 @@ pub const MONITOR_STOP: &str = "monitor.stop";
 /// Whether the context steward runs, and what it watches: no params, [`MonitorStatus`] out.
 pub const MONITOR_STATUS: &str = "monitor.status";
 
+/// What the daemon holds, as one record, read from its own state and running no command:
+/// [`StatusParams`] in, [`factory_core::status::Status`] out.
+pub const STATUS: &str = "status";
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
     pub id: u64,
@@ -99,6 +103,13 @@ pub struct LogResult {
     pub ledger: String,
     /// The line as it landed.
     pub event: Fields,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusParams {
+    /// The configured review backends, in the order they are tried: the daemon holds quotas, the
+    /// config says which backends there are.
+    pub backends: Vec<BackendSlots>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

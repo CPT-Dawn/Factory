@@ -75,6 +75,8 @@ pub struct Lab {
     callers: Mutex<HashSet<i64>>,
 }
 
+mod overview;
+
 type Answer<T> = Result<T, ErrorBody>;
 
 impl Lab {

@@ -12,13 +12,16 @@ use std::time::Duration;
 
 use factory_core::exit::Exit;
 use factory_core::quota::{self, Candidate, Pick, Quota, WhenBusy};
+use factory_core::status::{self, QuotaState};
 use factory_core::timestamp::Timestamp;
 use serde_json::Value;
 use tokio::sync::Notify;
 
 use crate::clock;
 use crate::output::Failure;
-use crate::protocol::{AcquireParams, AcquireResult, MISMATCH, Outcome, QuotaParams};
+use crate::protocol::{
+    AcquireParams, AcquireResult, BackendSlots, MISMATCH, Outcome, QuotaParams,
+};
 use crate::store::Store;
 
 pub struct Router {
@@ -108,6 +111,42 @@ impl Router {
                 None => changed.await,
             }
         }
+    }
+
+    /// Each of `backends` with its quota as it stands at `now` and the reviews running on it,
+    /// from memory alone.
+    pub fn snapshot(&self, backends: &[BackendSlots], now: Timestamp) -> Vec<status::Backend> {
+        let state = lock(&self.state);
+        backends
+            .iter()
+            .map(|backend| {
+                let quota = state
+                    .quotas
+                    .get(&backend.name)
+                    .copied()
+                    .unwrap_or(Quota::Unknown)
+                    .at(now);
+                let (quota, resets) = match quota {
+                    Quota::Unknown => (QuotaState::Unknown, None),
+                    Quota::Available => (QuotaState::Available, None),
+                    Quota::CoolingDown { until } => {
+                        (QuotaState::Cooling, Some(until.unix_millis()))
+                    }
+                };
+                status::Backend {
+                    name: backend.name.clone(),
+                    quota,
+                    resets,
+                    running: state.running.get(&backend.name).copied().unwrap_or(0),
+                    concurrency: backend.concurrency,
+                    when_busy: match WhenBusy::from(backend.when_busy) {
+                        WhenBusy::Queue => "queue",
+                        WhenBusy::Next => "next",
+                    }
+                    .to_owned(),
+                }
+            })
+            .collect()
     }
 
     /// Frees the slot `held` names, if any, and wakes the reviews waiting for one.

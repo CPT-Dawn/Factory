@@ -42,9 +42,11 @@ use crate::pollers::Pollers;
 use crate::protocol::{
     ErrorBody, LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH,
     MONITOR_START, MONITOR_STATUS, MONITOR_STOP, Outcome, REVIEW_ACQUIRE, REVIEW_QUOTA, Request,
-    Response, SpawnParams, WAIT_CI, WAIT_LEAD, WaitCiParams, WaitCiResult, WaitLeadParams,
+    Response, STATUS, SpawnParams, StatusParams, WAIT_CI, WAIT_LEAD, WaitCiParams, WaitCiResult,
+    WaitLeadParams,
 };
 use crate::router::Router;
+use crate::status;
 use crate::steward::Steward;
 use crate::store::Store;
 
@@ -389,6 +391,13 @@ async fn respond(line: &str, daemon: &Daemon, stop: &Stop, held: &mut Option<Str
         MONITOR_START => answered(daemon.steward.start().await),
         MONITOR_STOP => answered(daemon.steward.stop().await),
         MONITOR_STATUS => answered(Ok::<_, Failure>(daemon.steward.status())),
+        STATUS => match params::<StatusParams>(STATUS, request.params) {
+            Ok(params) => answered(
+                status::gather(&params, &daemon.router, &daemon.lab, &daemon.leads, &daemon.steward)
+                    .await,
+            ),
+            Err(refused) => refused,
+        },
         LOG => {
             let ledger = Arc::clone(&daemon.ledger);
             let params = request.params;
