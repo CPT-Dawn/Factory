@@ -3,6 +3,9 @@
 //! Every test builds a [`support::Sandbox`] and drives the built `factory` binary inside it.
 //! Add a module per command here.
 
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
+mod adb_stream;
 mod agy;
 mod ci;
 // cfg(test) for the same reason as support: its helpers unwrap.

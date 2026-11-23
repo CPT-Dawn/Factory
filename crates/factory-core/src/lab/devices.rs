@@ -95,6 +95,17 @@ pub fn parse_track(buf: &[u8]) -> (Vec<Vec<Attached>>, usize) {
     (frames, at)
 }
 
+/// How long to wait before restart number `restarts` (0 for the first) of the adb device
+/// stream: `base` doubled for each restart before it, at most `cap`.
+pub fn restart_delay(
+    restarts: u32,
+    base: std::time::Duration,
+    cap: std::time::Duration,
+) -> std::time::Duration {
+    base.saturating_mul(1u32.checked_shl(restarts).unwrap_or(u32::MAX))
+        .min(cap)
+}
+
 /// What the planner knows of the board for one request.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PlanInput {
