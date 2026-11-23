@@ -17,6 +17,7 @@ clap = { version = "4.6", features = ["derive"] }
 listenfd = "1"
 rustix = { version = "1", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
+signal-hook = "0.3"
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1.54", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "process", "signal"] }
 regex = "1"

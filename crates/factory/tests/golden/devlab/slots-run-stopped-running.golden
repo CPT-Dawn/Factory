@@ -1,0 +1,21 @@
+# A run stopped while its command runs says so before it waits on anything, hands the command
+# the signal, and ends as 128 plus the signal's number once the command is gone, whatever the
+# command exits with (#24; today's devlab died without a word). Only devlab is signalled here, so
+# what the command shows it got from devlab.
+& r a@demo-a exec devlab run --no-device -- sh -c 'trap "kill \$!; echo got TERM; exit 0" TERM; echo started; sleep 30 & wait'
+until r started
+signal r TERM
+wait r
+1> started
+1> got TERM
+2> devlab: lease 1, slot 0 (stack http://127.0.0.1:27321, down)
+2> devlab: sh stopped by SIGTERM after <n> s
+? 143
+& i a@demo-a exec devlab run --no-device --quiet -- sh -c 'trap "kill \$!; echo got INT; exit 3" INT; echo started; sleep 30 & wait'
+until i started
+signal i INT
+wait i
+1> started
+1> got INT
+2> devlab: sh stopped by SIGINT after <n> s
+? 130
