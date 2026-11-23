@@ -27,9 +27,9 @@ use crate::protocol::{Outcome, Request, Response};
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a CLI waits for another CLI that is starting the daemon.
 const START_LOCK_TIMEOUT: Duration = Duration::from_secs(20);
-/// How long the daemon may take to answer a request that doesn't wait on an event.
 /// How long a stopping daemon may take to exit: its drain, then its runtime's shutdown.
 const STOPPING_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the daemon may take to answer a request that doesn't wait on an event.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 /// The next step when the daemon fails to start for no reason it gave.
 const RUN_IT: &str = "run `factory daemon` to see why";
