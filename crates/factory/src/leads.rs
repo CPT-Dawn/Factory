@@ -241,6 +241,7 @@ impl<H: HerdrApi> Leads<H> {
                 let (kind, on) = match &wait.on {
                     WaitOn::Lead(name) => ("lead", name.clone()),
                     WaitOn::Ci(pr) => ("ci", pr.clone()),
+                    WaitOn::Review(label) => ("review", label.clone()),
                 };
                 status::Wait {
                     pane: wait.waiter.clone(),

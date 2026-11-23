@@ -35,6 +35,9 @@ pub const WAIT_LEAD: &str = "wait.lead";
 /// Answered once every check on a pull request's head has finished: [`WaitCiParams`] in,
 /// [`WaitCiResult`] out; an error with exit 124 when the time runs out first.
 pub const WAIT_CI: &str = "wait.ci";
+/// Answered once the review of a label has ended: [`WaitReviewParams`] in, the `review` event
+/// as it landed in the ledger out; an error with exit 124 when the time runs out first.
+pub const WAIT_REVIEW: &str = "wait.review";
 /// Starts the context steward unless it runs: no params, [`MonitorSwitch`] out.
 pub const MONITOR_START: &str = "monitor.start";
 /// Stops the context steward if it runs: no params, [`MonitorSwitch`] out.
@@ -116,6 +119,16 @@ pub struct StatusParams {
 pub struct AcquireParams {
     /// The configured backends, in the order they are tried.
     pub backends: Vec<BackendSlots>,
+    /// The review asking, so the daemon can tell a wait on its label that it is still running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewRef>,
+}
+
+/// A review by the repo it runs in and its label.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReviewRef {
+    pub repo: String,
+    pub label: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -255,6 +268,17 @@ pub struct WaitLeadResult {
     pub lead: LeadReport,
     /// 0 when the lead finished, 10 when it needs attention.
     pub exit: u8,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WaitReviewParams {
+    pub label: String,
+    /// The repo the caller works in; none when its working directory is no repo, which waits
+    /// for the label in any.
+    pub repo: Option<String>,
+    /// The herdr pane the wait comes from, so the lead in it shows as waiting.
+    pub waiter: Option<String>,
+    pub timeout_secs: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

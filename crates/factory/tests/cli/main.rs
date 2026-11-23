@@ -20,6 +20,7 @@ mod monitor;
 mod reserve;
 mod router;
 mod spawn;
+mod wait_review;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
 mod status;

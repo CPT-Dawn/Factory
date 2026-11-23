@@ -657,30 +657,12 @@ impl Reading {
 
     /// The line a caller sees: `review <label>: <verdict> (n blocking, n advisory, n question) → <report>`.
     pub fn summary(&self, label: &str, report: &str) -> String {
-        let Counts {
-            blocking,
-            advisory,
-            question,
-        } = self.counts;
-        // A fix round adds what it settled, what it left and what it dropped, when any.
-        let mut fix = Vec::new();
-        for (n, what) in [
-            (self.fixed, "fixed"),
-            (self.still_present, "still present"),
-            (self.dropped.len() as u64, "dropped"),
-        ] {
-            if n > 0 {
-                fix.push(format!("{n} {what}"));
-            }
-        }
-        let fix = match fix.is_empty() {
-            true => String::new(),
-            false => format!("; {}", fix.join(", ")),
+        let fix = crate::finished::Fixes {
+            fixed: self.fixed,
+            still_present: self.still_present,
+            dropped: self.dropped.len() as u64,
         };
-        format!(
-            "review {label}: {} ({blocking} blocking, {advisory} advisory, {question} question{fix}) → {report}",
-            self.verdict
-        )
+        crate::finished::summary(label, &self.verdict.to_string(), self.counts, fix, report)
     }
 }
 

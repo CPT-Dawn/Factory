@@ -64,6 +64,9 @@ pub enum Command {
         /// Seconds a reviewer may take before its process group is killed (default: the config's)
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
+        /// The ticket's tier, recorded in the review's event: hard, standard or trivial
+        #[arg(long, value_name = "TIER", value_parser = ["hard", "standard", "trivial"])]
+        tier: Option<String>,
     },
     /// Answer a Claude Code hook: its JSON on stdin, its hook protocol on stdout
     Hook {
@@ -149,6 +152,14 @@ pub enum WaitCommand {
     Ci {
         /// The PR: its number (from its repo's checkout), URL or branch
         pr: String,
+        /// Give up after this long with exit 124, such as 90s, 9m or 2h
+        #[arg(long, default_value = "9m", value_parser = duration)]
+        timeout: Duration,
+    },
+    /// Until the review of a label has ended: clean (exit 0), with findings or failed (exit 10)
+    Review {
+        /// The review's label, as factory review was given it
+        label: String,
         /// Give up after this long with exit 124, such as 90s, 9m or 2h
         #[arg(long, default_value = "9m", value_parser = duration)]
         timeout: Duration,

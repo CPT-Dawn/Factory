@@ -120,9 +120,9 @@ pub struct Wait {
     pub pane: Option<String>,
     /// The lead in that pane, when there is one.
     pub lead: Option<String>,
-    /// `lead` or `ci`.
+    /// `lead`, `ci` or `review`.
     pub kind: String,
-    /// The lead's name, or the pull request as `<owner>/<repo>#<number>`.
+    /// The lead's name, the pull request as `<owner>/<repo>#<number>`, or the review's label.
     pub on: String,
 }
 
@@ -309,10 +309,9 @@ fn waits(status: &Status, rows: &mut Vec<String>) {
                 (None, Some(pane)) => format!("pane {pane}"),
                 (None, None) => "outside herdr".to_owned(),
             };
-            let on = if wait.kind == "ci" {
-                format!("ci {}", wait.on)
-            } else {
-                wait.on.clone()
+            let on = match wait.kind.as_str() {
+                kind @ ("ci" | "review") => format!("{kind} {}", wait.on),
+                _ => wait.on.clone(),
             };
             format!("  {waiter} -> {on}")
         })

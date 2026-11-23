@@ -19,6 +19,7 @@ mod paths;
 mod pollers;
 mod protocol;
 mod review;
+mod reviews;
 mod router;
 mod sessions;
 mod spawn;
@@ -108,19 +109,26 @@ fn run(command: Command, json: bool) -> ExitCode {
         Command::Wait {
             command: WaitCommand::Ci { pr, timeout },
         } => ci::wait(&pr, timeout),
+        Command::Wait {
+            command: WaitCommand::Review { label, timeout },
+        } => reviews::wait(&label, timeout),
         Command::Review {
             base,
             label,
             spec,
             previous,
             timeout,
+            tier,
         } => review::run(&review::Args {
             base,
             label,
             spec,
             previous,
             timeout: timeout.map(std::time::Duration::from_secs),
-        }),
+            tier,
+        })
+        // review.sh's failures said so, and factory-stats' classifier still matches the text.
+        .map_err(|failure| Failure::new(failure.exit, format!("code-review: {}", failure.message))),
         // Answered in `main`: a hook prints its own protocol, not the output contract's line.
         Command::Hook { .. } => unreachable!("main answers hooks before it gets here"),
         Command::Install { units } => install::install(units.as_deref()),
