@@ -50,7 +50,31 @@ pub fn wait<P: Serialize, R: DeserializeOwned>(
     params: &P,
     limit: Duration,
 ) -> Result<R, Failure> {
-    Session::open(paths)?.exchange(method, params, Some(limit + ANSWER_TIMEOUT), Exit::Timeout)
+    Session::open(paths)?.exchange(
+        method,
+        params,
+        Some(limit + ANSWER_TIMEOUT),
+        Exit::Timeout,
+        &mut |_| {},
+    )
+}
+
+/// [`call`] for a request that waits: each note the daemon sends before its answer goes to
+/// `on_note`, and each line may take up to `read_timeout` (none waits as long as it takes).
+pub fn call_streaming<P: Serialize, R: DeserializeOwned>(
+    paths: &Paths,
+    method: &str,
+    params: &P,
+    read_timeout: Option<Duration>,
+    mut on_note: impl FnMut(&str),
+) -> Result<R, Failure> {
+    Session::open(paths)?.exchange(
+        method,
+        params,
+        read_timeout,
+        Exit::Precondition,
+        &mut on_note,
+    )
 }
 
 /// One connection to the daemon, kept open across requests: what the daemon grants on it (a
@@ -76,7 +100,13 @@ impl Session {
         method: &str,
         params: &P,
     ) -> Result<R, Failure> {
-        self.exchange(method, params, Some(ANSWER_TIMEOUT), Exit::Precondition)
+        self.exchange(
+            method,
+            params,
+            Some(ANSWER_TIMEOUT),
+            Exit::Precondition,
+            &mut |_| {},
+        )
     }
 
     /// Sends a request the daemon answers when what it waits on happens, however long that is.
@@ -85,7 +115,7 @@ impl Session {
         method: &str,
         params: &P,
     ) -> Result<R, Failure> {
-        self.exchange(method, params, None, Exit::Precondition)
+        self.exchange(method, params, None, Exit::Precondition, &mut |_| {})
     }
 
     /// Sends a request and reads its answer, giving up with `impatient` once `patience` (if
@@ -96,6 +126,7 @@ impl Session {
         params: &P,
         patience: Option<Duration>,
         impatient: Exit,
+        on_note: &mut dyn FnMut(&str),
     ) -> Result<R, Failure> {
         let paths = &self.paths;
         let broken = |e: &dyn std::fmt::Display| {
@@ -118,28 +149,34 @@ impl Session {
             .write_all(line.as_bytes())
             .map_err(|e| broken(&e))?;
         stream.set_read_timeout(patience).map_err(|e| broken(&e))?;
-        let mut answer = String::new();
-        match self.reader.read_line(&mut answer) {
-            Ok(0) => return Err(broken(&"it closed the connection without answering")),
-            Ok(_) => {}
-            Err(e) if is_timeout(&e) => {
-                return Err(Failure::new(
-                    impatient,
-                    format!(
-                        "the daemon did not answer within {}s; see {}",
-                        patience.unwrap_or_default().as_secs(),
-                        paths.daemon_log().display()
-                    ),
-                ));
+        // Notes may come before the answer; each line gets the whole patience.
+        loop {
+            let mut answer = String::new();
+            match self.reader.read_line(&mut answer) {
+                Ok(0) => return Err(broken(&"it closed the connection without answering")),
+                Ok(_) => {}
+                Err(e) if is_timeout(&e) => {
+                    return Err(Failure::new(
+                        impatient,
+                        format!(
+                            "the daemon did not answer within {}s; see {}",
+                            patience.unwrap_or_default().as_secs(),
+                            paths.daemon_log().display()
+                        ),
+                    ));
+                }
+                Err(e) => return Err(broken(&e)),
             }
-            Err(e) => return Err(broken(&e)),
-        }
-        let response: Response = serde_json::from_str(&answer).map_err(|e| broken(&e))?;
-        match response.outcome {
-            Outcome::Result(value) => serde_json::from_value(value).map_err(|e| broken(&e)),
-            Outcome::Error(error) => {
-                let exit = Exit::from_code(error.code).unwrap_or(Exit::Precondition);
-                Err(Failure::new(exit, error.message))
+            let response: Response = serde_json::from_str(&answer).map_err(|e| broken(&e))?;
+            match response.outcome {
+                Outcome::Note(note) => on_note(&note),
+                Outcome::Result(value) => {
+                    return serde_json::from_value(value).map_err(|e| broken(&e));
+                }
+                Outcome::Error(error) => {
+                    let exit = Exit::from_code(error.code).unwrap_or(Exit::Precondition);
+                    return Err(Failure::new(exit, error.message));
+                }
             }
         }
     }
