@@ -18,11 +18,8 @@ use tokio::sync::Notify;
 
 use crate::clock;
 use crate::output::Failure;
-use crate::protocol::{AcquireParams, AcquireResult, ErrorBody, Outcome, QuotaParams};
+use crate::protocol::{AcquireParams, AcquireResult, MISMATCH, Outcome, QuotaParams};
 use crate::store::Store;
-
-/// What to do when the CLI and the daemon don't agree on a request's shape.
-const MISMATCH: &str = "the daemon may be older than this factory: restart it";
 
 pub struct Router {
     store: Mutex<Store>,
@@ -61,20 +58,14 @@ impl Router {
             Ok(params) => params,
             Err(e) => return refuse(Exit::Usage, format!("bad acquire params: {e}; {MISMATCH}")),
         };
-        let mut wanted = Vec::with_capacity(params.backends.len());
-        for backend in &params.backends {
-            let when_busy = match backend.when_busy.as_str() {
-                "queue" => WhenBusy::Queue,
-                "next" => WhenBusy::Next,
-                other => {
-                    return refuse(
-                        Exit::Usage,
-                        format!("unknown when_busy {other:?}; {MISMATCH}"),
-                    );
-                }
-            };
-            wanted.push((backend.name.as_str(), backend.concurrency, when_busy));
-        }
+        let wanted: Vec<(&str, u32, WhenBusy)> = params
+            .backends
+            .iter()
+            .map(|backend| {
+                let when_busy = backend.when_busy.into();
+                (backend.name.as_str(), backend.concurrency, when_busy)
+            })
+            .collect();
         loop {
             let mut changed = std::pin::pin!(self.changed.notified());
             changed.as_mut().enable();
@@ -130,24 +121,20 @@ impl Router {
         self.changed.notify_waiters();
     }
 
-    /// Records a backend's quota in the database, then in the router.
+    /// Records what a review learned of a backend's quota, in the database, then in the
+    /// router. A finished review leaves a cooldown another review hit meanwhile in place.
     pub fn record(&self, params: Value) -> Outcome {
         let params: QuotaParams = match serde_json::from_value(params) {
             Ok(params) => params,
             Err(e) => return refuse(Exit::Usage, format!("bad quota params: {e}; {MISMATCH}")),
         };
-        let quota = match (params.quota.as_str(), params.until) {
-            ("available", None) => Quota::Available,
-            ("cooling", Some(until)) => Quota::CoolingDown {
-                until: Timestamp::from_unix_millis(until),
-            },
-            (other, _) => {
-                return refuse(
-                    Exit::Usage,
-                    format!("bad quota {other:?} for {}; {MISMATCH}", params.backend),
-                );
-            }
-        };
+        let mut state = lock(&self.state);
+        let known = state
+            .quotas
+            .get(&params.backend)
+            .copied()
+            .unwrap_or(Quota::Unknown);
+        let quota = known.learn(params.quota.into(), clock::now());
         if let Err(e) = lock(&self.store).set_quota(&params.backend, quota) {
             return refuse(
                 Exit::Precondition,
@@ -157,9 +144,8 @@ impl Router {
                 ),
             );
         }
-        lock(&self.state)
-            .quotas
-            .insert(params.backend.clone(), quota);
+        state.quotas.insert(params.backend.clone(), quota);
+        drop(state);
         self.changed.notify_waiters();
         Outcome::Result(serde_json::to_value(params).unwrap_or(Value::Null))
     }
@@ -201,10 +187,7 @@ fn until(reset: Timestamp, now: Timestamp) -> Duration {
 }
 
 fn refuse(exit: Exit, message: String) -> Outcome {
-    Outcome::Error(ErrorBody {
-        code: exit.code(),
-        message,
-    })
+    Outcome::refused(exit, message)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

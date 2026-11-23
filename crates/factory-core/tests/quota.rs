@@ -42,6 +42,31 @@ fn a_cooldown_holds_until_its_reset_and_then_the_quota_is_unknown_again() {
 }
 
 #[test]
+fn a_finished_review_does_not_clear_a_cooldown_another_review_hit() {
+    let cooling = Quota::CoolingDown { until: at(T11_00) };
+    let cases = [
+        // (known, learned, now, then)
+        (cooling, Quota::Available, T10_00, cooling),
+        (cooling, Quota::Available, T13_00, Quota::Available),
+        (Quota::Available, cooling, T10_00, cooling),
+        (Quota::Unknown, Quota::Available, T10_00, Quota::Available),
+        (
+            cooling,
+            Quota::CoolingDown { until: at(T13_00) },
+            T10_00,
+            Quota::CoolingDown { until: at(T13_00) },
+        ),
+    ];
+    for (known, learned, now, then) in cases {
+        assert_eq!(
+            known.learn(learned, at(now)),
+            then,
+            "{known:?} {learned:?} {now}"
+        );
+    }
+}
+
+#[test]
 fn the_router_takes_the_first_backend_with_quota_and_a_free_slot_or_says_why_not() {
     let cooling = |seconds| Quota::CoolingDown { until: at(seconds) };
     let cases: Vec<(&str, Vec<Candidate>, Pick)> = vec![
@@ -134,6 +159,21 @@ fn a_codex_usage_limit_is_read_from_its_event_stream() {
         ),
         ("You've hit your usage limit.", Some(Reset::Unknown)),
         ("{\"type\":\"turn.completed\"}", None),
+        // What Codex read while reviewing is not its own error.
+        (
+            concat!(
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"aggregated_output\":\"you hit your usage limit, try again at 3:00 PM\"}}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"stream disconnected\"}}\n",
+            ),
+            None,
+        ),
+        (
+            concat!(
+                "{\"type\":\"item.completed\",\"item\":{\"text\":\"try again at 3:00 PM\"}}\n",
+                "{\"type\":\"error\",\"message\":\"You've hit your usage limit.\"}\n",
+            ),
+            Some(Reset::Unknown),
+        ),
     ];
     for (stream, limit) in cases {
         assert_eq!(quota::codex_limit(stream), limit, "{stream}");

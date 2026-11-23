@@ -2,6 +2,8 @@
 //! backend, and the readers that find a backend's out-of-quota signature and its reset time
 //! (spec #1, "Reviewer router").
 
+use serde_json::Value;
+
 use crate::timestamp::Timestamp;
 
 const MILLIS_PER_MINUTE: i64 = 60_000;
@@ -26,6 +28,15 @@ impl Quota {
         match self {
             Quota::CoolingDown { until } if until <= now => Quota::Unknown,
             quota => quota,
+        }
+    }
+
+    /// What this quota becomes when a review reports `learned` at `now`. A review that finished
+    /// says nothing against a cooldown another review hit meanwhile, while that cooldown holds.
+    pub fn learn(self, learned: Quota, now: Timestamp) -> Quota {
+        match (self.at(now), learned) {
+            (Quota::CoolingDown { .. }, Quota::Available | Quota::Unknown) => self,
+            _ => learned,
         }
     }
 }
@@ -121,18 +132,38 @@ impl Reset {
     }
 }
 
-/// Codex's out-of-quota signature in its event stream: "usage limit", with the reset in its
-/// "try again at 12:39 PM" (the last such time the stream names). None when it isn't there.
+/// Codex's out-of-quota signature in its event stream: an error that says "usage limit", with
+/// the reset in its "try again at 12:39 PM" (the last such time its errors name). Only Codex's
+/// own errors count, not what it read while reviewing. None when no error says so.
 pub fn codex_limit(stream: &str) -> Option<Reset> {
-    if !stream.contains("usage limit") {
+    let errors: Vec<String> = stream.lines().filter_map(codex_error).collect();
+    if !errors.iter().any(|error| error.contains("usage limit")) {
         return None;
     }
-    let reset = stream
-        .match_indices("try again at ")
-        .filter_map(|(at, phrase)| clock_time(&stream[at + phrase.len()..]))
+    let reset = errors
+        .iter()
+        .flat_map(|error| {
+            error
+                .match_indices("try again at ")
+                .filter_map(|(at, phrase)| clock_time(&error[at + phrase.len()..]))
+        })
         .last()
         .unwrap_or(Reset::Unknown);
     Some(reset)
+}
+
+/// The error a line of Codex's stream reports: an `error` or `turn.failed` event's message, or
+/// a line that isn't JSON (its stderr). None for its other events.
+fn codex_error(line: &str) -> Option<String> {
+    let Ok(event) = serde_json::from_str::<Value>(line) else {
+        return Some(line.to_owned());
+    };
+    let message = match event.get("type").and_then(Value::as_str)? {
+        "error" => event.get("message"),
+        "turn.failed" => event.get("error").and_then(|error| error.get("message")),
+        _ => None,
+    };
+    message.and_then(Value::as_str).map(str::to_owned)
 }
 
 /// A 12-hour clock time at the start of `text`, such as `12:39 PM`.

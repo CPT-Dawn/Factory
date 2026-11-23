@@ -19,7 +19,6 @@ use factory_adapters::gh::{Gh, Issues};
 use factory_adapters::git::{GitError, GitRepo, Repo};
 use factory_adapters::reviewer::{Claude, Codex, Job, Reviewer, ReviewerError, home_of};
 use factory_core::exit::Exit;
-use factory_core::quota::WhenBusy;
 use factory_core::review::{self, Bundle, Finding, Part, Reading, Record, Verdict};
 use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
@@ -31,7 +30,8 @@ use crate::log;
 use crate::output::{Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{
-    AcquireParams, AcquireResult, BackendSlots, QuotaParams, REVIEW_ACQUIRE, REVIEW_QUOTA,
+    AcquireParams, AcquireResult, BackendSlots, QuotaParam, QuotaParams, REVIEW_ACQUIRE,
+    REVIEW_QUOTA,
 };
 
 /// Lines of context around each change in the bundle's diff, so the reviewer rarely opens a
@@ -55,24 +55,26 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
     review::check_label(&args.label).map_err(|e| Failure::usage(e.to_string()))?;
     let paths = Paths::from_env()?;
     let started = Instant::now();
-    let backends = config::review_backends(&paths);
-    let reviewers: Vec<Box<dyn Reviewer>> = backends
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(reviewer)
-        .collect();
+    let routes = config::review_backends(&paths).map(|backends| {
+        backends
+            .into_iter()
+            .map(|backend| Route {
+                reviewer: reviewer(&backend),
+                backend,
+            })
+            .collect::<Vec<_>>()
+    });
     let mut run = Run::default();
-    let result = match &backends {
-        Ok(backends) => review(args, &paths, backends, &reviewers, &mut run),
+    let result = match &routes {
+        Ok(routes) => review(args, &paths, routes, &mut run),
         Err(failure) => Err(Failure::new(failure.exit, failure.message.clone())),
     };
     let failed = result.as_ref().err().map(|failure| failure.message.clone());
-    let chosen = backends
+    let chosen = routes
         .as_ref()
         .ok()
-        .and_then(|backends| backends.get(run.backend));
-    let reviewer = reviewers.get(run.backend);
+        .and_then(|routes| routes.get(run.backend));
+    let reviewer = chosen.map(|route| &route.reviewer);
     let fallback_from: Vec<&str> = run.cooled.iter().map(|(name, _)| name.as_str()).collect();
     let fallback_from = fallback_from.join(",");
     let record = Record {
@@ -82,7 +84,7 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         base: &args.base,
         head: &run.head,
         spec: &run.spec,
-        backend: chosen.map_or("", |backend| backend.name.as_str()),
+        backend: chosen.map_or("", |route| route.backend.name.as_str()),
         model: reviewer.and_then(|reviewer| reviewer.model()),
         effort: reviewer.and_then(|reviewer| reviewer.effort()),
         duration_s: started.elapsed().as_secs(),
@@ -112,6 +114,12 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
             ),
         )),
     }
+}
+
+/// A configured backend and the adapter that runs it.
+struct Route {
+    backend: Backend,
+    reviewer: Box<dyn Reviewer>,
 }
 
 /// The adapter that runs a configured backend.
@@ -144,13 +152,7 @@ struct Run {
     reading: Option<Reading>,
 }
 
-fn review(
-    args: &Args,
-    paths: &Paths,
-    backends: &[Backend],
-    reviewers: &[Box<dyn Reviewer>],
-    run: &mut Run,
-) -> Result<Done, Failure> {
+fn review(args: &Args, paths: &Paths, routes: &[Route], run: &mut Run) -> Result<Done, Failure> {
     let cwd = env::current_dir().map_err(|e| {
         Failure::precondition(format!(
             "cannot read the working directory: {e}; cd into the repo under review"
@@ -171,31 +173,27 @@ fn review(
     // The daemon holds the backend's slot for as long as this session lives.
     let mut daemon = client::Session::open(paths)?;
     let slots = AcquireParams {
-        backends: backends
+        backends: routes
             .iter()
-            .map(|backend| BackendSlots {
+            .map(|Route { backend, .. }| BackendSlots {
                 name: backend.name.clone(),
                 concurrency: backend.concurrency,
-                when_busy: match backend.when_busy {
-                    WhenBusy::Queue => "queue",
-                    WhenBusy::Next => "next",
-                }
-                .to_owned(),
+                when_busy: backend.when_busy.into(),
             })
             .collect(),
     };
     let text = loop {
         let granted: AcquireResult = daemon.wait(REVIEW_ACQUIRE, &slots)?;
-        let index = backends
+        let index = routes
             .iter()
-            .position(|backend| backend.name == granted.backend)
+            .position(|route| route.backend.name == granted.backend)
             .ok_or_else(|| {
                 Failure::precondition(format!(
                     "the daemon granted an unknown backend {}; restart the daemon",
                     granted.backend
                 ))
             })?;
-        let (backend, reviewer) = (&backends[index], &reviewers[index]);
+        let Route { backend, reviewer } = &routes[index];
         if run.cooled.iter().any(|(name, _)| *name == backend.name) {
             return Err(Failure::precondition(format!(
                 "the daemon granted {} again although it ran out of quota; restart the daemon",
@@ -228,8 +226,9 @@ fn review(
                 let until = reset.until(now, clock::utc_offset(now));
                 let cooling = QuotaParams {
                     backend: backend.name.clone(),
-                    quota: "cooling".to_owned(),
-                    until: Some(until.unix_millis()),
+                    quota: QuotaParam::Cooling {
+                        until: until.unix_millis(),
+                    },
                 };
                 let _: QuotaParams = daemon.call(REVIEW_QUOTA, &cooling)?;
                 run.cooled.push((backend.name.clone(), until));
@@ -248,15 +247,14 @@ fn review(
         }
         let available = QuotaParams {
             backend: backend.name.clone(),
-            quota: "available".to_owned(),
-            until: None,
+            quota: QuotaParam::Available,
         };
         // The review is done whether or not this lands; the next run that cools it down
-        // records its quota again.
+        // records its quota again. The daemon keeps a cooldown another review hit meanwhile.
         let _: Result<QuotaParams, _> = daemon.call(REVIEW_QUOTA, &available);
         break text;
     };
-    let backend = &backends[run.backend];
+    let backend = &routes[run.backend].backend;
     let reading = Reading::of(&text).map_err(|e| {
         Failure::precondition(format!("{e}: {}; read it there", files.report.display()))
     })?;

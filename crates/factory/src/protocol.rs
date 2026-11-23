@@ -5,8 +5,14 @@
 //! `code` is an exit code from [`factory_core::exit`].
 
 use factory_core::event::Fields;
+use factory_core::exit::Exit;
+use factory_core::quota::{Quota, WhenBusy};
+use factory_core::timestamp::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// What to do when the CLI and the daemon don't speak the same protocol.
+pub const MISMATCH: &str = "the daemon may be older than this factory: restart it";
 
 /// Appends one event to the ledger: [`LogParams`] in, [`LogResult`] out.
 pub const LOG: &str = "log";
@@ -46,6 +52,16 @@ pub struct ErrorBody {
     pub message: String,
 }
 
+impl Outcome {
+    /// A refusal with `exit`'s code and a one-line `message`.
+    pub fn refused(exit: Exit, message: String) -> Outcome {
+        Outcome::Error(ErrorBody {
+            code: exit.code(),
+            message,
+        })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LogParams {
     #[serde(rename = "type")]
@@ -71,8 +87,33 @@ pub struct AcquireParams {
 pub struct BackendSlots {
     pub name: String,
     pub concurrency: u32,
-    /// `queue` or `next`.
-    pub when_busy: String,
+    pub when_busy: WhenBusyParam,
+}
+
+/// [`WhenBusy`] on the wire: `queue` or `next`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WhenBusyParam {
+    Queue,
+    Next,
+}
+
+impl From<WhenBusy> for WhenBusyParam {
+    fn from(when_busy: WhenBusy) -> WhenBusyParam {
+        match when_busy {
+            WhenBusy::Queue => WhenBusyParam::Queue,
+            WhenBusy::Next => WhenBusyParam::Next,
+        }
+    }
+}
+
+impl From<WhenBusyParam> for WhenBusy {
+    fn from(when_busy: WhenBusyParam) -> WhenBusy {
+        match when_busy {
+            WhenBusyParam::Queue => WhenBusy::Queue,
+            WhenBusyParam::Next => WhenBusy::Next,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,9 +125,26 @@ pub struct AcquireResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QuotaParams {
     pub backend: String,
-    /// `available` or `cooling`.
-    pub quota: String,
-    /// When a cooling backend resets, in milliseconds since the epoch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub until: Option<i64>,
+    #[serde(flatten)]
+    pub quota: QuotaParam,
+}
+
+/// What a review learned of a backend's quota: `{"quota": "available"}`, or
+/// `{"quota": "cooling", "until": <milliseconds since the epoch>}`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(tag = "quota", rename_all = "lowercase")]
+pub enum QuotaParam {
+    Available,
+    Cooling { until: i64 },
+}
+
+impl From<QuotaParam> for Quota {
+    fn from(quota: QuotaParam) -> Quota {
+        match quota {
+            QuotaParam::Available => Quota::Available,
+            QuotaParam::Cooling { until } => Quota::CoolingDown {
+                until: Timestamp::from_unix_millis(until),
+            },
+        }
+    }
 }

@@ -20,13 +20,11 @@ use crate::clock;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{
-    ErrorBody, LOG, LogParams, LogResult, Outcome, REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response,
+    ErrorBody, LOG, LogParams, LogResult, MISMATCH, Outcome, REVIEW_ACQUIRE, REVIEW_QUOTA, Request,
+    Response,
 };
 use crate::router::Router;
 use crate::store::Store;
-
-/// What to do when the CLI and the daemon don't speak the same protocol.
-const MISMATCH: &str = "the daemon may be older than this factory: restart it";
 
 pub fn run(json: bool) -> Result<Done, Failure> {
     let paths = Paths::from_env()?;

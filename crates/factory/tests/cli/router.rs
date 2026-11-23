@@ -437,3 +437,39 @@ fn every_backend_out_of_quota_exits_75_naming_when_to_retry() {
         "a cooling backend is not run"
     );
 }
+
+#[test]
+fn what_the_config_leaves_unset_is_left_to_codexs_own_config() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    configure(
+        &sandbox,
+        "[[review.backend]]\ncli = \"codex\"\nmodel = \"gpt-test\"\n",
+    );
+    fs::create_dir_all(sandbox.path("home/.codex")).unwrap();
+    fs::write(
+        sandbox.path("home/.codex/config.toml"),
+        "model = \"gpt-own\"\nmodel_reasoning_effort = \"xhigh\"\n",
+    )
+    .unwrap();
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let argv = &sandbox.calls("codex")[0];
+    assert_eq!(after(argv, "-m"), Some("gpt-test"), "{argv:?}");
+    assert!(!argv.iter().any(|arg| arg == "-c"), "{argv:?}");
+    let logged = event(&sandbox, 0);
+    assert_eq!(logged["model"], "gpt-test", "{logged}");
+    assert_eq!(logged["effort"], "xhigh", "{logged}");
+}
+
+/// A fake `codex` body that writes `report` at once.
+fn codex_writes(report: &str) -> String {
+    format!(
+        "out=\nwhile [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n\
+         cat > /dev/null\n\
+         cat > \"$out\" <<'REPORT'\n{report}REPORT"
+    )
+}

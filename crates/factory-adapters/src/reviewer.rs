@@ -67,8 +67,10 @@ pub trait Reviewer {
 pub struct Codex {
     model: Option<String>,
     effort: Option<String>,
-    /// Whether the model and effort are passed on its command line, or are its config file's.
-    pinned: bool,
+    /// Whether the model is passed on its command line, or is its config file's.
+    pinned_model: bool,
+    /// Whether the effort is passed on its command line, or is its config file's.
+    pinned_effort: bool,
 }
 
 impl Codex {
@@ -78,7 +80,8 @@ impl Codex {
     pub fn new(model: Option<String>, effort: Option<String>, codex_home: &Path) -> Codex {
         let config = fs::read_to_string(codex_home.join("config.toml")).unwrap_or_default();
         Codex {
-            pinned: model.is_some() || effort.is_some(),
+            pinned_model: model.is_some(),
+            pinned_effort: effort.is_some(),
             model: model.or_else(|| top_level_string(&config, "model")),
             effort: effort.or_else(|| top_level_string(&config, "model_reasoning_effort")),
         }
@@ -113,14 +116,12 @@ impl Reviewer for Codex {
         let mut cmd = Command::new("codex");
         cmd.arg("exec")
             .args(["--json", "-s", "read-only", "--ephemeral"]);
-        if self.pinned {
-            if let Some(model) = &self.model {
-                cmd.args(["-m", model]);
-            }
-            if let Some(effort) = &self.effort {
-                cmd.arg("-c")
-                    .arg(format!("model_reasoning_effort={}", json!(effort)));
-            }
+        if let Some(model) = self.model.as_ref().filter(|_| self.pinned_model) {
+            cmd.args(["-m", model]);
+        }
+        if let Some(effort) = self.effort.as_ref().filter(|_| self.pinned_effort) {
+            cmd.arg("-c")
+                .arg(format!("model_reasoning_effort={}", json!(effort)));
         }
         cmd.arg("-C")
             .arg(&job.cwd)
