@@ -3,7 +3,8 @@
 //! State resolves as factory-stats resolves it (`$FACTORY_STATE`, else
 //! `${XDG_STATE_HOME:-$HOME/.local/state}/factory`), so both read and write one ledger. The
 //! daemon's socket, locks and pid live in `$XDG_RUNTIME_DIR/factory`, and the config in
-//! `${XDG_CONFIG_HOME:-$HOME/.config}/factory`.
+//! `${XDG_CONFIG_HOME:-$HOME/.config}/factory`. `factory install` puts the binary in
+//! `~/.local/bin` and links the units into systemd's user unit dir.
 
 use std::env;
 use std::ffi::OsString;
@@ -23,6 +24,11 @@ pub struct Paths {
     /// herdr's socket: `$HERDR_SOCKET_PATH`, as herdr sets it in its panes, else herdr's
     /// default `${XDG_CONFIG_HOME:-$HOME/.config}/herdr/herdr.sock`.
     pub herdr: PathBuf,
+    /// Where `factory install` puts the binary: `$HOME/.local/bin`, where the service unit
+    /// runs it from.
+    pub bin: PathBuf,
+    /// systemd's user unit dir: `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user`.
+    pub units: PathBuf,
 }
 
 impl Paths {
@@ -35,14 +41,11 @@ impl Paths {
             (None, Some(dir)) => Path::new(&dir).join("factory"),
             (None, None) => Path::new(&home()).join(".local/state/factory"),
         };
-        let herdr = match (var("HERDR_SOCKET_PATH"), var("XDG_CONFIG_HOME")) {
-            (Some(socket), _) => PathBuf::from(socket),
-            (None, Some(dir)) => Path::new(&dir).join("herdr/herdr.sock"),
-            (None, None) => Path::new(&home()).join(".config/herdr/herdr.sock"),
-        };
-        let config = var("XDG_CONFIG_HOME")
-            .map_or_else(|| Path::new(&home()).join(".config"), PathBuf::from)
-            .join("factory");
+        let config_home = var("XDG_CONFIG_HOME")
+            .map_or_else(|| Path::new(&home()).join(".config"), PathBuf::from);
+        let herdr = var("HERDR_SOCKET_PATH")
+            .map_or_else(|| config_home.join("herdr/herdr.sock"), PathBuf::from);
+        let config = config_home.join("factory");
         let runtime = var("XDG_RUNTIME_DIR").ok_or_else(|| {
             Failure::precondition("XDG_RUNTIME_DIR is not set; run factory inside a user session")
         })?;
@@ -51,6 +54,8 @@ impl Paths {
             runtime: Path::new(&runtime).join("factory"),
             config,
             herdr,
+            bin: Path::new(&home()).join(".local/bin"),
+            units: config_home.join("systemd/user"),
         })
     }
 

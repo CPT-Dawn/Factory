@@ -1,0 +1,10 @@
+[Unit]
+Description=factory daemon socket: the first factory call starts the daemon
+
+[Socket]
+ListenStream=%t/factory/factory.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

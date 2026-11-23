@@ -8,6 +8,7 @@ mod ci;
 mod devlab_golden;
 mod harness;
 mod help;
+mod install;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
 mod lab;
