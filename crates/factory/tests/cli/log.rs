@@ -1,5 +1,8 @@
 //! `factory log <type> key=value…`: one event lands in the ledger, written by the daemon.
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+
 use serde_json::Value;
 
 use crate::support::{Sandbox, finish, lines_of, spawn};
@@ -142,7 +145,7 @@ fn two_hundred_concurrent_logs_land_two_hundred_intact_lines() {
                 (event["type"].as_str(), event["repo"].as_str()),
                 (Some("review"), Some("X"))
             );
-            event["n"].as_i64().unwrap()
+            event["n"].as_str().unwrap().parse::<i64>().unwrap()
         })
         .collect();
     seen.sort_unstable();
@@ -205,4 +208,49 @@ fn the_confirmation_stays_one_short_line_however_long_the_event() {
     assert_eq!(out.stdout_lines().len(), 1, "{out:?}");
     assert!(out.stdout_lines()[0].chars().count() <= 200, "{out:?}");
     assert!(sandbox.ledger_lines()[0].contains(&"x".repeat(300)));
+}
+
+#[test]
+fn a_sha_of_digits_stays_a_string_and_only_counts_become_numbers() {
+    let sandbox = Sandbox::new();
+
+    let out = sandbox.factory(&[
+        "log",
+        "review",
+        "head=0475004",
+        "from=4750048",
+        "round=2",
+        "duration_s=158",
+    ]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let (_, rest) = split_ts(&sandbox.ledger_lines()[0]);
+    assert_eq!(
+        rest,
+        r#"{"ts":"<ts>","type":"review","head":"0475004","from":"4750048","round":2,"duration_s":158}"#
+    );
+}
+
+#[test]
+fn the_daemon_keeps_a_typed_sha_a_string_and_a_count_a_number() {
+    let sandbox = Sandbox::new();
+    assert_eq!(sandbox.factory(&["log", "review", "n=1"]).code, 0);
+    let mut stream = UnixStream::connect(sandbox.path("run/factory/factory.sock")).unwrap();
+    let request = r#"{"id":1,"method":"log","params":{"type":"review","fields":{"head":4750048,"round":"2","tokens":1426343}}}"#;
+
+    writeln!(stream, "{request}").unwrap();
+
+    let answered = BufReader::new(&stream)
+        .lines()
+        .map(Result::unwrap)
+        .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+        .find(|answer| answer.get("note").is_none())
+        .unwrap();
+    assert!(answered.get("result").is_some(), "{answered}");
+    let lines = sandbox.ledger_lines();
+    let (_, rest) = split_ts(&lines[1]);
+    assert_eq!(
+        rest,
+        r#"{"ts":"<ts>","type":"review","head":"4750048","round":2,"tokens":1426343}"#
+    );
 }

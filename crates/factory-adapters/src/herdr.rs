@@ -75,7 +75,9 @@ pub trait HerdrApi: Send + Sync + 'static {
     ) -> impl Future<Output = Result<NewWorktree, HerdrError>> + Send;
 
     /// Starts the Claude agent `name` in `pane_id` with `args` and waits up to `timeout` for
-    /// it to come up.
+    /// it to be ready for input, as herdr's own `agent start` does. One blocked while coming up
+    /// (at the folder-trust dialog, say) is refused with `agent_not_ready` at once, and keeps
+    /// its name for [`HerdrApi::read_agent`] and [`HerdrApi::send_keys`].
     fn start_agent(
         &self,
         name: &str,
@@ -408,9 +410,8 @@ impl HerdrApi for Herdr {
             "args": args,
             "timeout_ms": millis(timeout),
         });
-        self.call_within::<Value>("agent.start", params, timeout)
-            .await
-            .map(drop)
+        self.call::<Value>("agent.start", params).await?;
+        self.until_ready(name, timeout).await
     }
 
     async fn read_agent(&self, name: &str) -> Result<String, HerdrError> {
@@ -467,7 +468,50 @@ fn millis(timeout: Duration) -> u64 {
     u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// How often a starting agent is asked whether it is ready, as herdr's CLI asks.
+const READY_POLL: Duration = Duration::from_millis(100);
+
 impl Herdr {
+    /// Waits up to `patience` for the agent `name` that `agent.start` answered for to be ready
+    /// for input. herdr answers `agent.start` at once, with the launch still pending; its CLI
+    /// then polls `agent.get`, and so does this.
+    async fn until_ready(&self, name: &str, patience: Duration) -> Result<(), HerdrError> {
+        #[derive(Deserialize)]
+        struct Got {
+            agent: Readiness,
+        }
+        #[derive(Deserialize)]
+        struct Readiness {
+            #[serde(default)]
+            agent_status: String,
+            #[serde(default)]
+            launch_pending: bool,
+            #[serde(default)]
+            interactive_ready: bool,
+        }
+        let deadline = tokio::time::Instant::now() + patience;
+        loop {
+            let got: Got = self.call("agent.get", json!({"target": name})).await?;
+            let agent = got.agent;
+            if agent.interactive_ready && !agent.launch_pending {
+                return Ok(());
+            }
+            if agent.agent_status == "blocked" {
+                return Err(HerdrError::Refused {
+                    code: "agent_not_ready".to_owned(),
+                    message: format!("agent {name} is blocked during startup"),
+                });
+            }
+            if tokio::time::Instant::now() + READY_POLL > deadline {
+                return Err(HerdrError::Refused {
+                    code: "agent_not_ready".to_owned(),
+                    message: format!("agent {name} was not ready within {}s", patience.as_secs()),
+                });
+            }
+            tokio::time::sleep(READY_POLL).await;
+        }
+    }
+
     /// Sends one request on a connection of its own and reads its answer.
     async fn call<R: DeserializeOwned>(
         &self,
@@ -477,8 +521,8 @@ impl Herdr {
         self.call_within(method, params, Duration::ZERO).await
     }
 
-    /// Like [`Herdr::call`] for a request herdr may hold for up to `patience` (a wait, or an
-    /// agent coming up) before it answers.
+    /// Like [`Herdr::call`] for a request herdr may hold for up to `patience` (a wait, or a
+    /// prompt waiting for the agent to start working) before it answers.
     async fn call_within<R: DeserializeOwned>(
         &self,
         method: &str,

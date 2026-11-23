@@ -164,7 +164,7 @@ fn restarting_the_daemon_mid_run_loses_no_ledger_line() {
         .iter()
         .map(|line| {
             let event: Value = serde_json::from_str(line).unwrap();
-            let field = |key: &str| usize::try_from(event[key].as_u64().unwrap()).unwrap();
+            let field = |key: &str| event[key].as_str().unwrap().parse::<usize>().unwrap();
             (field("w"), field("n"))
         })
         .collect();
