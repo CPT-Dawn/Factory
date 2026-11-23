@@ -9,6 +9,8 @@ One binary, `factory`:
 - `factory wait`: blocks on CI, a review, a lead or a lease, silently, then prints one line.
 - `factory lead`, `factory monitor`, `factory log`, `factory hook`, `factory status`.
 
+`factory hook pre-tool|post-tool|subagent-stop` answers Claude Code's hooks in about 2 ms, without the daemon. Wire them in `~/.claude/settings.json` (`PreToolUse` on `Bash|REPL`, `PostToolUse`, `SubagentStop`, each a `command` hook running `factory hook <event>`). They block npm, npx, yarn and pnpm (`FACTORY_ALLOW_NPM=1` is the escape), a commit or push adding an address from `[hook] private_addresses`, and a REPL script using `process`, `require` or `BASH_REMATCH`; they flag a tool result over 12k characters, and send back a subagent report longer than its `[hook.report]` template. A hook prints nothing to let a call through, and one protocol JSON line otherwise, so it keeps to its own protocol, not the one-line rule below.
+
 Every command prints one line by default, `--json` on request, and uses fixed exit codes.
 
 Status: being built; `factory log` works, through the daemon, and so does `factory review` on Codex, falling back to Claude, with its backends in `~/.config/factory/config.toml`. The spec is issue #1.
