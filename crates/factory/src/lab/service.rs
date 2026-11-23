@@ -17,6 +17,7 @@ use factory_adapters::docker::{Containers, Docker};
 use factory_adapters::emulator::{EmulatorSpec, Emulators, SystemdEmulators};
 use factory_core::event::{Event, Fields};
 use factory_core::exit::Exit;
+use factory_core::lab::args::{LONGEST_WAIT, wait_span};
 use factory_core::lab::devices::{
     Attached, EmulatorView, HeldBy, Mode, Plan, PlanInput, device_rows, plan_devices,
 };
@@ -59,8 +60,6 @@ const BOOT_LOOK: Duration = Duration::from_secs(2);
 const AWAY_GRACE_MS: i64 = 30_000;
 /// How long a caller may take to say it has its grant before the grant is given back.
 const RECEIVED_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a wait with no end of its own lasts.
-const FOREVER: Duration = Duration::from_secs(365 * 86400);
 
 mod reserve;
 pub use reserve::reserve;
@@ -599,9 +598,8 @@ fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<Queued> {
 }
 
 fn insert(c: &Connection, p: &AcquireParams, now: i64) -> rusqlite::Result<(i64, Option<i64>)> {
-    let deadline_ms = Duration::try_from_secs_f64(p.wait_sec)
+    let deadline_ms = i64::try_from(wait_span(p.wait_sec).as_millis())
         .ok()
-        .and_then(|wait| i64::try_from(wait.as_millis()).ok())
         .and_then(|wait| now_ms().checked_add(wait));
     let name = base_name(&p.worktree);
     let id = store::insert_waiter(
@@ -1187,12 +1185,12 @@ pub async fn acquire<W, R, S>(
         return;
     }
     let now = Instant::now();
-    let left = deadline_ms.map_or(FOREVER, |ms| {
+    let left = deadline_ms.map_or(LONGEST_WAIT, |ms| {
         Duration::from_millis(u64::try_from(ms.saturating_sub(now_ms())).unwrap_or(0))
     });
     let deadline = now
         .checked_add(left)
-        .or_else(|| now.checked_add(FOREVER))
+        .or_else(|| now.checked_add(LONGEST_WAIT))
         .unwrap_or(now);
     let mut said = String::new();
     loop {

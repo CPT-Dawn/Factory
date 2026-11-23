@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use factory_adapters::adb::{Adb, AdbCli};
 use factory_core::exit::Exit;
-use factory_core::lab::args::Opts;
+use factory_core::lab::args::{Opts, wait_span};
 use factory_core::lab::config::{MachineConfig, ProjectConfig, owner_cap};
 use factory_core::lab::devices::Mode;
 use factory_core::lab::emulator::BOOT_TIMEOUT_SEC;
@@ -97,9 +97,8 @@ pub fn ask(
         run,
         reservation: super::context::reserved(),
     };
-    let listen = Duration::try_from_secs_f64(wait_sec)
-        .ok()
-        .and_then(|wait| wait.checked_add(ANSWER_GRACE))
+    let listen = wait_span(wait_sec)
+        .checked_add(ANSWER_GRACE)
         .and_then(|wait| {
             if opts.want > 0 && opts.mode != Mode::Phone {
                 wait.checked_add(BOOT_GRACE)
