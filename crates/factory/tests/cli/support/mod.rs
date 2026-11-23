@@ -40,6 +40,7 @@ pub const FAKED_TOOLS: &[&str] = &[
     "avdmanager",
     "emulator",
     "notify-send",
+    "unshare",
 ];
 
 /// How long any one process a test runs may take before the test fails.

@@ -502,6 +502,12 @@ fn a_run_that_fails_before_the_reviewer_starts_logs_no_report_or_stream() {
         "model = \"gpt-test\"\n",
     )
     .unwrap();
+    fs::create_dir_all(sandbox.path("config/factory")).unwrap();
+    fs::write(
+        sandbox.path("config/factory/config.toml"),
+        "[[review.backend]]\ncli = \"codex\"\n",
+    )
+    .unwrap();
 
     let out = sandbox.factory_in(&repo, &["review", "nope", "t1"]);
 
