@@ -111,7 +111,7 @@ impl Lab {
                  [ -n \"$log\" ] && echo '{SANDBOX_STARTED}' >> \"$log\"\n\
                  {pop}\n\
                  case $step in\n\
-                 hold) timeout 60 sh -c 'until [ -e $1 ]; do sleep 0.05; done' hold '{release}' || exit 9; cat <<'R'\n{agy_result}\nR\n;;\n\
+                 hold) timeout 60 sh -c 'until [ -e \"$1\" ]; do sleep 0.05; done' hold '{release}' || exit 9; cat <<'R'\n{agy_result}\nR\n;;\n\
                  ok) cat <<'R'\n{agy_result}\nR\n;;\n\
                  quota) cat <<'R'\n{agy_quota}\nR\n\
                  echo 'AGY_ERROR: Individual quota reached. Resets in 2h0m0s' >&2; exit 3;;\n\
