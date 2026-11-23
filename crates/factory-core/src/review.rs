@@ -458,13 +458,20 @@ impl Record<'_> {
             pairs.push(format!("blocking={blocking}"));
             pairs.push(format!("advisory={advisory}"));
             pairs.push(format!("question={question}"));
-            pairs.extend(
-                reading
-                    .tallies
-                    .iter()
-                    .filter(|word| word.contains('='))
-                    .cloned(),
-            );
+            // A FINDINGS word joins only when it is `key=value` with a lowercase key the event
+            // doesn't already set, so a stray word can neither overwrite a field nor be refused.
+            let taken: Vec<String> = pairs
+                .iter()
+                .filter_map(|pair| Some(pair.split_once('=')?.0.to_owned()))
+                .collect();
+            let joins = |word: &&String| {
+                word.split_once('=').is_some_and(|(key, _)| {
+                    !key.is_empty()
+                        && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+                        && !taken.iter().any(|own| own == key)
+                })
+            };
+            pairs.extend(reading.tallies.iter().filter(joins).cloned());
         }
         pairs
     }
@@ -659,7 +666,7 @@ mod tests {
     #[test]
     fn an_ok_record_carries_its_counts_and_the_findings_words() {
         let reading =
-            Reading::of("FINDINGS: standards_hard=1 junk tags=x\nVERDICT: findings\n").unwrap();
+            Reading::of("FINDINGS: standards_hard=9\nFINDINGS: standards_hard=1 junk =x outcome=lie Bad=1 tags=x\nVERDICT: findings\n").unwrap();
         let pairs = record(Ok(&reading)).pairs();
         for pair in [
             "outcome=ok",
