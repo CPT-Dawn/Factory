@@ -16,7 +16,7 @@ use factory_adapters::docker::{Containers, Docker};
 use factory_adapters::emulator::{EmulatorSpec, Emulators, SystemdEmulators};
 use factory_core::exit::Exit;
 use factory_core::lab::devices::{
-    Attached, EmulatorView, Held, HeldBy, Mode, Plan, PlanInput, device_rows, lost, plan_devices,
+    Attached, EmulatorView, HeldBy, Mode, Plan, PlanInput, device_rows, plan_devices,
 };
 use factory_core::lab::emulator::{
     Boot, Settle, State, after_restart, boot_step, booting_note, free_indexes, serial_of, unit_name,
@@ -669,7 +669,7 @@ async fn settle<W: AsyncWrite + Unpin>(
             blocking(move || {
                 lab.write(|c, now| {
                     for serial in phones.iter().chain(&reused) {
-                        store::delete_lease_device(c, serial)?;
+                        store::delete_held_device(c, lease_id, serial)?;
                     }
                     for serial in &reused {
                         store::emulator_idle(c, serial, now)?;
@@ -713,17 +713,7 @@ async fn settle<W: AsyncWrite + Unpin>(
     let seen = lab.attached().await;
     let lease = lab.write(|c, _| store::lease(c, lease_id))?;
     let lease = with_states(lease.unwrap_or(taken.granted.lease), &seen);
-    let held: Vec<Held> = lease
-        .devices
-        .iter()
-        .map(|d| Held {
-            serial: d.serial.clone(),
-            kind: d.kind.clone(),
-            model: d.model.clone(),
-            state: d.state.clone(),
-        })
-        .collect();
-    match lost(&held) {
+    match lease.lost() {
         Some(why) => Err(ErrorBody {
             code: Exit::DeviceLost.code(),
             message: why,

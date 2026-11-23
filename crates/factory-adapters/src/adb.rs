@@ -156,8 +156,8 @@ fn kill_group(pid: u32) {
 
 /// Kills the stream's process group unless it shows bytes, or is dropped, within
 /// [`FIRST_FRAME`]. The stream is not reaped before it is dropped, so the group is still its.
-fn watch_first_frame(pid: u32, done: Arc<(Mutex<bool>, Condvar)>) {
-    let _ = std::thread::Builder::new()
+fn watch_first_frame(pid: u32, done: Arc<(Mutex<bool>, Condvar)>) -> std::io::Result<()> {
+    std::thread::Builder::new()
         .name("adb-track-first".to_owned())
         .spawn(move || {
             let (flag, cvar) = &*done;
@@ -168,7 +168,8 @@ fn watch_first_frame(pid: u32, done: Arc<(Mutex<bool>, Condvar)>) {
             if !*guard {
                 kill_group(pid);
             }
-        });
+        })
+        .map(drop)
 }
 
 impl TrackDevices for AdbTrack {
@@ -181,8 +182,14 @@ impl TrackDevices for AdbTrack {
             .process_group(0)
             .spawn()?;
         let done = Arc::new((Mutex::new(false), Condvar::new()));
-        watch_first_frame(child.id(), Arc::clone(&done));
-        Ok(Box::new(Stream { child, done }))
+        let pid = child.id();
+        // A stream with no watchdog is not handed out: dropping it kills its group.
+        let stream = Stream {
+            child,
+            done: Arc::clone(&done),
+        };
+        watch_first_frame(pid, done)?;
+        Ok(Box::new(stream))
     }
 }
 

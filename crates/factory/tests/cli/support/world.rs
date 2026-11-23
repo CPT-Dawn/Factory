@@ -110,11 +110,12 @@ impl World {
 
     /// Waits until every `adb track-devices -l` that runs on the world has streamed its device
     /// list as it is now, so that a call after a plug or unplug finds the daemon's tracker up
-    /// to date. Each stream writes the list it streamed last to `tracked.<pid>`.
+    /// to date. Each stream writes the list it streamed last to `tracked.<pid>`. The list is
+    /// read again on each look: a fake the daemon runs may change it meanwhile.
     pub fn settle_trackers(&self) {
-        let devices = fs::read_to_string(self.dir.join("devices")).unwrap_or_default();
-        let devices = devices.trim_end_matches('\n');
         let settled = poll_until(|| {
+            let devices = fs::read_to_string(self.dir.join("devices")).unwrap_or_default();
+            let devices = devices.trim_end_matches('\n');
             let Ok(entries) = fs::read_dir(&self.dir) else {
                 return true;
             };
@@ -127,10 +128,20 @@ impl World {
                     || fs::read_to_string(entry.path()).is_ok_and(|shown| shown == devices)
             })
         });
-        assert!(
-            settled,
-            "adb track-devices never streamed the world's devices"
-        );
+        if !settled {
+            let streams: Vec<String> = fs::read_dir(&self.dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let pid = name.strip_prefix("tracked.")?.to_owned();
+                    let shown = fs::read_to_string(entry.path()).unwrap_or_default();
+                    Some(format!("{pid} (runs: {}): {shown:?}", process_runs(&pid)))
+                })
+                .collect();
+            panic!("adb track-devices never streamed the world's devices: {streams:?}");
+        }
     }
 
     /// A worktree named `name` under the sandbox, made on first use. One whose name starts

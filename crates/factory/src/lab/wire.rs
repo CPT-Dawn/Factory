@@ -1,6 +1,7 @@
 //! The lab's daemon methods and what they carry. The CLI reads configs, finds the owner and runs
 //! stacks; the daemon keeps the lease store and decides grants.
 
+use factory_core::lab::devices::{Held, lost};
 use factory_core::lab::queue::{Holding, QueueEntry};
 use serde::{Deserialize, Serialize};
 
@@ -125,6 +126,22 @@ pub struct Lease {
 }
 
 impl Lease {
+    /// Why the lease can't be used because a device it holds is gone or not usable, by the
+    /// states its devices were filled with; none when each is attached as `device`.
+    pub fn lost(&self) -> Option<String> {
+        let held: Vec<Held> = self
+            .devices
+            .iter()
+            .map(|d| Held {
+                serial: d.serial.clone(),
+                kind: d.kind.clone(),
+                model: d.model.clone(),
+                state: d.state.clone(),
+            })
+            .collect();
+        lost(&held)
+    }
+
     pub fn owner_key(&self) -> String {
         format!("{}:{}", self.owner_pid, self.owner_start)
     }

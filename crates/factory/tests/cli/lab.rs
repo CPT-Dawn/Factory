@@ -268,7 +268,12 @@ fn boot_in_background(sandbox: &Sandbox, dir: &Path, ask: &str) -> std::process:
     let mut cmd = devlab(sandbox, dir, &["acquire", ask]);
     cmd.env("DEVLAB_OWNER_PID", std::process::id().to_string());
     let child = spawn(cmd);
-    let booting = poll_until(|| status(sandbox, dir).contains(" booting "));
+    // Booting shows from the grant; the emulator's unit starts a moment later.
+    let unit_ports = sandbox.path("world/unit-ports");
+    let booting = poll_until(|| {
+        status(sandbox, dir).contains(" booting ")
+            && fs::read_to_string(&unit_ports).is_ok_and(|u| u.contains("devlab-emu-0"))
+    });
     assert!(
         booting,
         "the emulator never showed as booting: {}",
@@ -327,7 +332,9 @@ fn an_emulator_whose_unit_ends_while_it_boots_is_never_ready_and_is_forgotten() 
         "devlab: booting 1 emulator(s), about a minute (quick boot) or three (first boot)\n\
          devlab: devlab-emu-0 exited while booting; see: journalctl --user -u devlab-emu-0 -n 50\n"
     );
-    assert!(status(&sandbox, &wt).starts_with("devices: none attached\n"));
+    // Status shows what adb lists, which drops the emulator once its stream says so.
+    let gone = poll_until(|| status(&sandbox, &wt).starts_with("devices: none attached\n"));
+    assert!(gone, "{}", status(&sandbox, &wt));
     // The lease stays, with no device in it.
     let env = owned(&sandbox, &wt, &["env"]);
     assert_eq!(
@@ -408,6 +415,8 @@ fn a_phone_unplugged_while_its_pair_boots_gives_the_acquire_exit_76() {
     let child = boot_in_background(&sandbox, &wt, "--pair");
 
     world.apply("unplug FAKEPHONE01").unwrap();
+    let seen = poll_until(|| !status(&sandbox, &wt).contains("Pixel 8        ready"));
+    assert!(seen, "the unplug never showed: {}", status(&sandbox, &wt));
     fs::write(sandbox.path("world/stalled"), "").unwrap();
     let out = finish(child);
 
@@ -417,5 +426,33 @@ fn a_phone_unplugged_while_its_pair_boots_gives_the_acquire_exit_76() {
             "devlab: phone FAKEPHONE01 (Pixel 8) is unplugged: run devlab acquire to replace it\n"
         ),
         "{out:?}"
+    );
+}
+
+#[test]
+fn a_failed_boot_takes_back_nothing_another_lease_was_granted_since() {
+    let (sandbox, world) = lab();
+    let (a, b) = (world.worktree("plain-a"), world.worktree("plain-b"));
+    world
+        .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
+        .unwrap();
+    world.apply("stall emulator-5580").unwrap();
+    let child = boot_in_background(&sandbox, &a, "--pair");
+    let released = owned(&sandbox, &a, &["release"]);
+    assert_eq!(released.code, 0, "{released:?}");
+    let taken = owned(&sandbox, &b, &["acquire", "--phone", "--quiet"]);
+    assert_eq!(taken.code, 0, "{taken:?}");
+
+    let killed = run(sandbox.command("systemctl", &["--user", "stop", "devlab-emu-0"]));
+    assert_eq!(killed.code, 0, "{killed:?}");
+    assert_eq!(finish(child).code, 77);
+
+    let env = owned(&sandbox, &b, &["env"]);
+    assert_eq!(env.code, 0, "{env:?}");
+    assert!(env.stdout.contains("ANDROID_SERIAL=FAKEPHONE01"), "{env:?}");
+    assert!(
+        !status(&sandbox, &b).contains("Pixel 8        ready        free"),
+        "{}",
+        status(&sandbox, &b)
     );
 }

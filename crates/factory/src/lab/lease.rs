@@ -7,7 +7,7 @@ use factory_adapters::adb::{Adb, AdbCli};
 use factory_core::exit::Exit;
 use factory_core::lab::args::Opts;
 use factory_core::lab::config::{MachineConfig, ProjectConfig, owner_cap};
-use factory_core::lab::devices::{Held, Mode, lost};
+use factory_core::lab::devices::Mode;
 use factory_core::lab::emulator::BOOT_TIMEOUT_SEC;
 use factory_core::lab::slots::{Env, slot_env};
 
@@ -187,17 +187,7 @@ pub fn live(ctx: &Ctx) -> Result<Lease, Failure> {
             ),
         )
     })?;
-    let held: Vec<Held> = lease
-        .devices
-        .iter()
-        .map(|d| Held {
-            serial: d.serial.clone(),
-            kind: d.kind.clone(),
-            model: d.model.clone(),
-            state: d.state.clone(),
-        })
-        .collect();
-    match lost(&held) {
+    match lease.lost() {
         Some(why) => Err(Failure::new(Exit::DeviceLost, why)),
         None => Ok(lease),
     }

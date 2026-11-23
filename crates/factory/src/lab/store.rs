@@ -162,6 +162,15 @@ pub fn insert_lease_device(c: &Connection, lease: i64, d: &LeaseDevice) -> rusql
     Ok(())
 }
 
+/// Takes `serial` from lease `lease`; a device another lease holds now stays with it.
+pub fn delete_held_device(c: &Connection, lease: i64, serial: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "DELETE FROM lease_devices WHERE serial = ?1 AND lease_id = ?2",
+        params![serial, lease],
+    )?;
+    Ok(())
+}
+
 pub fn delete_lease_device(c: &Connection, serial: &str) -> rusqlite::Result<()> {
     c.execute("DELETE FROM lease_devices WHERE serial = ?1", [serial])?;
     Ok(())
@@ -209,10 +218,11 @@ pub fn set_emulator_ready(
     Ok(())
 }
 
-/// No lease holds the emulator any more: it idles from `now`.
+/// The emulator idles from `now`, unless a lease holds it.
 pub fn emulator_idle(c: &Connection, serial: &str, now: i64) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE emulators SET idle_since = ?2 WHERE serial = ?1",
+        "UPDATE emulators SET idle_since = ?2
+         WHERE serial = ?1 AND serial NOT IN (SELECT serial FROM lease_devices)",
         params![serial, now],
     )?;
     Ok(())
