@@ -86,12 +86,11 @@ fn leak(input: &Value, actions: &[GitAction]) -> Result<Option<String>, Failure>
         let diff = GitRepo::at(&dir)
             .staged_diff(action.tracked, action.added.as_deref())
             .map_err(|e| {
-                Failure::precondition(format!(
-                    "The hook could not read what would be committed in {} ({}): run git -C {} status to see why, then commit again.",
-                    dir.display(),
-                    e.0.lines().next().unwrap_or_default(),
-                    dir.display()
-                ))
+                // Neither the path nor git's words: they may carry the address.
+                let _ = e;
+                Failure::precondition(
+                    "The hook could not read what would be committed: run git -C <the repository> status to see why, then commit again.",
+                )
             })?;
         if let Some(reason) = hook::private_address(&diff, &addresses) {
             return Ok(Some(reason));

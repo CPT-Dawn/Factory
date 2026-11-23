@@ -308,32 +308,50 @@ pub fn private_address(diff: &str, addresses: &[String]) -> Option<String> {
     if needles.is_empty() {
         return None;
     }
+    let has = |text: &str| {
+        let lowered = text.to_lowercase();
+        needles
+            .iter()
+            .any(|needle| lowered.contains(needle.as_str()))
+    };
+    let refusal = |named: &str| {
+        Some(format!(
+            "The staged diff adds a private address in {named}: remove it, or unstage that file, then commit again."
+        ))
+    };
+    // The name may carry the address too; the line must not.
+    let name_of = |file: &str| {
+        if has(file) {
+            "a file whose name has it (see git diff --cached --name-only)".to_owned()
+        } else {
+            file.to_owned()
+        }
+    };
     let mut file = "";
     let mut in_header = false;
+    // A file whose new path carries the address leaks it even when its content is clean,
+    // unless the diff deletes it.
+    let mut named = false;
+    let mut deleted = false;
     for line in diff.lines() {
         if let Some(names) = line.strip_prefix("diff --git ") {
+            if named && !deleted {
+                return refusal(&name_of(file));
+            }
             in_header = true;
             file = names.rsplit_once(" b/").map_or(names, |(_, new)| new);
+            named = has(file);
+            deleted = false;
         } else if line.starts_with("@@") {
             in_header = false;
-        } else if !in_header && line.starts_with('+') {
-            let added = line.to_lowercase();
-            if needles.iter().any(|needle| added.contains(needle.as_str())) {
-                // The name may carry the address too; the line must not.
-                let lowered = file.to_lowercase();
-                let named = if needles
-                    .iter()
-                    .any(|needle| lowered.contains(needle.as_str()))
-                {
-                    "a file whose name has it (see git diff --cached --name-only)"
-                } else {
-                    file
-                };
-                return Some(format!(
-                    "The staged diff adds a private address in {named}: remove it, or unstage that file, then commit again."
-                ));
-            }
+        } else if in_header && line.starts_with("deleted file mode") {
+            deleted = true;
+        } else if !in_header && line.starts_with('+') && has(line) {
+            return refusal(&name_of(file));
         }
+    }
+    if named && !deleted {
+        return refusal(&name_of(file));
     }
     None
 }

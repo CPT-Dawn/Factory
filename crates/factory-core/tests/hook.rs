@@ -575,8 +575,7 @@ fn a_staged_diff_adding_a_private_address_is_refused_naming_the_file() {
 fn a_private_address_that_is_only_removed_or_in_context_passes() {
     let removed = "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-me@example.invalid\n+clean\n";
     let context = "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1,2 +1,2 @@\n me@example.invalid\n-a\n+b\n";
-    let header = "diff --git a/me@example.invalid b/me@example.invalid\n--- a/me@example.invalid\n+++ b/me@example.invalid\n@@ -1 +1 @@\n-a\n+b\n";
-    for diff in [removed, context, header, ""] {
+    for diff in [removed, context, ""] {
         assert_eq!(
             private_address(diff, &addresses(&["me@example.invalid"])),
             None,
@@ -612,4 +611,31 @@ fn a_file_named_with_the_private_address_is_not_named_in_the_line() {
         !reason.to_lowercase().contains("example.invalid"),
         "{reason}"
     );
+}
+
+#[test]
+fn a_new_or_renamed_file_named_with_the_address_is_refused_even_with_clean_content() {
+    let created = "diff --git a/me@example.invalid.txt b/me@example.invalid.txt\nnew file mode 100644\nindex 0000000..e69de29\n";
+    let renamed = "diff --git a/old.txt b/me@example.invalid.txt\nsimilarity index 100%\nrename from old.txt\nrename to me@example.invalid.txt\n";
+    let deleted = "diff --git a/me@example.invalid.txt b/me@example.invalid.txt\ndeleted file mode 100644\n--- a/me@example.invalid.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n";
+    let addresses = addresses(&["me@example.invalid"]);
+    for diff in [created, renamed] {
+        let reason = private_address(diff, &addresses).expect(diff);
+        assert!(
+            !reason.to_lowercase().contains("example.invalid"),
+            "{reason}"
+        );
+    }
+    assert_eq!(private_address(deleted, &addresses), None);
+}
+
+#[test]
+fn a_wrappers_long_options_take_their_values_too() {
+    for command in [
+        "sudo --user root npm i",
+        "sudo --user=root npm i",
+        "env --unset HOME npm i",
+    ] {
+        assert!(blocked(&bash(command), false).is_some(), "{command:?}");
+    }
 }

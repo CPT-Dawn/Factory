@@ -229,6 +229,15 @@ const OPTIONS_WITH_VALUE: &[(&str, &str)] = &[
     ("env", "-C"),
     ("env", "-S"),
     ("nice", "-n"),
+    ("sudo", "--user"),
+    ("sudo", "--group"),
+    ("sudo", "--host"),
+    ("sudo", "--prompt"),
+    ("sudo", "--chdir"),
+    ("env", "--unset"),
+    ("env", "--chdir"),
+    ("env", "--split-string"),
+    ("nice", "--adjustment"),
 ];
 
 fn is_assignment(word: &str) -> bool {

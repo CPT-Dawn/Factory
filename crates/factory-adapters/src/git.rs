@@ -153,10 +153,13 @@ impl Repo for GitRepo {
 
     fn staged_diff(&self, tracked: bool, added: Option<&[String]>) -> Result<String, GitError> {
         let diff = ["diff", "--no-color", "--no-ext-diff"];
-        let mut text = if tracked {
-            // Before the first commit there is no HEAD to compare with.
-            self.git(&[&diff[..], &["HEAD"]].concat())
-                .or_else(|_| self.git(&[&diff[..], &["--cached"]].concat()))?
+        // Before the first commit there is no HEAD to compare with; any other failure is real.
+        let head = self
+            .output(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])?
+            .status
+            .success();
+        let mut text = if tracked && head {
+            self.git(&[&diff[..], &["HEAD"]].concat())?
         } else {
             self.git(&[&diff[..], &["--cached"]].concat())?
         };
@@ -170,11 +173,8 @@ impl Repo for GitRepo {
         let spec: Vec<&str> = paths.iter().map(String::as_str).collect();
         if !tracked {
             let tail = [&["--"][..], &spec].concat();
-            text.push_str(
-                &self
-                    .git(&[&diff[..], &["HEAD"], &tail].concat())
-                    .or_else(|_| self.git(&[&diff[..], &tail].concat()))?,
-            );
+            let against = if head { &["HEAD"][..] } else { &[] };
+            text.push_str(&self.git(&[&diff[..], against, &tail].concat())?);
         }
         let listing = [
             &[
