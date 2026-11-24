@@ -30,7 +30,7 @@ and counts, never its text.
 | `lab-lease` | `action=start|end`, `lease`, `project`, `owner` (label), `worktree` (basename), `devices` (`kind:model,…`), `count`, `slot`, `reservation`; on `end` also `seconds`, `idle_seconds` (no exec or run running), `reason=run-end|release|owner-exit|reclaim|settle-failed` |
 | `lab-wait` | `action=granted|gave-up`, `waiter`, `asked=phone|emulator|any|none`, `count`, `stack=yes|no`, `seconds`, `wait` (the last reason's kind: `none`, `phones`, `emulator-cap`, `device-cap`, `slot-cap`, `memory`, `queue`, `slots`, `adb`, `reprobe`, `other`), and its numbers: `busy`, `locked`, `asleep`, `stay_awake_off`, `offline`, `unauthorized`, `cap` |
 | `lab-reclaim` | `lease`, `kind`, `model`, `idle_minutes`. No `waiter`: the device is free once taken, and the waiter that gets it writes its own `lab-wait action=granted` |
-| `lab-readiness` | `model`, `phone` (short id), `from` (`none` when first seen), `to`, `notified=true|false` (the change earned a notification and notifications are on; whether notify-send then delivered it is in the daemon's log) |
+| `lab-readiness` | `model`, `phone` (short id), `from` (`none` when first seen), `to`, `notified=true|false` (the change earned a notification and notifications are on; whether notify-send then delivered it is in the daemon's log, and an offline held back 3 s that its unplug followed is said as the unplug alone) |
 
 The last reason a request waited for is kept in `lab.db` until the request is gone, so a wait
 that runs out across a daemon restart, or a grant handed over after one, still says what it
