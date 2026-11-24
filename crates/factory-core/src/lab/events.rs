@@ -167,9 +167,20 @@ fn wait_fields(
 }
 
 /// The `lab-wait` event of request `waiter` granted after `seconds`; `why`, the last reason
-/// it waited for, if it waited. `waiter` is what a `lab-reclaim` names.
-pub fn wait_granted(waiter: i64, asked: &Asked, seconds: u64, why: Option<&str>) -> Fields {
-    wait_fields("granted", waiter, asked, seconds, why)
+/// it waited for, if it waited; `reclaimed`, the lease a device it took was reclaimed from,
+/// which joins it to that `lab-reclaim`.
+pub fn wait_granted(
+    waiter: i64,
+    asked: &Asked,
+    seconds: u64,
+    why: Option<&str>,
+    reclaimed: Option<i64>,
+) -> Fields {
+    let mut out = wait_fields("granted", waiter, asked, seconds, why);
+    if let Some(lease) = reclaimed {
+        put(&mut out, "reclaimed", lease);
+    }
+    out
 }
 
 /// The `lab-wait` event of request `waiter` that gave up after `seconds`, waiting for `why`.
@@ -243,14 +254,9 @@ pub fn wait_reason(why: &str) -> Fields {
 }
 
 /// The `lab-reclaim` event of a `kind` device (`model`) taken from lease `lease`, which ran
-/// nothing for `idle_minutes`, for waiter `waiter`.
-pub fn reclaim(
-    lease: i64,
-    kind: &str,
-    model: &str,
-    idle_minutes: i64,
-    waiter: Option<i64>,
-) -> Fields {
+/// nothing for `idle_minutes`. Which waiter it went to is known once one takes it: that
+/// grant's `lab-wait` names this lease as `reclaimed`.
+pub fn reclaim(lease: i64, kind: &str, model: &str, idle_minutes: i64) -> Fields {
     let mut out = Fields::new();
     put(&mut out, "lease", lease);
     put(&mut out, "kind", kind);
@@ -258,9 +264,6 @@ pub fn reclaim(
         put(&mut out, "model", model);
     }
     put(&mut out, "idle_minutes", idle_minutes.max(0));
-    if let Some(waiter) = waiter {
-        put(&mut out, "waiter", waiter);
-    }
     out
 }
 

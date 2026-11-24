@@ -28,8 +28,8 @@ and counts, never its text.
 | type | fields |
 | --- | --- |
 | `lab-lease` | `action=start|end`, `lease`, `project`, `owner` (label), `worktree` (basename), `devices` (`kind:model,…`), `count`, `slot`, `reservation`; on `end` also `seconds`, `idle_seconds` (no exec or run running), `reason=run-end|release|owner-exit|reclaim|settle-failed` |
-| `lab-wait` | `action=granted|gave-up`, `waiter`, `asked=phone|emulator|any|none`, `count`, `stack=yes|no`, `seconds`, `wait` (the last reason's kind: `none`, `phones`, `emulator-cap`, `device-cap`, `slot-cap`, `memory`, `queue`, `slots`, `adb`, `reprobe`, `other`), and its numbers: `busy`, `locked`, `asleep`, `stay_awake_off`, `offline`, `unauthorized`, `cap` |
-| `lab-reclaim` | `lease`, `kind`, `model`, `idle_minutes`, `waiter` (the oldest waiter short of that kind, whom the queue serves first: join it to that waiter's `lab-wait`) |
+| `lab-wait` | `action=granted|gave-up`, `waiter`, `asked=phone|emulator|any|none`, `count`, `stack=yes|no`, `seconds`, `wait` (the last reason's kind: `none`, `phones`, `emulator-cap`, `device-cap`, `slot-cap`, `memory`, `queue`, `slots`, `adb`, `reprobe`, `other`), and its numbers: `busy`, `locked`, `asleep`, `stay_awake_off`, `offline`, `unauthorized`, `cap`; on `granted` also `reclaimed` (the lease a device it took was reclaimed from) when it took one |
+| `lab-reclaim` | `lease`, `kind`, `model`, `idle_minutes`; the waiter it went to is the one whose granted `lab-wait` says `reclaimed=<lease>`, known only once a grant takes the device |
 | `lab-readiness` | `model`, `phone` (short id), `from` (`none` when first seen), `to`, `notified=true|false` (the change earned a notification and notifications are on; whether notify-send then delivered it is in the daemon's log) |
 
 The last reason a request waited for is kept in `lab.db` until the request is gone, so a wait

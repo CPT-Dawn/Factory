@@ -1462,9 +1462,11 @@ fn try_grant(
                         state: None,
                     },
                 )?;
+                events::took(c, waiter, serial)?;
                 phones.push(serial.clone());
             }
             for serial in &plan.reuse {
+                events::took(c, waiter, serial)?;
                 store::insert_lease_device(c, lease.id, &emulator_device(serial))?;
                 store::emulator_held(c, serial)?;
                 reused.push(serial.clone());

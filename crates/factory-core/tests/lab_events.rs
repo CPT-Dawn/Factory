@@ -200,18 +200,36 @@ fn a_wait_says_what_was_asked_how_long_it_waited_and_its_last_reason() {
         stack: false,
     };
     assert_eq!(
-        object(&wait_granted(5, &none, 0, None)),
+        object(&wait_granted(5, &none, 0, None, None)),
         json!({"action": "granted", "waiter": 5, "asked": "none", "count": 0, "stack": "no", "seconds": 0, "wait": "none"})
     );
 }
 
 #[test]
-fn a_reclaim_names_the_lease_device_idle_minutes_and_waiter() {
-    let fields = reclaim(7, "phone", "Pixel_8", 12, Some(9));
+fn a_grant_that_took_a_reclaimed_device_names_the_lease_it_was_reclaimed_from() {
+    let asked = Asked {
+        mode: Some("phone".to_owned()),
+        count: 1,
+        stack: false,
+    };
+    let granted = wait_granted(
+        5,
+        &asked,
+        3,
+        Some("no free phone: 1 phone(s) busy"),
+        Some(7),
+    );
+    numbers_are_listed(&granted);
+    assert_eq!(granted["reclaimed"], 7, "{}", object(&granted));
+}
+
+#[test]
+fn a_reclaim_names_the_lease_device_and_idle_minutes() {
+    let fields = reclaim(7, "phone", "Pixel_8", 12);
     numbers_are_listed(&fields);
     assert_eq!(
         object(&fields),
-        json!({"lease": 7, "kind": "phone", "model": "Pixel_8", "idle_minutes": 12, "waiter": 9})
+        json!({"lease": 7, "kind": "phone", "model": "Pixel_8", "idle_minutes": 12})
     );
 }
 

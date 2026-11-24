@@ -22,6 +22,11 @@ CREATE TABLE IF NOT EXISTS lab_events (
   kind TEXT NOT NULL,
   fields TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reclaim_handoffs (
+  serial TEXT PRIMARY KEY,
+  lease INTEGER NOT NULL,
+  waiter INTEGER
+);
 CREATE TABLE IF NOT EXISTS wait_reasons (
   waiter INTEGER PRIMARY KEY,
   why TEXT NOT NULL
@@ -243,6 +248,13 @@ pub fn wait_event(
             |row| row.get(0),
         )
         .optional()?;
+    let reclaimed: Option<i64> = c
+        .query_row(
+            "SELECT lease FROM reclaim_handoffs WHERE waiter = ?1 ORDER BY rowid LIMIT 1",
+            [waiter],
+            |row| row.get(0),
+        )
+        .optional()?;
     let why = why.map(str::to_owned).or(kept).unwrap_or_default();
     let seconds = u64::try_from(now.saturating_sub(created.unwrap_or(now))).unwrap_or(0);
     Ok(if granted {
@@ -251,18 +263,28 @@ pub fn wait_event(
             asked,
             seconds,
             Some(why.as_str()).filter(|w| !w.is_empty()),
+            reclaimed,
         )
     } else {
         event::wait_gave_up(waiter, asked, seconds, &why)
     })
 }
 
-/// The oldest waiter short of a device `kind` can serve: who a reclaimed device goes to.
-pub fn waiter_for(c: &Connection, kind: &str) -> rusqlite::Result<Option<i64>> {
-    c.query_row(
-        "SELECT waiter FROM waiter_devices WHERE mode = ?1 OR mode = 'any' ORDER BY waiter LIMIT 1",
-        [kind],
-        |row| row.get(0),
-    )
-    .optional()
+/// Device `serial` was reclaimed from lease `lease`: the grant that takes it says so.
+pub fn reclaimed(c: &Connection, serial: &str, lease: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT OR REPLACE INTO reclaim_handoffs (serial, lease) VALUES (?1, ?2)",
+        params![serial, lease],
+    )?;
+    Ok(())
+}
+
+/// Waiter `waiter` is granted device `serial`: if it was reclaimed and no grant has taken it
+/// since, this one did, and its `lab-wait` names the lease it came from.
+pub fn took(c: &Connection, waiter: i64, serial: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE reclaim_handoffs SET waiter = ?1 WHERE serial = ?2 AND waiter IS NULL",
+        params![waiter, serial],
+    )?;
+    Ok(())
 }
