@@ -280,40 +280,34 @@ fn a_grant_probes_a_ready_phone_again_after_10_s_and_one_that_is_not_ready_every
 #[test]
 fn a_grant_takes_a_phone_adb_cannot_use_as_adb_shows_it_whatever_its_last_probe_found() {
     assert_eq!(
-        for_grant("unauthorized", Some((Readiness::Locked, AT)), AT),
+        for_grant("unauthorized", Some((Readiness::Locked, 0))),
         Some(Readiness::Unauthorized)
     );
     assert_eq!(
-        for_grant("unauthorized", None, AT),
+        for_grant("unauthorized", None),
         Some(Readiness::Unauthorized)
     );
     assert_eq!(
-        for_grant("offline", Some((Readiness::Ready, AT)), AT),
+        for_grant("offline", Some((Readiness::Ready, 0))),
         Some(Readiness::Offline)
     );
 }
 
 #[test]
 fn a_grant_believes_a_usable_phone_s_probe_and_a_ready_one_for_10_s() {
-    assert_eq!(for_grant("device", None, AT), Some(Readiness::Offline));
+    assert_eq!(for_grant("device", None), Some(Readiness::Offline));
     assert_eq!(
-        for_grant("device", Some((Readiness::Locked, AT)), later(60_000)),
+        for_grant("device", Some((Readiness::Locked, 60_000))),
         Some(Readiness::Locked)
     );
     assert_eq!(
-        for_grant("device", Some((Readiness::Ready, AT)), later(10_000)),
+        for_grant("device", Some((Readiness::Ready, 10_000))),
         Some(Readiness::Ready)
     );
     // Too old to grant on: the grant has it probed again.
-    assert_eq!(
-        for_grant("device", Some((Readiness::Ready, AT)), later(10_001)),
-        None
-    );
+    assert_eq!(for_grant("device", Some((Readiness::Ready, 10_001))), None);
     // Minutes old, as a probe of a phone locked since is.
-    assert_eq!(
-        for_grant("device", Some((Readiness::Ready, AT)), later(300_000)),
-        None
-    );
+    assert_eq!(for_grant("device", Some((Readiness::Ready, 300_000))), None);
 }
 
 #[test]

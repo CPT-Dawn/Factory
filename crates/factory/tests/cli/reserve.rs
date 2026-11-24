@@ -412,11 +412,11 @@ fn a_reservation_nobody_used_for_two_hours_goes_and_gc_says_so() {
     let id = reservation(&as_agent(&sandbox, &wt, &lead, &["reserve"]));
 
     // Not yet: a minute short of two hours.
-    std::fs::write(&skew, "7140").unwrap();
+    std::fs::write(&skew, "7140").expect("move the clock on");
     let early = as_agent(&sandbox, &wt, &lead, &["gc"]);
     assert_eq!((early.code, early.stdout.as_str()), (0, ""), "{early:?}");
 
-    std::fs::write(&skew, "7201").unwrap();
+    std::fs::write(&skew, "7201").expect("move the clock on");
     let gc = as_agent(&sandbox, &wt, &lead, &["gc"]);
     assert_eq!(
         (gc.code, gc.stdout.as_str()),

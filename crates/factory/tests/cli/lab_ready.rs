@@ -226,6 +226,137 @@ fn an_unplug_is_critical_while_a_lease_holds_the_phone_and_low_while_it_is_free(
     assert_eq!(posts(&sandbox)[3][3..5], ["low", "Pixel 8 unplugged"]);
 }
 
+/// The summaries of the notifications posted.
+fn summaries(sandbox: &Sandbox) -> Vec<String> {
+    posts(sandbox).into_iter().map(|p| p[4].clone()).collect()
+}
+
+/// Waits for the watcher to probe the phones `n` more times: about `n` tenths of a second.
+fn probed_more(sandbox: &Sandbox, n: usize) {
+    let then = probes(sandbox);
+    assert!(
+        poll_until(|| probes(sandbox) >= then + n),
+        "probed {} times",
+        probes(sandbox) - then
+    );
+}
+
+#[test]
+fn an_adb_reconnect_says_one_unplugged_by_model_and_no_offline() {
+    let (sandbox, world, _wt) = watching();
+    world.apply(PIXEL).unwrap();
+    assert!(
+        poll_until(|| summaries(&sandbox) == ["Pixel 8 ready"]),
+        "{:?}",
+        summaries(&sandbox)
+    );
+    // adb shows it offline, with no model on its line, then gone, then back.
+    world.apply("plug FAKEPHONE01 offline usb:1-1").unwrap();
+    world.apply("unplug FAKEPHONE01").unwrap();
+    world.apply(PIXEL).unwrap();
+    assert!(
+        poll_until(|| summaries(&sandbox).len() == 3),
+        "{:?}",
+        summaries(&sandbox)
+    );
+    // Past the time an offline is held back: nothing more is said.
+    probed_more(&sandbox, 40);
+    assert_eq!(
+        summaries(&sandbox),
+        ["Pixel 8 ready", "Pixel 8 unplugged", "Pixel 8 ready"]
+    );
+}
+
+#[test]
+fn a_phone_that_stays_offline_is_said_offline_once_by_its_model() {
+    let (sandbox, world, _wt) = watching();
+    world.apply(PIXEL).unwrap();
+    assert!(poll_until(|| summaries(&sandbox).len() == 1));
+    world.apply("plug FAKEPHONE01 offline usb:1-1").unwrap();
+    assert!(
+        poll_until(|| summaries(&sandbox).len() == 2),
+        "{:?}",
+        summaries(&sandbox)
+    );
+    world.apply(PIXEL).unwrap();
+    assert!(
+        poll_until(|| summaries(&sandbox).len() == 3),
+        "{:?}",
+        summaries(&sandbox)
+    );
+    probed_more(&sandbox, 10);
+    assert_eq!(
+        summaries(&sandbox),
+        ["Pixel 8 ready", "Pixel 8 offline", "Pixel 8 ready again"]
+    );
+}
+
+#[test]
+fn two_phones_of_one_model_are_told_apart_by_the_end_of_their_serials() {
+    let (sandbox, world, _wt) = watching();
+    world.apply("lock FAKEPHONE01").unwrap();
+    world.apply("lock FAKEPHONE02").unwrap();
+    world.apply(PIXEL).unwrap();
+    world
+        .apply("plug FAKEPHONE02 device usb:1-2 model:Pixel_8")
+        .unwrap();
+    assert!(
+        poll_until(|| summaries(&sandbox).len() == 2),
+        "{:?}",
+        summaries(&sandbox)
+    );
+    world.apply("unlock FAKEPHONE01").unwrap();
+    assert!(
+        poll_until(|| summaries(&sandbox).len() == 3),
+        "{:?}",
+        summaries(&sandbox)
+    );
+    world.apply("unlock FAKEPHONE02").unwrap();
+    assert!(
+        poll_until(|| summaries(&sandbox).len() == 4),
+        "{:?}",
+        summaries(&sandbox)
+    );
+    assert_eq!(
+        summaries(&sandbox)[2..],
+        ["Pixel 8 (NE01) ready", "Pixel 8 (NE02) ready"]
+    );
+}
+
+#[test]
+fn a_wall_clock_stepped_back_does_not_make_an_old_ready_probe_count() {
+    let (sandbox, world) = lab();
+    let skew = sandbox.path("clock-skew");
+    let sandbox = sandbox.env("FACTORY_CLOCK_SKEW_FILE", &skew);
+    // Probed as it is plugged in, and not again on its own for a minute.
+    write_machine_config(&sandbox, r#""notify": true, "readinessCheckSec": 60"#);
+    let wt = world.worktree("plain-ready");
+    assert_eq!(run(devlab(&sandbox, &wt, &["status"])).code, 0);
+    world.apply(PIXEL).unwrap();
+    assert!(poll_until(|| summaries(&sandbox) == ["Pixel 8 ready"]));
+    world.apply("lock FAKEPHONE01").unwrap();
+    std::fs::write(&skew, "-3600").expect("step the clock back");
+
+    // While its ready probe is young the phone is granted on it; once the probe is older than a
+    // grant believes, by the monotonic clock, it is not, though by the stepped-back wall clock it
+    // is from the future. An acquire that won't wait probes nothing again.
+    let refused = poll_until(|| {
+        let asked = run(devlab(
+            &sandbox,
+            &wt,
+            &["acquire", "--phone", "--wait", "0"],
+        ));
+        if asked.code == 0 {
+            assert_eq!(run(devlab(&sandbox, &wt, &["release"])).code, 0);
+        }
+        asked.code == 75
+    });
+    assert!(
+        refused,
+        "a ready probe from before the clock stepped back still counts"
+    );
+}
+
 /// The daemon's log.
 fn daemon_log(sandbox: &Sandbox) -> String {
     std::fs::read_to_string(sandbox.path("run/factory/daemon.log")).unwrap_or_default()
@@ -235,7 +366,7 @@ fn daemon_log(sandbox: &Sandbox) -> String {
 /// is not found, though the host has it.
 fn system_without(sandbox: &Sandbox, missing: &str) -> PathBuf {
     let dir = sandbox.path("system-bin");
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
     for sys in ["/usr/bin", "/bin"] {
         for entry in std::fs::read_dir(sys).into_iter().flatten().flatten() {
             let name = entry.file_name();
@@ -253,7 +384,7 @@ fn a_daemon_with_no_notify_send_says_so_in_its_log_once_and_goes_on_watching() {
     let system = system_without(&sandbox, "notify-send");
     let path = format!("{}:{}", sandbox.path("bin").display(), system.display());
     let sandbox = sandbox.env("PATH", path);
-    std::fs::remove_file(sandbox.path("bin/notify-send")).unwrap();
+    std::fs::remove_file(sandbox.path("bin/notify-send")).expect("remove the fake notify-send");
     write_machine_config(&sandbox, r#""notify": true, "readinessCheckSec": 0.1"#);
     let wt = world.worktree("plain-ready");
     assert_eq!(run(devlab(&sandbox, &wt, &["status"])).code, 0);

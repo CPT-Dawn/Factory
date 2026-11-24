@@ -16,14 +16,13 @@ use factory_core::lab::emulator::{State, unit_name};
 use factory_core::lab::events as event;
 use factory_core::lab::idle::{self, IdleDevice, IdleEmulator, IdleSlot, Need, Timers};
 use factory_core::lab::js_number;
-use factory_core::lab::ready::EpochMs;
 use factory_core::lab::slots::slot_project_id;
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags, pidfd_open};
 
 use super::super::{activity, context, events, host, lease, stack};
-use super::{Lab, Lease, grantable, lock_ignoring_poison, now_ms, readiness, reservations, store};
+use super::{Lab, Lease, grantable, lock_ignoring_poison, now_ms, reservations, store};
 use crate::lab::wire::SlotRow;
 
 /// The longest the keeper goes without a look: a changed config is read by then.
@@ -86,9 +85,9 @@ impl Lab {
                 };
                 // Only a phone a grant could take is of use to a waiter: one locked, asleep or
                 // otherwise not ready is neither free for it nor worth taking from a lease.
-                let rows = readiness::all(c)?;
-                let probed_by = EpochMs(now_ms());
-                let grantable = |a: &Attached| grantable(&rows, &since, a, probed_by);
+                let probes = self.probes(c)?;
+                let probed_by = std::time::Instant::now();
+                let grantable = |a: &Attached| grantable(&probes, &since, a, probed_by);
                 let taken = store::taken(c)?;
                 // A slot a lease or a reservation holds, or a release is stopping, isn't idle.
                 let leases = store::leases(c)?;
