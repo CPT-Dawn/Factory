@@ -32,6 +32,17 @@ factory review [--tier <tier>] --skill <its checkout's codex/code-review/SKILL.m
   chain's last waits. A pool out of quota (agy's free `/usage`, or a quota error mid-run) cools down until its
   reset. A failed `claude -p` counts as out of quota when its `result` or stderr says a plan limit (`You've hit your session limit · resets 3:45pm`, `usage limit reached|<epoch>`), a rate limit (`rate_limit_error`, HTTP 429 as a status) or a message naming a reset (`resets 3:45pm`, `resets Mon 12:00am`): the pool cools until the reset named, else for an hour, and any other failure is exit 3; a mid-run hit tries the same pool's next model first when it is next in the chain. Standard and
   trivial reviews leave the Gemini pool alone while its 5-hour bucket is under 20%.
+- The default pools are `agy-gemini` and `agy-claude` (agy's two quota groups), `codex` and `claude`. A model's
+  group is the one whose "Models within this group" list in agy's `/usage` names it, so Argon, Carbon and Hydrogen
+  draw on the Gemini group with Neon and Flash, and the 20% reserve covers them all; an answer that lists no models
+  falls back to a static map. The default chains: hard is Neon high, agy's Opus high, Codex high, Claude Opus high;
+  standard is Codex medium, Neon medium, agy's Opus high, agy's Sonnet high, Claude Sonnet high; trivial is Flash high,
+  Neon low, Codex low, Claude Sonnet medium. Argon is in none of them, but a chain may name it
+  (`agy-gemini:gemini-4-argon-high:high`), and an old config's `agy-argon` still works: a configured pool of that
+  name reads the shared group, and a chain step naming it over the default pools runs on `agy-gemini`.
+- An agy pool whose usage answer can't be read (the query fails, or the answer shows no buckets for the model's
+  group) is skipped with one stderr line, `factory: <pool> skipped: <why>`, and `factory status` shows its quota
+  as unknown with the reason until a review learns it again.
 
 ## What `factory review` prints
 

@@ -6,8 +6,9 @@
 //! caller's, or standard), and each step names a pool, a model and an effort. The daemon holds
 //! each pool's slots and cooldown. A pool's preflight runs before the review is prepared for
 //! it: one out of quota is cooled down until its reset, and one that can't review now (agy
-//! without a usage answer, an active sandbox, or quota above its reserve) is skipped for this
-//! run. A step that runs out of quota partway hands the review to the chain's next step: the
+//! without an active sandbox or quota above its reserve, or whose usage answer can't be read)
+//! is skipped for this run. A pool skipped for its usage answer says so: a line on stderr, and
+//! `factory status` shows its quota unknown with the reason. A step that runs out of quota partway hands the review to the chain's next step: the
 //! same pool's next model when that is next, else the next pool, once this one is cooled down.
 //!
 //! Every file of a review is kept in `<state>/reviews/<repo>/`, named by its label: the
@@ -367,6 +368,21 @@ fn review(
                 continue;
             }
             Err(ReviewerError::Unready(why)) => {
+                run.skipped.push((backend.name.clone(), why));
+                continue;
+            }
+            // Said, so a pool whose usage can't be read is never passed over unseen: on this
+            // review's stderr, and in factory status until a review learns its quota.
+            Err(ReviewerError::NoUsage(why)) => {
+                run.notes.push(format!("{} skipped: {why}", backend.name));
+                let unknown = QuotaParams {
+                    backend: backend.name.clone(),
+                    quota: QuotaParam::Unknown {
+                        reason: why.clone(),
+                    },
+                };
+                // The review goes on whether or not this lands.
+                let _: Result<QuotaParams, _> = daemon.call(REVIEW_QUOTA, &unknown);
                 run.skipped.push((backend.name.clone(), why));
                 continue;
             }

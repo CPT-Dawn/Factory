@@ -17,6 +17,17 @@ const REPORT: &str = "## Standards\nnone\n## Spec\nnone\nFINDINGS: standards_har
 /// The reviewer skill, as the one-session prompt carries it.
 const SKILL: &str = "---\nname: code-review\ndescription: the reviewer\n---\n# Code review\n\n## Severity and tags\n\nBlocking, advisory, question.\n";
 
+/// The models agy's usage answer lists in each group (2026-11-24).
+const GEMINI_MODELS: &str = "Models within this group: Gemini 4 Neon, Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, Orchestrator (Neon), Orchestrator (Carbon), Orchestrator (Argon), Gemini 3.8 Flash";
+const CLAUDE_MODELS: &str =
+    "Models within this group: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B";
+
+/// A usage bucket over `window` with `left` of its quota, which resets far off, so an empty
+/// one holds.
+fn bucket(window: &str, left: f64) -> Value {
+    json!({"window": window, "remaining_fraction": left, "reset_time": "2099-01-01T00:00:00Z"})
+}
+
 /// What agy logs at startup when its sandbox is in effect.
 const SANDBOX_STARTED: &str =
     "I1123 09:37:00.811680 1 session.go:87] Print mode: enabling terminal sandbox for this session";
@@ -33,9 +44,9 @@ struct Lab {
 
 impl Lab {
     /// A lab whose repo's branch `work` holds `change` over the branch `base`, whose agy
-    /// usage shows the Gemini 5-hour bucket, the Argon weekly bucket and the Claude 5-hour
-    /// bucket with these fractions left, and whose reviewers play `plan`.
-    fn new(change: &str, gemini: f64, argon: f64, claude: f64, plan: &[&str]) -> Lab {
+    /// usage shows the Gemini 5-hour bucket and the Claude 5-hour bucket with these fractions
+    /// left, and whose reviewers play `plan`.
+    fn new(change: &str, gemini: f64, claude: f64, plan: &[&str]) -> Lab {
         let sandbox = Sandbox::new().env("TZ", "UTC");
         let repo = sandbox.path("repo");
         must(fs::create_dir(&repo), "create the repo");
@@ -65,7 +76,7 @@ impl Lab {
         must(fs::create_dir_all(&skills), "create the skill's dir");
         must(fs::write(&skill, SKILL), "write the skill");
         let lab = Lab { sandbox, repo };
-        lab.usage(gemini, argon, claude);
+        lab.usage(gemini, claude);
         lab.plan(plan);
         lab.fakes();
         lab
@@ -75,18 +86,28 @@ impl Lab {
         self.sandbox.path(name)
     }
 
-    /// agy's usage, as in [`Lab::new`]. Every bucket resets far off, so an empty one holds.
-    fn usage(&self, gemini: f64, argon: f64, claude: f64) {
-        let bucket = |window: &str, left: f64| json!({"window": window, "remaining_fraction": left, "reset_time": "2099-01-01T00:00:00Z"});
-        let usage = json!({"command": {"data": {"groups": [
-            {"name": "Gemini Models", "buckets": [bucket("weekly", 0.8), bucket("5h", gemini)]},
-            {"name": "Claude and GPT models", "buckets": [bucket("5h", claude)]},
-            {"name": "Gemini 4 Argon", "buckets": [bucket("weekly", argon)]},
-        ]}}});
+    /// agy's usage, as in [`Lab::new`], in the shape of its 2026-11-24 answer: each group lists
+    /// its models, Argon among the Gemini ones.
+    fn usage(&self, gemini: f64, claude: f64) {
+        self.usage_is(&json!({"command": {"data": {"groups": [
+            {"name": "Gemini Models", "description": GEMINI_MODELS, "buckets": [bucket("weekly", 0.8), bucket("5h", gemini)]},
+            {"name": "Claude and GPT models", "description": CLAUDE_MODELS, "buckets": [bucket("5h", claude)]},
+        ]}}}));
+    }
+
+    /// agy's usage answer, whole.
+    fn usage_is(&self, usage: &Value) {
         must(
             fs::write(self.file("usage.json"), usage.to_string()),
             "write the usage",
         );
+    }
+
+    /// The factory's config file.
+    fn configure(&self, toml: &str) {
+        let dir = self.file("config/factory");
+        must(fs::create_dir_all(&dir), "create the config's dir");
+        must(fs::write(dir.join("config.toml"), toml), "write the config");
     }
 
     fn plan(&self, plan: &[&str]) {
@@ -144,6 +165,7 @@ impl Lab {
             ),
         );
         self.sandbox.fake("unshare", "exit 0");
+        self.sandbox.fake("bwrap", crate::support::BWRAP_PASSES);
     }
 
     fn review(&self, args: &[&str]) -> Run {
@@ -198,7 +220,7 @@ fn read(path: &Path) -> String {
 
 #[test]
 fn hard_runs_gemini_4_neon_high_first() {
-    let lab = Lab::new("code", 0.9, 1.0, 1.0, &["ok"]);
+    let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
 
     let out = lab.review(&["--tier", "hard", "base", "t1-r1"]);
 
@@ -208,7 +230,7 @@ fn hard_runs_gemini_4_neon_high_first() {
 
 #[test]
 fn the_event_names_tier_pool_reviewer_model_effort_and_tokens() {
-    let lab = Lab::new("code", 0.9, 1.0, 1.0, &["ok"]);
+    let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
 
     let out = lab.review(&["--tier", "hard", "base", "t1-r1"]);
 
@@ -232,7 +254,7 @@ fn the_event_names_tier_pool_reviewer_model_effort_and_tokens() {
 
 #[test]
 fn the_ledger_keeps_the_reviewed_head() {
-    let lab = Lab::new("code", 0.9, 1.0, 1.0, &["ok"]);
+    let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
 
     let out = lab.review(&["--tier", "hard", "base", "t1-r1"]);
 
@@ -246,7 +268,7 @@ fn the_ledger_keeps_the_reviewed_head() {
 
 #[test]
 fn the_bundle_holds_commits_stat_diff_spec_touched_docs_standards_and_evidence() {
-    let lab = Lab::new("code", 0.9, 1.0, 1.0, &["ok"]);
+    let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
 
     let out = lab.review(&["--tier", "hard", "base", "t1-r1"]);
 
@@ -275,7 +297,7 @@ fn the_bundle_holds_commits_stat_diff_spec_touched_docs_standards_and_evidence()
 
 #[test]
 fn the_prompt_carries_the_skill_and_the_bundle() {
-    let lab = Lab::new("code", 0.9, 1.0, 1.0, &["ok"]);
+    let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
 
     let out = lab.review(&["--tier", "hard", "base", "t1-r1"]);
 
@@ -295,7 +317,7 @@ fn the_prompt_carries_the_skill_and_the_bundle() {
 
 #[test]
 fn a_touched_doc_travels_whole() {
-    let lab = Lab::new("docs", 0.9, 1.0, 1.0, &["ok"]);
+    let lab = Lab::new("docs", 0.9, 1.0, &["ok"]);
 
     let out = lab.review(&["base", "t1b-r1"]);
 
@@ -309,7 +331,7 @@ fn a_touched_doc_travels_whole() {
 
 #[test]
 fn standard_skips_gemini_under_the_20_percent_reserve_and_takes_codex_medium() {
-    let lab = Lab::new("code", 0.1, 1.0, 1.0, &["ok"]);
+    let lab = Lab::new("code", 0.1, 1.0, &["ok"]);
 
     let out = lab.review(&["base", "t2-r1"]);
 
@@ -330,7 +352,7 @@ fn standard_skips_gemini_under_the_20_percent_reserve_and_takes_codex_medium() {
 
 #[test]
 fn standard_with_codex_at_its_limit_takes_agys_opus_high() {
-    let lab = Lab::new("code", 0.1, 1.0, 1.0, &["limit", "ok"]);
+    let lab = Lab::new("code", 0.1, 1.0, &["limit", "ok"]);
 
     let out = lab.review(&["base", "t2b-r1", "--json"]);
 
@@ -342,7 +364,7 @@ fn standard_with_codex_at_its_limit_takes_agys_opus_high() {
 
 #[test]
 fn a_spec_review_is_hard_and_may_spend_the_reserve() {
-    let lab = Lab::new("code", 0.1, 1.0, 1.0, &["ok"]);
+    let lab = Lab::new("code", 0.1, 1.0, &["ok"]);
 
     let out = lab.review(&["base", "spec-r1"]);
 
@@ -353,7 +375,7 @@ fn a_spec_review_is_hard_and_may_spend_the_reserve() {
 
 #[test]
 fn an_agy_quota_hit_cools_its_pool_and_the_next_review_skips_it() {
-    let lab = Lab::new("code", 0.9, 1.0, 1.0, &["limit", "quota", "ok"]);
+    let lab = Lab::new("code", 0.9, 1.0, &["limit", "quota", "ok"]);
 
     let out = lab.review(&["--tier", "standard", "base", "t3-r1", "--json"]);
 
@@ -388,7 +410,7 @@ fn an_agy_quota_hit_cools_its_pool_and_the_next_review_skips_it() {
 
 #[test]
 fn a_quota_hit_tries_the_chains_next_model_in_the_same_pool_before_cooling_the_pool() {
-    let lab = Lab::new("docs", 0.9, 1.0, 1.0, &["quota", "ok"]);
+    let lab = Lab::new("docs", 0.9, 1.0, &["quota", "ok"]);
 
     let out = lab.review(&["base", "t3c-r1", "--json"]);
 
@@ -403,7 +425,7 @@ fn a_quota_hit_tries_the_chains_next_model_in_the_same_pool_before_cooling_the_p
 
 #[test]
 fn the_pools_last_model_hitting_its_quota_cools_the_pool() {
-    let lab = Lab::new("docs", 0.9, 1.0, 1.0, &["quota", "quota", "ok"]);
+    let lab = Lab::new("docs", 0.9, 1.0, &["quota", "quota", "ok"]);
 
     let out = lab.review(&["base", "t3d-r1", "--json"]);
 
@@ -422,7 +444,7 @@ fn the_pools_last_model_hitting_its_quota_cools_the_pool() {
 
 #[test]
 fn a_spec_path_that_is_no_file_still_reviews() {
-    let lab = Lab::new("code", 0.9, 1.0, 1.0, &["ok"]);
+    let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
 
     let out = lab.review(&["--tier", "hard", "base", "t4-r1", "x"]);
 
@@ -433,7 +455,7 @@ fn a_spec_path_that_is_no_file_still_reviews() {
 
 #[test]
 fn an_empty_bucket_skips_its_pool() {
-    let lab = Lab::new("code", 0.0, 0.0, 1.0, &["ok"]);
+    let lab = Lab::new("code", 0.0, 1.0, &["ok"]);
 
     let out = lab.review(&["--tier", "hard", "base", "t4-r1", "--json"]);
 
@@ -446,12 +468,12 @@ fn an_empty_bucket_skips_its_pool() {
         .iter()
         .filter_map(|c| c["backend"].as_str())
         .collect();
-    assert_eq!(cooled, ["agy-gemini", "agy-argon"], "{shown}");
+    assert_eq!(cooled, ["agy-gemini"], "{shown}");
 }
 
 #[test]
 fn a_docs_only_diff_is_trivial_and_under_the_reserve_goes_to_codex_at_low() {
-    let lab = Lab::new("docs", 0.1, 0.0, 0.0, &["ok"]);
+    let lab = Lab::new("docs", 0.1, 0.0, &["ok"]);
 
     let out = lab.review(&["base", "t5-r1"]);
 
@@ -473,7 +495,7 @@ fn a_docs_only_diff_is_trivial_and_under_the_reserve_goes_to_codex_at_low() {
 
 #[test]
 fn codex_runs_without_web_search_or_sub_agents() {
-    let lab = Lab::new("docs", 0.1, 0.0, 0.0, &["ok"]);
+    let lab = Lab::new("docs", 0.1, 0.0, &["ok"]);
 
     let out = lab.review(&["base", "t5-r1"]);
 
@@ -485,7 +507,7 @@ fn codex_runs_without_web_search_or_sub_agents() {
 
 #[test]
 fn a_5_line_diff_is_trivial_flash_high() {
-    let lab = Lab::new("tiny", 0.9, 1.0, 1.0, &["ok"]);
+    let lab = Lab::new("tiny", 0.9, 1.0, &["ok"]);
 
     let out = lab.review(&["base", "t6-r1"]);
 
@@ -496,7 +518,7 @@ fn a_5_line_diff_is_trivial_flash_high() {
 #[test]
 fn a_6_line_diff_or_a_tests_only_diff_is_standard() {
     for change in ["small", "tests"] {
-        let lab = Lab::new(change, 0.9, 1.0, 1.0, &["ok"]);
+        let lab = Lab::new(change, 0.9, 1.0, &["ok"]);
 
         let out = lab.review(&["base", "t6b-r1"]);
 
@@ -508,7 +530,7 @@ fn a_6_line_diff_or_a_tests_only_diff_is_standard() {
 
 #[test]
 fn the_callers_hard_tag_wins_over_detection_even_given_last() {
-    let lab = Lab::new("tiny", 0.9, 1.0, 1.0, &["ok"]);
+    let lab = Lab::new("tiny", 0.9, 1.0, &["ok"]);
 
     let out = lab.review(&["base", "t7-r1", "none", "--tier", "hard"]);
 
@@ -518,7 +540,7 @@ fn the_callers_hard_tag_wins_over_detection_even_given_last() {
 
 #[test]
 fn codex_at_its_limit_hands_a_standard_review_to_claude_sonnet_high() {
-    let lab = Lab::new("code", 0.0, 0.0, 0.0, &["limit", "ok"]);
+    let lab = Lab::new("code", 0.0, 0.0, &["limit", "ok"]);
 
     let out = lab.review(&["base", "t8-r1"]);
 
@@ -534,7 +556,7 @@ fn codex_at_its_limit_hands_a_standard_review_to_claude_sonnet_high() {
 
 #[test]
 fn a_pool_with_both_slots_taken_passes_to_the_next() {
-    let lab = Lab::new("code", 0.9, 1.0, 1.0, &["hold", "hold", "ok", "ok", "ok"]);
+    let lab = Lab::new("code", 0.9, 1.0, &["hold", "hold", "ok", "ok", "ok"]);
     let holding = |label: &str| {
         let mut cmd = lab
             .sandbox
@@ -557,14 +579,204 @@ fn a_pool_with_both_slots_taken_passes_to_the_next() {
     fs::write(lab.file("release"), "").unwrap();
 
     assert_eq!(out.code, 0, "{out:?}");
-    assert_eq!(lab.who()[2], "agy gemini-4-argon-high", "{:?}", lab.who());
+    assert_eq!(lab.who()[2], "agy claude-opus-5-5-high", "{:?}", lab.who());
     assert_eq!(finish(first).code, 0);
     assert_eq!(finish(second).code, 0);
 }
 
 #[test]
+fn hard_runs_neon_high_then_agys_opus_high_then_codex_high_then_claude_opus_high() {
+    let lab = Lab::new("code", 0.9, 1.0, &["quota", "quota", "limit", "ok"]);
+
+    let out = lab.review(&["--tier", "hard", "base", "t12-r1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(
+        lab.who(),
+        [
+            "agy gemini-4-neon-high",
+            "agy claude-opus-5-5-high",
+            "codex",
+            "claude"
+        ]
+    );
+    let runs = lab.runs();
+    assert!(
+        runs[2].contains("-m gpt-6.2-sol -c model_reasoning_effort=\"high\""),
+        "{runs:?}"
+    );
+    assert!(
+        runs[3].starts_with("claude -p --model opus --effort high"),
+        "{runs:?}"
+    );
+}
+
+#[test]
+fn standard_runs_codex_medium_neon_medium_agys_opus_high_agys_sonnet_high_then_claude_sonnet_high()
+{
+    let lab = Lab::new(
+        "code",
+        0.9,
+        1.0,
+        &["limit", "quota", "quota", "quota", "ok"],
+    );
+
+    let out = lab.review(&["base", "t12b-r1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(
+        lab.who(),
+        [
+            "codex",
+            "agy gemini-4-neon-medium",
+            "agy claude-opus-5-5-high",
+            "agy claude-sonnet-5-5-high",
+            "claude"
+        ]
+    );
+    let runs = lab.runs();
+    assert!(
+        runs[0].contains("-m gpt-6.2-sol -c model_reasoning_effort=\"medium\""),
+        "{runs:?}"
+    );
+    assert!(
+        runs[4].starts_with("claude -p --model sonnet --effort high"),
+        "{runs:?}"
+    );
+}
+
+#[test]
+fn trivial_runs_flash_high_neon_low_codex_low_then_claude_sonnet_medium() {
+    let lab = Lab::new("docs", 0.9, 1.0, &["quota", "quota", "limit", "ok"]);
+
+    let out = lab.review(&["base", "t12c-r1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(
+        lab.who(),
+        [
+            "agy gemini-3.8-flash-high",
+            "agy gemini-4-neon-low",
+            "codex",
+            "claude"
+        ]
+    );
+    let runs = lab.runs();
+    assert!(
+        runs[2].contains("-m gpt-6.2-sol -c model_reasoning_effort=\"low\""),
+        "{runs:?}"
+    );
+    assert!(
+        runs[3].starts_with("claude -p --model sonnet --effort medium"),
+        "{runs:?}"
+    );
+}
+
+#[test]
+fn a_chain_naming_agy_argon_runs_argon_on_the_gemini_pool() {
+    let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
+    lab.configure(
+        "[review.chains]\nhard = [\"agy-argon:gemini-4-argon-high:high\", \"codex:gpt-6.2-sol:high\"]\n",
+    );
+
+    let out = lab.review(&["--tier", "hard", "base", "t13-r1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(lab.who(), ["agy gemini-4-argon-high"]);
+    assert_eq!(lab.last_event()["pool"], "agy-gemini");
+}
+
+#[test]
+fn a_configured_agy_argon_pool_draws_on_the_shared_gemini_quota() {
+    let config = "[[review.backend]]\ncli = \"agy\"\nname = \"agy-argon\"\nmodel = \"gemini-4-argon-high\"\n\n[[review.backend]]\ncli = \"codex\"\n";
+    let left = Lab::new("code", 0.9, 1.0, &["ok"]);
+    left.configure(config);
+    let empty = Lab::new("code", 0.0, 1.0, &["ok"]);
+    empty.configure(config);
+
+    let reviewed = left.review(&["--tier", "hard", "base", "t14-r1"]);
+    let passed = empty.review(&["--tier", "hard", "base", "t14-r1", "--json"]);
+
+    assert_eq!(reviewed.code, 0, "{reviewed:?}");
+    assert_eq!(left.who(), ["agy gemini-4-argon-high"]);
+    assert_eq!(left.last_event()["pool"], "agy-argon");
+    assert_eq!(passed.code, 0, "{passed:?}");
+    assert_eq!(empty.who(), ["codex"]);
+    let shown: Value = serde_json::from_str(&passed.stdout).unwrap();
+    assert_eq!(shown["cooled"][0]["backend"], "agy-argon", "{shown}");
+}
+
+#[test]
+fn standard_and_trivial_skip_an_argon_step_under_the_20_percent_reserve_and_hard_spends_it() {
+    let chains = "[review.chains]\n\
+        hard = [\"agy-gemini:gemini-4-argon-high:high\", \"codex:gpt-6.2-sol:high\"]\n\
+        standard = [\"agy-gemini:gemini-4-argon-high:high\", \"codex:gpt-6.2-sol:medium\"]\n\
+        trivial = [\"agy-gemini:gemini-4-argon-high:high\", \"codex:gpt-6.2-sol:low\"]\n";
+    for (change, tier, who) in [
+        ("code", "standard", "codex"),
+        ("docs", "trivial", "codex"),
+        ("code", "hard", "agy gemini-4-argon-high"),
+    ] {
+        let lab = Lab::new(change, 0.1, 1.0, &["ok"]);
+        lab.configure(chains);
+        let mut args = vec!["base", "t15-r1", "--json"];
+        if tier == "hard" {
+            args.extend(["--tier", "hard"]);
+        }
+
+        let out = lab.review(&args);
+
+        assert_eq!(out.code, 0, "{tier}: {out:?}");
+        assert_eq!(lab.who(), [who], "{tier}");
+        let shown: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(shown["tier"], tier, "{shown}");
+        if tier != "hard" {
+            assert_eq!(shown["skipped"][0]["backend"], "agy-gemini", "{shown}");
+            let reason = shown["skipped"][0]["reason"].as_str().unwrap_or_default();
+            assert!(reason.contains("under 20%"), "{tier}: {reason}");
+        }
+    }
+}
+
+#[test]
+fn a_pool_skipped_for_an_unreadable_usage_answer_says_so_on_stderr_and_in_status() {
+    let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
+    lab.usage_is(&json!({"command": {"data": {"groups": [
+        {"name": "Claude and GPT models", "description": CLAUDE_MODELS, "buckets": [bucket("5h", 1.0)]},
+    ]}}}));
+    let why = "its usage query is unreadable: it shows no Gemini Models quota";
+
+    let out = lab.review(&["--tier", "hard", "base", "t16-r1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(lab.who(), ["agy claude-opus-5-5-high"]);
+    assert_eq!(
+        out.stderr_lines(),
+        [format!("factory: agy-gemini skipped: {why}")],
+        "{out:?}"
+    );
+    let status = lab.sandbox.factory(&["status", "--json"]);
+    assert_eq!(status.code, 0, "{status:?}");
+    let shown: Value = serde_json::from_str(&status.stdout).unwrap();
+    let gemini = shown["review"]
+        .as_array()
+        .and_then(|pools| pools.iter().find(|pool| pool["name"] == "agy-gemini"))
+        .unwrap_or_else(|| panic!("no agy-gemini in {shown}"));
+    assert_eq!(gemini["quota"], "unknown", "{shown}");
+    assert_eq!(gemini["reason"], why, "{shown}");
+    let screen = lab.sandbox.factory(&["status"]);
+    let lines = screen.stdout_lines();
+    let row = lines
+        .iter()
+        .position(|line| line.starts_with("  agy-gemini"))
+        .unwrap_or_else(|| panic!("no agy-gemini row: {screen:?}"));
+    assert!(lines[row].contains("unknown, 0/2 running"), "{screen:?}");
+    assert_eq!(lines[row + 1], format!("    {why}"), "{screen:?}");
+}
+
+#[test]
 fn round_2_reviews_only_the_fix_with_the_previous_report_and_logs_where_it_started() {
-    let lab = Lab::new("code", 0.9, 1.0, 1.0, &["ok", "ok", "ok"]);
+    let lab = Lab::new("code", 0.9, 1.0, &["ok", "ok", "ok"]);
     let first = lab.review(&["base", "t10-r1"]);
     assert_eq!(first.code, 0, "{first:?}");
     let r1_head = lab.git(&["rev-parse", "HEAD"]).trim().to_owned();
@@ -612,7 +824,7 @@ fn round_2_reviews_only_the_fix_with_the_previous_report_and_logs_where_it_start
 
 #[test]
 fn round_2_finds_the_head_in_a_review_sh_ledger() {
-    let lab = Lab::new("code", 0.9, 1.0, 1.0, &["ok"]);
+    let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
     let r1_head = lab.git(&["rev-parse", "HEAD"]).trim().to_owned();
     fs::write(lab.repo.join("src/b.ts"), "fix\n").unwrap();
     lab.git(&["add", "-A"]);
@@ -639,7 +851,7 @@ fn round_2_finds_the_head_in_a_review_sh_ledger() {
 
 #[test]
 fn a_bad_label_an_unknown_tier_or_a_missing_previous_report_exits_2() {
-    let lab = Lab::new("code", 0.9, 1.0, 1.0, &["ok"]);
+    let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
 
     let label = lab.review(&["base", "bad label"]);
     let tier = lab.review(&["--tier", "easy", "base", "t11-r1"]);

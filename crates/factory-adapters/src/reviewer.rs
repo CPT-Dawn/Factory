@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::git::{Checkout, Git, Repo, Repos};
+use crate::guard;
 use crate::process::{self, RunError};
 
 /// One review for a backend to run.
@@ -52,9 +53,12 @@ pub enum ReviewerError {
     Files(io::Error),
     /// The backend ran out of quota; it gets it back at this reset.
     OutOfQuota(Reset),
-    /// The backend can't take a review now, for this reason (its usage query failed, say);
-    /// the review goes on to the next one.
+    /// The backend can't take a review now, for this reason (its quota is kept for hard
+    /// reviews, say); the review goes on to the next one.
     Unready(String),
+    /// The backend's usage answer, which says whether it has quota, could not be had or read,
+    /// for this reason; the review goes on to the next one, and says so.
+    NoUsage(String),
     /// The backend's sandbox would not be active, or was not, for this reason, so it must
     /// not review, or its review is not kept.
     NoSandbox(String),
@@ -75,8 +79,9 @@ pub trait Reviewer {
     /// The extension of its event stream's file, after the review's label.
     fn stream_extension(&self) -> &str;
     /// Checks, before a review is prepared for it, that the backend can take one: quota left,
-    /// its sandbox active. [`ReviewerError::OutOfQuota`], [`ReviewerError::Unready`] and
-    /// [`ReviewerError::NoSandbox`] send the review on to the next backend.
+    /// its sandbox active. [`ReviewerError::OutOfQuota`], [`ReviewerError::Unready`],
+    /// [`ReviewerError::NoUsage`] and [`ReviewerError::NoSandbox`] send the review on to the
+    /// next backend.
     fn preflight(&self) -> Result<(), ReviewerError> {
         Ok(())
     }
@@ -205,8 +210,9 @@ pub enum AgyAuth {
 
 /// Antigravity, headless: `agy -p` in plan mode inside its sandbox, with writes, URLs and MCP
 /// denied, JSON output, a print timeout, and no paid credits. It reviews a throwaway detached
-/// checkout of the head, so a terminal command that writes changes nothing of the caller's;
-/// its review is kept only when its own log says its sandbox started.
+/// checkout of the head, so a terminal command that writes changes nothing of the caller's,
+/// under a write guard ([`guard`]) that leaves it nothing else to write but its own log and
+/// agy's state; its review is kept only when its own log says its sandbox started.
 ///
 /// With no model configured it runs the model chosen in agy, and its quota is that model's
 /// group: the label agy's `/model` saved under `model` in
@@ -314,7 +320,20 @@ impl Agy {
 
     /// agy as its auth runs it: the subscription login never sees an API key.
     fn command(&self) -> Command {
-        let mut cmd = Command::new("agy");
+        self.as_its_auth(Command::new("agy"))
+    }
+
+    /// How a review on its auth reaches the session bus: the subscription login reads its
+    /// token from the keyring over it; an API key needs none of it.
+    fn bus(&self) -> guard::Bus {
+        match self.auth {
+            AgyAuth::Subscription => guard::Bus::Keyring,
+            AgyAuth::ApiKey => guard::Bus::Closed,
+        }
+    }
+
+    /// `cmd`, which runs agy, as its auth runs it.
+    fn as_its_auth(&self, mut cmd: Command) -> Command {
         if self.auth == AgyAuth::Subscription {
             cmd.env_remove("GEMINI_API_KEY");
         }
@@ -340,14 +359,14 @@ impl Agy {
         cmd.args(["-p", "/usage", "--output-format", "json"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let unready = |why: String| ReviewerError::Unready(format!("its usage query {why}"));
-        let output = process::run(cmd, AGY_CHECK_TIMEOUT).map_err(|e| unready(e.to_string()))?;
+        let no_usage = |why: String| ReviewerError::NoUsage(format!("its usage query {why}"));
+        let output = process::run(cmd, AGY_CHECK_TIMEOUT).map_err(|e| no_usage(e.to_string()))?;
         if !output.status.success() {
             let code = output
                 .status
                 .code()
                 .map_or("by a signal".to_owned(), |code| code.to_string());
-            return Err(unready(format!("exited {code}")));
+            return Err(no_usage(format!("exited {code}")));
         }
         let usage = String::from_utf8_lossy(&output.stdout).into_owned();
         // A cache that can't be written only costs the next review another query. It is
@@ -364,17 +383,18 @@ impl Agy {
     /// than the reserve this review must leave.
     fn quota_left(&self) -> Result<(), ReviewerError> {
         let model = self.quota_model();
-        let group = quota::agy_group(&model);
         let (mut usage, cached) = self.usage(false)?;
-        let mut said = quota::agy_usage(&usage, group);
+        let mut group = quota::agy_group(&usage, &model);
+        let mut said = quota::agy_usage(&usage, &group);
         // A cached answer may name an empty bucket whose reset has come since: ask again.
         if cached && matches!(said, quota::AgyUsage::Empty { until } if until <= now()) {
             usage = self.usage(true)?.0;
-            said = quota::agy_usage(&usage, group);
+            group = quota::agy_group(&usage, &model);
+            said = quota::agy_usage(&usage, &group);
         }
         if let Some(reserve) = self.reserve
             && matches!(said, quota::AgyUsage::Left)
-            && quota::agy_below(&usage, group, "5h", reserve)
+            && quota::agy_below(&usage, &group, "5h", reserve)
         {
             return Err(ReviewerError::Unready(format!(
                 "its {group} 5-hour bucket is under {:.0}%, kept for hard reviews",
@@ -389,7 +409,7 @@ impl Agy {
             }
             // An empty bucket whose reset has passed has its quota back.
             quota::AgyUsage::Left | quota::AgyUsage::Empty { .. } => Ok(()),
-            quota::AgyUsage::Unreadable(why) => Err(ReviewerError::Unready(format!(
+            quota::AgyUsage::Unreadable(why) => Err(ReviewerError::NoUsage(format!(
                 "its usage query is unreadable: {why}"
             ))),
         }
@@ -436,7 +456,7 @@ impl Reviewer for Agy {
                 }
             }
         }
-        sandbox_active(self.namespaces.as_ref())
+        sandbox_active(self.namespaces.as_ref(), self.bus())
     }
 
     fn review(&self, job: &Job) -> Result<(), ReviewerError> {
@@ -454,8 +474,12 @@ impl Reviewer for Agy {
         let own_log = job.stream.with_extension("run.log");
         File::create(&own_log).map_err(ReviewerError::Files)?;
         // Dropped, so removed, however the review ends.
-        let (_checkout, within) = self.checkout(job)?;
-        let mut cmd = self.command();
+        let (checkout, within) = self.checkout(job)?;
+        // Under the write guard, which leaves it its checkout, its own log and agy's state, and
+        // which stays up until the review is done.
+        let guard = guard::Guard::start(&[checkout.dir(), own_log.as_path()], self.bus())
+            .map_err(guard_down)?;
+        let mut cmd = self.as_its_auth(guard.command("agy"));
         cmd.arg("-p")
             .arg(prompt)
             .args(["--mode", "plan", "--sandbox", "--add-dir"])
@@ -542,21 +566,27 @@ fn sweep_checkouts(dir: &Path, repo: &dyn Repo) {
 }
 
 /// Whether unprivileged user namespaces are available, which agy's sandbox needs: without
-/// them `--sandbox` silently does nothing.
+/// them `--sandbox` silently does nothing. And whether the write guard ([`guard`]) a review
+/// runs under starts, with agy's sandbox able to start inside it.
 pub trait Namespaces: fmt::Debug + Send + Sync {
     /// `Ok`, or why they are unavailable, in the probe's own words.
     fn user_namespaces(&self) -> Result<(), String>;
+    /// `Ok`, or why the guard, reaching the bus as `bus` says, can't start, in the probe's
+    /// own words.
+    fn guard(&self, bus: guard::Bus) -> Result<(), String>;
 }
 
-/// The probe through `unshare --user --map-root-user true`.
+/// The probes through `unshare --user --map-root-user true`, bare and under the guard.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Unshare;
 
-impl Namespaces for Unshare {
-    fn user_namespaces(&self) -> Result<(), String> {
-        let mut cmd = Command::new("unshare");
-        cmd.args(["--user", "--map-root-user", "true"])
-            .stdin(Stdio::null())
+/// The arguments that make `unshare` start a user namespace and do nothing in it.
+const UNSHARE_PROBE: [&str; 3] = ["--user", "--map-root-user", "true"];
+
+impl Unshare {
+    /// Runs `cmd`, a probe whose program is `program`: `Ok`, or what it said.
+    fn probe(mut cmd: Command, program: &str) -> Result<(), String> {
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         match process::run(cmd, AGY_CHECK_TIMEOUT) {
@@ -566,32 +596,63 @@ impl Namespaces for Unshare {
                 let said = stderr.lines().find(|line| !line.trim().is_empty());
                 Err(match (said, output.status.code()) {
                     (Some(said), _) => said.trim().to_owned(),
-                    (None, Some(code)) => format!("unshare exited {code}"),
-                    (None, None) => "unshare was killed by a signal".to_owned(),
+                    (None, Some(code)) => format!("{program} exited {code}"),
+                    (None, None) => format!("{program} was killed by a signal"),
                 })
             }
-            Err(e) => Err(format!("unshare: {e}")),
+            Err(e) => Err(format!("{program}: {e}")),
         }
     }
 }
 
-/// A probe that answers as it was told: `None` for available, else the reason they are not.
-#[derive(Clone, Debug, Default)]
-pub struct FakeNamespaces(pub Option<String>);
-
-impl Namespaces for FakeNamespaces {
+impl Namespaces for Unshare {
     fn user_namespaces(&self) -> Result<(), String> {
-        self.0.clone().map_or(Ok(()), Err)
+        let mut cmd = Command::new("unshare");
+        cmd.args(UNSHARE_PROBE);
+        Unshare::probe(cmd, "unshare")
+    }
+
+    fn guard(&self, bus: guard::Bus) -> Result<(), String> {
+        let guard = guard::Guard::start(&[], bus)?;
+        let mut cmd = guard.command("unshare");
+        cmd.args(UNSHARE_PROBE);
+        Unshare::probe(cmd, guard::BWRAP)
     }
 }
 
-/// Whether agy's sandbox would be active, as `namespaces` says.
-fn sandbox_active(namespaces: &dyn Namespaces) -> Result<(), ReviewerError> {
+/// A probe that answers as it was told: `None` for available, else the reason they are not;
+/// the same for the guard.
+#[derive(Clone, Debug, Default)]
+pub struct FakeNamespaces {
+    pub namespaces: Option<String>,
+    pub guard: Option<String>,
+}
+
+impl Namespaces for FakeNamespaces {
+    fn user_namespaces(&self) -> Result<(), String> {
+        self.namespaces.clone().map_or(Ok(()), Err)
+    }
+
+    fn guard(&self, _bus: guard::Bus) -> Result<(), String> {
+        self.guard.clone().map_or(Ok(()), Err)
+    }
+}
+
+/// Whether agy's sandbox would be active, and its write guard start, as `namespaces` says.
+fn sandbox_active(namespaces: &dyn Namespaces, bus: guard::Bus) -> Result<(), ReviewerError> {
     namespaces.user_namespaces().map_err(|why| {
         ReviewerError::NoSandbox(format!(
             "its sandbox is not active (unprivileged user namespaces are unavailable: {why})"
         ))
-    })
+    })?;
+    namespaces.guard(bus).map_err(guard_down)
+}
+
+/// A review's sandbox, when its write guard can't start, for `why`.
+fn guard_down(why: String) -> ReviewerError {
+    ReviewerError::NoSandbox(format!(
+        "its sandbox is not active (its write guard can't start: {why})"
+    ))
 }
 
 /// The tools a headless Claude reviewer may not use: it reads and reports, and runs no skill
@@ -794,7 +855,9 @@ impl fmt::Display for ReviewerError {
             ReviewerError::TimedOut(timeout) => write!(f, "timed out after {}s", timeout.as_secs()),
             ReviewerError::Files(e) => write!(f, "cannot open its files: {e}"),
             ReviewerError::OutOfQuota(_) => write!(f, "is out of quota"),
-            ReviewerError::Unready(why) | ReviewerError::NoSandbox(why) => {
+            ReviewerError::Unready(why)
+            | ReviewerError::NoUsage(why)
+            | ReviewerError::NoSandbox(why) => {
                 write!(f, "skipped: {why}")
             }
             ReviewerError::Checkout(why) => write!(f, "has no checkout to review in: {why}"),
@@ -819,7 +882,10 @@ mod seams {
         )
         .with(
             Arc::new(repo.clone()),
-            Arc::new(FakeNamespaces(namespaces.map(str::to_owned))),
+            Arc::new(FakeNamespaces {
+                namespaces: namespaces.map(str::to_owned),
+                guard: None,
+            }),
         )
     }
 
@@ -867,8 +933,11 @@ mod seams {
 
     #[test]
     fn no_user_namespaces_sends_the_review_on_in_the_probes_words() {
-        let off = FakeNamespaces(Some("unshare: Operation not permitted".to_owned()));
-        match sandbox_active(&off) {
+        let off = FakeNamespaces {
+            namespaces: Some("unshare: Operation not permitted".to_owned()),
+            guard: None,
+        };
+        match sandbox_active(&off, guard::Bus::Keyring) {
             Err(ReviewerError::NoSandbox(why)) => assert_eq!(
                 why,
                 "its sandbox is not active (unprivileged user namespaces are unavailable: \
@@ -876,6 +945,22 @@ mod seams {
             ),
             other => panic!("expected NoSandbox, got {other:?}"),
         }
-        assert!(sandbox_active(&FakeNamespaces(None)).is_ok());
+        assert!(sandbox_active(&FakeNamespaces::default(), guard::Bus::Keyring).is_ok());
+    }
+
+    #[test]
+    fn a_guard_that_cannot_start_sends_the_review_on_in_the_probes_words() {
+        let off = FakeNamespaces {
+            namespaces: None,
+            guard: Some("bwrap: No such file or directory".to_owned()),
+        };
+        match sandbox_active(&off, guard::Bus::Keyring) {
+            Err(ReviewerError::NoSandbox(why)) => assert_eq!(
+                why,
+                "its sandbox is not active (its write guard can't start: \
+                 bwrap: No such file or directory)"
+            ),
+            other => panic!("expected NoSandbox, got {other:?}"),
+        }
     }
 }
