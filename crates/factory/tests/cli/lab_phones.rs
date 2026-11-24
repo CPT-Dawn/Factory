@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use super::lab::{devlab, lab};
 use crate::support::world::{World, poll_until};
@@ -111,6 +112,53 @@ fn offline_and_unauthorized_phones_are_counted_in_the_reason() {
     assert!(
         got.stderr.contains(
             "gave up after 0 s: no free phone: 0 phone(s) busy, 1 offline, 1 unauthorized (tap Allow on the phone)"
+        ),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn a_phone_wait_ends_when_it_is_due_though_a_probe_is_still_answering() {
+    let (sandbox, world, wt) = plugged(&["FAKEPHONE01"], &[PIXEL_1]);
+    // Unlocked now, which the grant's probe would find 6 s on, after the wait is over.
+    world.apply("slow FAKEPHONE01").unwrap();
+    world.apply("unlock FAKEPHONE01").unwrap();
+
+    let started = Instant::now();
+    let refused = owned(&sandbox, &wt, &["acquire", "--phone", "--wait", "2"]);
+    let took = started.elapsed();
+
+    assert_eq!(refused.code, 75, "{refused:?}");
+    assert!(
+        refused.stderr.contains(
+            "gave up after 2 s: no free phone: 0 phone(s) busy, 1 locked (unlock it once)"
+        ),
+        "{refused:?}"
+    );
+    assert!(took < Duration::from_millis(3500), "took {took:?}");
+}
+
+#[test]
+fn while_the_watcher_lags_a_replugged_phone_is_not_granted_on_its_old_probe() {
+    let (sandbox, world, wt) = plugged(&[], &[PIXEL_3]);
+    // The watcher spends 6 s on the next phone plugged in; meanwhile adb's lists go on.
+    world.apply("slow FAKEPHONE05").unwrap();
+    world
+        .apply("plug FAKEPHONE05 device usb:1-5 product:komodo model:Pixel_9 transport_id:5")
+        .unwrap();
+    world.apply("unplug FAKEPHONE03").unwrap();
+    world.apply(PIXEL_3).unwrap();
+    world
+        .apply("plug FAKEPHONE02 unauthorized usb:1-2 transport_id:2")
+        .unwrap();
+
+    let got = owned(&sandbox, &wt, &["acquire", "--phone", "--wait", "0"]);
+
+    // 03 and 05 are not probed as adb shows them yet; 02 is unauthorized, as adb says.
+    assert_eq!(got.code, 75, "{got:?}");
+    assert!(
+        got.stderr.contains(
+            "gave up after 0 s: no free phone: 0 phone(s) busy, 2 offline, 1 unauthorized (tap Allow on the phone)"
         ),
         "{got:?}"
     );

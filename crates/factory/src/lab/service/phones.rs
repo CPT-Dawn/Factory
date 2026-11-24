@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -33,7 +34,7 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 /// What the watcher thread is asked to do.
 pub enum Job {
     /// adb's stream showed this list.
-    Frame(Vec<Attached>),
+    Frame(u64, Vec<Attached>),
     /// `devlab check`: the phones named (every phone when none), answered on the sender.
     Check(Vec<String>, mpsc::Sender<Vec<PhoneCheck>>),
     /// A grant: bring these phones' readiness up to date, then answer on the sender.
@@ -66,9 +67,9 @@ impl Lab {
 
     /// Tells the watcher what adb's stream showed; called before the list is told to anyone
     /// else, so anything that saw the list is answered after the watcher has it.
-    pub(super) fn saw_phones(&self, list: &[Attached]) {
+    pub(super) fn saw_phones(&self, list: &[Attached], frame: u64) {
         if let Some(tx) = self.phones.get() {
-            let _ = tx.send(Job::Frame(list.to_vec()));
+            let _ = tx.send(Job::Frame(frame, list.to_vec()));
         }
     }
 
@@ -88,15 +89,16 @@ impl Lab {
 
     /// Has the watcher bring the readiness of the phones `serials` up to date for a grant: a
     /// probe at most 10 s old is kept when it found the phone ready, any other is made again.
-    /// The grant then reads the store. A watcher that is gone or slow leaves the rows as they
-    /// are, which the grant trusts only while they are fresh.
-    pub(super) fn refresh_phones(&self, serials: Vec<String>) {
+    /// The grant then reads the store. It waits `within` at most, and never more than 10 s: a
+    /// watcher that is gone or slow leaves the rows as they are, which the grant trusts only
+    /// while they are fresh.
+    pub(super) fn refresh_phones(&self, serials: Vec<String>, within: Duration) {
         let (reply, answer) = mpsc::channel();
         let Some(tx) = self.phones.get() else {
             return;
         };
         if tx.send(Job::Refresh(serials, reply)).is_ok() {
-            let _ = answer.recv_timeout(REFRESH_TIMEOUT);
+            let _ = answer.recv_timeout(within.min(REFRESH_TIMEOUT));
         }
     }
 }
@@ -136,7 +138,12 @@ impl Watcher {
         let mut next = Instant::now() + every(&config());
         loop {
             match jobs.recv_timeout(next.saturating_duration_since(Instant::now())) {
-                Ok(Job::Frame(list)) => self.frame(list),
+                Ok(Job::Frame(number, list)) => {
+                    self.frame(list);
+                    // Its rows are written: a grant may believe them of the phones it lists.
+                    self.lab.phones_handled.store(number, Ordering::SeqCst);
+                    self.lab.notify();
+                }
                 Ok(Job::Check(serials, reply)) => {
                     let _ = reply.send(self.check(&serials));
                 }

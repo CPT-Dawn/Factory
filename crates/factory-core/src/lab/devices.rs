@@ -1,6 +1,8 @@
 //! Phones and emulators: what adb says is attached, which devices a request is granted, and how
 //! the devices show in status. devlab's device planner, kept apart from adb and the store.
 
+use std::collections::BTreeMap;
+
 /// Which devices a request takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -47,6 +49,27 @@ pub struct Attached {
     pub kind: &'static str,
     /// The `model:` property with its underscores as spaces; empty when adb gave none.
     pub model: String,
+}
+
+/// Since which frame of adb's stream each device in `now`, frame number `frame`, has been shown
+/// as it is shown now, by serial: `before` is the frame before and `since` its answer. A
+/// device that appears or changes state is shown from `frame` on.
+pub fn shown_since(
+    before: &[Attached],
+    since: &BTreeMap<String, u64>,
+    now: &[Attached],
+    frame: u64,
+) -> BTreeMap<String, u64> {
+    now.iter()
+        .map(|a| {
+            let kept = before
+                .iter()
+                .any(|b| b.serial == a.serial && b.state == a.state)
+                .then(|| since.get(&a.serial).copied())
+                .flatten();
+            (a.serial.clone(), kept.unwrap_or(frame))
+        })
+        .collect()
 }
 
 /// The devices in `adb devices -l` text, or in a frame of `adb track-devices -l`: one

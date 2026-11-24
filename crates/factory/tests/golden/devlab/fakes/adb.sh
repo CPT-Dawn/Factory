@@ -43,13 +43,16 @@ track-devices)
     # adb runs its arguments as one command line, whether they come as one or several; each
     # command of a "a; b" line plays on its own. A phone's global settings are world/settings
     # ("serial key value" lines), its screen sleeps while world/asleep names it and wakes on
-    # KEYCODE_WAKEUP, and it is on the power world/power names (USB when none).
+    # KEYCODE_WAKEUP, and it is on the power world/power names (USB when none). A phone
+    # world/slow names takes 6 s to answer whether its lock screen shows.
     shift
     printf '%s\n' "$*" | tr ';' '\n' | while IFS= read -r cmd; do
       case "$cmd" in
       *ro.product.cpu.abi*) case "$serial" in emulator-*) echo x86_64 ;; *) echo arm64-v8a ;; esac ;;
       *sys.boot_completed*) grep -qxF "$serial" "$w/stalled" || echo 1 ;;
-      *dumpsys\ window*) grep -qxF "$serial" "$w/locked" && echo "  mDreamingLockscreen=true" ;;
+      *dumpsys\ window*)
+        if grep -qxF "$serial" "$w/slow"; then sleep 6; fi
+        grep -qxF "$serial" "$w/locked" && echo "  mDreamingLockscreen=true" ;;
       *dumpsys\ power*)
         if grep -qxF "$serial" "$w/asleep"; then echo "  mWakefulness=Asleep"; else echo "  mWakefulness=Awake"; fi ;;
       *dumpsys\ battery*)

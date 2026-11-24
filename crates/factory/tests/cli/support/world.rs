@@ -44,6 +44,7 @@ const STATE_FILES: &[&str] = &[
     "asleep",
     "power",
     "settings",
+    "slow",
 ];
 
 /// How often a wait on a file looks again.
@@ -85,6 +86,7 @@ impl World {
     /// - `unplug <serial>`: adb no longer lists it,
     /// - `lock <serial>`: its lock screen stays up; `unlock <serial>`: it is unlocked,
     /// - `asleep <serial>`: its screen is off until something wakes it,
+    /// - `slow <serial>`: it takes 6 s to answer whether its lock screen shows,
     /// - `setting <serial> <key> <value>`: a global setting of the phone, such as
     ///   `stay_on_while_plugged_in`, is changed on it,
     /// - `power <serial> AC|USB|Wireless`: the power source it is on,
@@ -106,6 +108,7 @@ impl World {
             ["lock", serial] => self.append("locked", serial),
             ["unlock", serial] => self.remove("locked", |line| line == *serial),
             ["asleep", serial] => self.append("asleep", serial),
+            ["slow", serial] => self.append("slow", serial),
             ["setting", serial, key, value] => {
                 self.remove("settings", |line| {
                     line.split_whitespace().take(2).eq([*serial, *key])

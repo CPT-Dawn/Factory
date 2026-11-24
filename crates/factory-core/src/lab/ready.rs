@@ -22,6 +22,28 @@ pub fn probe_again(was: Readiness, age_ms: i64) -> bool {
     was != Readiness::Ready || age_ms > GRANT_FRESH_MS
 }
 
+/// What a grant takes a phone to be: `state` is how adb shows it now, `probed` what the last
+/// probe of it found and that probe's age in ms, when one was made since adb has shown it so.
+/// A phone adb can't use is what adb says, whatever was probed before; one it can use is what
+/// its probe found, or offline before any. None: a ready probe more than [GRANT_FRESH_MS] old,
+/// which the grant has made again before it believes the phone ready.
+pub fn for_grant(state: &str, probed: Option<(Readiness, i64)>) -> Option<Readiness> {
+    if state != "device" {
+        return Some(judge(&Probe {
+            state: state.to_owned(),
+            stay_on: None,
+            battery: None,
+            power: None,
+            lock: None,
+        }));
+    }
+    match probed {
+        None => Some(Readiness::Offline),
+        Some((Readiness::Ready, age_ms)) if age_ms > GRANT_FRESH_MS => None,
+        Some((readiness, _)) => Some(readiness),
+    }
+}
+
 /// What a phone is, as far as running unattended goes. Serialized as its [`Readiness::word`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
