@@ -407,6 +407,38 @@ mod tests {
         assert_eq!(decide(&device_ask(2, emulator), &b, 0), NEW);
     }
 
+    /// A waiter queued only behind a device-short waiter it competes with waits on those devices
+    /// too, though some are free for it: it steps aside for a request that needs none of them.
+    #[test]
+    fn a_waiter_held_behind_a_device_short_one_steps_aside_too() {
+        let phone_waiter = device_entry(1, 0, Some(need(Mode::Phone, 1, true)));
+        let any_waiter = device_entry(2, 1, Some(need(Mode::Any, 1, false)));
+        let emulator = Some(need(Mode::Emulator, 1, false));
+        for (asker, devices) in [(None, None), (Some(Mode::Emulator), emulator)] {
+            let b = board(
+                vec![],
+                vec![
+                    phone_waiter.clone(),
+                    any_waiter.clone(),
+                    device_entry(3, 2, devices),
+                ],
+                2,
+            );
+            let expected = match asker {
+                // An emulator competes with any device: it keeps its place behind the second.
+                Some(_) => {
+                    Decision::Wait("queued behind claude:1 @ wt1 (waiting since 0 min)".to_owned())
+                }
+                None => NEW,
+            };
+            assert_eq!(
+                decide(&device_ask(3, devices), &b, 0),
+                expected,
+                "{asker:?}"
+            );
+        }
+    }
+
     #[test]
     fn waiters_for_the_same_devices_keep_their_order() {
         for (short_of, mine) in [

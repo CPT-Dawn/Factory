@@ -1123,7 +1123,17 @@ fn grant_board(
     facts: &Facts,
     stopping: &keeper::Stopping,
 ) -> rusqlite::Result<grant::Board> {
-    let mut leases: Vec<_> = store::leases(c)?.iter().map(Lease::holding).collect();
+    // An emulator counts against its owner's device cap from its grant, booted or not.
+    let booting = store::booting_per_lease(c)?;
+    let mut leases: Vec<_> = store::leases(c)?
+        .iter()
+        .map(|l| {
+            let mut held = l.holding();
+            let boots = booting.get(&l.id).copied().unwrap_or(0);
+            held.devices = held.devices.saturating_add(boots);
+            held
+        })
+        .collect();
     leases.extend(reservations::all(c)?.iter().map(|r| r.holding()));
     let rows = store::slots(c)?;
     let asks = activity::asks(c)?;
@@ -1301,7 +1311,7 @@ fn try_grant(
         // A request short of devices that waits says which it needs, so the keeper may take
         // them from a lease that runs nothing (#57); it looks as soon as the request first says
         // so. One that won't wait takes nothing from anyone.
-        let need = match (&devices, &devices_wait) {
+        let reclaim = match (&devices, &devices_wait) {
             (Some(d), Some(why)) if why != ADB_RESTARTING && p.wait_sec > 0.0 && !capped => {
                 Some((d.mode.as_str(), d.lacks))
             }
@@ -1323,8 +1333,8 @@ fn try_grant(
                 // After the claim is undone, so a waiter with a reservation keeps its need.
                 // What it asks of devices tells the waiters behind it whether it is in their way
                 // (#58): when that changes, they look again.
-                let needs = activity::set_need(c, waiter, need)?;
-                if activity::set_ask(c, waiter, devices)? || needs {
+                let reclaims = activity::set_need(c, waiter, reclaim)?;
+                if activity::set_ask(c, waiter, devices)? || reclaims {
                     lab.notify();
                 }
                 return Ok(Err(Refused::Wait(why)));
@@ -1392,7 +1402,7 @@ fn try_grant(
                 reused.push(serial.clone());
             }
             for idx in free_indexes(&used, plan.boot) {
-                store::insert_emulator(c, idx, &serial_of(idx, ask.port_base))?;
+                store::insert_emulator(c, idx, &serial_of(idx, ask.port_base), lease.id)?;
                 boots.push(idx);
             }
         }

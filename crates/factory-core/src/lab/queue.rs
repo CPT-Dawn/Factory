@@ -108,13 +108,10 @@ pub fn competes(mine: Option<Mode>, theirs: Mode) -> bool {
     mine.is_some_and(|mine| mine == theirs || mine == Mode::Any || theirs == Mode::Any)
 }
 
-/// Whether waiter `e` lets a request for `mine` go ahead of it: its owner is at a cap, so only
-/// one of its own leases ending serves it, or it is short of devices `mine` doesn't compete for.
-fn steps_aside(e: &QueueEntry, mine: Option<Mode>, counts: &Counts<'_>) -> bool {
+/// Whether waiter `e`'s owner is at a cap, so that only one of its own leases ending serves it.
+fn capped(e: &QueueEntry, counts: &Counts<'_>) -> bool {
     waiter_capped(e, counts.slots).is_some()
         || device_cap_wait(e, (counts.devices)(&e.owner)).is_some()
-        || e.devices
-            .is_some_and(|d| d.short && !competes(mine, d.mode))
 }
 
 /// What each owner holds: `slots(owner, project)` stack slots, `devices(owner)` devices.
@@ -134,9 +131,28 @@ pub fn queue_turn(queue: &[QueueEntry], me: i64, counts: &Counts<'_>, now: i64) 
         return Some(why);
     }
     let wants = mine.and_then(|e| e.devices).map(|d| d.mode);
-    let head = queue
-        .iter()
-        .find(|e| e.id == me || !steps_aside(e, wants, counts))?;
+    // The kinds of device the waiters stepping aside so far wait for: a waiter is short of
+    // devices, or queued behind one that is and that it competes with. Either waits on devices,
+    // and lets a request that doesn't compete for its own go ahead of it.
+    let mut held: Vec<Mode> = Vec::new();
+    let head = queue.iter().find(|e| {
+        if e.id == me {
+            return true;
+        }
+        if capped(e, counts) {
+            return false;
+        }
+        let on_devices = e
+            .devices
+            .filter(|d| d.short || held.iter().any(|kind| competes(Some(d.mode), *kind)));
+        match on_devices {
+            Some(d) if !competes(wants, d.mode) => {
+                held.push(d.mode);
+                false
+            }
+            _ => true,
+        }
+    })?;
     (head.id != me).then(|| {
         format!(
             "queued behind {} (waiting since {} min)",

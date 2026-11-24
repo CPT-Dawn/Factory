@@ -1,6 +1,7 @@
 //! The lease store: `lab.db`, written by the daemon alone. Every write is one short
 //! `BEGIN IMMEDIATE` transaction, and no external command runs while one is open.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -98,6 +99,10 @@ CREATE TABLE IF NOT EXISTS emulators (
   serial TEXT NOT NULL,
   state TEXT NOT NULL,
   idle_since INTEGER
+);
+CREATE TABLE IF NOT EXISTS emulator_boots (
+  idx INTEGER PRIMARY KEY,
+  lease INTEGER NOT NULL
 );
 ";
 
@@ -269,12 +274,29 @@ pub fn emulators(c: &Connection) -> rusqlite::Result<Vec<EmulatorRow>> {
     .collect()
 }
 
-pub fn insert_emulator(c: &Connection, idx: u32, serial: &str) -> rusqlite::Result<()> {
+/// Records emulator `idx` booting for lease `lease`, which counts it as held until it has
+/// booted (or is forgotten).
+pub fn insert_emulator(c: &Connection, idx: u32, serial: &str, lease: i64) -> rusqlite::Result<()> {
     c.execute(
         "INSERT INTO emulators (idx, serial, state) VALUES (?1, ?2, 'booting')",
         params![idx, serial],
     )?;
+    c.execute(
+        "INSERT OR REPLACE INTO emulator_boots (idx, lease) VALUES (?1, ?2)",
+        params![idx, lease],
+    )?;
     Ok(())
+}
+
+/// The emulators each lease has booting, by lease id.
+pub fn booting_per_lease(c: &Connection) -> rusqlite::Result<BTreeMap<i64, u32>> {
+    let mut q = c.prepare(
+        "SELECT b.lease, COUNT(*) FROM emulator_boots b
+         JOIN emulators e ON e.idx = b.idx AND e.state = 'booting'
+         GROUP BY b.lease",
+    )?;
+    q.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect()
 }
 
 /// Marks a booting emulator ready, idle since `idle_since` (none: a lease holds it).
@@ -287,6 +309,7 @@ pub fn set_emulator_ready(
         "UPDATE emulators SET state = 'ready', idle_since = ?2 WHERE idx = ?1 AND state = 'booting'",
         params![idx, idle_since],
     )?;
+    c.execute("DELETE FROM emulator_boots WHERE idx = ?1", params![idx])?;
     Ok(())
 }
 
@@ -315,6 +338,11 @@ pub fn delete_emulator(c: &Connection, idx: u32, state: &str) -> rusqlite::Resul
     c.execute(
         "DELETE FROM emulators WHERE idx = ?1 AND state = ?2",
         params![idx, state],
+    )?;
+    c.execute(
+        "DELETE FROM emulator_boots WHERE idx = ?1
+         AND NOT EXISTS (SELECT 1 FROM emulators WHERE idx = ?1)",
+        params![idx],
     )?;
     Ok(())
 }
