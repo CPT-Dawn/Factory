@@ -279,34 +279,36 @@ fn result(response: Value) -> Value {
 
 #[test]
 fn post_tool_answers_a_result_over_the_limit_with_one_line() {
-    assert_eq!(RESULT_LIMIT, 12_000);
-    let over = "x".repeat(12_001);
+    assert_eq!(RESULT_LIMIT, 20_000);
+    let over = "x".repeat(20_001);
     // (response, the characters in all its strings)
     for (response, chars) in [
         (
             json!({"stdout": over, "stderr": "", "interrupted": false}),
-            12_001,
+            20_001,
         ),
         // The parts add up.
         (
-            json!({"stdout": "x".repeat(6_000), "stderr": "y".repeat(6_001)}),
-            12_001,
+            json!({"stdout": "x".repeat(10_000), "stderr": "y".repeat(10_001)}),
+            20_001,
         ),
         (
             json!({"type": "text", "file": {"filePath": "/a", "content": over}}),
-            12_007,
+            20_007,
         ),
-        (json!(over), 12_001),
+        (json!(over), 20_001),
         (
-            json!([{"type": "text", "text": "x".repeat(7_000)}, {"type": "text", "text": "x".repeat(5_001)}]),
-            12_009,
+            json!([{"type": "text", "text": "x".repeat(12_000)}, {"type": "text", "text": "x".repeat(8_001)}]),
+            20_009,
         ),
     ] {
         let line = post_tool(&result(response.clone()))
             .unwrap_or_else(|| panic!("{} should be answered", preview(&response)));
         assert!(!line.contains('\n'), "{line}");
         assert!(line.chars().count() <= 200, "{line}");
-        assert!(line.contains("rg -n"), "{line}");
+        assert!(line.contains("rg -n") && line.contains("slice"), "{line}");
+        // A fact about the result, not an order to the agent.
+        assert!(line.starts_with("That result was "), "{line}");
         assert!(line.contains(&chars.to_string()), "{line}");
     }
 }
@@ -318,12 +320,12 @@ fn preview(value: &Value) -> String {
 #[test]
 fn post_tool_says_nothing_to_a_result_within_the_limit() {
     for response in [
-        json!({"stdout": "x".repeat(12_000), "stderr": ""}),
+        json!({"stdout": "x".repeat(20_000), "stderr": ""}),
         // Characters count, not bytes.
-        json!({"stdout": "é".repeat(7_000)}),
+        json!({"stdout": "é".repeat(12_000)}),
         json!({"stdout": "", "interrupted": true, "isImage": false}),
         // Keys and numbers are not output.
-        json!({"a".repeat(13_000): 1}),
+        json!({"a".repeat(21_000): 1}),
         json!(null),
         json!("short"),
     ] {

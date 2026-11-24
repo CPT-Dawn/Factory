@@ -138,14 +138,30 @@ fn post_tool(sandbox: &Sandbox, stdout: &str) -> Run {
 fn post_tool_answers_a_long_result_in_claude_codes_protocol() {
     let sandbox = Sandbox::new();
 
-    let out = post_tool(&sandbox, &"x".repeat(12_500));
+    let out = post_tool(&sandbox, &"x".repeat(20_500));
 
     let said = answer(&out);
-    assert_eq!(said["decision"], "block");
-    let reason = said["reason"].as_str().unwrap();
+    // A note beside the result for the model, not a "blocking error" shown to the user.
+    assert_eq!(said.get("decision"), None, "{said}");
+    assert_eq!(said.get("reason"), None, "{said}");
+    let note = &said["hookSpecificOutput"];
+    assert_eq!(note["hookEventName"], "PostToolUse");
+    let context = note["additionalContext"].as_str().unwrap();
     assert!(
-        reason.contains("rg -n") && reason.contains("12500"),
-        "{reason}"
+        context.contains("rg -n") && context.contains("20500"),
+        "{context}"
+    );
+}
+
+#[test]
+fn post_tool_lets_a_result_of_a_dozen_thousand_characters_pass() {
+    let sandbox = Sandbox::new();
+
+    let out = post_tool(&sandbox, &"x".repeat(12_500));
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "", "")
     );
 }
 

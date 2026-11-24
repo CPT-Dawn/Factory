@@ -147,16 +147,18 @@ pub fn repl_misuse(code: &str) -> Option<String> {
     ))
 }
 
-/// The most characters of a tool result the post-tool hook lets pass without a word.
-pub const RESULT_LIMIT: usize = 12_000;
+/// The most characters of a tool result the post-tool hook lets pass without a word. The REPL
+/// itself cuts each part of its result at 30k, so a limit near that only speaks to the large ones.
+pub const RESULT_LIMIT: usize = 20_000;
 
 /// The post-tool rule over Claude Code's hook input: one line for a result over
-/// [`RESULT_LIMIT`] characters, which tells the agent to read less next time.
+/// [`RESULT_LIMIT`] characters, worded as a fact about it (Claude Code hands it to the model
+/// beside the result, and advises facts over orders).
 pub fn post_tool(input: &Value) -> Option<String> {
     let chars = text_chars(input.get("tool_response")?);
     (chars > RESULT_LIMIT).then(|| {
         format!(
-            "That result was {chars} characters: next time locate with rg -n and read only the line range you need."
+            "That result was {chars} characters; results this size read cheaper in slices: locate with rg -n and read the line range, or keep it in a REPL variable and return a slice."
         )
     })
 }

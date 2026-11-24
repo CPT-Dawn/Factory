@@ -3,7 +3,8 @@
 //!
 //! A hook runs on every tool call, so it never talks to the daemon and reads no more than it
 //! must; only stop-failure, which runs when a turn ends on an API error, tells the daemon. It
-//! prints nothing and exits 0 to let a call through, and one JSON line to refuse it.
+//! prints nothing and exits 0 to let a call through, and one JSON line to refuse it, or
+//! (post-tool) to add a note beside the result.
 //! A hook that cannot read its input exits 3: Claude Code shows that line and carries on, where
 //! exit 2 would block the call. A commit or push in a repository the hook cannot work out exits
 //! 2: it cannot be checked, so it must not run.
@@ -54,9 +55,11 @@ fn answer(command: &HookCommand) -> Result<Option<Value>, Failure> {
                 }
             }
         },
-        HookCommand::PostTool => {
-            hook::post_tool(&input).map(|line| json!({"decision": "block", "reason": line}))
-        }
+        // Context for the model beside the result. A "block" decision would show the user a
+        // "PostToolUse hook blocking error" on every large but legitimate read.
+        HookCommand::PostTool => hook::post_tool(&input).map(|line| {
+            json!({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": line}})
+        }),
         HookCommand::StopFailure => {
             crate::claude::stop_failure(&input)?;
             None

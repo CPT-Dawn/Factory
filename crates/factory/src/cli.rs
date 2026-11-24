@@ -117,7 +117,7 @@ pub enum Command {
 pub enum HookCommand {
     /// Before a tool runs: refuse npm, pkill -f and killall, a leaking commit or push, a REPL script that can't run
     PreTool,
-    /// After a tool ran: one line when its result is over 12k characters
+    /// After a tool ran: a note to the model when its result is over 20k characters
     PostTool,
     /// When a subagent stops: send back a report longer than its template
     SubagentStop,
