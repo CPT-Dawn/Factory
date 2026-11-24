@@ -9,10 +9,10 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::lab::{Agent, ask, devlab, lab, owned, received, write_machine_config};
+use super::lab::{Agent, ask, devlab, lab, owned, received, started, write_machine_config};
 use crate::support::herdr::FakeHerdr;
 use crate::support::world::{World, poll_until};
-use crate::support::{Run, Sandbox, run, stop_daemon};
+use crate::support::{Run, Sandbox, finish, run, spawn, stop_daemon};
 
 const PIXEL: &str = "plug FAKEPHONE01 device usb:1-1 model:Pixel_8";
 
@@ -191,7 +191,7 @@ fn a_reclaim_writes_the_reclaim_and_the_waiters_grant() {
     // The grant that took the phone names the lease it was reclaimed from; the reclaim, made
     // before any grant, names no waiter it could only guess at.
     assert_eq!(granted[0].get("reclaimed"), None, "{granted:?}");
-    assert_eq!(granted[1]["reclaimed"], reclaim["lease"], "{granted:?}");
+    assert_eq!(granted[1]["reclaimed"], "1", "{granted:?}");
     assert_eq!(reclaim.get("waiter"), None, "{reclaim}");
     let _ = holder.kill();
     let _ = holder.wait();
@@ -335,9 +335,14 @@ fn a_grant_handed_over_after_a_restart_says_the_last_reason_its_wait_had() {
     assert_eq!(regranted["result"]["lease"], granted["result"]["lease"]);
     assert_eq!(received(&mut again)["result"], true);
 
-    let grants = await_events(&sandbox, "lab-wait", 2, |e| e["action"] == "granted");
-    assert_eq!(grants.len(), 2, "{grants:?}");
-    let resumed = &grants[1];
+    // a's grant came first; one appended just before the stop may go out twice.
+    let a_waiter =
+        await_events(&sandbox, "lab-wait", 1, |e| e["action"] == "granted")[0]["waiter"].clone();
+    let grants = await_events(&sandbox, "lab-wait", 1, |e| {
+        e["action"] == "granted" && e["waiter"] != a_waiter
+    });
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    let resumed = &grants[0];
     assert_eq!(resumed["wait"], "slots", "{resumed}");
     assert!(resumed["seconds"].is_u64(), "{resumed}");
 }
@@ -378,4 +383,67 @@ fn an_unreadable_ledger_with_a_lead_to_settle_still_starts_the_daemon_and_settle
     let ends = await_events(&sandbox, "lead-end", 1, |e| e["slug"] == "cart");
     assert_eq!(ends.len(), 1, "{:?}", sandbox.ledger_lines());
     assert_eq!(ends[0]["outcome"], "finished");
+}
+
+/// Sends the daemon a `lab.acquire` for one phone straight over its socket, by `owner` in
+/// `worktree`; the connection, and its first line that holds `until` or an error.
+fn ask_phone(sandbox: &Sandbox, worktree: &Path, owner: u32, until: &str) -> (UnixStream, Value) {
+    let params = serde_json::json!({
+        "worktree": worktree,
+        "owner": {"pid": owner, "start": started(owner), "label": format!("sleep:{owner}"), "found": true},
+        "lease": null,
+        "project": null,
+        "wait_sec": 30,
+        "devices": {
+            "want": 1, "mode": "phone", "max_emulators": 0, "emulator_ram_mb": 0,
+            "host_floor_mb": 0, "port_base": 5554, "image": "", "device": "", "gpu": "",
+            "stay_awake": false, "animations_off": false,
+        },
+        "client": {"pid": owner, "start": started(owner)},
+    });
+    let stream =
+        UnixStream::connect(sandbox.path("run/factory/factory.sock")).expect("reach the daemon");
+    let request = serde_json::json!({"id": 1, "method": "lab.acquire", "params": params});
+    std::io::Write::write_all(&mut &stream, format!("{request}\n").as_bytes())
+        .expect("send a request");
+    let answer = next_with(&stream, until);
+    (stream, answer)
+}
+
+#[test]
+fn a_reclaimed_phone_whose_first_grant_never_arrives_is_named_by_the_grant_that_takes_it() {
+    let (sandbox, world) = one_phone(Some(r#""deviceIdleMin": 0"#));
+    let (wt_a, wt_b, wt_c) = (
+        world.worktree("plain-a"),
+        world.worktree("plain-b"),
+        world.worktree("plain-c"),
+    );
+    let holder = Agent::start();
+    let held = owned_by(
+        &sandbox,
+        &wt_a,
+        holder.pid(),
+        &["acquire", "--phone", "--quiet"],
+    );
+    assert_eq!(held.code, 0, "{held:?}");
+
+    // b is granted the phone reclaimed from the holder, and never says it has it: the phone
+    // goes back, and c, asking after, takes it.
+    let b = Agent::start();
+    let (lost, granted) = ask_phone(&sandbox, &wt_b, b.pid(), "result");
+    assert!(granted["result"]["lease"]["id"].is_i64(), "{granted}");
+    let mut c = devlab(
+        &sandbox,
+        &wt_c,
+        &["acquire", "--phone", "--wait", "60", "--quiet"],
+    );
+    c.env("DEVLAB_OWNER_PID", std::process::id().to_string());
+    let c = spawn(c);
+    drop(lost);
+
+    let grants = await_events(&sandbox, "lab-wait", 2, |e| e["action"] == "granted");
+    assert_eq!(grants.len(), 2, "{grants:?}");
+    // c, not b, took the reclaimed phone: its grant names the lease it came from.
+    assert_eq!(grants[1]["reclaimed"], "1", "{grants:?}");
+    assert_eq!(finish(c).code, 0);
 }

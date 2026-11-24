@@ -200,27 +200,23 @@ fn a_wait_says_what_was_asked_how_long_it_waited_and_its_last_reason() {
         stack: false,
     };
     assert_eq!(
-        object(&wait_granted(5, &none, 0, None, None)),
+        object(&wait_granted(5, &none, 0, None, &[])),
         json!({"action": "granted", "waiter": 5, "asked": "none", "count": 0, "stack": "no", "seconds": 0, "wait": "none"})
     );
 }
 
 #[test]
-fn a_grant_that_took_a_reclaimed_device_names_the_lease_it_was_reclaimed_from() {
+fn a_grant_that_took_reclaimed_devices_names_the_leases_they_were_reclaimed_from() {
     let asked = Asked {
         mode: Some("phone".to_owned()),
         count: 1,
         stack: false,
     };
-    let granted = wait_granted(
-        5,
-        &asked,
-        3,
-        Some("no free phone: 1 phone(s) busy"),
-        Some(7),
-    );
+    let granted = wait_granted(5, &asked, 3, Some("no free phone: 1 phone(s) busy"), &[7]);
     numbers_are_listed(&granted);
-    assert_eq!(granted["reclaimed"], 7, "{}", object(&granted));
+    assert_eq!(granted["reclaimed"], "7", "{}", object(&granted));
+    let from_two = wait_granted(6, &asked, 3, None, &[7, 9]);
+    assert_eq!(from_two["reclaimed"], "7,9", "{}", object(&from_two));
 }
 
 #[test]
