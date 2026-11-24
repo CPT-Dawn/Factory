@@ -268,3 +268,23 @@ fn factory_lab_check_keeps_the_output_contract() {
         "{summary:?}"
     );
 }
+
+#[test]
+fn a_daemon_on_a_machine_with_no_devlab_config_readies_phones_and_notifies_by_default() {
+    let (sandbox, world) = lab();
+    std::fs::remove_file(sandbox.path("config/devlab/config.json")).unwrap();
+    let wt = world.worktree("plain-ready");
+    // A call that needs no device list starts the daemon.
+    run(devlab(&sandbox, &wt, &["release"]));
+    world.apply(PIXEL).unwrap();
+
+    assert!(poll_until(|| !posts(&sandbox).is_empty()), "nothing posted");
+    assert_eq!(posts(&sandbox)[0][3..5], ["low", "Pixel 8 ready"]);
+    assert!(
+        world
+            .read("settings")
+            .contains("FAKEPHONE01 stay_on_while_plugged_in 7"),
+        "{}",
+        world.read("settings")
+    );
+}

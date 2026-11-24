@@ -26,8 +26,8 @@ pub struct CheckParams {
 pub struct PhoneCheck {
     pub serial: String,
     pub model: String,
-    /// Its readiness word; none when adb doesn't list it.
-    pub readiness: Option<String>,
+    /// None when adb doesn't list it.
+    pub readiness: Option<Readiness>,
     /// What a ready phone is warned of.
     pub warning: Option<String>,
     /// When it was probed, in ms since the epoch.
@@ -36,14 +36,14 @@ pub struct PhoneCheck {
 
 impl PhoneCheck {
     pub fn ready(&self) -> bool {
-        self.readiness.as_deref() == Some(Readiness::Ready.word())
+        self.readiness == Some(Readiness::Ready)
     }
 
     pub fn line(&self) -> String {
         check_line(
             &self.serial,
             &self.model,
-            self.readiness.as_deref().and_then(Readiness::from_word),
+            self.readiness,
             self.warning.as_deref(),
         )
     }

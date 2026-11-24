@@ -4,6 +4,7 @@
 //! saying what to do. One thread does it all, so the probes, the store's rows and the
 //! notifications follow the stream's order; `devlab check` is answered on it too.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -36,8 +37,8 @@ pub enum Job {
 }
 
 impl Lab {
-    /// Starts the watcher thread, once, and the device tracker on a machine with a devlab
-    /// config: phones are readied as they are plugged in, before any call needs the list.
+    /// Starts the watcher thread, once, and the device tracker: phones are readied as they are
+    /// plugged in, before any call needs the list.
     pub fn watch_phones(self: &Arc<Self>) {
         let (tx, rx) = mpsc::channel();
         let lab = Arc::clone(self);
@@ -50,13 +51,11 @@ impl Lab {
                     desktop: Box::new(NotifySend),
                     shown: Vec::new(),
                     said_missing: false,
+                    doubted: HashSet::new(),
                 }
                 .run(&rx);
             });
-        if spawned.is_err() || self.phones.set(tx).is_err() {
-            return;
-        }
-        if context::machine_config_path().exists() {
+        if spawned.is_ok() && self.phones.set(tx).is_ok() {
             self.track();
         }
     }
@@ -92,6 +91,8 @@ struct Watcher {
     shown: Vec<Attached>,
     /// Whether the log already said notify-send is missing.
     said_missing: bool,
+    /// The phones whose last probe got no answer.
+    doubted: HashSet<String>,
 }
 
 /// The machine config now; its defaults when it can't be read (the CLI says why).
@@ -152,6 +153,7 @@ impl Watcher {
             self.post(&unplugged(&name, holder.ok().flatten().as_deref()));
         }
         let before = std::mem::replace(&mut self.shown, phones.clone());
+        self.doubted.clear();
         for phone in &phones {
             let was = before.iter().find(|b| b.serial == phone.serial);
             if was.is_some_and(|b| b.state == phone.state) {
@@ -181,10 +183,15 @@ impl Watcher {
             lock: shell(LOCK_PROBE),
         };
         let readiness = judge(&probe);
-        // A phone adb lost between two lists is the next list's to tell.
-        if readiness == Readiness::Offline && !self.still_listed(&phone.serial) {
+        // A phone that stops answering is most often one being unplugged, which the next list
+        // tells: only a second probe in a row with no answer, of a phone adb still lists, finds
+        // it offline.
+        if readiness == Readiness::Offline
+            && (!self.still_listed(&phone.serial) || self.doubted.insert(phone.serial.clone()))
+        {
             return None;
         }
+        self.doubted.remove(&phone.serial);
         let warning = if readiness == Readiness::Ready {
             auth_timeout_warning(shell(AUTH_TIMEOUT_PROBE).as_deref())
         } else {
@@ -293,14 +300,14 @@ impl Watcher {
                     Some(row) => PhoneCheck {
                         serial,
                         model: row.model,
-                        readiness: Some(row.known.readiness.word().to_owned()),
+                        readiness: Some(row.known.readiness),
                         warning: row.warning,
                         probed_ms: Some(row.probed_ms),
                     },
                     None => PhoneCheck {
                         serial,
                         model: phone.model,
-                        readiness: Some(Readiness::Offline.word().to_owned()),
+                        readiness: Some(Readiness::Offline),
                         warning: None,
                         probed_ms: None,
                     },

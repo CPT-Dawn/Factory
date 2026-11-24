@@ -79,6 +79,70 @@ fn adbs_own_word_wins_and_a_phone_adb_cannot_reach_is_offline() {
         lock: None,
     };
     assert_eq!(judge(&unreachable), Readiness::Offline);
+    // adb lost it between two probes: what it can't tell is not taken as fine.
+    let dropped = Probe {
+        battery: None,
+        power: None,
+        lock: None,
+        ..ready_phone()
+    };
+    assert_eq!(judge(&dropped), Readiness::Offline);
+    for one_lost in [
+        Probe {
+            lock: None,
+            ..ready_phone()
+        },
+        Probe {
+            power: None,
+            ..ready_phone()
+        },
+        Probe {
+            battery: None,
+            ..ready_phone()
+        },
+        Probe {
+            stay_on: None,
+            ..ready_phone()
+        },
+    ] {
+        assert_eq!(judge(&one_lost), Readiness::Offline, "{one_lost:?}");
+    }
+}
+
+#[test]
+fn a_readiness_serializes_as_its_word() {
+    for r in [
+        Readiness::Ready,
+        Readiness::Locked,
+        Readiness::Asleep,
+        Readiness::StayAwakeOff,
+        Readiness::Unauthorized,
+        Readiness::Offline,
+    ] {
+        assert_eq!(serde_json::to_value(r).unwrap(), r.word());
+        assert_eq!(Readiness::from_word(r.word()), Some(r));
+        assert_eq!(
+            serde_json::from_value::<Readiness>(r.word().into()).unwrap(),
+            r
+        );
+    }
+}
+
+#[test]
+fn a_phone_on_no_power_cannot_stay_awake() {
+    let unpowered = Probe {
+        battery: Some(
+            "  AC powered: false\n  USB powered: false\n  Wireless powered: false\n".to_owned(),
+        ),
+        ..ready_phone()
+    };
+    assert_eq!(judge(&unpowered), Readiness::StayAwakeOff);
+    // A battery report that names no source at all is a phone on the USB adb reaches it by.
+    let unnamed = Probe {
+        battery: Some(String::new()),
+        ..ready_phone()
+    };
+    assert_eq!(judge(&unnamed), Readiness::Ready);
 }
 
 #[test]

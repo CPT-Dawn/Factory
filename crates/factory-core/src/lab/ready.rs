@@ -5,14 +5,16 @@
 /// source the screen stays on for (1 AC, 2 USB, 4 wireless, 8 dock).
 pub const STAY_ON_PROBE: &str = "settings get global stay_on_while_plugged_in";
 /// The shell line that prints which power sources the phone is on.
-pub const BATTERY_PROBE: &str = "dumpsys battery | grep -E 'powered: '";
+/// It ends in `head` so that naming no source is an answer, not a failure.
+pub const BATTERY_PROBE: &str = "dumpsys battery | grep -E 'powered: ' | head -8";
 /// The shell line that prints whether the screen is awake.
 pub const POWER_PROBE: &str = "dumpsys power | grep -E 'mWakefulness=' | head -1";
 /// The shell line that prints adb's authorization timeout; `0` when it is off.
 pub const AUTH_TIMEOUT_PROBE: &str = "settings get global adb_allowed_connection_time";
 
-/// What a phone is, as far as running unattended goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a phone is, as far as running unattended goes. Serialized as its [`Readiness::word`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Readiness {
     /// Authorized, kept awake on its power source, awake and unlocked.
     Ready,
@@ -21,6 +23,7 @@ pub enum Readiness {
     /// The screen is not awake.
     Asleep,
     /// `stay_on_while_plugged_in` doesn't cover the power source it is on.
+    #[serde(rename = "stay-awake off")]
     StayAwakeOff,
     /// adb lists it, but the phone hasn't allowed this computer's USB debugging.
     Unauthorized,
@@ -78,25 +81,25 @@ pub fn judge(p: &Probe) -> Readiness {
         "unauthorized" => return Readiness::Unauthorized,
         _ => return Readiness::Offline,
     }
-    if p.stay_on.is_none() && p.battery.is_none() && p.power.is_none() && p.lock.is_none() {
+    // A probe adb got no answer to leaves the phone unknown, not fine.
+    let (Some(stay_on), Some(battery), Some(power), Some(lock)) = (
+        p.stay_on.as_deref(),
+        p.battery.as_deref(),
+        p.power.as_deref(),
+        p.lock.as_deref(),
+    ) else {
         return Readiness::Offline;
-    }
-    let stay_on: u32 = p
-        .stay_on
-        .as_deref()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    let sources = power_sources(p.battery.as_deref().unwrap_or_default());
-    if stay_on & sources != sources {
+    };
+    let stay_on: u32 = stay_on.trim().parse().unwrap_or(0);
+    // A phone on no power at all sleeps whatever stay-awake says.
+    let sources = power_sources(battery);
+    if sources == 0 || stay_on & sources != sources {
         return Readiness::StayAwakeOff;
     }
-    if p.lock.as_deref().is_some_and(|l| !l.trim().is_empty()) {
+    if !lock.trim().is_empty() {
         return Readiness::Locked;
     }
-    let wakefulness = p
-        .power
-        .as_deref()
-        .unwrap_or_default()
+    let wakefulness = power
         .split_whitespace()
         .find_map(|w| w.strip_prefix("mWakefulness="));
     if wakefulness.is_some_and(|w| w != "Awake") {
@@ -105,13 +108,15 @@ pub fn judge(p: &Probe) -> Readiness {
     Readiness::Ready
 }
 
-/// The stay-awake bits of the power sources `dumpsys battery` says the phone is on; USB when
-/// it names none, as a phone adb reaches over USB is on it.
+/// The stay-awake bits of the power sources `dumpsys battery` says the phone is on, none when
+/// it says each is off; USB when it names no source, as a phone adb reaches over USB is on it.
 fn power_sources(battery: &str) -> u32 {
+    let mut named = false;
     let on: u32 = battery
         .lines()
         .filter_map(|line| {
             let (source, powered) = line.trim().split_once(" powered:")?;
+            named = true;
             (powered.trim() == "true").then_some(match source {
                 "AC" => 1,
                 "USB" => 2,
@@ -121,7 +126,7 @@ fn power_sources(battery: &str) -> u32 {
             })
         })
         .fold(0, |bits, bit| bits | bit);
-    if on == 0 { 2 } else { on }
+    if named { on } else { 2 }
 }
 
 /// How loud a notification is: `notify-send -u`.
