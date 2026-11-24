@@ -147,7 +147,7 @@ impl<H: HerdrApi> Leads<H> {
                 ))
             })?;
             if !standing.owes {
-                if let Err(e) = store.lead_ended(&name) {
+                if let Err(e) = store.lead_ended(&name, &repo) {
                     eprintln!("factory: cannot mark {name} ended in the database: {e}");
                 }
                 continue;
@@ -447,7 +447,7 @@ impl<H: HerdrApi> Leads<H> {
                     .store
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .lead_ended(&name);
+                    .lead_ended(&name, &lead.repo);
                 if let Err(e) = kept {
                     eprintln!("factory: cannot mark {name} ended in the database: {e}");
                 }
@@ -462,7 +462,8 @@ impl<H: HerdrApi> Leads<H> {
             // A newer run of this name has its own record to close: nothing is written for this one.
             if let Err(e) = landed {
                 eprintln!("factory: cannot write the lead-end of {name}: {e}");
-                self.lock().unfinished.insert(name, lead);
+                // Tried again later, unless a respawn of this name has taken its place since.
+                self.lock().unfinished.entry(name).or_insert(lead);
             }
         }
     }
