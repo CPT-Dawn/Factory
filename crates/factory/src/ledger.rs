@@ -22,6 +22,61 @@ fn named(event: &Fields, field: &str, want: &str) -> bool {
     }
 }
 
+/// Where a lead stands in the ledger: how many starts it has, and whether the latest of its
+/// starts and ends is a start. A lead with no events owes nothing, since an end without a start
+/// reads as a lead that never began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Standing {
+    pub starts: usize,
+    pub owes: bool,
+}
+
+fn standing_in(path: &std::path::Path, repo: &str, slug: &str) -> io::Result<Standing> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(Standing {
+                starts: 0,
+                owes: false,
+            });
+        }
+        Err(e) => return Err(e),
+    };
+    let mut standing = Standing {
+        starts: 0,
+        owes: false,
+    };
+    for event in text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        let Value::Object(event) = &event else {
+            continue;
+        };
+        if !(named(event, "repo", repo) && named(event, "slug", slug)) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("lead-start") => {
+                standing.starts += 1;
+                standing.owes = true;
+            }
+            Some("lead-end") => standing.owes = false,
+            _ => {}
+        }
+    }
+    Ok(standing)
+}
+
+/// Stamps `event` and writes it as one line.
+fn write_line(file: &mut File, event: &Event) -> io::Result<Fields> {
+    let landed = event.stamped(clock::now());
+    let mut line = Value::Object(landed.clone()).to_string();
+    line.push('\n');
+    file.write_all(line.as_bytes())?;
+    Ok(landed)
+}
+
 /// The ledger's file. Each event is stamped and written as one line under one lock, so lines
 /// never interleave.
 pub struct Ledger {
@@ -30,33 +85,58 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// Whether the lead `slug` of `repo` still owes the ledger its `lead-end`: its latest event
-    /// is a `lead-start`. A lead with no events owes nothing, since an end without a start
-    /// reads as a lead that never began.
-    pub fn owes_end(&self, repo: &str, slug: &str) -> io::Result<bool> {
-        let text = match std::fs::read_to_string(&self.path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e),
-        };
-        let mut owes = false;
-        for event in text
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        {
-            let Value::Object(event) = &event else {
-                continue;
-            };
-            if !(named(event, "repo", repo) && named(event, "slug", slug)) {
-                continue;
-            }
-            match event["type"].as_str() {
-                Some("lead-start") => owes = true,
-                Some("lead-end") => owes = false,
-                _ => {}
-            }
+    /// Where the lead `slug` of `repo` stands: whether it still owes the ledger its `lead-end`,
+    /// and which run of that slug the latest start is.
+    pub fn standing(&self, repo: &str, slug: &str) -> io::Result<Standing> {
+        standing_in(&self.path, repo, slug)
+    }
+
+    /// Appends the `lead-start` of the lead `slug` of `repo` and says which run of that slug it
+    /// is. The run is counted, and `keep` called, under the same lock as the write, so a start
+    /// logged beside it cannot take its number and a settlement of an earlier run, which holds
+    /// that lock too, cannot fall between what `keep` records and the start it records.
+    pub fn append_start(
+        &self,
+        repo: &str,
+        slug: &str,
+        event: &Event,
+        keep: impl FnOnce(),
+    ) -> io::Result<usize> {
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let run = standing_in(&self.path, repo, slug)?.starts + 1;
+        keep();
+        write_line(&mut file, event)?;
+        Ok(run)
+    }
+
+    /// Appends the `lead-end` of the lead `slug` of `repo`, the run whose start was the
+    /// `run`th, unless the ledger already holds an end for it, whoever wrote it, or the lead has
+    /// been started again since. The check, the write and `settled`, called once the run has its
+    /// end, share the lock every append takes, so an event logged in between cannot slip past.
+    pub fn append_end(
+        &self,
+        repo: &str,
+        slug: &str,
+        run: usize,
+        event: &Event,
+        settled: impl FnOnce(),
+    ) -> io::Result<()> {
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let standing = standing_in(&self.path, repo, slug)?;
+        if standing.starts != run {
+            return Ok(());
         }
-        Ok(owes)
+        if standing.owes {
+            write_line(&mut file, event)?;
+        }
+        settled();
+        Ok(())
     }
 
     /// The latest `review` event of `label` (in `repo`, when one is named) as it landed.
@@ -101,10 +181,6 @@ impl Ledger {
             .file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let landed = event.stamped(clock::now());
-        let mut line = Value::Object(landed.clone()).to_string();
-        line.push('\n');
-        file.write_all(line.as_bytes())?;
-        Ok(landed)
+        write_line(&mut file, event)
     }
 }
