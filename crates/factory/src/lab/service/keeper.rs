@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use factory_adapters::adb::{Adb, AdbCli};
 use factory_adapters::emulator::{Emulators, SystemdEmulators};
@@ -447,7 +447,5 @@ fn on_thread(name: &str, work: impl FnOnce() + Send + 'static) {
 
 /// Seconds since the epoch, with their fraction.
 fn now_f64() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64())
+    now_ms() as f64 / 1000.0
 }

@@ -226,6 +226,59 @@ fn an_unplug_is_critical_while_a_lease_holds_the_phone_and_low_while_it_is_free(
     assert_eq!(posts(&sandbox)[3][3..5], ["low", "Pixel 8 unplugged"]);
 }
 
+/// The daemon's log.
+fn daemon_log(sandbox: &Sandbox) -> String {
+    std::fs::read_to_string(sandbox.path("run/factory/daemon.log")).unwrap_or_default()
+}
+
+/// A directory of links to every program in /usr/bin and /bin but `missing`: a PATH where it
+/// is not found, though the host has it.
+fn system_without(sandbox: &Sandbox, missing: &str) -> PathBuf {
+    let dir = sandbox.path("system-bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    for sys in ["/usr/bin", "/bin"] {
+        for entry in std::fs::read_dir(sys).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            if name != missing && !dir.join(&name).exists() {
+                let _ = std::os::unix::fs::symlink(entry.path(), dir.join(&name));
+            }
+        }
+    }
+    dir
+}
+
+#[test]
+fn a_daemon_with_no_notify_send_says_so_in_its_log_once_and_goes_on_watching() {
+    let (sandbox, world) = lab();
+    let system = system_without(&sandbox, "notify-send");
+    let path = format!("{}:{}", sandbox.path("bin").display(), system.display());
+    let sandbox = sandbox.env("PATH", path);
+    std::fs::remove_file(sandbox.path("bin/notify-send")).unwrap();
+    write_machine_config(&sandbox, r#""notify": true, "readinessCheckSec": 0.1"#);
+    let wt = world.worktree("plain-ready");
+    assert_eq!(run(devlab(&sandbox, &wt, &["status"])).code, 0);
+
+    world.apply("lock FAKEPHONE01").unwrap();
+    world.apply(PIXEL).unwrap();
+    assert!(
+        poll_until(|| daemon_log(&sandbox).contains("Pixel 8 needs unlocking")),
+        "{}",
+        daemon_log(&sandbox)
+    );
+    world.apply("unlock FAKEPHONE01").unwrap();
+    assert!(
+        poll_until(|| daemon_log(&sandbox).contains("Pixel 8 ready")),
+        "{}",
+        daemon_log(&sandbox)
+    );
+    let log = daemon_log(&sandbox);
+    let said =
+        "factory: lab: notify-send not found: no desktop notifications until it is installed";
+    assert_eq!(log.lines().filter(|l| *l == said).count(), 1, "{log}");
+    assert!(posts(&sandbox).is_empty(), "{:?}", posts(&sandbox));
+    assert_eq!(check(&sandbox, &wt, &[]).code, 0, "{log}");
+}
+
 #[test]
 fn factory_lab_check_keeps_the_output_contract() {
     let (sandbox, world, wt) = watching();

@@ -15,7 +15,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock, mpsc};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use factory_adapters::adb::{Adb, AdbCli, AdbTrack};
 use factory_adapters::docker::{Containers, Docker};
@@ -2532,16 +2532,12 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, response: Response) -> bool
     writer.write_all(line.as_bytes()).await.is_ok()
 }
 
-/// Milliseconds since the epoch.
+/// Milliseconds since the epoch, on the lab's wall clock ([`crate::clock::lab_now_ms`]).
 pub(super) fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+    crate::clock::lab_now_ms()
 }
 
-/// Seconds since the epoch.
+/// Seconds since the epoch, on the lab's wall clock.
 pub fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+    now_ms().div_euclid(1000)
 }
