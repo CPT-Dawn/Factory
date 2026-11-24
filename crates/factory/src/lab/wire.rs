@@ -327,7 +327,7 @@ pub struct Granted {
 /// The schema a slot's stack last ran, whether or not it runs now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotSchema {
-    /// The worktree whose lease last held the slot while devlab's stack ran there.
+    /// The worktree whose lease last started the slot's stack.
     pub worktree: String,
     /// That worktree's newest migration when the record was made, if it had one.
     pub head: Option<String>,

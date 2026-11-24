@@ -192,7 +192,11 @@ impl Lab {
                             lab.notify();
                         },
                         &|| {
+                            // Under the store's lock: a grant reads the list and commits under
+                            // it, so none commits from a list whose stream ended after it read it.
+                            let store = lock_ignoring_poison(&lab.store);
                             lab.attached.send_modify(|d| d.stale = true);
+                            drop(store);
                             lab.notify();
                         },
                         &|| {
@@ -927,7 +931,8 @@ fn try_grant(
         }
         let stopping = lock_ignoring_poison(&lab.stopping).clone();
         // Devices are planned from the list adb shows as this transaction runs, never from
-        // one read before the probes: none is granted from a list its stream stopped
+        // one read before the probes. A stream that ends marks its list stale under the
+        // store's lock, so not while this runs: none is granted from a list its stream stopped
         // following, and the request waits for the stream to show one again. A request for
         // no device goes on.
         let attached = match &p.devices {

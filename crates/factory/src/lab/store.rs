@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS slot_schemas (
   head TEXT,
   PRIMARY KEY (project, slot)
 );
+-- A stack an earlier daemon started and has not stopped ran its last worktree's schema. A
+-- stack this daemon starts is recorded as it starts, so this adds nothing once a record exists.
+INSERT OR IGNORE INTO slot_schemas (project, slot, worktree)
+  SELECT project, slot, last_worktree FROM slots WHERE stack_ours = 1 AND last_worktree IS NOT NULL;
 CREATE TABLE IF NOT EXISTS stoppers (
   project TEXT NOT NULL,
   slot INTEGER NOT NULL,
@@ -443,10 +447,9 @@ pub fn find_lease(
     .transpose()
 }
 
-/// Forgets a lease; its slot and its emulators start idling, its phones are free. A lease that
-/// held the slot while devlab's stack ran there, or whose worktree's schema the slot holds,
-/// records its worktree's schema as the slot's as it ends: migrations added during the lease
-/// count.
+/// Forgets a lease; its slot and its emulators start idling, its phones are free. A lease whose
+/// worktree started the slot's stack records that worktree's newest migration as it ends, so
+/// that one added during the lease counts.
 pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<()> {
     c.execute(
         "UPDATE emulators SET idle_since = ?1
@@ -460,8 +463,7 @@ pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<(
             params![now, project, slot],
         )?;
         let ran: bool = c.query_row(
-            "SELECT EXISTS (SELECT 1 FROM slots WHERE project = ?1 AND slot = ?2 AND stack_ours = 1)
-                 OR EXISTS (SELECT 1 FROM slot_schemas
+            "SELECT EXISTS (SELECT 1 FROM slot_schemas
                             WHERE project = ?1 AND slot = ?2 AND worktree = ?3)",
             params![project, slot, lease.worktree],
             |row| row.get(0),
@@ -590,7 +592,8 @@ pub fn insert_lease(
     })
 }
 
-/// Marks a slot held by `worktree`; returns the worktree it ran before.
+/// Marks a slot held by `worktree`; returns the worktree of the lease that held it last, whether
+/// or not that lease ran its stack (see [`slot_schema`] for the schema it holds).
 pub fn claim_slot(
     c: &Connection,
     project: &str,
@@ -658,39 +661,34 @@ pub fn clear_dead_stoppers(
 }
 
 /// Marks the slot's stack as devlab's to stop, or not. A stack devlab starts runs the schema
-/// of the worktree whose lease holds the slot, and so does one that lease stops: either is
-/// recorded as the slot's schema (see [`slot_schema`]). The keeper, stopping an idle stack no
-/// lease holds, changes no record.
+/// of the worktree whose lease holds the slot: that worktree is recorded as the slot's schema
+/// (see [`slot_schema`]), and stays so when the stack stops or another lease holds the slot.
 pub fn set_stack_ours(
     c: &Connection,
     project: &str,
     slot: u32,
     ours: bool,
 ) -> rusqlite::Result<()> {
-    let (was_ours, holder) = c
-        .query_row(
-            "SELECT stack_ours,
-                    (SELECT worktree FROM leases l WHERE l.project = slots.project
-                                                     AND l.slot = slots.slot)
-             FROM slots WHERE project = ?1 AND slot = ?2",
-            params![project, slot],
-            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<String>>(1)?)),
-        )
-        .optional()?
-        .unwrap_or((false, None));
     c.execute(
         "UPDATE slots SET stack_ours = ?3 WHERE project = ?1 AND slot = ?2",
         params![project, slot, ours],
     )?;
-    if let Some(worktree) = holder.filter(|_| ours || was_ours) {
+    let holder: Option<String> = c
+        .query_row(
+            "SELECT worktree FROM leases WHERE project = ?1 AND slot = ?2",
+            params![project, slot],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(worktree) = holder.filter(|_| ours) {
         record_schema(c, project, slot, &worktree)?;
     }
     Ok(())
 }
 
-/// The schema the slot's stack last ran: the worktree whose lease last held the slot while
-/// devlab's stack ran there, and that worktree's newest migration when its lease ended. None
-/// when devlab never ran the slot's stack.
+/// The schema the slot's stack last ran: the worktree whose lease last started it, and that
+/// worktree's newest migration when that lease ended. None when devlab never ran the slot's
+/// stack.
 pub fn slot_schema(
     c: &Connection,
     project: &str,

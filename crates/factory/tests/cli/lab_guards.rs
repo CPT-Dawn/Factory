@@ -176,7 +176,18 @@ fn migrations(worktree: &Path, files: &[&str], dirs: &[&str]) -> PathBuf {
 fn a_lease_that_ends_records_the_newest_migration_of_its_worktree_with_the_slots_schema() {
     let (sandbox, world) = lab();
     let (a, b) = (world.worktree("demo-a"), world.worktree("demo-b"));
-    let dir = migrations(&a, &["20260101_a.sql", "README.md"], &["zzz.sql"]);
+    // Only `<version>_<name>.sql` files are migrations, as the supabase CLI reads them.
+    let dir = migrations(
+        &a,
+        &[
+            "20260101_a.sql",
+            "README.md",
+            "zzz.draft.sql",
+            ".zzz.sql",
+            "9_x.txt",
+        ],
+        &["99999999999999_dir.sql"],
+    );
     assert_eq!(
         owned(&sandbox, &a, &["acquire", "--no-device", "--stack"]).code,
         0
@@ -254,6 +265,33 @@ fn a_running_stack_devlab_has_no_schema_record_of_warns_of_the_slots_last_worktr
     assert_eq!(owned(&sandbox, &a, &["release"]).code, 0);
 
     let out = owned(&sandbox, &b, &["acquire", "--no-device"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(
+        out.stderr
+            .contains("slot 0's stack last ran demo-a's schema:"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_lease_that_holds_a_running_stack_it_did_not_start_leaves_its_schema_to_the_starter() {
+    let (sandbox, world) = lab();
+    let (a, b, c) = (
+        world.worktree("demo-a"),
+        world.worktree("demo-b"),
+        world.worktree("demo-c"),
+    );
+    migrations(&b, &["20260301_b.sql"], &[]);
+    assert_eq!(
+        owned(&sandbox, &a, &["acquire", "--no-device", "--stack"]).code,
+        0
+    );
+    assert_eq!(owned(&sandbox, &a, &["release"]).code, 0);
+    assert_eq!(owned(&sandbox, &b, &["acquire", "--no-device"]).code, 0);
+    assert_eq!(owned(&sandbox, &b, &["release"]).code, 0);
+
+    let out = owned(&sandbox, &c, &["acquire", "--no-device"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     assert!(
