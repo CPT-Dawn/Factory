@@ -2,6 +2,25 @@
 w='@WORLD@'
 row() { awk -v s="$1" '$1 == s' "$w/devices"; }
 frame() { awk '{ printf "%s\t%s\n", $1, $2 }' "$w/devices"; }
+# A yanked phone is unplugged now, once every running track stream has shown it gone (as the
+# harness waits after an unplug); it is yanked once.
+yank() {
+  grep -qxF "$1" "$w/yanked" || return 1
+  grep -vxF "$1" "$w/yanked" > "$w/yanked.new"; mv "$w/yanked.new" "$w/yanked"
+  awk -v s="$1" '$1 != s' "$w/devices" > "$w/devices.new"; mv "$w/devices.new" "$w/devices"
+  n=0
+  while [ "$n" -lt 200 ]; do
+    now=$(cat "$w/devices") shown=1
+    for f in "$w"/tracked.*; do
+      [ -e "$f" ] && kill -0 "${f##*.}" 2>/dev/null || continue
+      [ "$(cat "$f")" = "$now" ] || shown=
+    done
+    [ -n "$shown" ] && break
+    n=$((n + 1)); sleep 0.05
+  done
+  sleep 0.1
+  echo "adb: device '$1' not found" >&2
+}
 case "$1" in
 devices)
   echo "List of devices attached"
@@ -43,7 +62,7 @@ track-devices)
     # adb runs its arguments as one command line, whether they come as one or several.
     shift
     case "$*" in
-    *ro.product.cpu.abi*) case "$serial" in emulator-*) echo x86_64 ;; *) echo arm64-v8a ;; esac ;;
+    *ro.product.cpu.abi*) yank "$serial" && exit 1; case "$serial" in emulator-*) echo x86_64 ;; *) echo arm64-v8a ;; esac ;;
     *sys.boot_completed*) grep -qxF "$serial" "$w/stalled" || echo 1 ;;
     *dumpsys\ window*) grep -qxF "$serial" "$w/locked" && echo "  mDreamingLockscreen=true" ;;
     esac

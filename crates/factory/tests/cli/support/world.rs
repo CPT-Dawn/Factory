@@ -41,6 +41,7 @@ const STATE_FILES: &[&str] = &[
     "broken",
     "locked",
     "stalled",
+    "yanked",
 ];
 
 /// How often a wait on a file looks again.
@@ -82,6 +83,8 @@ impl World {
     /// - `unplug <serial>`: adb no longer lists it,
     /// - `lock <serial>`: its lock screen stays up,
     /// - `stall <serial>`: the emulator never finishes booting,
+    /// - `yank <serial>`: the phone is unplugged when it is next asked its ABI, as a grant of it
+    ///   settles: between the grant and the prep,
     /// - `break <operation>` / `mend <operation>`: `supabase start`, `supabase stop` or `systemd-run` fails,
     ///   or works again.
     pub fn apply(&self, step: &str) -> Result<(), String> {
@@ -98,6 +101,7 @@ impl World {
             }
             ["lock", serial] => self.append("locked", serial),
             ["stall", serial] => self.append("stalled", serial),
+            ["yank", serial] => self.append("yanked", serial),
             ["break", what @ ..] if !what.is_empty() => self.append("broken", &what.join(" ")),
             ["mend", what @ ..] if !what.is_empty() => {
                 let what = what.join(" ");

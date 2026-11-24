@@ -120,6 +120,7 @@ impl Store {
         }
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(reservations::SCHEMA)?;
+        reservations::upgrade(&conn)?;
         if version < VERSION {
             conn.pragma_update(None, "user_version", VERSION)?;
         }
@@ -464,7 +465,7 @@ pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<(
     c.execute("DELETE FROM leases WHERE id = ?1", [lease.id])?;
     c.execute("DELETE FROM run_leases WHERE lease = ?1", [lease.id])?;
     if let Some(from) = &from {
-        reservations::restore(c, from)?;
+        reservations::restore(c, from, now)?;
     }
     reservations::record_lease_end(c, lease, now)
 }

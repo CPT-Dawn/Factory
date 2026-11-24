@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS reservations (
   owner_pid INTEGER NOT NULL,
   owner_start TEXT NOT NULL,
   owner_label TEXT NOT NULL,
-  created INTEGER NOT NULL
+  created INTEGER NOT NULL,
+  used INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS reservations_slot ON reservations (project, slot);
 CREATE TABLE IF NOT EXISTS lease_history (
@@ -27,6 +28,22 @@ CREATE TABLE IF NOT EXISTS lease_history (
 
 /// How many of a project's latest leases its ETA is read from.
 const HISTORY: i64 = 20;
+
+/// How long a reservation lasts after it was made or last used, in seconds (#59).
+const UNUSED_FOR: i64 = 2 * 3600;
+
+/// Adds `used` to a reservations table made before it had one.
+pub fn upgrade(c: &Connection) -> rusqlite::Result<()> {
+    let has_used: bool = c.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('reservations') WHERE name = 'used'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_used {
+        c.execute_batch("ALTER TABLE reservations ADD COLUMN used INTEGER")?;
+    }
+    Ok(())
+}
 
 fn row(row: &Row<'_>) -> rusqlite::Result<Reservation> {
     Ok(Reservation {
@@ -107,21 +124,29 @@ pub fn drop_by_id(c: &Connection, id: i64, now: i64) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Drops every reservation whose owner exited; a line per reservation dropped.
+/// Drops every reservation whose owner exited, or that nobody used for [`UNUSED_FOR`] since it
+/// was made or last used; a line per reservation dropped.
 pub fn gc(
     c: &Connection,
     now: i64,
     alive: &dyn Fn(i64, &str) -> bool,
 ) -> rusqlite::Result<Vec<String>> {
+    let mut stale =
+        c.prepare("SELECT id FROM reservations WHERE MAX(created, COALESCE(used, created)) <= ?1")?;
+    let stale: Vec<i64> = stale
+        .query_map([now - UNUSED_FOR], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     let mut freed = Vec::new();
     for r in all(c)? {
-        if !alive(r.owner_pid, &r.owner_start) {
-            drop_reservation(c, &r, now)?;
-            freed.push(format!(
-                "reservation {} ({}, owner exited)",
-                r.id, r.owner_label
-            ));
-        }
+        let why = if !alive(r.owner_pid, &r.owner_start) {
+            "owner exited".to_owned()
+        } else if stale.contains(&r.id) {
+            format!("unused for {} h", UNUSED_FOR / 3600)
+        } else {
+            continue;
+        };
+        drop_reservation(c, &r, now)?;
+        freed.push(format!("reservation {} ({}, {why})", r.id, r.owner_label));
     }
     Ok(freed)
 }
@@ -149,13 +174,13 @@ pub fn claim(
 }
 
 /// Puts back reservation `r` that a lease was made from, under its own id, once that lease
-/// ended: its slot is spoken for again. A slot a lease or another reservation holds by then
-/// stays as it is.
-pub fn restore(c: &Connection, r: &Reservation) -> rusqlite::Result<()> {
+/// ended: its slot is spoken for again, and it was used `now`. A slot a lease or another
+/// reservation holds by then stays as it is.
+pub fn restore(c: &Connection, r: &Reservation, now: i64) -> rusqlite::Result<()> {
     let put = c.execute(
         "INSERT OR IGNORE INTO reservations
-           (id, project, slot, worktree, owner_pid, owner_start, owner_label, created)
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+           (id, project, slot, worktree, owner_pid, owner_start, owner_label, created, used)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
          WHERE NOT EXISTS (SELECT 1 FROM leases WHERE project = ?2 AND slot = ?3)",
         params![
             r.id,
@@ -165,7 +190,8 @@ pub fn restore(c: &Connection, r: &Reservation) -> rusqlite::Result<()> {
             r.owner_pid,
             r.owner_start,
             r.owner_label,
-            r.created
+            r.created,
+            now
         ],
     )?;
     if put > 0 {
