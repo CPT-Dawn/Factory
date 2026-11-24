@@ -110,15 +110,18 @@ pub fn prepare_workdir(p: &ProjectConfig, worktree: &str, slot: u32) -> Result<(
     Ok(())
 }
 
-/// The name of the newest migration in the worktree's supabase dir; none when it has none.
+/// The name of the newest `.sql` migration in the worktree's supabase dir; none when it has none.
 pub fn migration_head(p: &ProjectConfig, worktree: &str) -> Option<String> {
     let dir = Path::new(worktree)
         .join(&p.supabase.as_ref()?.dir)
         .join("migrations");
     fs::read_dir(dir)
         .ok()?
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|name| !name.starts_with('.'))
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().into_string().ok()?;
+            (name.ends_with(".sql") && entry.path().is_file()).then_some(name)
+        })
         .max()
 }
 
@@ -219,9 +222,10 @@ mod tests {
         let migrations = dir.path().join("db/migrations");
         fs::create_dir_all(&migrations).unwrap();
         assert_eq!(migration_head(&p, worktree), None);
-        for name in ["20260102_b.sql", "20260101_a.sql", ".keep"] {
+        for name in ["20260102_b.sql", "20260101_a.sql", ".keep", "README.md"] {
             fs::write(migrations.join(name), "").unwrap();
         }
+        fs::create_dir(migrations.join("zzz.sql")).unwrap();
         assert_eq!(
             migration_head(&p, worktree).as_deref(),
             Some("20260102_b.sql")
