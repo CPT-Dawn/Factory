@@ -15,6 +15,7 @@ pub mod docker;
 pub mod emulator;
 pub mod gh;
 pub mod git;
+pub mod guard;
 pub mod herdr;
 pub mod inbox;
 pub mod process;
