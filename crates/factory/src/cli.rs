@@ -115,7 +115,7 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum HookCommand {
-    /// Before a tool runs: refuse npm, a leaking commit or push, a REPL script that can't run
+    /// Before a tool runs: refuse npm, pkill -f and killall, a leaking commit or push, a REPL script that can't run
     PreTool,
     /// After a tool ran: one line when its result is over 12k characters
     PostTool,

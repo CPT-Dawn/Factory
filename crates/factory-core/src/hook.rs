@@ -105,6 +105,9 @@ pub fn pre_tool(input: &Value, escape: bool) -> PreTool {
             if let Some(reason) = package_manager(command, escape) {
                 return PreTool::Block(reason);
             }
+            if let Some(reason) = machine_wide_kill(command) {
+                return PreTool::Block(reason);
+            }
             match git_actions(command) {
                 actions if actions.is_empty() => PreTool::Allow,
                 actions => PreTool::Check(actions),
@@ -806,6 +809,35 @@ pub fn package_manager(command: &str, escape: bool) -> Option<String> {
     Some(format!(
         "{found} is not used here: run it with {fix}, or put {ESCAPE}=1 in front of the command to use {found} this once."
     ))
+}
+
+/// The refusal for a command that kills processes by pattern: `pkill -f` and `killall` match
+/// every agent's processes on the machine, and the pattern can match the caller's own shell. No
+/// escape: the damage lands on other agents, not on the one that asks.
+pub fn machine_wide_kill(command: &str) -> Option<String> {
+    all_parts(command).iter().any(|part| match part {
+        Part::Command(words) => shell::invocation(words).is_some_and(|call| match call.program {
+            "killall" => true,
+            "pkill" => matches_full_command_line(call.args),
+            _ => false,
+        }),
+        _ => false,
+    })
+    .then(|| {
+        "pkill -f and killall reach every agent's processes on this machine; kill the PID you started (note $! when you start it, or list candidates with pgrep -af <pattern> and kill only yours)."
+            .to_owned()
+    })
+}
+
+/// Whether pkill's options, up to a bare `--`, include `-f` (alone or inside a group such as
+/// `-9f`) or `--full` (or any prefix of it getopt accepts).
+fn matches_full_command_line(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| match arg.strip_prefix("--") {
+            Some(long) => !long.is_empty() && "full".starts_with(long),
+            None => is_short_flag(arg, 'f'),
+        })
 }
 
 fn manager_in(words: &[String]) -> Option<&'static str> {

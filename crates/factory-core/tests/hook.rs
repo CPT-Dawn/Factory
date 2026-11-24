@@ -101,6 +101,90 @@ fn the_package_manager_block_is_one_line_with_the_fix() {
 }
 
 #[test]
+fn pre_tool_blocks_a_machine_wide_kill_wherever_it_sits() {
+    for command in [
+        "pkill -f 'claude -p --input-format stream-json'",
+        "pkill -f \"target/debug/factory daemon\"",
+        "pkill --full factory",
+        "pkill --ful factory",
+        "pkill -9f factory",
+        "pkill -fx factory",
+        "pkill -TERM -f factory",
+        "pkill -u me -f factory",
+        "killall claude",
+        "killall -9 factory",
+        "/usr/bin/killall node",
+        "cd x && pkill -f y",
+        "true; killall y",
+        "ps aux | pkill -f y",
+        "sudo pkill -f y",
+        "sudo -u root killall y",
+        "env X=1 pkill -f y",
+        "bash -c 'pkill -f y'",
+        "sh -c \"cd x && killall y\"",
+        "(pkill -f y)",
+        "echo $(pkill -f y)",
+        "pkill \\\n  -f y",
+    ] {
+        let reason = blocked(&bash(command), false);
+        assert!(reason.is_some(), "{command:?} should be blocked");
+        // No escape variable reaches this far: a kill hits other agents, not only this one.
+        assert!(
+            blocked(&bash(command), true).is_some(),
+            "{command:?} with the escape"
+        );
+    }
+}
+
+#[test]
+fn pre_tool_lets_a_kill_of_one_pid_through() {
+    for command in [
+        "kill 123",
+        "kill -9 123",
+        "kill $!",
+        "pkill factory",
+        "pkill -9 factory",
+        "pkill -u me factory",
+        "pkill -x factory",
+        "pgrep -af factory",
+        "pkill -- -f",
+        "echo pkill -f y",
+        "echo 'killall y'",
+        "man killall",
+        "git commit -m 'no more pkill -f'",
+        "rg killall src",
+        "ls killall-notes",
+        "cd pkill && ls",
+        "killall_helper x",
+    ] {
+        assert!(
+            matches!(
+                pre_tool(&bash(command), false),
+                PreTool::Allow | PreTool::Check(_)
+            ),
+            "{command:?} should pass"
+        );
+    }
+}
+
+#[test]
+fn the_kill_block_is_one_line_naming_what_to_do_instead() {
+    for command in ["pkill -f x", "killall x"] {
+        let reason = blocked(&bash(command), false).unwrap();
+        assert!(!reason.contains('\n'), "{reason}");
+        assert!(reason.chars().count() <= 200, "{reason}");
+        assert!(
+            reason.contains("pkill -f") && reason.contains("killall"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("$!") && reason.contains("pgrep -af"),
+            "{reason}"
+        );
+    }
+}
+
+#[test]
 fn other_tools_and_shapes_pass_untouched() {
     for call in [
         json!({}),

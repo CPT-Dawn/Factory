@@ -41,6 +41,32 @@ fn pre_tool_denies_npm_in_claude_codes_protocol() {
 }
 
 #[test]
+fn pre_tool_denies_a_machine_wide_kill_even_with_the_npm_escape_set() {
+    let sandbox = Sandbox::new().env("FACTORY_ALLOW_NPM", "1");
+
+    let out = pre_tool(&sandbox, &bash("pkill -f 'factory daemon'"));
+
+    let said = answer(&out);
+    assert_eq!(said["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = said["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(reason.contains("pgrep -af"), "{reason}");
+}
+
+#[test]
+fn pre_tool_lets_a_kill_of_one_pid_through() {
+    let sandbox = Sandbox::new();
+
+    let out = pre_tool(&sandbox, &bash("kill 4242"));
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "", "")
+    );
+}
+
+#[test]
 fn pre_tool_says_nothing_to_a_call_it_allows() {
     let sandbox = Sandbox::new();
 
