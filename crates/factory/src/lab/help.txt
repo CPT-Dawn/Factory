@@ -13,6 +13,7 @@ Agents: lease before touching adb, an emulator or a local stack; never pick a se
   devlab release --lease <id>     give back that lease of yours from any folder (also: DEVLAB_LEASE)
   devlab release --all-mine       give back every lease of yours (leases also end when the agent exits)
   devlab status [--json]          devices, holders, stack slots, queue, memory
+  devlab check [serial...]        can each phone run unattended, and what to do if not (exit 10)
 
 Options for run/acquire:
   --devices N    devices to hold (default 1); --pair is 2; --no-device holds only a stack slot

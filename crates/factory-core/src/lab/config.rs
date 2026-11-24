@@ -45,6 +45,10 @@ pub struct MachineConfig {
     pub emulator_idle_min: f64,
     /// Minutes a stack devlab started runs with no lease on its slot before it is stopped.
     pub stack_idle_min: f64,
+    /// Post a desktop notification when a phone's readiness changes.
+    pub notify: bool,
+    /// Seconds between two probes of every attached phone's readiness.
+    pub readiness_check_sec: f64,
 }
 
 impl Default for MachineConfig {
@@ -65,6 +69,8 @@ impl Default for MachineConfig {
             prep_animations_off: true,
             emulator_idle_min: 10.0,
             stack_idle_min: 45.0,
+            notify: true,
+            readiness_check_sec: 60.0,
         }
     }
 }
@@ -177,6 +183,18 @@ pub fn machine_config(file: &str, text: &str) -> Result<MachineConfig, ConfigErr
                 })?;
             }
         }
+    }
+    if let Some(v) = raw.get("notify") {
+        cfg.notify = v
+            .as_bool()
+            .ok_or_else(|| ConfigError(format!("{file}: \"notify\" must be true or false")))?;
+    }
+    if let Some(v) = raw.get("readinessCheckSec") {
+        cfg.readiness_check_sec = v.as_f64().filter(|n| *n > 0.0).ok_or_else(|| {
+            ConfigError(format!(
+                "{file}: \"readinessCheckSec\" must be a number of seconds above 0"
+            ))
+        })?;
     }
     cfg.max_slots_per_owner = cap(&raw, file)?;
     Ok(cfg)
@@ -480,6 +498,22 @@ mod tests {
             machine_config("m", r#"{"stackIdleMin":-1}"#),
             Err(ConfigError(
                 "m: \"stackIdleMin\" must be a number of minutes".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn notifications_are_on_and_phones_probed_every_minute_unless_the_config_says_otherwise() {
+        let cfg = machine_config("m", "{}").unwrap();
+        assert!(cfg.notify);
+        assert_eq!(cfg.readiness_check_sec, 60.0);
+        let cfg = machine_config("m", r#"{"notify":false,"readinessCheckSec":0.5}"#).unwrap();
+        assert!(!cfg.notify);
+        assert_eq!(cfg.readiness_check_sec, 0.5);
+        assert_eq!(
+            machine_config("m", r#"{"readinessCheckSec":0}"#),
+            Err(ConfigError(
+                "m: \"readinessCheckSec\" must be a number of seconds above 0".to_owned()
             ))
         );
     }

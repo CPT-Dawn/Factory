@@ -10,7 +10,7 @@ use super::wire::{
     AcquireParams, Granted, Lease, LeaseDevice, Owner, Process, Reservation, SlotRow, SlotSchema,
     Waiter,
 };
-use super::{reservations, stack};
+use super::{readiness, reservations, stack};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS leases (
@@ -132,6 +132,7 @@ impl Store {
         }
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(reservations::SCHEMA)?;
+        conn.execute_batch(readiness::SCHEMA)?;
         if version < VERSION {
             conn.pragma_update(None, "user_version", VERSION)?;
         }

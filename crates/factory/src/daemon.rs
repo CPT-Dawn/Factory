@@ -162,6 +162,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
         lab.recover();
         notifier.resume();
         lab.keep();
+        lab.watch_phones();
         let daemon = Daemon {
             ledger,
             leads,

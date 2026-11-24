@@ -14,7 +14,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, Once};
+use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use factory_adapters::adb::{Adb, AdbCli, AdbTrack};
@@ -41,6 +41,7 @@ use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt, Lines};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+use super::check::{CHECK, CheckParams};
 use super::reservations;
 use super::store::{self, RunRow, Store};
 use super::wire::{
@@ -70,6 +71,7 @@ const AWAY_GRACE_MS: i64 = 30_000;
 /// How long a caller may take to say it has its grant before the grant is given back.
 const RECEIVED_TIMEOUT: Duration = Duration::from_secs(10);
 
+mod phones;
 mod reserve;
 pub use reserve::reserve;
 
@@ -82,6 +84,8 @@ pub struct Lab {
     attached: watch::Sender<DeviceList>,
     /// Starts the one device tracker, on the first call that needs the device list.
     tracking: Once,
+    /// The phone watcher's queue, once it runs ([`Lab::watch_phones`]).
+    phones: OnceLock<mpsc::Sender<phones::Job>>,
     /// The waiters whose callers are connected to this daemon; the rest are kept for callers
     /// that come back after a restart, until they can't.
     callers: Mutex<HashSet<i64>>,
@@ -133,6 +137,7 @@ impl Lab {
             changed: watch::Sender::new(0),
             attached: watch::Sender::new(DeviceList::default()),
             tracking: Once::new(),
+            phones: OnceLock::new(),
             watched: Mutex::new(HashSet::new()),
             stopping: Mutex::new(keeper::Stopping::default()),
             callers: Mutex::new(HashSet::new()),
@@ -185,6 +190,7 @@ impl Lab {
                         &tracker,
                         tracker.pace,
                         &|list| {
+                            lab.saw_phones(&list);
                             lab.attached.send_replace(DeviceList {
                                 shown: Some(list),
                                 stale: false,
@@ -415,10 +421,12 @@ pub async fn respond(lab: &Arc<Lab>, method: &str, params: Value) -> Option<Outc
         STATUS => |lab, _, seen| reply(status(lab, seen)),
         SLOT => |lab, p, _| reply(slot(lab, parse(p)?)),
         UNRESERVE => |lab, p, _| reply(reserve::unreserve(lab, parse(p)?)),
+        CHECK => |lab, p, _| reply(lab.check_phones(parse::<CheckParams>(p)?.serials)),
         _ => return None,
     };
-    // A lease's devices and the status table are told as adb lists them now.
-    let seen = if method == LEASE || method == STATUS {
+    // A lease's devices and the status table are told as adb lists them now; a check waits
+    // for adb's first list, which reaches the phone watcher before it.
+    let seen = if method == LEASE || method == STATUS || method == CHECK {
         lab.attached().await
     } else {
         Vec::new()
