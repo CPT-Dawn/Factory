@@ -1497,7 +1497,7 @@ pub async fn acquire<W, R, S>(
                         {
                             match lab.give_back(waiter, lease.id, from.as_ref()) {
                                 Ok(()) => given_back = true,
-                                // Not exit 77: the lease is still held.
+                                // Not the exit it failed with: the lease is still held.
                                 Err(why) => {
                                     body = ErrorBody {
                                         code: why.code,

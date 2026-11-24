@@ -494,31 +494,19 @@ fn a_reservation_backed_lease_whose_phone_goes_before_its_prep_is_given_back_to_
     assert_eq!(run(call(&sandbox, &dir, &child, &[], &["env"])).code, 4);
 }
 
-/// Moves the clock of `column` of every reservation in the sandbox's lab store back by
-/// `hours`, as if they had been made, or last used, that long ago.
-fn age_reservations(sandbox: &Sandbox, column: &str, hours: i64) {
-    let aged = rusqlite::Connection::open(sandbox.path("state/factory/lab.db")).and_then(|db| {
-        db.busy_timeout(std::time::Duration::from_secs(15))?;
-        db.execute(
-            &format!("UPDATE reservations SET {column} = {column} - ?1"),
-            [hours * 3600],
-        )
-    });
-    if let Err(e) = aged {
-        panic!("cannot age the reservations: {e}");
-    }
-}
-
 #[test]
-fn a_reservation_nobody_used_for_two_hours_expires_and_a_run_returning_its_slot_is_a_use() {
+fn a_run_that_gives_its_slot_back_to_a_reservation_is_its_last_use() {
     let (sandbox, world) = lab();
     write_machine_config(&sandbox, r#""maxSlotsPerOwner": 2"#);
     let (lead, wt) = (Agent::new(), world.worktree("demo-lead"));
     let reserved = as_agent(&sandbox, &wt, &lead, &["reserve", "--slots", "2"]);
     assert_eq!(reserved.code, 0, "{reserved:?}");
-    // A run gives reservation 2's slot back: that is a use.
     let (child, dir) = (Agent::new(), world.worktree("demo-child"));
     let suite = ["run", "--no-device", "--stack", "--quiet", "--", "true"];
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
     let ran = run(call(
         &sandbox,
         &dir,
@@ -528,65 +516,20 @@ fn a_reservation_nobody_used_for_two_hours_expires_and_a_run_returning_its_slot_
     ));
     assert_eq!(ran.code, 0, "{ran:?}");
 
-    // Both were made 3 h ago; reservation 1 was never used since.
-    age_reservations(&sandbox, "created", 3);
-    let gc = as_agent(&sandbox, &wt, &lead, &["gc"]);
-    assert_eq!(
-        (gc.code, gc.stdout.as_str()),
-        (
-            0,
-            format!(
-                "released reservation 1 ({}, unused for 2 h)\n",
-                lead.label()
-            )
-            .as_str()
-        ),
-        "{gc:?}"
-    );
-    let status = as_agent(&sandbox, &wt, &lead, &["status"]).stdout;
-    assert!(status.contains("(reservation 2)"), "{status}");
-
-    // Reservation 2 was last used 3 h ago: it goes too.
-    age_reservations(&sandbox, "used", 3);
-    let gc = as_agent(&sandbox, &wt, &lead, &["gc"]);
-    assert_eq!(
-        gc.stdout,
-        format!(
-            "released reservation 2 ({}, unused for 2 h)\n",
-            lead.label()
-        ),
-        "{gc:?}"
-    );
-}
-
-#[test]
-fn a_lab_store_from_before_reservations_were_used_still_reserves_and_expires() {
-    let (sandbox, world) = lab();
-    std::fs::create_dir_all(sandbox.path("state/factory")).expect("create the state dir");
-    let db = rusqlite::Connection::open(sandbox.path("state/factory/lab.db")).expect("open lab.db");
-    db.execute_batch(
-        "CREATE TABLE reservations (
-           id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, slot INTEGER NOT NULL,
-           worktree TEXT NOT NULL, owner_pid INTEGER NOT NULL, owner_start TEXT NOT NULL,
-           owner_label TEXT NOT NULL, created INTEGER NOT NULL);",
-    )
-    .expect("make the old table");
-    drop(db);
-    let (lead, wt) = (Agent::new(), world.worktree("demo-lead"));
-
-    assert_eq!(as_agent(&sandbox, &wt, &lead, &["reserve"]).code, 0);
-    age_reservations(&sandbox, "created", 3);
-    let gc = as_agent(&sandbox, &wt, &lead, &["gc"]);
-    assert_eq!(
-        (gc.code, gc.stdout.as_str()),
-        (
-            0,
-            format!(
-                "released reservation 1 ({}, unused for 2 h)\n",
-                lead.label()
-            )
-            .as_str()
-        ),
-        "{gc:?}"
+    let mut cmd = sandbox.factory_command(&["lab", "status", "--json"]);
+    cmd.current_dir(&wt).env("DEVLAB_OWNER_PID", lead.pid());
+    let board = run(cmd);
+    let board: serde_json::Value =
+        serde_json::from_str(&board.stdout).unwrap_or_else(|e| panic!("{e}: {board:?}"));
+    let reservations = &board["reservations"];
+    // Reservation 1 was never used; 2 was used when the run ended, so its two hours start again.
+    assert_eq!(reservations[0]["id"], 1, "{board}");
+    assert!(reservations[0].get("used").is_none(), "{board}");
+    assert_eq!(reservations[1]["id"], 2, "{board}");
+    assert!(
+        reservations[1]["used"]
+            .as_u64()
+            .is_some_and(|used| used >= before),
+        "{board}"
     );
 }

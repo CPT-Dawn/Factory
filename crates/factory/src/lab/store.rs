@@ -120,7 +120,6 @@ impl Store {
         }
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(reservations::SCHEMA)?;
-        reservations::upgrade(&conn)?;
         if version < VERSION {
             conn.pragma_update(None, "user_version", VERSION)?;
         }

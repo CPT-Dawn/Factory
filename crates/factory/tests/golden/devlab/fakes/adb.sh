@@ -18,7 +18,6 @@ yank() {
     [ -n "$shown" ] && break
     n=$((n + 1)); sleep 0.05
   done
-  sleep 0.1
   echo "adb: device '$1' not found" >&2
 }
 case "$1" in
