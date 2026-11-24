@@ -270,19 +270,71 @@ fn agy_buckets<'a>(usage: &'a Value, group: &'a str) -> impl Iterator<Item = &'a
 /// `Gemini 4 Neon (High)` (agy 1.5).
 pub const AGY_DEFAULT_MODEL: &str = "gemini-4-neon";
 
-/// The group of agy's models whose quota `model` draws on, as its usage names them: its
-/// Claude and GPT models share one, Gemini 4 Argon has its own, and the other Gemini models
-/// share the rest. `model` is an ID such as `claude-opus-5-5` or a label as agy's `/model`
-/// saves it, such as `Claude Opus 5.5 (Thinking)`.
-pub fn agy_group(model: &str) -> &'static str {
-    let model = model.trim().to_lowercase().replace(' ', "-");
-    if model.starts_with("claude-") || model.starts_with("gpt-") {
-        "Claude and GPT models"
-    } else if model.starts_with("gemini-4-argon") {
-        "Gemini 4 Argon"
-    } else {
-        "Gemini Models"
-    }
+/// What a group's description says before the labels of the models that share its quota.
+const AGY_MODELS_LISTED: &str = "Models within this group:";
+
+/// The group of agy's models whose quota `model` draws on, by agy's `usage` answer: the group
+/// whose "Models within this group" list names the model's family (`Gemini 4 Argon`,
+/// `Claude Opus 5.5`), else a group named for it (the old answer's `Gemini 4 Argon`), else
+/// the static map: Claude and GPT models share one group and every Gemini model the other.
+/// `model` is an ID such as `claude-opus-5-5-high` or a label as agy's `/model` saves it,
+/// such as `Claude Opus 5.5 (Thinking)`; the longest family that begins it wins.
+pub fn agy_group(usage: &str, model: &str) -> String {
+    let model = words(model);
+    let groups: Vec<Value> = serde_json::from_str::<Value>(usage)
+        .ok()
+        .and_then(|usage| usage.pointer("/command/data/groups")?.as_array().cloned())
+        .unwrap_or_default();
+    let named = |group: &Value| group.get("name").and_then(Value::as_str).map(str::to_owned);
+    // The longest of `families` that begins the model, with its group.
+    let longest = |families: Vec<(String, String)>| {
+        families
+            .into_iter()
+            .filter_map(|(family, group)| {
+                let family = words(&family);
+                (!family.is_empty() && model.starts_with(&family)).then_some((family.len(), group))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, group)| group)
+    };
+    let listed = groups
+        .iter()
+        .filter_map(|group| {
+            let name = named(group)?;
+            let description = group.get("description")?.as_str()?;
+            let (_, models) = description.split_once(AGY_MODELS_LISTED)?;
+            Some(
+                models
+                    .split(',')
+                    .map(|family| (family.trim().trim_end_matches('.').to_owned(), name.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect();
+    let by_name = groups
+        .iter()
+        .filter_map(|group| named(group).map(|name| (name.clone(), name)))
+        .collect();
+    longest(listed)
+        .or_else(|| longest(by_name))
+        .unwrap_or_else(|| {
+            match model.first().map(String::as_str) {
+                Some("claude" | "gpt") => "Claude and GPT models",
+                _ => "Gemini Models",
+            }
+            .to_owned()
+        })
+}
+
+/// The lowercase words of a model's ID or label, split at anything not a letter or digit:
+/// `claude-opus-5-5-high` and `Claude Opus 5.5` both begin `claude opus 5 5`.
+fn words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The model a review draws on when the factory's config names none: the one chosen with

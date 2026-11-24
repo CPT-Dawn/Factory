@@ -6,12 +6,16 @@
 //! chains leave out tries the configured backends in their order, on their own model and
 //! effort. Without backends, the pools and chains are review.sh's:
 //!
-//! - pools `agy-gemini` (with a 20% reserve), `agy-argon` and `agy-claude` (agy's usage groups),
-//!   `codex` and `claude`, each with 2 slots;
-//! - hard: Gemini 4 Neon high, Argon high, agy's Opus high, Codex high, Claude Opus high;
-//! - standard: Codex medium, Neon medium, agy's Opus high, Argon high, agy's Sonnet high,
-//!   Claude Sonnet high;
+//! - pools `agy-gemini` (with a 20% reserve) and `agy-claude` (agy's two usage groups: every
+//!   Gemini model, Argon too, draws on the first), `codex` and `claude`, each with 2 slots;
+//! - hard: Gemini 4 Neon high, agy's Opus high, Codex high, Claude Opus high;
+//! - standard: Codex medium, Neon medium, agy's Opus high, agy's Sonnet high, Claude Sonnet
+//!   high;
 //! - trivial: Flash high, Neon low, Codex low, Claude Sonnet medium.
+//!
+//! Argon is in no default chain, but a chain may name it (`agy-gemini:gemini-4-argon-high:high`).
+//! An old config's `agy-argon` pool still works: configured, it is a pool of its own that reads
+//! the shared Gemini group; named in a chain over the default pools, it is `agy-gemini`.
 //!
 //! A pool's `when_busy` left unset passes a busy pool to the next one in the chain, and waits
 //! for a slot on the chain's last.
@@ -535,15 +539,16 @@ pub fn review_backends(paths: &Paths) -> Result<Vec<Backend>, Failure> {
     review_setup(paths).map(|setup| setup.backends)
 }
 
-/// A chain's step, `pool:model:effort`, with the model and effort optional.
+/// A chain's step, `pool:model:effort`, with the model and effort optional. `agy-argon`, when no
+/// pool has that name, is `agy-gemini`'s.
 fn parse_step(step: &str, backends: &[Backend]) -> Result<Step, String> {
     let mut parts = step.splitn(3, ':');
     let pool = parts.next().unwrap_or_default();
     let given = |part: Option<&str>| part.filter(|part| !part.is_empty()).map(str::to_owned);
     let (model, effort) = (given(parts.next()), given(parts.next()));
-    let backend = backends
-        .iter()
-        .position(|backend| backend.name == pool)
+    let named = |pool: &str| backends.iter().position(|backend| backend.name == pool);
+    let backend = named(pool)
+        .or_else(|| (pool == FOLDED.0).then(|| named(FOLDED.1)).flatten())
         .ok_or_else(|| format!("{step:?} names no backend {pool:?}"))?;
     Ok(Step {
         backend,
@@ -628,7 +633,7 @@ fn backend(entry: Entry) -> Backend {
     }
 }
 
-/// review.sh's pools: agy's three usage groups, Codex and Claude, two slots each.
+/// review.sh's pools: agy's two usage groups, Codex and Claude, two slots each.
 fn default_backends() -> Vec<Backend> {
     let pool = |name: &str, cli, reserve| Backend {
         reserve,
@@ -646,31 +651,35 @@ fn default_backends() -> Vec<Backend> {
     };
     vec![
         pool("agy-gemini", Cli::Agy, Some(DEFAULT_GEMINI_RESERVE)),
-        pool("agy-argon", Cli::Agy, None),
         pool("agy-claude", Cli::Agy, None),
         pool("codex", Cli::Codex, None),
         pool("claude", Cli::Claude, None),
     ]
 }
 
-/// The share of Gemini's five-hour bucket kept for hard reviews.
+/// The share of Gemini's five-hour bucket kept for hard reviews, whichever Gemini model spends
+/// it: Argon draws on the same group as Neon and Flash.
 const DEFAULT_GEMINI_RESERVE: f64 = 0.2;
 
-/// review.sh's chains, over [`default_backends`].
-const DEFAULT_HARD: [&str; 5] = [
+/// The pool an old config's `agy-argon` names when it configures no pool of that name: Argon
+/// shares the Gemini group's quota (spec #47).
+const FOLDED: (&str, &str) = ("agy-argon", "agy-gemini");
+
+/// review.sh's chains, over [`default_backends`]. Argon left them (owner, 2026-11-24): it
+/// shares the Gemini quota, and the replays' known findings went to the models kept. Config can
+/// still name it.
+const DEFAULT_HARD: [&str; 4] = [
     "agy-gemini:gemini-4-neon-high:high",
-    "agy-argon:gemini-4-argon-high:high",
     "agy-claude:claude-opus-5-5-high:high",
     "codex:gpt-6.2-sol:high",
     "claude:opus:high",
 ];
 /// Standard (owner, 2026-11-23): Codex medium leads, because Neon medium and Argon high missed
-/// known hard findings in replays that Codex caught. agy's Opus comes before Argon high.
-const DEFAULT_STANDARD: [&str; 6] = [
+/// known hard findings in replays that Codex caught.
+const DEFAULT_STANDARD: [&str; 5] = [
     "codex:gpt-6.2-sol:medium",
     "agy-gemini:gemini-4-neon-medium:medium",
     "agy-claude:claude-opus-5-5-high:high",
-    "agy-argon:gemini-4-argon-high:high",
     "agy-claude:claude-sonnet-5-5-high:high",
     "claude:sonnet:high",
 ];

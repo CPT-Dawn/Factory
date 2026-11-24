@@ -250,22 +250,25 @@ pub struct QuotaParams {
     pub quota: QuotaParam,
 }
 
-/// What a review learned of a backend's quota: `{"quota": "available"}`, or
-/// `{"quota": "cooling", "until": <milliseconds since the epoch>}`.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+/// What a review learned of a backend's quota: `{"quota": "available"}`,
+/// `{"quota": "cooling", "until": <milliseconds since the epoch>}`, or
+/// `{"quota": "unknown", "reason": <why>}` when it could not be read.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "quota", rename_all = "lowercase")]
 pub enum QuotaParam {
     Available,
     Cooling { until: i64 },
+    Unknown { reason: String },
 }
 
-impl From<QuotaParam> for Quota {
-    fn from(quota: QuotaParam) -> Quota {
-        match quota {
+impl From<&QuotaParam> for Quota {
+    fn from(quota: &QuotaParam) -> Quota {
+        match *quota {
             QuotaParam::Available => Quota::Available,
             QuotaParam::Cooling { until } => Quota::CoolingDown {
                 until: Timestamp::from_unix_millis(until),
             },
+            QuotaParam::Unknown { .. } => Quota::Unknown,
         }
     }
 }
