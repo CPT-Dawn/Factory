@@ -16,7 +16,8 @@ use super::host::proc;
 use super::stack;
 use super::wire::{
     ACQUIRE, AcquireParams, DeviceAsk, GC, Granted, LEASE, Lease, Process, ProjectAsk, RECEIVED,
-    RELEASE, ReleaseParams, RunAsk, SLOT, STOPPING, SlotParams, SlotSchema, StackAsk, StopParams,
+    RELEASE, ReleaseParams, Released, RunAsk, SLOT, STOPPING, SlotParams, SlotSchema, StackAsk,
+    StopParams,
 };
 use crate::client;
 use crate::output::Failure;
@@ -233,14 +234,32 @@ pub fn live(ctx: &Ctx) -> Result<Lease, Failure> {
     }
 }
 
-/// Drops the caller's lease, and lets go of any slot this call held while stopping its stack.
-pub fn release(ctx: &Ctx) -> Result<Option<Lease>, Failure> {
+/// Which leases a release ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// This worktree's lease, or the one `DEVLAB_LEASE` names.
+    Here,
+    /// The lease with this id, from any folder.
+    Lease(i64),
+    /// Every lease of the calling owner.
+    AllMine,
+}
+
+/// Drops the leases `target` names, and lets go of any slot this call held while stopping its
+/// stack; what it dropped and the caller's leases still held. A lease named by id that another
+/// owner holds is refused, exit 4.
+pub fn release(ctx: &Ctx, target: Target) -> Result<Released, Failure> {
+    let mut find = ctx.find();
+    if let Target::Lease(id) = target {
+        find.lease = Some(id);
+    }
     client::call(
         &paths()?,
         RELEASE,
         &ReleaseParams {
-            find: ctx.find(),
+            find,
             stopper: Some(me()),
+            all: target == Target::AllMine,
         },
     )
 }

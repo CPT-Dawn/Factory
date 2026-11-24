@@ -86,7 +86,8 @@ pub fn parse_opts(args: &[String]) -> Result<(Opts, &[String], Vec<String>), Str
                     Some(wait_arg(args.get(i))?)
                 };
             }
-            "--quiet" => flags.push("--quiet".to_owned()),
+            // Flags the caller reads itself: --keep is run's (#53).
+            flag @ ("--quiet" | "--keep") => flags.push(flag.to_owned()),
             flag if flag.len() > 1 && flag.starts_with('-') => {
                 return Err(format!("unknown option {flag}; devlab help"));
             }
@@ -142,15 +143,23 @@ mod tests {
 
     #[test]
     fn options_stop_at_the_command_and_keep_quiet() {
-        let (o, rest, flags) =
-            opts(&["--no-device", "--stack", "--quiet", "--", "echo", "--x"]).unwrap();
+        let (o, rest, flags) = opts(&[
+            "--no-device",
+            "--stack",
+            "--quiet",
+            "--keep",
+            "--",
+            "echo",
+            "--x",
+        ])
+        .unwrap();
         assert_eq!(
             (o.want, o.stack, rest, flags),
             (
                 0,
                 true,
                 vec!["echo".into(), "--x".into()],
-                vec!["--quiet".to_owned()]
+                vec!["--quiet".to_owned(), "--keep".to_owned()]
             )
         );
         let (o, rest, _) = opts(&["--pair", "--wait", "2.5", "true"]).unwrap();
