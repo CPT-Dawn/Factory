@@ -469,15 +469,15 @@ fn no_phone_is_reclaimed_while_adbs_stream_is_down() {
     ));
     assert_eq!(held.code, 0, "{held:?}");
     // The lease runs a command, so its phone stays while b waits for one.
+    let done = adb.join("done");
+    let until_done = format!("while [ ! -e '{}' ]; do sleep 0.05; done", done.display());
     let exec = spawn(for_owner(
         &sandbox,
         &wt_a,
         a.pid(),
-        &["exec", "--", "sleep", "2"],
+        &["exec", "--", "sh", "-c", &until_done],
     ));
-    assert!(poll_until(
-        || status(&sandbox, &wt_a).contains("running sleep 2")
-    ));
+    assert!(poll_until(|| status(&sandbox, &wt_a).contains("running sh")));
     let waiter = spawn(for_owner(
         &sandbox,
         &wt_b,
@@ -489,6 +489,7 @@ fn no_phone_is_reclaimed_while_adbs_stream_is_down() {
     // The stream ends and stays down while the command ends and b's wait runs out.
     fs::write(adb.join("end"), "").expect("end the stream");
     assert!(poll_until(|| pid_of(&adb, 2).trim().parse::<u32>().is_ok()));
+    fs::write(&done, "").expect("end the command");
     assert_eq!(finish(exec).code, 0);
     assert_eq!(finish(waiter).code, 75);
     fs::write(adb.join("back"), "").expect("bring the stream back");

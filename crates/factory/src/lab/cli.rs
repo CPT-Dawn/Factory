@@ -355,7 +355,7 @@ fn stop(held: &str, worktree: &str, slot: u32, granted: Option<&str>) -> Result<
             None => Ok(()),
             Some(id) => Err(Failure::precondition(format!(
                 "lease held slot {slot} of {held} with no stack of its own: stack {id} left running; \
-                 stop it with devlab stack down if it is yours"
+                 if it is yours, stop it from a lease of this worktree: devlab acquire --no-device, then devlab stack down"
             ))),
         };
     };
