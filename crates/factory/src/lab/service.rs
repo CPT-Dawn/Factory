@@ -350,7 +350,7 @@ impl Lab {
     /// and tells the ledger so.
     fn give_up(&self, waiter: i64, p: &AcquireParams, why: Option<&str>) {
         let gone = self.write(|c, now| {
-            let fields = events::wait_event(c, waiter, &asked(p), None, why, now)?;
+            let fields = events::wait_event(c, waiter, &asked(p), false, why, now)?;
             events::queue(c, "lab-wait", &fields)?;
             store::delete_waiter(c, waiter)
         });
@@ -1323,7 +1323,7 @@ fn try_grant(
             store::touch(c, lease.id, now)?;
             let reservation = claimed.as_ref().map(|r| r.id);
             events::lease_began(c, lease.id, reservation, 0)?;
-            let waited = events::wait_event(c, waiter, &asked(p), Some(lease.id), None, now)?;
+            let waited = events::wait_event(c, waiter, &asked(p), true, None, now)?;
             store::delete_waiter(c, waiter)?;
             ends_with_run(c, p, waiter, lease, claimed.as_ref())?;
             return Ok(Ok(Taken {
@@ -1480,7 +1480,7 @@ fn try_grant(
             let booting = u32::try_from(boots.len()).unwrap_or(u32::MAX);
             events::lease_began(c, lease.id, reservation, booting)?;
         }
-        let waited = events::wait_event(c, waiter, &asked(p), Some(lease.id), None, now)?;
+        let waited = events::wait_event(c, waiter, &asked(p), true, None, now)?;
         // A grant that boots emulators can't be handed to a caller again after a restart: the
         // daemon that comes back stops them, so the place goes now, as it did before.
         if fresh && boots.is_empty() {
@@ -1870,9 +1870,7 @@ pub async fn acquire<W, R, S>(
             // Its grant was never handed over: it is told now, waited until now, for the
             // reason it last waited for. One the store can't say is not told, not told empty.
             let waited = lab
-                .write(|c, now| {
-                    events::wait_event(c, waiter, &asked(&p), Some(granted.lease.id), None, now)
-                })
+                .write(|c, now| events::wait_event(c, waiter, &asked(&p), true, None, now))
                 .map_err(|e| {
                     eprintln!(
                         "factory: lab: cannot read the wait of request {waiter}: {}; its lab-wait is not written",
@@ -2192,17 +2190,8 @@ async fn deliver<W, R, S>(
     )
     .await;
     // The caller has its grant: only now was the request granted.
-    // The reclaimed devices it holds went to it, and the next grant of one names no reclaim.
-    if let Receipt::Received { .. } = &receipt {
-        let told = lab.write(|c, _| {
-            if let Some(waited) = &waited {
-                events::queue(c, "lab-wait", waited)?;
-            }
-            events::handed_over(c, lease.id)
-        });
-        if let Err(e) = told {
-            eprintln!("factory: lab: cannot queue a lab-wait event: {}", e.message);
-        }
+    if let (Receipt::Received { .. }, Some(waited)) = (&receipt, waited) {
+        lab.log("lab-wait", waited);
     }
     let Some(mut run) = run else { return };
     match receipt {

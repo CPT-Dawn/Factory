@@ -22,10 +22,8 @@ CREATE TABLE IF NOT EXISTS lab_events (
   kind TEXT NOT NULL,
   fields TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS reclaim_handoffs (
-  serial TEXT PRIMARY KEY,
-  lease INTEGER NOT NULL
-);
+-- A table an earlier build of #62 kept, to join a reclaim to the grant that took its device.
+DROP TABLE IF EXISTS reclaim_handoffs;
 CREATE TABLE IF NOT EXISTS wait_reasons (
   waiter INTEGER PRIMARY KEY,
   why TEXT NOT NULL
@@ -223,14 +221,14 @@ pub fn waiting(c: &Connection, waiter: i64, why: &str) -> rusqlite::Result<()> {
 }
 
 /// The `lab-wait` of waiter `waiter`, which asked for `asked` and ends its wait now (`now`,
-/// in seconds): granted lease `granted`, or (none) given up. Its reason is `why`, else the last
+/// in seconds): granted, or given up. Its reason is `why`, else the last
 /// it waited for ([`waiting`]), kept until the request is gone: a grant handed over after a
 /// restart says it too.
 pub fn wait_event(
     c: &Connection,
     waiter: i64,
     asked: &event::Asked,
-    granted: Option<i64>,
+    granted: bool,
     why: Option<&str>,
     now: i64,
 ) -> rusqlite::Result<Fields> {
@@ -248,58 +246,16 @@ pub fn wait_event(
             |row| row.get(0),
         )
         .optional()?;
-    let reclaimed = match granted {
-        Some(lease) => reclaimed_into(c, lease)?,
-        None => Vec::new(),
-    };
     let why = why.map(str::to_owned).or(kept).unwrap_or_default();
     let seconds = u64::try_from(now.saturating_sub(created.unwrap_or(now))).unwrap_or(0);
-    Ok(if granted.is_some() {
+    Ok(if granted {
         event::wait_granted(
             waiter,
             asked,
             seconds,
             Some(why.as_str()).filter(|w| !w.is_empty()),
-            &reclaimed,
         )
     } else {
         event::wait_gave_up(waiter, asked, seconds, &why)
     })
-}
-
-/// Device `serial` was reclaimed from lease `lease`: the grant that takes it says so.
-pub fn reclaimed(c: &Connection, serial: &str, lease: i64) -> rusqlite::Result<()> {
-    c.execute(
-        "INSERT OR REPLACE INTO reclaim_handoffs (serial, lease) VALUES (?1, ?2)",
-        params![serial, lease],
-    )?;
-    Ok(())
-}
-
-/// The leases the devices lease `lease` holds were reclaimed from, oldest reclaim first, for
-/// each such device no grant has been handed since its reclaim.
-pub fn reclaimed_into(c: &Connection, lease: i64) -> rusqlite::Result<Vec<i64>> {
-    let mut q = c.prepare(
-        "SELECT h.lease FROM reclaim_handoffs h JOIN lease_devices d ON d.serial = h.serial
-         WHERE d.lease_id = ?1 ORDER BY h.rowid",
-    )?;
-    let mut leases: Vec<i64> = Vec::new();
-    for from in q.query_map([lease], |row| row.get(0))? {
-        let from = from?;
-        if !leases.contains(&from) {
-            leases.push(from);
-        }
-    }
-    Ok(leases)
-}
-
-/// Lease `lease` was handed to its caller: the reclaimed devices it holds have gone to it, and
-/// a later grant of one names no reclaim.
-pub fn handed_over(c: &Connection, lease: i64) -> rusqlite::Result<()> {
-    c.execute(
-        "DELETE FROM reclaim_handoffs WHERE serial IN
-         (SELECT serial FROM lease_devices WHERE lease_id = ?1)",
-        [lease],
-    )?;
-    Ok(())
 }

@@ -167,21 +167,9 @@ fn wait_fields(
 }
 
 /// The `lab-wait` event of request `waiter` granted after `seconds`; `why`, the last reason
-/// it waited for, if it waited; `reclaimed`, the leases the devices it took were reclaimed
-/// from, which join it to those `lab-reclaim`s: one value, the ids joined by commas.
-pub fn wait_granted(
-    waiter: i64,
-    asked: &Asked,
-    seconds: u64,
-    why: Option<&str>,
-    reclaimed: &[i64],
-) -> Fields {
-    let mut out = wait_fields("granted", waiter, asked, seconds, why);
-    if !reclaimed.is_empty() {
-        let ids: Vec<String> = reclaimed.iter().map(i64::to_string).collect();
-        put(&mut out, "reclaimed", ids.join(","));
-    }
-    out
+/// it waited for, if it waited.
+pub fn wait_granted(waiter: i64, asked: &Asked, seconds: u64, why: Option<&str>) -> Fields {
+    wait_fields("granted", waiter, asked, seconds, why)
 }
 
 /// The `lab-wait` event of request `waiter` that gave up after `seconds`, waiting for `why`.

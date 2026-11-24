@@ -1397,7 +1397,7 @@ fn a_wait_that_ran_out_while_the_daemon_was_down_takes_no_slot_freed_meanwhile()
 }
 
 /// Field 22 of `/proc/<pid>/stat`: when the process started.
-pub(super) fn started(pid: u32) -> String {
+fn started(pid: u32) -> String {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("a live process");
     stat.rsplit(')')
         .next()

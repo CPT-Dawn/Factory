@@ -320,7 +320,6 @@ fn reclaim(
             .map_or("", |d| d.model.as_str());
         let fields = event::reclaim(*id, &kind, model, idle_min);
         events::queue(c, "lab-reclaim", &fields)?;
-        events::reclaimed(c, serial, *id)?;
         eprintln!(
             "factory: lab: took {kind} {serial} from lease {id}, idle for {idle_min} min, for a waiter"
         );
