@@ -53,7 +53,8 @@ impl Default for Opts {
     }
 }
 
-/// Options for run and acquire, the command after them, and the other `--flags` seen. A
+/// Options for run and acquire, the command after them, and the other flags seen (`--quiet`);
+/// any other `--flag` before the command or `--` is refused, naming it. A
 /// `--wait -1` leaves `wait_sec` unset: the machine's default wait.
 pub fn parse_opts(args: &[String]) -> Result<(Opts, &[String], Vec<String>), String> {
     let mut want = 1.0;
@@ -85,7 +86,10 @@ pub fn parse_opts(args: &[String]) -> Result<(Opts, &[String], Vec<String>), Str
                     Some(wait_arg(args.get(i))?)
                 };
             }
-            flag if flag.starts_with("--") => flags.push(flag.to_owned()),
+            "--quiet" => flags.push("--quiet".to_owned()),
+            flag if flag.len() > 1 && flag.starts_with('-') => {
+                return Err(format!("unknown option {flag}; devlab help"));
+            }
             _ => break,
         }
         i += 1;
@@ -137,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn options_stop_at_the_command_and_keep_unknown_flags() {
+    fn options_stop_at_the_command_and_keep_quiet() {
         let (o, rest, flags) =
             opts(&["--no-device", "--stack", "--quiet", "--", "echo", "--x"]).unwrap();
         assert_eq!(
@@ -157,6 +161,30 @@ mod tests {
             (o.want, o.wait_sec, rest),
             (2, Some(2.5), vec!["true".to_owned()])
         );
+    }
+
+    #[test]
+    fn an_unknown_flag_is_refused_by_name_and_dashes_still_end_the_options() {
+        assert_eq!(
+            opts(&["--abi", "x86"]).unwrap_err(),
+            "unknown option --abi; devlab help"
+        );
+        assert_eq!(
+            opts(&["--stack", "--phoen", "--", "true"]).unwrap_err(),
+            "unknown option --phoen; devlab help"
+        );
+        assert_eq!(
+            opts(&["-x", "--", "true"]).unwrap_err(),
+            "unknown option -x; devlab help"
+        );
+        // After `--` or the command's first word, `--x` belongs to the command.
+        let (_, rest, flags) = opts(&["--stack", "--", "--abi", "x86"]).unwrap();
+        assert_eq!(
+            (rest, flags),
+            (vec!["--abi".to_owned(), "x86".to_owned()], vec![])
+        );
+        let (_, rest, _) = opts(&["true", "--abi"]).unwrap();
+        assert_eq!(rest, vec!["true".to_owned(), "--abi".to_owned()]);
     }
 
     #[test]

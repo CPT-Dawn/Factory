@@ -110,6 +110,18 @@ pub fn prepare_workdir(p: &ProjectConfig, worktree: &str, slot: u32) -> Result<(
     Ok(())
 }
 
+/// The name of the newest migration in the worktree's supabase dir; none when it has none.
+pub fn migration_head(p: &ProjectConfig, worktree: &str) -> Option<String> {
+    let dir = Path::new(worktree)
+        .join(&p.supabase.as_ref()?.dir)
+        .join("migrations");
+    fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.'))
+        .max()
+}
+
 pub fn running(project_id: &str) -> bool {
     Docker.running(&format!("supabase_db_{project_id}"))
 }
@@ -190,4 +202,32 @@ pub fn down(p: &ProjectConfig, project_id: &str, cwd: &str) -> Result<(), Failur
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use factory_core::lab::config::project_config;
+
+    #[test]
+    fn the_migration_head_is_the_newest_migration_name_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().to_str().unwrap();
+        let p = project_config("devlab.json", r#"{"name":"demo","supabase":"db"}"#).unwrap();
+        assert_eq!(migration_head(&p, worktree), None);
+
+        let migrations = dir.path().join("db/migrations");
+        fs::create_dir_all(&migrations).unwrap();
+        assert_eq!(migration_head(&p, worktree), None);
+        for name in ["20260102_b.sql", "20260101_a.sql", ".keep"] {
+            fs::write(migrations.join(name), "").unwrap();
+        }
+        assert_eq!(
+            migration_head(&p, worktree).as_deref(),
+            Some("20260102_b.sql")
+        );
+
+        let none = project_config("devlab.json", r#"{"name":"demo"}"#).unwrap();
+        assert_eq!(migration_head(&none, worktree), None);
+    }
 }

@@ -409,4 +409,8 @@ pub struct SlotParams {
     pub project: String,
     pub slot: u32,
     pub stack_ours: bool,
+    /// With `stack_ours`: the newest migration the stack started with, when the caller could
+    /// read one; kept with the slot's schema record.
+    #[serde(default)]
+    pub head: Option<String>,
 }

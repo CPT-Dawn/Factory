@@ -30,6 +30,16 @@ CREATE TABLE IF NOT EXISTS slots (
   idle_since INTEGER,
   PRIMARY KEY (project, slot)
 );
+CREATE TABLE IF NOT EXISTS slot_schemas (
+  project TEXT NOT NULL,
+  slot INTEGER NOT NULL,
+  worktree TEXT NOT NULL,
+  head TEXT,
+  PRIMARY KEY (project, slot)
+);
+-- Slots whose stack an earlier daemon started and has not stopped ran their last worktree's schema.
+INSERT OR IGNORE INTO slot_schemas (project, slot, worktree)
+  SELECT project, slot, last_worktree FROM slots WHERE stack_ours = 1 AND last_worktree IS NOT NULL;
 CREATE TABLE IF NOT EXISTS stoppers (
   project TEXT NOT NULL,
   slot INTEGER NOT NULL,
@@ -558,7 +568,8 @@ pub fn insert_lease(
     })
 }
 
-/// Marks a slot held by `worktree`; returns the worktree it ran before.
+/// Marks a slot held by `worktree`; returns the worktree whose schema the slot's stack last
+/// ran (see [`set_stack_ours`]), whether or not that stack runs now.
 pub fn claim_slot(
     c: &Connection,
     project: &str,
@@ -570,7 +581,9 @@ pub fn claim_slot(
         params![project, slot],
     )?;
     let previous: Option<String> = c.query_row(
-        "SELECT last_worktree FROM slots WHERE project = ?1 AND slot = ?2",
+        "SELECT (SELECT worktree FROM slot_schemas s WHERE s.project = slots.project
+                                                       AND s.slot = slots.slot)
+         FROM slots WHERE project = ?1 AND slot = ?2",
         params![project, slot],
         |row| row.get(0),
     )?;
@@ -625,16 +638,31 @@ pub fn clear_dead_stoppers(
     Ok(cleared)
 }
 
+/// Marks the slot's stack as devlab's to stop, or not. Devlab starts a stack for the lease
+/// that holds the slot, so a stack it starts also records that worktree, and the newest
+/// migration (`head`) the caller read there, as the schema the slot now holds; the record
+/// stays when the stack stops, for the next lease to be warned.
 pub fn set_stack_ours(
     c: &Connection,
     project: &str,
     slot: u32,
     ours: bool,
+    head: Option<&str>,
 ) -> rusqlite::Result<()> {
     c.execute(
         "UPDATE slots SET stack_ours = ?3 WHERE project = ?1 AND slot = ?2",
         params![project, slot, ours],
     )?;
+    if ours {
+        c.execute(
+            "INSERT INTO slot_schemas (project, slot, worktree, head)
+             SELECT project, slot, last_worktree, ?3 FROM slots
+             WHERE project = ?1 AND slot = ?2 AND last_worktree IS NOT NULL
+             ON CONFLICT (project, slot)
+             DO UPDATE SET worktree = excluded.worktree, head = excluded.head",
+            params![project, slot, head],
+        )?;
+    }
     Ok(())
 }
 
@@ -774,4 +802,65 @@ pub fn take_orphan_runs(
         orphans.push(run);
     }
     Ok(orphans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open(dir: &tempfile::TempDir) -> Store {
+        Store::open(&dir.path().join("lab.db")).unwrap()
+    }
+
+    /// What `claim_slot` says the slot's stack last ran, for a lease of `worktree`.
+    fn claim(store: &mut Store, worktree: &str) -> Option<String> {
+        store.write(|c| claim_slot(c, "demo", 0, worktree)).unwrap()
+    }
+
+    #[test]
+    fn a_slot_remembers_the_schema_of_a_stack_started_there_after_the_stack_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        assert_eq!(claim(&mut store, "/w/a"), None);
+        store
+            .write(|c| set_stack_ours(c, "demo", 0, true, Some("20260101_x.sql")))
+            .unwrap();
+        store
+            .write(|c| set_stack_ours(c, "demo", 0, false, None))
+            .unwrap();
+
+        assert_eq!(claim(&mut store, "/w/b").as_deref(), Some("/w/a"));
+        let head: Option<String> = store
+            .write(|c| c.query_row("SELECT head FROM slot_schemas", [], |row| row.get(0)))
+            .unwrap();
+        assert_eq!(head.as_deref(), Some("20260101_x.sql"));
+    }
+
+    #[test]
+    fn a_slot_whose_stack_never_started_has_no_schema_to_warn_of() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        assert_eq!(claim(&mut store, "/w/a"), None);
+        assert_eq!(claim(&mut store, "/w/b"), None);
+    }
+
+    #[test]
+    fn a_stack_an_earlier_daemon_started_and_left_running_keeps_its_worktree_as_its_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(&dir);
+        store
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO slots (project, slot, last_worktree, stack_ours)
+                     VALUES ('demo', 0, '/w/a', 1)",
+                    [],
+                )
+            })
+            .unwrap();
+        drop(store);
+
+        let mut store = open(&dir);
+
+        assert_eq!(claim(&mut store, "/w/b").as_deref(), Some("/w/a"));
+    }
 }

@@ -114,9 +114,9 @@ pub fn take(
     if let (Some(p), Some(slot)) = (&ctx.project, lease.slot) {
         stack::prepare_workdir(p, &ctx.worktree, slot)?;
         let info = stack::info(p, &ctx.worktree, slot)?;
-        if let (Some(previous), Some(info)) = (&granted.previous, &info)
+        if let Some(previous) = &granted.previous
+            && info.is_some()
             && *previous != ctx.worktree
-            && stack::running(&info.project_id)
         {
             warn(&format!(
                 "slot {slot}'s stack last ran {}'s schema: reset it if your migrations differ",
@@ -126,7 +126,7 @@ pub fn take(
         if opts.stack && info.is_some() {
             let env = lease_env(&lease, Some(p))?;
             if stack::up(p, &ctx.worktree, slot, &env, &ctx.cfg)? == stack::Up::Started {
-                stack_ours(&p.name, slot, true)?;
+                stack_started(p, &ctx.worktree, slot)?;
             }
         }
     }
@@ -267,6 +267,22 @@ pub fn stack_ours(project: &str, slot: u32, ours: bool) -> Result<(), Failure> {
             project: project.to_owned(),
             slot,
             stack_ours: ours,
+            head: None,
+        },
+    )
+}
+
+/// Records that devlab started the slot's stack from `worktree`: its schema is that
+/// worktree's, up to its newest migration, whether the stack runs or stops.
+pub fn stack_started(p: &ProjectConfig, worktree: &str, slot: u32) -> Result<(), Failure> {
+    client::call(
+        &paths()?,
+        SLOT,
+        &SlotParams {
+            project: p.name.clone(),
+            slot,
+            stack_ours: true,
+            head: stack::migration_head(p, worktree),
         },
     )
 }

@@ -14,6 +14,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -58,6 +59,8 @@ use factory_core::lab::base_name;
 /// How often a waiting acquire looks again without a change to the board: a port that freed
 /// tells no one. An owner that exits does: the keeper watches each one.
 const RECHECK: Duration = Duration::from_secs(3);
+/// Why a device request waits while adb's track stream is down.
+const ADB_RESTARTING: &str = "adb is restarting";
 /// How long a call that needs the device list waits for adb's first one.
 const FIRST_LIST: Duration = Duration::from_secs(15);
 /// How often a booting emulator is looked at without a change to the device list.
@@ -78,6 +81,9 @@ pub struct Lab {
     changed: watch::Sender<u64>,
     /// What `adb track-devices` showed last; none until its first list.
     attached: watch::Sender<Option<Vec<Attached>>>,
+    /// Whether adb's track stream is down (it ended and no list has followed): `attached` is
+    /// then stale, and no device is granted from it. Read before `attached`, written after it.
+    adb_down: AtomicBool,
     /// Starts the one device tracker, on the first call that needs the device list.
     tracking: Once,
     /// The waiters whose callers are connected to this daemon; the rest are kept for callers
@@ -109,6 +115,7 @@ impl Lab {
             store: Mutex::new(store),
             changed: watch::Sender::new(0),
             attached: watch::Sender::new(None),
+            adb_down: AtomicBool::new(false),
             tracking: Once::new(),
             watched: Mutex::new(HashSet::new()),
             stopping: Mutex::new(keeper::Stopping::default()),
@@ -161,8 +168,16 @@ impl Lab {
                     android::track_forever(
                         &tracker,
                         tracker.pace,
+                        // The list is published before the stream counts as up again, and it
+                        // counts as down before anything else is told it ended: a reader that
+                        // finds it up, having read that first, then reads a list at least as new.
                         &|list| {
                             lab.attached.send_replace(Some(list));
+                            lab.adb_down.store(false, Ordering::SeqCst);
+                            lab.notify();
+                        },
+                        &|| {
+                            lab.adb_down.store(true, Ordering::SeqCst);
                             lab.notify();
                         },
                         &|| {
@@ -530,7 +545,7 @@ fn status(lab: &Lab, seen: &[Attached]) -> Answer<Board> {
 }
 
 fn slot(lab: &Lab, p: SlotParams) -> Answer<()> {
-    lab.write(|c, _| store::set_stack_ours(c, &p.project, p.slot, p.stack_ours))
+    lab.write(|c, _| store::set_stack_ours(c, &p.project, p.slot, p.stack_ours, p.head.as_deref()))
 }
 
 /// What a grant needs from outside the store, gathered before its transaction.
@@ -540,6 +555,8 @@ struct Facts {
     running: Vec<bool>,
     /// What adb lists; empty when the request asks for no device.
     attached: Vec<Attached>,
+    /// Whether adb's track stream is down, so that `attached` is stale.
+    adb_down: bool,
     mem_available_mb: i64,
 }
 
@@ -577,6 +594,7 @@ fn gather_stack(project: Option<&ProjectAsk>) -> Facts {
         listening: host::listening_ports(),
         running,
         attached: Vec::new(),
+        adb_down: false,
         mem_available_mb: 0,
     }
 }
@@ -896,6 +914,9 @@ fn try_grant(
         }
         let stopping = lock_ignoring_poison(&lab.stopping).clone();
         let planned = match &p.devices {
+            // No device is granted from a list adb stopped updating: the request waits for the
+            // stream to show one again. A request for no device goes on.
+            Some(_) if facts.adb_down => Err(ADB_RESTARTING.to_owned()),
             Some(ask) => plan(
                 c,
                 ask,
@@ -1373,6 +1394,9 @@ pub async fn acquire<W, R, S>(
     let mut said = String::new();
     loop {
         let mut changed = lab.changed.subscribe();
+        // Whether the stream is down is read before the list, so that a list read after it is
+        // at least as new as the stream's last word: see [`Lab::track`].
+        let adb_down = lab.adb_down.load(Ordering::SeqCst);
         let seen = if p.devices.is_some() {
             lab.attached().await
         } else {
@@ -1381,7 +1405,10 @@ pub async fn acquire<W, R, S>(
         let tried = {
             let (lab, p) = (Arc::clone(&lab), Arc::clone(&p));
             blocking(move || {
-                let facts = gather(&lab, &p, seen);
+                let facts = Facts {
+                    adb_down,
+                    ..gather(&lab, &p, seen)
+                };
                 try_grant(&lab, &p, waiter, &facts)
             })
             .await
