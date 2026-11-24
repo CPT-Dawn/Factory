@@ -31,16 +31,6 @@ pub struct Standing {
     pub owes: bool,
 }
 
-/// What came of asking for a lead's end to be written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum End {
-    Written,
-    /// The ledger already holds an end for that start, whoever logged it.
-    Already,
-    /// The lead was started again since: the end is not this run's to write.
-    Superseded,
-}
-
 fn standing_in(path: &std::path::Path, repo: &str, slug: &str) -> io::Result<Standing> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -102,35 +92,51 @@ impl Ledger {
     }
 
     /// Appends the `lead-start` of the lead `slug` of `repo` and says which run of that slug it
-    /// is, counted under the same lock as the write, so a start logged beside it cannot take
-    /// its number.
-    pub fn append_start(&self, repo: &str, slug: &str, event: &Event) -> io::Result<usize> {
+    /// is. The run is counted, and `keep` called, under the same lock as the write, so a start
+    /// logged beside it cannot take its number and a settlement of an earlier run, which holds
+    /// that lock too, cannot fall between what `keep` records and the start it records.
+    pub fn append_start(
+        &self,
+        repo: &str,
+        slug: &str,
+        event: &Event,
+        keep: impl FnOnce(),
+    ) -> io::Result<usize> {
         let mut file = self
             .file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let run = standing_in(&self.path, repo, slug)?.starts + 1;
+        keep();
         write_line(&mut file, event)?;
-        Ok(standing_in(&self.path, repo, slug)?.starts)
+        Ok(run)
     }
 
     /// Appends the `lead-end` of the lead `slug` of `repo`, the run whose start was the
     /// `run`th, unless the ledger already holds an end for it, whoever wrote it, or the lead has
-    /// been started again since. The check and the write share the lock every append takes, so
-    /// an event logged in between cannot slip past.
-    pub fn append_end(&self, repo: &str, slug: &str, run: usize, event: &Event) -> io::Result<End> {
+    /// been started again since. The check, the write and `settled`, called once the run has its
+    /// end, share the lock every append takes, so an event logged in between cannot slip past.
+    pub fn append_end(
+        &self,
+        repo: &str,
+        slug: &str,
+        run: usize,
+        event: &Event,
+        settled: impl FnOnce(),
+    ) -> io::Result<()> {
         let mut file = self
             .file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let standing = standing_in(&self.path, repo, slug)?;
         if standing.starts != run {
-            return Ok(End::Superseded);
+            return Ok(());
         }
-        if !standing.owes {
-            return Ok(End::Already);
+        if standing.owes {
+            write_line(&mut file, event)?;
         }
-        write_line(&mut file, event)?;
-        Ok(End::Written)
+        settled();
+        Ok(())
     }
 
     /// The latest `review` event of `label` (in `repo`, when one is named) as it landed.

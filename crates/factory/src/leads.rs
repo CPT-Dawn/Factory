@@ -39,7 +39,7 @@ use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
-use crate::ledger::{End, Ledger};
+use crate::ledger::Ledger;
 use crate::output::Failure;
 use crate::paths::Paths;
 use crate::protocol::{LeadList, LeadReport, SpawnParams, SpawnResult, WaitLeadResult};
@@ -95,8 +95,6 @@ struct Unfinished {
     /// Which run of its slug this is, by the count of `lead-start` events in the ledger when it
     /// began: an end is written only for the run it belongs to.
     run: usize,
-    /// Which spawn of its name this is in the database: only that spawn's row is marked ended.
-    spawn: i64,
 }
 
 struct Lead {
@@ -141,7 +139,7 @@ impl<H: HerdrApi> Leads<H> {
         // The ledger says which still owe their end: a daemon that stopped between keeping a
         // lead and writing its start, or between writing its end and keeping that, owes none.
         let mut unfinished = BTreeMap::new();
-        for (name, repo, report, spawn) in running {
+        for (name, repo, report) in running {
             let standing = ledger.standing(&repo, lead::slug(&name)).map_err(|e| {
                 Failure::precondition(format!(
                     "cannot read {}: {e}; check FACTORY_STATE",
@@ -149,7 +147,7 @@ impl<H: HerdrApi> Leads<H> {
                 ))
             })?;
             if !standing.owes {
-                if let Err(e) = store.lead_ended(&name, spawn) {
+                if let Err(e) = store.lead_ended(&name) {
                     eprintln!("factory: cannot mark {name} ended in the database: {e}");
                 }
                 continue;
@@ -160,7 +158,6 @@ impl<H: HerdrApi> Leads<H> {
                     repo,
                     report: PathBuf::from(report),
                     run: standing.starts,
-                    spawn,
                 },
             );
         }
@@ -346,17 +343,18 @@ impl<H: HerdrApi> Leads<H> {
             ("effort", params.effort.as_str()),
         ]
         .map(|(key, value)| format!("{key}={value}"));
-        // Kept before the event is written: a daemon that stops after it still owes the end,
-        // and one that stops before it owes none, which the ledger shows on restart.
-        let spawn = match started {
-            Ok(_) => self.keep(&name, &params.repo_name, &report),
-            Err(_) => 0,
-        };
         let event = event::Event::from_args("lead-start", &pairs, params.session.as_deref())
             .map_err(|e| Failure::usage(e.to_string()))?;
+        // Kept before the event is written: a daemon that stops after it still owes the end,
+        // and one that stops before it owes none, which the ledger shows on restart. Kept under
+        // the ledger's lock, so an earlier run's settlement cannot mark this one's row ended.
         let run = self
             .ledger
-            .append_start(&params.repo_name, slug, &event)
+            .append_start(&params.repo_name, slug, &event, || {
+                if started.is_ok() {
+                    self.keep(&name, &params.repo_name, &report);
+                }
+            })
             .map_err(|e| {
                 Failure::precondition(format!(
                     "cannot append to {}: {e}; check the disk and FACTORY_STATE",
@@ -378,7 +376,6 @@ impl<H: HerdrApi> Leads<H> {
                 repo: params.repo_name.clone(),
                 report: report.clone(),
                 run,
-                spawn,
             },
         );
         self.bump();
@@ -392,20 +389,17 @@ impl<H: HerdrApi> Leads<H> {
     }
 
     /// Keeps `name` in the database as running, so a restarted daemon still owes its end.
-    /// Keeps the lead `name` in the database and returns which spawn of that name it is, 0 when
-    /// it could not be kept.
-    fn keep(&self, name: &str, repo: &str, report: &Path) -> i64 {
+    fn keep(&self, name: &str, repo: &str, report: &Path) {
         let kept = self
             .store
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .lead_started(name, repo, &report.to_string_lossy());
-        kept.unwrap_or_else(|e| {
+        if let Err(e) = kept {
             eprintln!(
                 "factory: cannot keep {name} in the database: {e}; its end is lost on a restart"
             );
-            0
-        })
+        }
     }
 
     /// Writes the `lead-end` of every spawned lead that has finished or died, once each, whenever the
@@ -446,31 +440,29 @@ impl<H: HerdrApi> Leads<H> {
                 format!("slug={}", lead::slug(&name)),
                 format!("outcome={how}"),
             ];
-            // A lead-end the ledger already holds, whoever logged it, is not written again.
+            // A lead-end the ledger already holds, whoever logged it, is not written again. The row
+            // is marked under the ledger's lock: a respawn keeps its own row under it too.
+            let mark = || {
+                let kept = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .lead_ended(&name);
+                if let Err(e) = kept {
+                    eprintln!("factory: cannot mark {name} ended in the database: {e}");
+                }
+            };
             let landed = event::Event::from_args("lead-end", &pairs, None)
                 .map_err(|e| e.to_string())
                 .and_then(|event| {
                     self.ledger
-                        .append_end(&lead.repo, lead::slug(&name), lead.run, &event)
+                        .append_end(&lead.repo, lead::slug(&name), lead.run, &event, mark)
                         .map_err(|e| e.to_string())
                 });
-            match landed {
-                // A newer run of this name has its own record: it is not this one's to close.
-                Ok(End::Superseded) => {}
-                Ok(End::Written | End::Already) => {
-                    let kept = self
-                        .store
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .lead_ended(&name, lead.spawn);
-                    if let Err(e) = kept {
-                        eprintln!("factory: cannot mark {name} ended in the database: {e}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("factory: cannot write the lead-end of {name}: {e}");
-                    self.lock().unfinished.insert(name, lead);
-                }
+            // A newer run of this name has its own record to close: nothing is written for this one.
+            if let Err(e) = landed {
+                eprintln!("factory: cannot write the lead-end of {name}: {e}");
+                self.lock().unfinished.insert(name, lead);
             }
         }
     }

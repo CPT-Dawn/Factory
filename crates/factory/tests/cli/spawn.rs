@@ -17,21 +17,6 @@ fn configure(sandbox: &Sandbox, toml: &str) {
     fs::write(dir.join("config.toml"), toml).expect("write the factory config");
 }
 
-/// Kills the daemon outright and waits until it is gone; the next command starts a new one.
-// cfg(test), as the harness is, so clippy lets it unwrap.
-#[cfg(test)]
-fn kill_daemon(sandbox: &Sandbox) {
-    let pid = fs::read_to_string(sandbox.path("run/factory/daemon.pid")).expect("the daemon's pid");
-    let killed = sandbox
-        .command("kill", &["-9", pid.trim()])
-        .output()
-        .expect("run kill");
-    assert!(killed.status.success(), "{killed:?}");
-    // A command sent while it is dying would be reset, not start a new one.
-    let gone = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
-    assert!(poll_until(|| !gone.exists()), "the daemon never died");
-}
-
 /// The ledger's events of one type, parsed.
 // cfg(test), as the harness is, so clippy lets it unwrap.
 #[cfg(test)]
@@ -782,7 +767,15 @@ fn a_restarted_daemon_still_writes_the_end_of_a_lead_it_spawned_and_only_once() 
         "outcome=finished",
     ]);
     assert_eq!(logged.code, 0, "{logged:?}");
-    kill_daemon(&sandbox);
+    let pid = fs::read_to_string(sandbox.path("run/factory/daemon.pid")).expect("the daemon's pid");
+    let killed = sandbox
+        .command("kill", &["-9", pid.trim()])
+        .output()
+        .expect("run kill");
+    assert!(killed.status.success(), "{killed:?}");
+    // A command sent while it is dying would be reset, not start a new one.
+    let gone = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
+    assert!(poll_until(|| !gone.exists()), "the daemon never died");
     for (slug, pane) in [("cart", "w1:p1"), ("pay", "w2:p1")] {
         fs::write(
             sandbox.path(format!("state/factory/leads/repo/{slug}.md")),
@@ -906,51 +899,4 @@ fn a_lead_respawned_after_its_logged_end_still_gets_its_own_end() {
         .map(|end| end["outcome"].as_str().unwrap_or_default().to_owned())
         .collect();
     assert_eq!(outcomes, ["parked", "finished"]);
-}
-
-#[test]
-fn a_daemon_upgraded_from_schema_5_settles_the_lead_the_old_one_kept_and_its_respawn() {
-    let sandbox = Sandbox::new();
-    let herdr = FakeHerdr::start(&sandbox);
-    let repo = sandbox.repo();
-    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
-    assert_eq!(out.code, 0, "{out:?}");
-    herdr.await_watch("w1:p1");
-    kill_daemon(&sandbox);
-    // The database as a schema-5 daemon left it: its lead table has no spawn numbers.
-    let db = rusqlite::Connection::open(sandbox.path("state/factory/factory.db")).unwrap();
-    db.execute_batch("ALTER TABLE lead DROP COLUMN spawn; PRAGMA user_version = 5;")
-        .unwrap();
-    drop(db);
-    fs::write(sandbox.path("state/factory/leads/repo/cart.md"), "done\n")
-        .expect("write the report");
-    herdr.status("w1:p1", "idle");
-
-    let listed = sandbox.factory(&["lead", "list"]);
-    assert_eq!(listed.code, 0, "{listed:?}");
-    assert!(
-        poll_until(|| events(&sandbox, "lead-end")
-            .iter()
-            .any(|end| end["slug"] == "cart")),
-        "no lead-end for cart in {:?}",
-        sandbox.ledger_lines()
-    );
-    herdr.close("w1:p1");
-    let again = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
-    assert_eq!(again.code, 0, "{again:?}");
-    herdr.await_watch("w2:p1");
-    fs::write(sandbox.path("state/factory/leads/repo/cart.md"), "done\n")
-        .expect("write the report");
-    herdr.status("w2:p1", "idle");
-
-    assert!(
-        poll_until(|| events(&sandbox, "lead-end").len() == 2),
-        "no second lead-end in {:?}",
-        sandbox.ledger_lines()
-    );
-    let outcomes: Vec<String> = events(&sandbox, "lead-end")
-        .iter()
-        .map(|end| end["outcome"].as_str().unwrap_or_default().to_owned())
-        .collect();
-    assert_eq!(outcomes, ["finished", "finished"]);
 }
