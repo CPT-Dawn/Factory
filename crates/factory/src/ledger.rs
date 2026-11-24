@@ -10,7 +10,6 @@ use factory_core::event::{Event, Fields};
 use serde_json::Value;
 
 use crate::clock;
-use crate::output::Failure;
 
 /// Whether an event's field names `want`. A repo or slug of digits is stored as a number, so
 /// what each prints is compared.
@@ -70,8 +69,24 @@ fn standing_in(path: &std::path::Path, repo: &str, slug: &str) -> io::Result<Sta
     Ok(standing)
 }
 
-/// Stamps `event` and writes it as one line.
-fn write_line(file: &mut File, event: &Event) -> io::Result<Fields> {
+/// Opens the ledger for appending, creating it.
+fn open_file(path: &std::path::Path) -> io::Result<File> {
+    File::options().create(true).append(true).open(path)
+}
+
+/// Stamps `event` and writes it as one line, opening the ledger first if it isn't open: one
+/// that could not be opened before may be openable now.
+fn write_line(
+    file: &mut Option<File>,
+    path: &std::path::Path,
+    event: &Event,
+) -> io::Result<Fields> {
+    if file.is_none() {
+        *file = Some(open_file(path)?);
+    }
+    let Some(file) = file.as_mut() else {
+        return Err(io::Error::other("the ledger is not open"));
+    };
     let landed = event.stamped(clock::now());
     let mut line = Value::Object(landed.clone()).to_string();
     line.push('\n');
@@ -80,10 +95,11 @@ fn write_line(file: &mut File, event: &Event) -> io::Result<Fields> {
 }
 
 /// The ledger's file. Each event is stamped and written as one line under one lock, so lines
-/// never interleave.
+/// never interleave. A ledger that can't be opened fails each write, not the daemon: the lab
+/// goes on without its events (#62), and `factory log` says why it can't log.
 pub struct Ledger {
     pub path: PathBuf,
-    file: Mutex<File>,
+    file: Mutex<Option<File>>,
 }
 
 impl Ledger {
@@ -110,7 +126,7 @@ impl Ledger {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let run = standing_in(&self.path, repo, slug)?.starts + 1;
         keep();
-        write_line(&mut file, event)?;
+        write_line(&mut file, &self.path, event)?;
         Ok(run)
     }
 
@@ -135,7 +151,7 @@ impl Ledger {
             return Ok(());
         }
         if standing.owes {
-            write_line(&mut file, event)?;
+            write_line(&mut file, &self.path, event)?;
         }
         settled();
         Ok(())
@@ -161,21 +177,23 @@ impl Ledger {
             }))
     }
 
-    pub fn open(path: PathBuf) -> Result<Ledger, Failure> {
-        let file = File::options()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| {
-                Failure::precondition(format!(
-                    "cannot open {}: {e}; check FACTORY_STATE and XDG_STATE_HOME",
+    /// The ledger at `path`; one that can't be opened yet is said once on stderr and tried
+    /// again on each write.
+    pub fn open(path: PathBuf) -> Ledger {
+        let file = match open_file(&path) {
+            Ok(file) => Some(file),
+            Err(e) => {
+                eprintln!(
+                    "factory: cannot open {}: {e}; check FACTORY_STATE and XDG_STATE_HOME",
                     path.display()
-                ))
-            })?;
-        Ok(Ledger {
+                );
+                None
+            }
+        };
+        Ledger {
             path,
             file: Mutex::new(file),
-        })
+        }
     }
 
     pub fn append(&self, event: &Event) -> io::Result<Fields> {
@@ -183,6 +201,6 @@ impl Ledger {
             .file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        write_line(&mut file, event)
+        write_line(&mut file, &self.path, event)
     }
 }

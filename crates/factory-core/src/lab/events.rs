@@ -8,7 +8,7 @@
 //!
 //! Every field is a flat value; the numbers are all in the ledger's numeric list. No field names
 //! a device serial ([`short_id`] stands in for it), a home path (a worktree is its basename) or
-//! a user. A wait's reason is kept as its kind and counts ([`wait_reason`]), never its text.
+//! a user (the home dir's name is shown as `~`). A wait's reason is kept as its kind and counts ([`wait_reason`]), never its text.
 
 use std::sync::LazyLock;
 
@@ -28,6 +28,8 @@ pub struct LeaseFacts {
     pub owner_label: String,
     /// The worktree's path; the event keeps its basename.
     pub worktree: String,
+    /// The home dir, whose name (most often the user's) no event shows.
+    pub home: Option<String>,
     /// `(kind, model)` of each device it holds; a model may be empty.
     pub devices: Vec<(String, String)>,
     pub slot: Option<u32>,
@@ -73,7 +75,11 @@ fn lease_fields(f: &LeaseFacts, action: &str) -> Fields {
         put(&mut out, "project", project.as_str());
     }
     put(&mut out, "owner", f.owner_label.as_str());
-    put(&mut out, "worktree", base_name(&f.worktree));
+    put(
+        &mut out,
+        "worktree",
+        worktree_name(&f.worktree, f.home.as_deref()),
+    );
     if !f.devices.is_empty() {
         let devices: Vec<String> = f
             .devices
@@ -96,6 +102,16 @@ fn lease_fields(f: &LeaseFacts, action: &str) -> Fields {
         put(&mut out, "reservation", reservation);
     }
     out
+}
+
+/// A worktree as an event names it: its basename, or `~` for the home dir and for any dir
+/// named as the home dir is, which is most often the user's name.
+fn worktree_name<'a>(path: &'a str, home: Option<&str>) -> &'a str {
+    let name = base_name(path);
+    match home.map(base_name) {
+        Some(home) if !home.is_empty() && name == home => "~",
+        _ => name,
+    }
 }
 
 /// The `lab-lease` event of a lease granted.
@@ -135,9 +151,16 @@ pub struct Asked {
     pub stack: bool,
 }
 
-fn wait_fields(action: &str, asked: &Asked, seconds: u64, why: Option<&str>) -> Fields {
+fn wait_fields(
+    action: &str,
+    waiter: i64,
+    asked: &Asked,
+    seconds: u64,
+    why: Option<&str>,
+) -> Fields {
     let mut out = Fields::new();
     put(&mut out, "action", action);
+    put(&mut out, "waiter", waiter);
     put(&mut out, "asked", asked.mode.as_deref().unwrap_or("none"));
     put(&mut out, "count", asked.count);
     put(&mut out, "stack", if asked.stack { "yes" } else { "no" });
@@ -146,15 +169,15 @@ fn wait_fields(action: &str, asked: &Asked, seconds: u64, why: Option<&str>) -> 
     out
 }
 
-/// The `lab-wait` event of a request granted after `seconds`; `why`, the last reason it
-/// waited for, if it waited.
-pub fn wait_granted(asked: &Asked, seconds: u64, why: Option<&str>) -> Fields {
-    wait_fields("granted", asked, seconds, why)
+/// The `lab-wait` event of request `waiter` granted after `seconds`; `why`, the last reason
+/// it waited for, if it waited. `waiter` is what a `lab-reclaim` names.
+pub fn wait_granted(waiter: i64, asked: &Asked, seconds: u64, why: Option<&str>) -> Fields {
+    wait_fields("granted", waiter, asked, seconds, why)
 }
 
-/// The `lab-wait` event of a request that gave up after `seconds`, waiting for `why`.
-pub fn wait_gave_up(asked: &Asked, seconds: u64, why: &str) -> Fields {
-    wait_fields("gave-up", asked, seconds, Some(why))
+/// The `lab-wait` event of request `waiter` that gave up after `seconds`, waiting for `why`.
+pub fn wait_gave_up(waiter: i64, asked: &Asked, seconds: u64, why: &str) -> Fields {
+    wait_fields("gave-up", waiter, asked, seconds, Some(why))
 }
 
 /// The counts a wait on phones names (#56), by the field that keeps each.

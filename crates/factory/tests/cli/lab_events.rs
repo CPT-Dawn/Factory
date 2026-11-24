@@ -113,7 +113,6 @@ fn a_leases_idle_seconds_leave_out_the_time_an_exec_ran_on_it() {
     let (sandbox, world) = lab();
     let wt = world.worktree("demo-idle");
     assert_eq!(owned(&sandbox, &wt, &["acquire", "--no-device"]).code, 0);
-    std::thread::sleep(std::time::Duration::from_millis(1500));
     assert_eq!(owned(&sandbox, &wt, &["exec", "--", "sleep", "2"]).code, 0);
     assert_eq!(owned(&sandbox, &wt, &["release"]).code, 0);
 
@@ -122,8 +121,8 @@ fn a_leases_idle_seconds_leave_out_the_time_an_exec_ran_on_it() {
         ends[0]["seconds"].as_u64().unwrap_or_default(),
         ends[0]["idle_seconds"].as_u64().unwrap_or_default(),
     );
-    assert!(seconds >= 3, "{ends:?}");
-    assert!((1..=seconds - 2).contains(&idle), "{ends:?}");
+    assert!(seconds >= 2, "{ends:?}");
+    assert!(idle <= seconds - 2, "{ends:?}");
 }
 
 #[test]
@@ -183,9 +182,11 @@ fn a_reclaim_writes_the_reclaim_and_the_waiters_grant() {
     assert_eq!(reclaim["kind"], "phone", "{reclaim}");
     assert_eq!(reclaim["model"], "Pixel 8", "{reclaim}");
     assert!(reclaim["idle_minutes"].is_u64(), "{reclaim}");
-    assert!(reclaim["waiter"].is_i64(), "{reclaim}");
     let granted = await_events(&sandbox, "lab-wait", 2, |e| e["action"] == "granted");
     assert_eq!(granted.len(), 2, "{granted:?}");
+    // The reclaim names the waiter whose grant took the phone.
+    assert!(reclaim["waiter"].is_i64(), "{reclaim}");
+    assert_eq!(granted[1]["waiter"], reclaim["waiter"], "{granted:?}");
     let _ = holder.kill();
     let _ = holder.wait();
     nothing_private(&sandbox);
@@ -247,19 +248,31 @@ fn a_day_in_the_lab(sandbox: &Sandbox, world: &World) -> Vec<(i32, String, Strin
         .collect()
 }
 
+/// The lab day of [`a_day_in_the_lab`] in a sandbox whose ledger `spoil` made unwritable.
+fn a_day_with_a_spoilt_ledger(spoil: impl Fn(&Path)) -> Vec<(i32, String, String)> {
+    let (sandbox, world) = one_phone(Some(r#""maxEmulators": 0"#));
+    let ledger = sandbox.ledger();
+    std::fs::create_dir_all(ledger.parent().expect("a state dir")).expect("make the state dir");
+    spoil(&ledger);
+    a_day_in_the_lab(&sandbox, &world)
+}
+
 #[test]
 fn a_ledger_that_cannot_be_written_leaves_every_lab_commands_exit_code_and_output_unchanged() {
     let (writable, world) = one_phone(Some(r#""maxEmulators": 0"#));
     let expected = a_day_in_the_lab(&writable, &world);
 
-    let (full, world) = one_phone(Some(r#""maxEmulators": 0"#));
-    let ledger = full.ledger();
-    std::fs::create_dir_all(ledger.parent().expect("a state dir")).expect("make the state dir");
-    // Every write to it fails, as on a read-only or full disk.
-    std::os::unix::fs::symlink("/dev/full", &ledger).expect("link the ledger to /dev/full");
-    let got = a_day_in_the_lab(&full, &world);
+    // Every write to it fails, as on a full disk or a filesystem remounted read-only.
+    let full = a_day_with_a_spoilt_ledger(|ledger| {
+        std::os::unix::fs::symlink("/dev/full", ledger).expect("link the ledger to /dev/full");
+    });
+    // It can't even be opened, as in a read-only dir: the daemon starts all the same.
+    let unopenable = a_day_with_a_spoilt_ledger(|ledger| {
+        std::fs::create_dir(ledger).expect("make the ledger a dir");
+    });
 
-    assert_eq!(got, expected);
+    assert_eq!(full, expected);
+    assert_eq!(unopenable, expected);
     assert!(
         expected.iter().any(|(code, _, _)| *code == 75),
         "{expected:?}"

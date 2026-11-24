@@ -103,6 +103,9 @@ pub struct Lab {
     stopping: Mutex<keeper::Stopping>,
     /// Where runs no daemon can follow any more are recorded.
     ledger: Arc<Ledger>,
+    /// The lab's events on their way to the ledger, which one thread writes, so that no lab
+    /// call waits on the ledger (#62).
+    events: mpsc::Sender<(String, Fields)>,
 }
 
 /// What `adb track-devices` showed last, and whether its stream still follows it: one value,
@@ -142,6 +145,18 @@ impl Lab {
     pub fn open(path: &Path, ledger: Arc<Ledger>) -> Result<Lab, String> {
         let store =
             Store::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let (events, queued) = mpsc::channel::<(String, Fields)>();
+        let writer = Arc::clone(&ledger);
+        let spawned = std::thread::Builder::new()
+            .name("lab-ledger".to_owned())
+            .spawn(move || {
+                for (kind, fields) in queued {
+                    append_event(&writer, &kind, fields);
+                }
+            });
+        if let Err(e) = spawned {
+            return Err(format!("cannot start the lab's ledger writer: {e}"));
+        }
         Ok(Lab {
             path: path.to_owned(),
             store: Mutex::new(store),
@@ -153,6 +168,7 @@ impl Lab {
             stopping: Mutex::new(keeper::Stopping::default()),
             callers: Mutex::new(HashSet::new()),
             ledger,
+            events,
         })
     }
 
@@ -329,22 +345,19 @@ impl Lab {
         Ok((out, lines))
     }
 
-    /// Appends one lab event to the ledger. One that can't be written costs a log line and
-    /// nothing else: no lab command waits on the ledger or fails with it.
+    /// Hands one lab event to the ledger's writer; no lab call waits for it to land.
     fn log(&self, kind: &str, fields: Fields) {
-        let landed = Event::new(kind, fields).map(|event| self.ledger.append(&event));
-        if !matches!(landed, Ok(Ok(_))) {
-            let _ = writeln!(
-                std::io::stderr(),
-                "factory: lab: cannot write a {kind} event to the ledger"
-            );
+        if let Err(mpsc::SendError((kind, fields))) = self.events.send((kind.to_owned(), fields)) {
+            append_event(&self.ledger, &kind, fields);
         }
     }
 
-    /// Ends request `waiter`, which gave up waiting for `why`, and tells the ledger so.
-    fn give_up(&self, waiter: i64, p: &AcquireParams, why: &str) {
+    /// Ends request `waiter`, which gave up waiting for `why` (none: what it waited for last),
+    /// and tells the ledger so.
+    fn give_up(&self, waiter: i64, p: &AcquireParams, why: Option<&str>) {
         let gone = self.write(|c, now| {
-            events::wait_ended(c, waiter, &asked(p), false, why, now)?;
+            let fields = events::wait_event(c, waiter, &asked(p), false, why, now)?;
+            events::queue(c, "lab-wait", &fields)?;
             store::delete_waiter(c, waiter)
         });
         if let Ok(true) = gone {
@@ -843,6 +856,9 @@ struct Taken {
     reused: Vec<String>,
     /// The reservation a fresh lease was made from, put back if the lease is given back.
     from: Option<Reservation>,
+    /// The request's `lab-wait`, written once the grant is handed over: one that fails as it
+    /// is settled was no grant.
+    waited: Fields,
 }
 
 /// What the request's device ask plans, or why it waits: the held devices adb no longer lists
@@ -1250,7 +1266,6 @@ fn try_grant(
     waiter: i64,
     facts: &Facts,
     reprobe: bool,
-    last_why: &str,
 ) -> Answer<Result<Taken, Refused>> {
     let looked = lab.write(|c, now| {
         // Probes are timed in ms, a lease in seconds.
@@ -1314,7 +1329,7 @@ fn try_grant(
             store::touch(c, lease.id, now)?;
             let reservation = claimed.as_ref().map(|r| r.id);
             events::lease_began(c, lease.id, reservation, 0)?;
-            events::wait_ended(c, waiter, &asked(p), true, last_why, now)?;
+            let waited = events::wait_event(c, waiter, &asked(p), true, None, now)?;
             store::delete_waiter(c, waiter)?;
             ends_with_run(c, p, waiter, lease, claimed.as_ref())?;
             return Ok(Ok(Taken {
@@ -1328,6 +1343,7 @@ fn try_grant(
                 phones: Vec::new(),
                 reused: Vec::new(),
                 from: claimed,
+                waited,
             }));
         }
         let stopping = lock_ignoring_poison(&lab.stopping).clone();
@@ -1386,6 +1402,7 @@ fn try_grant(
                     c.execute_batch("ROLLBACK TO claim")?;
                 }
                 c.execute_batch("RELEASE claim")?;
+                events::waiting(c, waiter, &why)?;
                 // After the claim is undone, so a waiter with a reservation keeps its need.
                 // What it asks of devices tells the waiters behind it whether it is in their way
                 // (#58): when that changes, they look again.
@@ -1469,7 +1486,7 @@ fn try_grant(
             let booting = u32::try_from(boots.len()).unwrap_or(u32::MAX);
             events::lease_began(c, lease.id, reservation, booting)?;
         }
-        events::wait_ended(c, waiter, &asked(p), true, last_why, now)?;
+        let waited = events::wait_event(c, waiter, &asked(p), true, None, now)?;
         // A grant that boots emulators can't be handed to a caller again after a restart: the
         // daemon that comes back stops them, so the place goes now, as it did before.
         if fresh && boots.is_empty() {
@@ -1489,6 +1506,7 @@ fn try_grant(
             phones,
             reused,
             from,
+            waited,
         }))
     })?;
     match looked {
@@ -1890,7 +1908,7 @@ pub async fn acquire<W, R, S>(
     }
     // A wait that ran out while the daemon was away takes nothing that came free meanwhile.
     if resumed && deadline_ms.is_some_and(|ms| ms <= now_ms()) {
-        lab.give_up(waiter, &p, "the wait ran out while the daemon restarted");
+        lab.give_up(waiter, &p, None);
         let body = ErrorBody {
             code: Exit::Busy.code(),
             message: format!(
@@ -1934,7 +1952,7 @@ pub async fn acquire<W, R, S>(
             } else {
                 Vec::new()
             };
-            let (lab, p, last_why) = (Arc::clone(&lab), Arc::clone(&p), said.clone());
+            let (lab, p) = (Arc::clone(&lab), Arc::clone(&p));
             blocking(move || {
                 let facts = gather(&lab, &p, seen, deadline);
                 let mut reprobes = 0;
@@ -1945,7 +1963,7 @@ pub async fn acquire<W, R, S>(
                     // A ready probe found too old is made again while the wait lasts, a few
                     // times at most; past that, the phone is not known to be ready.
                     let reprobe = reprobes < REPROBES && Instant::now() < deadline;
-                    match try_grant(&lab, &p, waiter, &facts, reprobe, &last_why)? {
+                    match try_grant(&lab, &p, waiter, &facts, reprobe)? {
                         Err(Refused::Reprobe) => {
                             reprobes += 1;
                             refresh_phones(&lab, &p, deadline);
@@ -1970,8 +1988,10 @@ pub async fn acquire<W, R, S>(
                 );
                 let lease = taken.granted.lease.clone();
                 let from = taken.from.clone();
+                let waited = taken.waited.clone();
                 match settle(&lab, &p, taken, writer, id).await {
                     Ok(lease) => {
+                        lab.log("lab-wait", waited);
                         let granted = Granted {
                             lease,
                             previous,
@@ -2041,7 +2061,7 @@ pub async fn acquire<W, R, S>(
             }
         };
         if Instant::now() >= deadline {
-            lab.give_up(waiter, &p, &why);
+            lab.give_up(waiter, &p, Some(&why));
             let body = ErrorBody {
                 code: Exit::Busy.code(),
                 message: format!("gave up after {} s: {why}", js_number(p.wait_sec)),
@@ -2443,6 +2463,18 @@ pub async fn resume_run<W, R, S>(
         kept: true,
     };
     run.follow(writer, lines, None, stopping).await;
+}
+
+/// Appends one lab event to the ledger. One that can't be written costs a log line and
+/// nothing else: no lab command fails with the ledger.
+fn append_event(ledger: &Ledger, kind: &str, fields: Fields) {
+    let landed = Event::new(kind, fields).map(|event| ledger.append(&event));
+    if !matches!(landed, Ok(Ok(_))) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "factory: lab: cannot write a {kind} event to the ledger"
+        );
+    }
 }
 
 /// Appends the `lab-run` event of `run`, ended with `outcome` in `phase`.

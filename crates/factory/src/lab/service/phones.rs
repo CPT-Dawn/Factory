@@ -20,8 +20,8 @@ use factory_core::lab::ready::{
 };
 
 use super::super::check::PhoneCheck;
-use super::super::context;
 use super::super::readiness::{self, ReadyRow};
+use super::super::{context, events};
 use super::{Answer, Lab, failed, now_ms};
 
 /// How old a probe `devlab check` answers from may be.
@@ -287,26 +287,31 @@ impl Watcher {
                 probed_ms: EpochMs(at),
             };
             readiness::put(c, &row)?;
-            Ok((
-                row,
-                notice(&name(&phone.model, &phone.serial), before, readiness),
-                before.map(|k| k.readiness),
-            ))
+            let said = notice(&name(&phone.model, &phone.serial), before, readiness);
+            let was = before.map(|k| k.readiness);
+            let changed = was != Some(readiness);
+            if changed {
+                // Notified: the change earns a notification and notifications are on.
+                let notified = said.is_some() && config().notify;
+                let fields =
+                    event::readiness(&phone.model, &phone.serial, was, readiness, notified);
+                events::queue(c, "lab-readiness", &fields)?;
+            }
+            Ok((row, said, changed))
         });
-        let (row, said, was) = written.ok()?;
-        let changed = was != Some(readiness);
-        let notified = said.is_some_and(|said| self.post(&said));
+        let (row, said, changed) = written.ok()?;
+        if let Some(said) = said {
+            self.post(&said);
+        }
         if changed {
-            let fields = event::readiness(&phone.model, &phone.serial, was, readiness, notified);
-            self.lab.log("lab-readiness", fields);
             // A request waiting for a phone looks again.
             self.lab.notify();
         }
         Some(row)
     }
 
-    /// Logs `n`, and posts it when the machine config has notifications on; whether it was.
-    fn post(&mut self, n: &Notice) -> bool {
+    /// Logs `n`, and posts it when the machine config has notifications on.
+    fn post(&mut self, n: &Notice) {
         let body = if n.body.is_empty() {
             String::new()
         } else {
@@ -314,13 +319,13 @@ impl Watcher {
         };
         eprintln!("factory: lab: {}{body}", n.summary);
         if !config().notify {
-            return false;
+            return;
         }
         match self
             .desktop
             .post("devlab", n.urgency.word(), &n.summary, &n.body)
         {
-            Ok(()) => return true,
+            Ok(()) => {}
             Err(PostError::Missing) => {
                 if !self.said_missing {
                     eprintln!(
@@ -331,7 +336,6 @@ impl Watcher {
             }
             Err(PostError::Failed(e)) => eprintln!("factory: lab: {e}"),
         }
-        false
     }
 
     /// `phone`'s row: the kept one unless `stale` says, of its readiness and its age in ms, that

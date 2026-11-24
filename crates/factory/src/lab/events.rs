@@ -18,6 +18,10 @@ CREATE TABLE IF NOT EXISTS lab_events (
   kind TEXT NOT NULL,
   fields TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS wait_reasons (
+  waiter INTEGER PRIMARY KEY,
+  why TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS lease_clocks (
   lease INTEGER PRIMARY KEY,
   start_ms INTEGER NOT NULL,
@@ -71,12 +75,14 @@ fn facts(c: &Connection, lease: &Lease, booting: u32) -> rusqlite::Result<LeaseF
         .into_iter()
         .map(|d| (d.kind, d.model))
         .collect();
-    devices.extend((0..booting).map(|_| ("emulator".to_owned(), String::new())));
+    // An emulator still booting is held as the daemon's emulators are, once it is up.
+    devices.extend((0..booting).map(|_| ("emulator".to_owned(), "emulator".to_owned())));
     Ok(LeaseFacts {
         id: lease.id,
         project: lease.project.clone(),
         owner_label: lease.owner_label.clone(),
         worktree: lease.worktree.clone(),
+        home: std::env::var("HOME").ok().filter(|home| !home.is_empty()),
         devices,
         slot: lease.slot,
         reservation,
@@ -128,6 +134,12 @@ pub fn lease_ended(c: &Connection, lease: &Lease, reason: LeaseEnd) -> rusqlite:
 /// Brings lease `lease`'s clock up to date with the commands running on it now: its execs and
 /// its started run. Called after each starts or ends.
 pub fn commands_changed(c: &Connection, lease: i64) -> rusqlite::Result<()> {
+    // A lease granted before clocks were kept gets one from when it was made.
+    c.execute(
+        "INSERT OR IGNORE INTO lease_clocks (lease, start_ms)
+         SELECT id, created * 1000 FROM leases WHERE id = ?1",
+        [lease],
+    )?;
     let running: i64 = c.query_row(
         "SELECT (SELECT COUNT(*) FROM execs WHERE lease = ?1)
               + (SELECT COUNT(*) FROM runs WHERE lease = ?1 AND started_ms IS NOT NULL)",
@@ -150,16 +162,31 @@ pub fn commands_changed(c: &Connection, lease: i64) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Waiter `waiter`, which asked for `asked`, ends its wait now (`now`, in seconds): granted,
-/// or given up waiting for `why`; `why` empty: it never waited. Its `lab-wait` is queued.
-pub fn wait_ended(
+/// Keeps `why` as what waiter `waiter` waits for, so its `lab-wait` can say it, even from a
+/// daemon that comes back after a restart.
+pub fn waiting(c: &Connection, waiter: i64, why: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT OR REPLACE INTO wait_reasons (waiter, why) VALUES (?1, ?2)",
+        params![waiter, why],
+    )?;
+    c.execute(
+        "DELETE FROM wait_reasons WHERE waiter NOT IN (SELECT id FROM waiters)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// The `lab-wait` of waiter `waiter`, which asked for `asked` and ends its wait now (`now`,
+/// in seconds): granted, or given up. Its reason is `why`, else the last it waited for
+/// ([`waiting`]), which is forgotten.
+pub fn wait_event(
     c: &Connection,
     waiter: i64,
     asked: &event::Asked,
     granted: bool,
-    why: &str,
+    why: Option<&str>,
     now: i64,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<Fields> {
     let created: Option<i64> = c
         .query_row(
             "SELECT created FROM waiters WHERE id = ?1",
@@ -167,13 +194,26 @@ pub fn wait_ended(
             |row| row.get(0),
         )
         .optional()?;
+    let kept: Option<String> = c
+        .query_row(
+            "SELECT why FROM wait_reasons WHERE waiter = ?1",
+            [waiter],
+            |row| row.get(0),
+        )
+        .optional()?;
+    c.execute("DELETE FROM wait_reasons WHERE waiter = ?1", [waiter])?;
+    let why = why.map(str::to_owned).or(kept).unwrap_or_default();
     let seconds = u64::try_from(now.saturating_sub(created.unwrap_or(now))).unwrap_or(0);
-    let fields = if granted {
-        event::wait_granted(asked, seconds, Some(why).filter(|w| !w.is_empty()))
+    Ok(if granted {
+        event::wait_granted(
+            waiter,
+            asked,
+            seconds,
+            Some(why.as_str()).filter(|w| !w.is_empty()),
+        )
     } else {
-        event::wait_gave_up(asked, seconds, why)
-    };
-    queue(c, "lab-wait", &fields)
+        event::wait_gave_up(waiter, asked, seconds, &why)
+    })
 }
 
 /// The oldest waiter short of a device `kind` can serve: who a reclaimed device goes to.

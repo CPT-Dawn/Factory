@@ -1383,6 +1383,17 @@ fn a_wait_that_ran_out_while_the_daemon_was_down_takes_no_slot_freed_meanwhile()
         "{gave_up:?}"
     );
     assert!(!gave_up.stdout.contains("DEVLAB_SLOT"), "{gave_up:?}");
+    // Its `lab-wait` keeps what it waited for before the restart (#62).
+    let waits = || -> Vec<serde_json::Value> {
+        sandbox
+            .ledger_lines()
+            .iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|e| e["type"] == "lab-wait" && e["action"] == "gave-up")
+            .collect()
+    };
+    assert!(poll_until(|| !waits().is_empty()), "no lab-wait");
+    assert_eq!(waits()[0]["wait"], "slots", "{:?}", waits());
 }
 
 /// Field 22 of `/proc/<pid>/stat`: when the process started.

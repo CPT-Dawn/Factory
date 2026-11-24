@@ -2,6 +2,7 @@
 //! a flat value, the measures numbers, and nothing that names a serial, a home or a user.
 
 use factory_core::event::{Fields, is_numeric_field};
+use factory_core::lab::devices::{Mode, PlanInput, Unready, plan_devices};
 use factory_core::lab::events::{
     Asked, LeaseEnd, LeaseFacts, lease_end, lease_start, readiness, reclaim, short_id, spans,
     wait_gave_up, wait_granted, wait_reason,
@@ -30,6 +31,7 @@ fn facts() -> LeaseFacts {
         project: Some("demo".to_owned()),
         owner_label: "claude:4242".to_owned(),
         worktree: "/tmp/sandbox/worktrees/demo-a".to_owned(),
+        home: Some("/home/someone".to_owned()),
         devices: vec![
             ("phone".to_owned(), "Pixel_8".to_owned()),
             ("emulator".to_owned(), String::new()),
@@ -186,11 +188,11 @@ fn a_wait_says_what_was_asked_how_long_it_waited_and_its_last_reason() {
         count: 1,
         stack: true,
     };
-    let gave_up = wait_gave_up(&asked, 12, "no free phone: 1 phone(s) busy");
+    let gave_up = wait_gave_up(4, &asked, 12, "no free phone: 1 phone(s) busy");
     numbers_are_listed(&gave_up);
     assert_eq!(
         object(&gave_up),
-        json!({"action": "gave-up", "asked": "phone", "count": 1, "stack": "yes", "seconds": 12, "wait": "phones", "busy": 1})
+        json!({"action": "gave-up", "waiter": 4, "asked": "phone", "count": 1, "stack": "yes", "seconds": 12, "wait": "phones", "busy": 1})
     );
     let none = Asked {
         mode: None,
@@ -198,8 +200,8 @@ fn a_wait_says_what_was_asked_how_long_it_waited_and_its_last_reason() {
         stack: false,
     };
     assert_eq!(
-        object(&wait_granted(&none, 0, None)),
-        json!({"action": "granted", "asked": "none", "count": 0, "stack": "no", "seconds": 0, "wait": "none"})
+        object(&wait_granted(5, &none, 0, None)),
+        json!({"action": "granted", "waiter": 5, "asked": "none", "count": 0, "stack": "no", "seconds": 0, "wait": "none"})
     );
 }
 
@@ -241,4 +243,50 @@ fn a_short_id_is_the_first_8_hex_of_the_serials_sha256() {
     // sha256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
     assert_eq!(short_id("abc"), "ba7816bf");
     assert_eq!(short_id("FAKEPHONE01").len(), 8);
+}
+
+#[test]
+fn a_worktree_that_is_the_home_dir_or_named_like_it_is_shown_as_a_tilde() {
+    let at = |worktree: &str| {
+        let f = LeaseFacts {
+            worktree: worktree.to_owned(),
+            ..facts()
+        };
+        object(&lease_start(&f))["worktree"].clone()
+    };
+    assert_eq!(at("/home/someone"), "~");
+    assert_eq!(at("/home/someone/"), "~");
+    assert_eq!(at("/mnt/backup/someone"), "~");
+    assert_eq!(at("/home/someone/src/app"), "app");
+}
+
+#[test]
+fn the_counts_are_read_from_the_wait_text_the_planner_writes() {
+    let input = PlanInput {
+        want: 1,
+        mode: Mode::Phone,
+        busy_phones: 2,
+        unready: Unready {
+            locked: 1,
+            asleep: 1,
+            stay_awake_off: 1,
+            offline: 1,
+            unauthorized: 1,
+        },
+        ..PlanInput::default()
+    };
+    let why = plan_devices(&input).expect_err("no phone is free");
+    assert_eq!(
+        object(&wait_reason(&why)),
+        json!({"wait": "phones", "busy": 2, "locked": 1, "asleep": 1, "stay_awake_off": 1, "offline": 1, "unauthorized": 1})
+    );
+    let capped = PlanInput {
+        mode: Mode::Any,
+        max_emulators: 3,
+        emulators_running: 3,
+        ..input
+    };
+    let why = plan_devices(&capped).expect_err("the cap is reached");
+    assert_eq!(object(&wait_reason(&why))["wait"], "emulator-cap");
+    assert_eq!(object(&wait_reason(&why))["cap"], 3);
 }
