@@ -20,9 +20,9 @@ use std::io::{BufRead, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -54,10 +54,7 @@ const LEAVE_GRACE: Duration = Duration::from_millis(500);
 /// the time a resume takes, and a last answer.
 const SETTLE_TIMEOUT: Duration = client::RESUME_TIMEOUT.saturating_add(client::ANSWER_TIMEOUT);
 
-/// `devlab run`: queues for the lease, takes it, runs `argv` in it (its devices woken and the
-/// project's ports reversed onto them) and returns its exit code
-/// (128 + the signal that ended it, or that stopped devlab). A lease the run made ends with it,
-/// however it ends, unless `keep`; one it found (an acquire's, an earlier `--keep`) stays.
+/// `devlab run`: [`run_to`] with the caller's stdio, the lease's summary said unless `quiet`.
 pub fn run(
     ctx: &Ctx,
     opts: &Opts,
@@ -65,9 +62,47 @@ pub fn run(
     keep: bool,
     argv: &[String],
 ) -> Result<u8, Failure> {
+    run_to(ctx, opts, keep, argv, &Out::Caller { quiet }).map(|ran| ran.code)
+}
+
+/// Where a run's command's output, and what the run says, go.
+pub enum Out<'a> {
+    /// The caller's stdout and stderr, and devlab's stderr; `quiet` leaves out the lease's
+    /// summary.
+    Caller { quiet: bool },
+    /// The file this makes for the lease granted (`factory lab run`); nothing is said before.
+    File(&'a dyn Fn(&Lease) -> Result<PathBuf, Failure>),
+}
+
+/// How a run ended: its exit code, and the lease it ran in and the file its output went to
+/// once it was granted one.
+pub struct Ran {
+    pub code: u8,
+    pub lease: Option<i64>,
+    pub output: Option<PathBuf>,
+}
+
+/// A run: queues for the lease, takes it, runs `argv` in it (its devices woken and the
+/// project's ports reversed onto them) and returns its exit code
+/// (128 + the signal that ended it, or that stopped devlab). A lease the run made ends with it,
+/// however it ends, unless `keep`; one it found (an acquire's, an earlier `--keep`) stays. The
+/// daemon follows it as running, so its devices are never reclaimed from under it.
+pub fn run_to(
+    ctx: &Ctx,
+    opts: &Opts,
+    keep: bool,
+    argv: &[String],
+    out: &Out<'_>,
+) -> Result<Ran, Failure> {
     let Some(program) = argv.first() else {
         return Err(Failure::usage("devlab run [opts] -- <cmd...>"));
     };
+    let mut ran = Ran {
+        code: 0,
+        lease: None,
+        output: None,
+    };
+    let say = Say::new(None, matches!(out, Out::Caller { .. }));
     let ask = RunAsk {
         command: argv.join(" "),
         session: std::env::var("CLAUDE_CODE_SESSION_ID")
@@ -77,7 +112,7 @@ pub fn run(
     };
     let (params, listen) = lease::ask(ctx, opts, Some(ask))?;
     let paths = lease::paths()?;
-    let watch = Watch::install(program, None, true, Say(None))?;
+    let watch = Watch::install(program, None, true, say.clone())?;
     let ask_at = |resume| AcquireParams {
         resume,
         ..params.clone()
@@ -95,7 +130,7 @@ pub fn run(
                 watch.lock().reason = reason.to_owned();
             }
             if why != said {
-                note(why);
+                say.line(why);
                 why.clone_into(&mut said);
             }
         },
@@ -104,37 +139,45 @@ pub fn run(
     let taken = asked.and_then(|(granted, session)| {
         watch.lock().reason = format!("lease {} granted, not started yet", granted.lease.id);
         watch.follow(session, paths);
-        lease::take(ctx, opts, granted, &mut note)
+        if let Out::File(make) = out {
+            let path = make(&granted.lease)?;
+            let _ = say.file.set(create_log(&path)?);
+            ran.output = Some(path);
+        }
+        ran.lease = Some(granted.lease.id);
+        lease::take(ctx, opts, granted, &mut |why| say.line(why))
     });
     let lease = match taken {
         Ok(lease) => lease,
         Err(failure) => {
             if let Some(signal) = watch.lock().stopped {
                 watch.settle();
-                return Ok(signal_code(signal));
+                ran.code = signal_code(signal);
+                return Ok(ran);
             }
             watch.end(End::Exit(failure.exit.code()), Phase::Queued);
             return Err(failure);
         }
     };
-    if !quiet {
+    if let Out::Caller { quiet: false } = out {
         note(&lease::summary(&lease, ctx.project.as_ref())?);
     }
     wake(&lease);
-    apply_reverses(&lease, ctx.project.as_ref(), &mut |why| note(why))?;
+    apply_reverses(&lease, ctx.project.as_ref(), &mut |why| say.line(why))?;
     let env = lease_env(&lease, ctx.project.as_ref())?;
     let child = {
         let mut state = watch.lock();
         if let Some(signal) = state.stopped {
             drop(state);
             watch.settle();
-            return Ok(signal_code(signal));
+            ran.code = signal_code(signal);
+            return Ok(ran);
         }
         // Said before the spawn: a devlab killed the moment its command starts is a lost run
         // that was running, not one still queued.
         notify(state.link.as_ref(), 0, RUN_START, &());
         state.started = true;
-        match spawn(argv, &env, None) {
+        match spawn(argv, &env, say.file.get()) {
             Ok(child) => {
                 state.child = Some(Running {
                     pidfd: child_pidfd(&child),
@@ -144,9 +187,10 @@ pub fn run(
             }
             Err(e) => {
                 drop(state);
-                note(&format!("cannot run {program}: {e}"));
+                say.line(&format!("cannot run {program}: {e}"));
                 watch.end(End::Exit(CANNOT_RUN), Phase::Queued);
-                return Ok(CANNOT_RUN);
+                ran.code = CANNOT_RUN;
+                return Ok(ran);
             }
         }
     };
@@ -157,26 +201,38 @@ pub fn run(
         drop(state);
         // Only once the command is gone does the run end, and its lease with it (#53).
         watch.end(End::Stopped(signal), Phase::Running);
-        return Ok(signal_code(signal));
+        ran.code = signal_code(signal);
+        return Ok(ran);
     }
     let since = state.child.take().map_or_else(Instant::now, |c| c.since);
     drop(state);
     let (end, code) = match waited {
         Ok(status) => match status.signal() {
             Some(signal) => {
-                note(&killed(program, signal, since.elapsed().as_secs()));
+                say.line(&killed(program, signal, since.elapsed().as_secs()));
                 (End::Signal(signal), exit_code(&status))
             }
             None => (End::Exit(exit_code(&status)), exit_code(&status)),
         },
         Err(e) => {
-            note(&format!("cannot wait for {program}: {e}"));
+            say.line(&format!("cannot wait for {program}: {e}"));
             (End::Exit(CANNOT_RUN), CANNOT_RUN)
         }
     };
     // The end is in the ledger before devlab exits, whichever daemon follows the run by then.
     watch.end(end, Phase::Running);
-    Ok(code)
+    ran.code = code;
+    Ok(ran)
+}
+
+/// The file `factory lab` gives a command's output, made empty.
+fn create_log(path: &Path) -> Result<File, Failure> {
+    File::create(path).map_err(|e| {
+        Failure::precondition(format!(
+            "cannot write {}: {e}; check XDG_RUNTIME_DIR",
+            path.display()
+        ))
+    })
 }
 
 /// Runs `argv` in the lease, its devices woken and the project's ports reversed onto them, and
@@ -195,19 +251,8 @@ pub fn exec_in(
     let Some(program) = argv.first() else {
         return Err(Failure::usage("devlab exec -- <cmd...>"));
     };
-    let log = match output {
-        Some(path) => Some(File::create(path).map_err(|e| {
-            Failure::precondition(format!(
-                "cannot write {}: {e}; check XDG_RUNTIME_DIR",
-                path.display()
-            ))
-        })?),
-        None => None,
-    };
-    let say = Say(log
-        .as_ref()
-        .and_then(|file| file.try_clone().ok())
-        .map(Arc::new));
+    let log = output.map(create_log).transpose()?;
+    let say = Say::new(log.as_ref().and_then(|file| file.try_clone().ok()), true);
     wake(lease);
     apply_reverses(lease, ctx.project.as_ref(), &mut |why| say.line(why))?;
     let watch = Watch::install(program, None, false, say.clone())?;
@@ -252,19 +297,34 @@ pub fn exec_in(
     }
 }
 
-/// Where a run or exec says what happened: devlab's stderr, or the file `factory lab` gave
-/// its command's output.
+/// Where a run or exec says what happened: the file `factory lab` gave its command's output,
+/// once there is one; before, devlab's stderr if `stderr`, else nowhere.
 #[derive(Clone)]
-struct Say(Option<Arc<File>>);
+struct Say {
+    file: Arc<OnceLock<File>>,
+    stderr: bool,
+}
 
 impl Say {
+    fn new(file: Option<File>, stderr: bool) -> Say {
+        let once = OnceLock::new();
+        if let Some(file) = file {
+            let _ = once.set(file);
+        }
+        Say {
+            file: Arc::new(once),
+            stderr,
+        }
+    }
+
     fn line(&self, why: &str) {
-        match &self.0 {
+        match self.file.get() {
             Some(file) => {
                 let mut file: &File = file;
                 let _ = writeln!(file, "{why}");
             }
-            None => note(why),
+            None if self.stderr => note(why),
+            None => {}
         }
     }
 }

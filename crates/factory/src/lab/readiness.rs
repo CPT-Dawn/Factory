@@ -2,7 +2,7 @@
 //! probe found it, and when. A row lives from the phone's plug-in to its unplug. Written by the
 //! daemon alone, in the lab's short transactions.
 
-use factory_core::lab::ready::{Known, Readiness};
+use factory_core::lab::ready::{EpochMs, Known, Readiness};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 pub const SCHEMA: &str = "
@@ -24,8 +24,8 @@ pub struct ReadyRow {
     pub known: Known,
     /// What `devlab check` warns of a ready phone.
     pub warning: Option<String>,
-    /// When it was probed, in ms since the epoch.
-    pub probed_ms: i64,
+    /// When it was probed.
+    pub probed_ms: EpochMs,
 }
 
 fn row(row: &Row<'_>) -> rusqlite::Result<ReadyRow> {
@@ -38,7 +38,7 @@ fn row(row: &Row<'_>) -> rusqlite::Result<ReadyRow> {
             ever_ready: row.get("ever_ready")?,
         },
         warning: row.get("warning")?,
-        probed_ms: row.get("probed_ms")?,
+        probed_ms: EpochMs(row.get("probed_ms")?),
     })
 }
 
@@ -66,7 +66,7 @@ pub fn put(c: &Connection, r: &ReadyRow) -> rusqlite::Result<()> {
             r.known.readiness.word(),
             r.known.ever_ready,
             r.warning,
-            r.probed_ms
+            r.probed_ms.0
         ],
     )?;
     Ok(())

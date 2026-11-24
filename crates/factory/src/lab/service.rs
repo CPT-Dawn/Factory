@@ -34,7 +34,7 @@ use factory_core::lab::emulator::{
 use factory_core::lab::grant::{self, Ask, Decision};
 use factory_core::lab::js_number;
 use factory_core::lab::queue::{DeviceNeed, QueueEntry, devices_held_by, over_device_cap};
-use factory_core::lab::ready::{Readiness, for_grant};
+use factory_core::lab::ready::{EpochMs, Readiness, for_grant};
 use factory_core::lab::run::{End, Phase};
 use factory_core::lab::slots::{SlotView, slot_host_ports, slot_project_id};
 use rusqlite::Connection;
@@ -825,7 +825,7 @@ fn plan(
     lease: Option<&Lease>,
     sight: Sight<'_>,
     mem_available_mb: i64,
-    now: i64,
+    now: EpochMs,
     stopping: &keeper::Stopping,
 ) -> rusqlite::Result<Result<Option<Planned>, String>> {
     let Sight { seen, since } = sight;
@@ -913,25 +913,38 @@ fn plan(
     }))
 }
 
-/// What phone `a` is to a grant ([`for_grant`]), from the watcher's `rows` as the store has
-/// them now: a row from a probe made before adb showed the phone as it does now (`since`) is
-/// of an earlier attachment, or state, of it, and not about it.
-fn grant_readiness(
+/// What phone `a` is to a grant at `now` ([`for_grant`]), from the watcher's `rows` as the
+/// store has them now: a row from a probe made before adb showed the phone as it does now
+/// (`since`, in ms since the epoch) is of an earlier attachment, or state, of it, and not about it.
+pub(super) fn grant_readiness(
     rows: &[readiness::ReadyRow],
     since: &BTreeMap<String, i64>,
     a: &Attached,
-    now: i64,
+    now: EpochMs,
 ) -> Option<Readiness> {
     let row = rows.iter().find(|r| {
         r.serial == a.serial
             && since
                 .get(&a.serial)
-                .is_some_and(|&from| r.probed_ms >= from)
+                .is_some_and(|&from| r.probed_ms >= EpochMs(from))
     });
-    for_grant(
-        &a.state,
-        row.map(|r| (r.known.readiness, now - r.probed_ms)),
-    )
+    for_grant(&a.state, row.map(|r| (r.known.readiness, r.probed_ms)), now)
+}
+
+/// Whether phone `a` is one a grant could take ([`grant_readiness`]): ready, or ready when last
+/// probed too long ago, which the grant probes again before it believes.
+pub(super) fn grantable(
+    rows: &[readiness::ReadyRow],
+    since: &BTreeMap<String, i64>,
+    a: &Attached,
+    now: EpochMs,
+) -> bool {
+    a.kind == "phone"
+        && a.state == "device"
+        && matches!(
+            grant_readiness(rows, since, a, now),
+            None | Some(Readiness::Ready)
+        )
 }
 
 /// Whether a phone the request may take has a ready probe too old to grant on, which the
@@ -940,7 +953,7 @@ fn ready_lapsed(
     c: &Connection,
     ask: &DeviceAsk,
     sight: &Sight<'_>,
-    now: i64,
+    now: EpochMs,
 ) -> rusqlite::Result<bool> {
     if Mode::from_word(&ask.mode) == Mode::Emulator {
         return Ok(false);
@@ -1202,6 +1215,8 @@ fn try_grant(
     reprobe: bool,
 ) -> Answer<Result<Taken, Refused>> {
     let looked = lab.write(|c, now| {
+        // Probes are timed in ms, a lease in seconds.
+        let probed_by = EpochMs(now_ms());
         // Devices are planned from the list adb shows as this transaction runs, never from
         // one read before the probes. A stream that ends marks its list stale under the
         // store's lock, so not while this runs: none is granted from a list its stream stopped
@@ -1224,7 +1239,7 @@ fn try_grant(
                     seen,
                     since: &since,
                 },
-                now,
+                probed_by,
             )?
         {
             return Ok(Err(Refused::Reprobe));
@@ -1286,7 +1301,7 @@ fn try_grant(
                     since: &since,
                 },
                 facts.mem_available_mb,
-                now,
+                probed_by,
                 &stopping,
             )?,
             (None, _) => Ok(None),
@@ -2436,7 +2451,7 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, response: Response) -> bool
 }
 
 /// Milliseconds since the epoch.
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))

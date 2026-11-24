@@ -14,8 +14,8 @@ use factory_adapters::desktop::{Desktop, NotifySend, PostError};
 use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{Attached, LOCK_PROBE, prep_command};
 use factory_core::lab::ready::{
-    AUTH_TIMEOUT_PROBE, BATTERY_PROBE, Notice, POWER_PROBE, Probe, Readiness, STAY_ON_PROBE, after,
-    auth_timeout_warning, judge, notice, refresh_again, unplugged,
+    AUTH_TIMEOUT_PROBE, BATTERY_PROBE, EpochMs, Notice, POWER_PROBE, Probe, Readiness,
+    STAY_ON_PROBE, after, auth_timeout_warning, judge, notice, refresh_again, unplugged,
 };
 
 use super::super::check::PhoneCheck;
@@ -283,7 +283,7 @@ impl Watcher {
                 model: phone.model.clone(),
                 known: after(before, readiness),
                 warning: warning.map(str::to_owned),
-                probed_ms: at,
+                probed_ms: EpochMs(at),
             };
             readiness::put(c, &row)?;
             Ok((
@@ -339,7 +339,7 @@ impl Watcher {
             .write(|c, _| readiness::get(c, &phone.serial))
             .ok()
             .flatten()
-            .filter(|r| !stale(r.known.readiness, now_ms() - r.probed_ms));
+            .filter(|r| !stale(r.known.readiness, EpochMs(now_ms()).since(r.probed_ms)));
         match kept {
             Some(row) => Some(row),
             None if phone.state == "device" => self.probe(phone),
@@ -390,7 +390,7 @@ impl Watcher {
                 .flatten()
                 .is_some_and(|r| {
                     r.known.readiness == Readiness::Ready
-                        && refresh_again(r.known.readiness, now_ms() - r.probed_ms)
+                        && refresh_again(r.known.readiness, EpochMs(now_ms()).since(r.probed_ms))
                 })
     }
 
@@ -425,7 +425,7 @@ impl Watcher {
                         model: row.model,
                         readiness: Some(row.known.readiness),
                         warning: row.warning,
-                        probed_ms: Some(row.probed_ms),
+                        probed_ms: Some(row.probed_ms.0),
                     },
                     None => PhoneCheck {
                         serial,

@@ -2,24 +2,17 @@
 //! is skipped like a missing one, a `--phone` request waits and says how many of each, and a
 //! locked phone unlocked during the wait goes to the waiter.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use super::lab::{devlab, lab};
+use super::lab::{devlab, lab, owned};
 use crate::support::world::{World, poll_until};
 use crate::support::{Run, Sandbox, run};
 
 const PIXEL_1: &str = "plug FAKEPHONE01 device usb:1-1 product:shiba model:Pixel_8 transport_id:1";
 const PIXEL_3: &str =
     "plug FAKEPHONE03 device usb:1-3 product:panther model:Pixel_7 transport_id:3";
-
-/// `devlab <args>` in `dir`, the test process its owner.
-fn owned(sandbox: &Sandbox, dir: &Path, args: &[&str]) -> Run {
-    let mut cmd = devlab(sandbox, dir, args);
-    cmd.env("DEVLAB_OWNER_PID", std::process::id().to_string());
-    run(cmd)
-}
 
 /// A lab whose daemon has seen `plugs`: each applied to adb, then waited for in `devlab check`.
 /// The phones `locked` name are locked before they are plugged in.

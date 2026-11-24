@@ -32,7 +32,7 @@ pub(super) fn devlab(sandbox: &Sandbox, dir: &Path, args: &[&str]) -> Command {
 }
 
 /// `devlab` run with the test process as its owner.
-fn owned(sandbox: &Sandbox, dir: &Path, args: &[&str]) -> Run {
+pub(super) fn owned(sandbox: &Sandbox, dir: &Path, args: &[&str]) -> Run {
     let mut cmd = devlab(sandbox, dir, args);
     cmd.env("DEVLAB_OWNER_PID", std::process::id().to_string());
     run(cmd)
@@ -1053,6 +1053,42 @@ fn factory_lab_says_one_line_per_verb_and_json_with_the_flag() {
             "",
             "factory: unknown command frobnicate; factory lab help\n"
         )
+    );
+}
+
+#[test]
+fn factory_lab_run_ends_the_lease_it_made_unless_kept_and_lands_in_the_ledger() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-native-run");
+    let me = std::process::id();
+    let lab = |args: &[&str]| native(&sandbox, &wt, me, &[&["lab"], args].concat());
+
+    let ran = lab(&["run", "--no-device", "--", "true"]);
+    assert!(
+        one_line(&ran).starts_with("true exited 0 in lease 1; output in "),
+        "{ran:?}"
+    );
+    assert_eq!(one_line(&lab(&["release"])), "nothing held here");
+
+    let kept = lab(&["run", "--no-device", "--keep", "--", "true"]);
+    assert!(
+        one_line(&kept).starts_with("true exited 0 in lease 2; output in "),
+        "{kept:?}"
+    );
+    assert_eq!(
+        one_line(&lab(&["release"])),
+        format!("released lease 2 ({})", wt.display())
+    );
+    assert!(
+        poll_until(|| lab_runs(&sandbox).len() == 2),
+        "{:?}",
+        lab_runs(&sandbox)
+    );
+    let refused = lab(&["acquire", "--no-device", "--keep"]);
+    assert_eq!(
+        (refused.code, refused.stdout.as_str()),
+        (2, ""),
+        "{refused:?}"
     );
 }
 
