@@ -5,7 +5,7 @@ set -euo pipefail
 
 # A push that only deletes branches sends no code, so there is nothing to check.
 zero=0000000000000000000000000000000000000000
-head=$(git rev-parse HEAD)
+head=$(git rev-parse -q --verify HEAD || true)
 deleting=1
 while read -r local_ref local_sha _ _; do
   [[ "$local_sha" == "$zero" ]] && continue
