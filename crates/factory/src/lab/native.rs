@@ -303,7 +303,8 @@ fn release_done(released: &Released, target: Target) -> Result<Done, Failure> {
         let file = save_new("release", &(lines.join("\n") + "\n"))?;
         line = format!("{short}, list in {}", file.display());
         let mut json = json;
-        json["releasedFile"] = json!(file);
+        // Lossy, never a panic: serde refuses a path that isn't UTF-8.
+        json["releasedFile"] = json!(file.to_string_lossy());
         let mut done = Done::new(line, json);
         // The path is the point of the line: never cut it.
         done.whole = true;
