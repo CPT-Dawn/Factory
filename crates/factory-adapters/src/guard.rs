@@ -97,6 +97,8 @@ struct Proxy {
     child: Child,
     ready: Option<ChildStdout>,
     socket: PathBuf,
+    /// Whether its leader is reaped: from then on its ID may name someone else's group.
+    reaped: bool,
 }
 
 impl Proxy {
@@ -140,6 +142,7 @@ impl Proxy {
             child,
             ready: None,
             socket,
+            reaped: false,
         };
         match heard.recv_timeout(PROXY_READY) {
             Ok((Ok(1), ready)) => {
@@ -154,12 +157,18 @@ impl Proxy {
         }
     }
 
-    /// Kills the proxy's process group and reaps it. Its leader is unreaped until then, so the
-    /// group's ID is still its own; once killed, the wait is short.
+    /// Kills the proxy's process group and reaps it, once: a second call only reads the status
+    /// back. Its leader is unreaped until the first, so the group's ID is still its own then;
+    /// once killed, the wait is short.
     fn stop(&mut self) -> io::Result<std::process::ExitStatus> {
-        if let Some(group) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
+        if !self.reaped
+            && let Some(group) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw)
+        {
             let _ = kill_process_group(group, Signal::KILL);
         }
+        // Even a wait that fails leaves the ID unsafe to signal: it fails only once the leader
+        // is no child of ours to wait for.
+        self.reaped = true;
         self.child.wait()
     }
 
