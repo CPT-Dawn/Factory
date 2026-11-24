@@ -214,7 +214,16 @@ fn run_and_exec_keep_devlab_alive_as_the_parent_of_the_command() {
     let ran = owned(
         &sandbox,
         &wt,
-        &["run", "--no-device", "--quiet", "--", "sh", "-c", parent],
+        &[
+            "run",
+            "--no-device",
+            "--quiet",
+            "--keep",
+            "--",
+            "sh",
+            "-c",
+            parent,
+        ],
     );
     let held = owned(&sandbox, &wt, &["exec", "--", "sh", "-c", parent]);
 
@@ -1722,6 +1731,35 @@ fn sigterm_while_the_command_runs_reaches_the_command_and_the_ledger() {
 }
 
 #[test]
+fn a_stopped_run_keeps_its_lease_until_its_command_is_gone_then_gives_it_back() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-stopping");
+    let script = r#"trap 'kill $!; touch got; while [ ! -e go ]; do sleep 0.05; done; exit 0' TERM; sleep 30 & touch started; wait"#;
+    let child = spawn_run(&sandbox, &wt, script);
+    assert!(
+        poll_until(|| wt.join("started").exists()),
+        "the command never started"
+    );
+
+    signal(child.id(), Signal::TERM);
+    assert!(
+        poll_until(|| wt.join("got").exists()),
+        "the command never got the signal"
+    );
+    // The command still runs, cleaning up: the lease is still its.
+    let held = leases_on(&board(&sandbox, &wt));
+    assert_eq!(held.len(), 1, "{held:?}");
+
+    fs::write(wt.join("go"), "").expect("write go");
+    let out = finish(child);
+    assert_eq!(out.code, 143, "{out:?}");
+    assert!(leases_on(&board(&sandbox, &wt)).is_empty());
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "stopped SIGTERM", "{event}");
+    assert_eq!(event["phase"], "running", "{event}");
+}
+
+#[test]
 fn a_command_killed_by_sigkill_is_named_and_recorded_as_a_signal() {
     let (sandbox, world) = lab();
     let wt = world.worktree("demo-killed");
@@ -1983,7 +2021,8 @@ fn a_run_a_daemon_stop_cut_off_for_good_is_recorded_as_daemon_stopped_not_lost()
     let event = the_lab_run(&sandbox);
     assert_eq!(event["outcome"], "daemon-stopped", "{event}");
     assert_eq!(event["phase"], "running", "{event}");
-    assert_eq!(leases_on(&after).len(), 1, "{after}");
+    // The lease the run made ends with it, however it ended (#53).
+    assert!(leases_on(&after).is_empty(), "{after}");
 }
 
 #[test]

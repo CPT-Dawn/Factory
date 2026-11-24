@@ -60,7 +60,8 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
             }
             let quiet = flags.iter().any(|f| f == "--quiet");
             if cmd == "run" {
-                return run::run(&ctx, &opts, quiet, rest);
+                let keep = flags.iter().any(|f| f == "--keep");
+                return run::run(&ctx, &opts, quiet, keep, rest);
             }
             let granted = lease::acquire(&ctx, &opts, &mut |why| note(why), &mut |w| note(w))?;
             if !quiet {

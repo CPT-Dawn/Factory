@@ -7,7 +7,9 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::reservations;
-use super::wire::{AcquireParams, Granted, Lease, LeaseDevice, Owner, Process, SlotRow, Waiter};
+use super::wire::{
+    AcquireParams, Granted, Lease, LeaseDevice, Owner, Process, Reservation, SlotRow, Waiter,
+};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS leases (
@@ -74,6 +76,11 @@ CREATE TABLE IF NOT EXISTS runs (
   lease INTEGER,
   slot INTEGER
 );
+CREATE TABLE IF NOT EXISTS run_leases (
+  run INTEGER PRIMARY KEY,
+  lease INTEGER NOT NULL,
+  reservation TEXT
+);
 CREATE TABLE IF NOT EXISTS emulators (
   idx INTEGER PRIMARY KEY,
   serial TEXT NOT NULL,
@@ -94,7 +101,7 @@ pub struct EmulatorRow {
 }
 /// The schema's version, in `PRAGMA user_version`. Version 0 kept waiters only while the
 /// daemon that queued them ran, so their table is rebuilt; `stoppers` is new. Version 2 adds
-/// `runs`.
+/// `runs`. `run_leases` (#53) needs no new version: `SCHEMA` makes it on every open.
 const VERSION: i64 = 2;
 
 pub struct Store {
@@ -424,8 +431,24 @@ pub fn find_lease(
     .transpose()
 }
 
-/// Forgets a lease; its slot and its emulators start idling, its phones are free.
+/// Forgets a lease; its slot and its emulators start idling, its phones are free. A run's lease
+/// made from a reservation ([`end_with_run`]) gives that reservation its slot back, however the
+/// lease ends.
 pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<()> {
+    let from: Option<Option<String>> = c
+        .query_row(
+            "SELECT reservation FROM run_leases WHERE lease = ?1",
+            [lease.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let from = from
+        .flatten()
+        .map(|text| serde_json::from_str::<Reservation>(&text))
+        .transpose()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
     c.execute(
         "UPDATE emulators SET idle_since = ?1
          WHERE serial IN (SELECT serial FROM lease_devices WHERE lease_id = ?2)",
@@ -439,7 +462,52 @@ pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<(
         )?;
     }
     c.execute("DELETE FROM leases WHERE id = ?1", [lease.id])?;
+    c.execute("DELETE FROM run_leases WHERE lease = ?1", [lease.id])?;
+    if let Some(from) = &from {
+        reservations::restore(c, from)?;
+    }
     reservations::record_lease_end(c, lease, now)
+}
+
+/// Lease `lease` ends with run `run`: the run made it and didn't ask to keep it. `from` is the
+/// reservation it was made from, which gets its slot back then.
+pub fn end_with_run(
+    c: &Connection,
+    run: i64,
+    lease: i64,
+    from: Option<&Reservation>,
+) -> rusqlite::Result<()> {
+    let from = from
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    c.execute(
+        "INSERT OR REPLACE INTO run_leases (run, lease, reservation) VALUES (?1, ?2, ?3)",
+        params![run, lease, from],
+    )?;
+    Ok(())
+}
+
+/// Run `run` ended: the lease that ends with it ([`end_with_run`]) is dropped, and the
+/// reservation it was made from, if any, holds its slot again, under the same id
+/// ([`drop_lease`]). The lease dropped, if it was still there.
+pub fn end_run_lease(c: &Connection, run: i64, now: i64) -> rusqlite::Result<Option<Lease>> {
+    let ending: Option<i64> = c
+        .query_row(
+            "SELECT lease FROM run_leases WHERE run = ?1",
+            [run],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(id) = ending else {
+        return Ok(None);
+    };
+    let Some(held) = lease(c, id)? else {
+        c.execute("DELETE FROM run_leases WHERE run = ?1", [run])?;
+        return Ok(None);
+    };
+    drop_lease(c, &held, now)?;
+    Ok(Some(held))
 }
 
 /// Drops every lease and reservation whose owner exited: the leases as they were, with their
@@ -689,6 +757,10 @@ pub fn begin_run(c: &Connection, fresh: &RunRow) -> rusqlite::Result<RunRow> {
         if kept.id != fresh.id {
             c.execute(
                 "UPDATE runs SET id = ?1 WHERE id = ?2",
+                params![fresh.id, kept.id],
+            )?;
+            c.execute(
+                "UPDATE run_leases SET run = ?1 WHERE run = ?2",
                 params![fresh.id, kept.id],
             )?;
             kept.id = fresh.id;
