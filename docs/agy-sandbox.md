@@ -31,7 +31,7 @@ What a guarded review can write:
 - its own log, `reviews/<repo>/<label>.agy.run.log` (`--bind`)
 - agy's state: `~/.gemini`, `${XDG_CONFIG_HOME:-~/.config}/antigravity`, `${XDG_CACHE_HOME:-~/.cache}/antigravity` (`--bind-try`, so a missing dir is skipped)
 - tmpfs mounts that are thrown away with the review: an empty `$XDG_RUNTIME_DIR`, and a private `/dev` (`--dev`: `null`, `zero`, `random`, `urandom`, `tty` and its own `pts`) with its own `/dev/shm`
-- with the subscription login, the Secret Service keyring (`org.freedesktop.secrets`), which holds agy's login. It is reached over the session bus, through an `xdg-dbus-proxy` started for the review with `--filter --talk=org.freedesktop.secrets`. The proxy's socket is mounted where the bus socket was, and `DBUS_SESSION_BUS_ADDRESS` points at it. A socket on a read-only mount still connects, so the filter, not the mount, is what limits the bus. The proxy stops with the review: it is killed when the guard drops, and it stops on its own when the factory's end of its `--fd` pipe closes.
+- with the subscription login, the Secret Service keyring (`org.freedesktop.secrets`), which holds agy's login. It is reached over the session bus, through an `xdg-dbus-proxy` started for the review with `--filter --talk=org.freedesktop.secrets`. The proxy's socket is mounted where the bus socket was, and `DBUS_SESSION_BUS_ADDRESS` points at it. A socket on a read-only mount still connects, so the filter, not the mount, is what limits the bus. The proxy stops with the review: it runs in a process group of its own, which is killed whole when the guard drops, and it stops on its own when the factory's end of its `--fd` pipe closes.
 
 What it refuses:
 

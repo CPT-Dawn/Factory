@@ -2,7 +2,6 @@
 //! read-only and offline invocation, its sandbox check, its quota error and its auth modes.
 
 use std::fs;
-use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -688,10 +687,13 @@ fn agy_reviews_inside_a_write_guard_that_leaves_only_its_checkout_its_log_and_it
         "{guard:?}"
     );
     let pids = fs::read_to_string(sandbox.path("bin/proxy.pids")).unwrap();
-    for pid in pids.lines() {
+    for pid in pids.split_whitespace() {
+        // Gone, or dead and not yet reaped by whoever adopted it.
+        let state = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let state = state.rsplit(") ").next().unwrap_or_default();
         assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
-            "a proxy is stopped with its guard: {pid}"
+            state.is_empty() || state.starts_with('Z'),
+            "a proxy's whole group is stopped with its guard: {pid} {state}"
         );
     }
 }

@@ -20,12 +20,15 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+use rustix::process::{Pid, Signal, kill_process_group};
 
 /// The program that puts the guard up.
 pub const BWRAP: &str = "bwrap";
@@ -87,8 +90,9 @@ impl Guard {
     }
 }
 
-/// A running `xdg-dbus-proxy`, listening on `socket`. It stops when the pipe it was given as
-/// `--fd` closes, so it never outlives the factory, and is stopped when this drops.
+/// A running `xdg-dbus-proxy`, listening on `socket`, in a process group of its own. It stops
+/// when the pipe it was given as `--fd` closes, so it never outlives the factory, and its group
+/// is killed when this drops.
 struct Proxy {
     child: Child,
     ready: Option<ChildStdout>,
@@ -115,6 +119,7 @@ impl Proxy {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .spawn()
             .map_err(|e| match e.kind() {
                 io::ErrorKind::NotFound => format!("{PROXY} is not installed"),
@@ -149,9 +154,19 @@ impl Proxy {
         }
     }
 
-    /// Why a proxy that ended without listening ended, in its own words.
+    /// Kills the proxy's process group and reaps it. Its leader is unreaped until then, so the
+    /// group's ID is still its own; once killed, the wait is short.
+    fn stop(&mut self) -> io::Result<std::process::ExitStatus> {
+        if let Some(group) = i32::try_from(self.child.id()).ok().and_then(Pid::from_raw) {
+            let _ = kill_process_group(group, Signal::KILL);
+        }
+        self.child.wait()
+    }
+
+    /// Why a proxy that ended without listening ended, in its own words. It is stopped first,
+    /// so neither the wait nor the read of its stderr can hang on it.
     fn why_it_stopped(&mut self) -> String {
-        let status = self.child.wait();
+        let status = self.stop();
         let mut stderr = String::new();
         if let Some(mut pipe) = self.child.stderr.take() {
             let _ = pipe.read_to_string(&mut stderr);
@@ -167,8 +182,7 @@ impl Proxy {
 impl Drop for Proxy {
     fn drop(&mut self) {
         drop(self.ready.take());
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.stop();
         let _ = fs::remove_file(&self.socket);
     }
 }

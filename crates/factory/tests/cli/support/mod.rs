@@ -54,9 +54,9 @@ pub const BWRAP_PASSES: &str =
     "while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"";
 
 /// A fake `xdg-dbus-proxy` that says it listens, as the real one does on its `--fd=1`, and then
-/// waits to be stopped. It notes its pid in `proxy.pids` beside it.
+/// waits to be stopped, with a child of its own beside it. It notes both pids in `proxy.pids`.
 pub const PROXY_LISTENS: &str =
-    "echo $$ >> \"$(dirname \"$0\")/proxy.pids\"\nprintf x\nexec sleep 60";
+    "sleep 60 &\necho $! $$ >> \"$(dirname \"$0\")/proxy.pids\"\nprintf x\nexec sleep 60";
 
 /// How long any one process a test runs may take before the test fails.
 pub const DEADLINE: Duration = Duration::from_secs(30);
