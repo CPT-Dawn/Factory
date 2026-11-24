@@ -82,7 +82,7 @@ impl World {
     /// - `unplug <serial>`: adb no longer lists it,
     /// - `lock <serial>`: its lock screen stays up,
     /// - `stall <serial>`: the emulator never finishes booting,
-    /// - `break <operation>` / `mend <operation>`: `supabase start` or `systemd-run` fails,
+    /// - `break <operation>` / `mend <operation>`: `supabase start`, `supabase stop` or `systemd-run` fails,
     ///   or works again.
     pub fn apply(&self, step: &str) -> Result<(), String> {
         let words: Vec<&str> = step.split_whitespace().collect();

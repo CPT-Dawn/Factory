@@ -6,9 +6,8 @@ use std::process::ExitCode;
 
 use factory_core::lab::slots::export_lines;
 
-use super::context::{Ctx, context};
+use super::context::{Ctx, context, project_config, release_context};
 use factory_core::lab::args::parse_opts;
-use factory_core::lab::config::ProjectConfig;
 
 use super::lease::{self, Target};
 use super::wire::{Lease, Released};
@@ -97,11 +96,12 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
         }
         "release" => {
             let (target, stop_stack) = release_args(args)?;
-            let released = release(&context()?, stop_stack, target)?;
+            let (released, stop_failed) =
+                release(&release_context(stop_stack)?, stop_stack, target)?;
             for line in release_lines(&released, target)? {
                 note(&line);
             }
-            Ok(0)
+            stop_failed.map_or(Ok(0), Err)
         }
         "stack" => {
             let done = stack(&context()?, args.first().map_or("status", String::as_str))?;
@@ -225,7 +225,10 @@ pub(super) fn release_lines(released: &Released, target: Target) -> Result<Vec<S
                 Target::Here => "nothing held here",
                 Target::AllMine => "nothing held",
                 Target::Lease(id) => {
-                    return Err(Failure::new(Exit::NoLease, format!("no lease {id}")));
+                    return Err(Failure::new(
+                        Exit::NoLease,
+                        format!("no lease {id}: see devlab status for the leases held"),
+                    ));
                 }
             }
             .to_owned(),
@@ -259,34 +262,45 @@ pub(super) fn still_held(lease: &Lease) -> String {
 /// Gives the leases `target` names back. With `--stop-stack` the
 /// stack stops first, its slot held for this call meanwhile, whatever ends the lease, so the next
 /// in the queue never gets a stack being torn down; a stop that fails still gives the lease back.
-pub(super) fn release(ctx: &Ctx, stop_stack: bool, target: Target) -> Result<Released, Failure> {
+///
+/// A stack that fails to stop does not undo the release: the failure comes back beside what was
+/// released, for the caller to say after it. The stack stopped is the held lease's own, by its
+/// worktree, even when `DEVLAB_LEASE` named a lease of another worktree.
+pub(super) fn release(
+    ctx: &Ctx,
+    stop_stack: bool,
+    target: Target,
+) -> Result<(Released, Option<Failure>), Failure> {
     let held = if stop_stack {
         lease::stopping(ctx)?
     } else {
         None
     };
-    let stopped = match (&held, &ctx.project) {
-        (
-            Some(Lease {
-                slot: Some(slot), ..
-            }),
-            Some(project),
-        ) => Some(stop(ctx, project, *slot)),
+    let stopped = match &held {
+        Some(Lease {
+            slot: Some(slot),
+            worktree,
+            ..
+        }) => Some(stop(worktree, *slot)),
         _ => None,
     };
     let released = lease::release(ctx, target)?;
-    if let Some(stopped) = stopped.filter(|_| !released.dropped.is_empty()) {
-        stopped?;
-    }
-    Ok(released)
+    let stop_failed = stopped
+        .filter(|_| !released.dropped.is_empty())
+        .and_then(Result::err);
+    Ok((released, stop_failed))
 }
 
-/// Stops the slot's stack if it runs, and marks it no longer devlab's to stop.
-fn stop(ctx: &Ctx, project: &ProjectConfig, slot: u32) -> Result<(), Failure> {
-    if let Some(info) = stack::info(project, &ctx.worktree, slot)?
+/// Stops the slot's stack of the project at `worktree` if it runs, and marks it no longer
+/// devlab's to stop.
+fn stop(worktree: &str, slot: u32) -> Result<(), Failure> {
+    let Some(project) = project_config(worktree)? else {
+        return Ok(());
+    };
+    if let Some(info) = stack::info(&project, worktree, slot)?
         && stack::running(&info.project_id)
     {
-        stack::down(project, &info.project_id, &ctx.worktree)?;
+        stack::down(&project, &info.project_id, worktree)?;
     }
     lease::stack_ours(&project.name, slot, false)
 }

@@ -15,7 +15,7 @@ use factory_core::lab::slots::export_lines;
 use serde_json::{Map, Value, json};
 
 use super::cli::{self, HELP, Stack};
-use super::context::{Ctx, context};
+use super::context::{Ctx, context, release_context};
 use super::lease::Target;
 use super::wire::{Board, Lease, Released};
 use super::{lease, reserve, run, status};
@@ -110,7 +110,15 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
         }
         "release" => {
             let (target, stop_stack) = cli::release_args(args)?;
-            let released = cli::release(&context()?, stop_stack, target)?;
+            let (released, stop_failed) =
+                cli::release(&release_context(stop_stack)?, stop_stack, target)?;
+            if let Some(failed) = stop_failed {
+                let said = cli::release_lines(&released, target)?.join("; ");
+                return Err(Failure::new(
+                    failed.exit,
+                    format!("{}; the lease was still released: {said}", failed.message),
+                ));
+            }
             release_done(&released, target)?
         }
         "stack" => stack_done(&cli::stack(
@@ -262,39 +270,46 @@ fn stack_done(done: &Stack) -> Done {
     Done::new(line, json!({ "stack": id, "slot": slot, "state": state }))
 }
 
-/// Writes `text` to `name` in the lab's runtime directory; its path.
-/// What a release says in one line: what it ended, and what the caller still holds, in a file
-/// when the line would run long.
+/// What a release says in one line: what it ended and what the caller still holds, or when that
+/// would run long a count and a file with a line for each lease.
 fn release_done(released: &Released, target: Target) -> Result<Done, Failure> {
     let lines = cli::release_lines(released, target)?;
     let json = json!({ "released": released.dropped, "stillHeld": released.still_held });
     let ended = lines.len() - released.still_held.len();
-    let mut line = lines[..ended]
-        .iter()
-        .map(|l| l.as_str())
-        .collect::<Vec<_>>()
-        .join("; ");
+    let mut line = lines[..ended].join("; ");
     if !released.still_held.is_empty() {
-        let held: Vec<String> = released
+        let ids: Vec<String> = released
             .still_held
             .iter()
             .map(|l| format!("lease {}", l.id))
             .collect();
-        let inline = format!("{line}; still held: {}", held.join(", "));
-        if inline.chars().count() <= 150 {
-            line = inline;
+        line = format!("{line}; still held: {}", ids.join(", "));
+    }
+    if line.chars().count() > 150 {
+        let dropped = released.dropped.len();
+        let said = if dropped == 0 {
+            lines[0].clone()
         } else {
-            let file = save("release.txt", &(lines.join("\n") + "\n"))?;
-            line = format!(
-                "{line}; {} still held, list in {}",
-                released.still_held.len(),
-                file.display()
-            );
+            format!(
+                "released {dropped} lease{}",
+                if dropped == 1 { "" } else { "s" }
+            )
+        };
+        let held = released.still_held.len();
+        let mut short = said;
+        if held > 0 {
+            short.push_str(&format!("; {held} still held"));
         }
+        let file = save(
+            &format!("release-{}.txt", std::process::id()),
+            &(lines.join("\n") + "\n"),
+        )?;
+        line = format!("{short}, list in {}", file.display());
     }
     Ok(Done::new(line, json))
 }
 
+/// Writes `text` to `name` in the lab's runtime directory; its path.
 fn save(name: &str, text: &str) -> Result<PathBuf, Failure> {
     let paths = Paths::from_env()?;
     paths.create_runtime()?;

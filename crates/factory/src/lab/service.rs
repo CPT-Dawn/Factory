@@ -446,11 +446,9 @@ fn release(lab: &Lab, p: ReleaseParams) -> Answer<Released> {
         let dropped = if p.all {
             store::leases(c)?.into_iter().filter(mine).collect()
         } else {
-            match store::find_lease(c, &f.worktree, &f.owner, f.lease)? {
-                Some(lease) if f.lease.is_some() && !mine(&lease) => {
-                    return Ok(Err(not_yours(&lease)));
-                }
-                found => found.into_iter().collect(),
+            match own_lease(c, f)? {
+                Ok(found) => found.into_iter().collect(),
+                Err(refused) => return Ok(Err(refused)),
             }
         };
         for lease in &dropped {
@@ -481,12 +479,22 @@ fn held_by(lease: &Lease, owner: &Owner) -> bool {
     lease.owner_pid == owner.pid && lease.owner_start == owner.start
 }
 
+/// The caller's lease, found as `find_lease` does; a lease named by id that another owner holds
+/// is refused instead.
+fn own_lease(c: &Connection, f: &FindParams) -> rusqlite::Result<Result<Option<Lease>, ErrorBody>> {
+    let lease = store::find_lease(c, &f.worktree, &f.owner, f.lease)?;
+    Ok(match lease {
+        Some(lease) if f.lease.is_some() && !held_by(&lease, &f.owner) => Err(not_yours(&lease)),
+        found => Ok(found),
+    })
+}
+
 /// The refusal of a lease named by id that another owner holds.
 fn not_yours(lease: &Lease) -> ErrorBody {
     ErrorBody {
         code: Exit::NoLease.code(),
         message: format!(
-            "lease {} belongs to {} ({}), not to you: it stays held",
+            "lease {} belongs to {} ({}), not to you: it stays held; ask its owner to release it",
             lease.id, lease.owner_label, lease.worktree
         ),
     }
@@ -496,13 +504,10 @@ fn not_yours(lease: &Lease) -> ErrorBody {
 fn stopping(lab: &Lab, p: StopParams) -> Answer<Option<Lease>> {
     lab.write(|c, _| {
         let f = &p.find;
-        let lease = store::find_lease(c, &f.worktree, &f.owner, f.lease)?;
-        if let Some(lease) = lease
-            .as_ref()
-            .filter(|l| f.lease.is_some() && !held_by(l, &f.owner))
-        {
-            return Ok(Err(not_yours(lease)));
-        }
+        let lease = match own_lease(c, f)? {
+            Ok(lease) => lease,
+            Err(refused) => return Ok(Err(refused)),
+        };
         if let Some(Lease {
             project: Some(project),
             slot: Some(slot),

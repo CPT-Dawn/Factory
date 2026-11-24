@@ -2570,7 +2570,10 @@ fn release_lease_of_a_lease_that_does_not_exist_exits_4() {
     ));
     assert_eq!(
         (out.code, out.stderr.as_str()),
-        (4, "devlab: no lease 9\n"),
+        (
+            4,
+            "devlab: no lease 9: see devlab status for the leases held\n"
+        ),
         "{out:?}"
     );
 }
@@ -2646,4 +2649,90 @@ fn factory_lab_release_says_in_one_line_and_in_json_what_is_still_held() {
     );
     let nothing = at(&one, &["lab", "release"]);
     assert_eq!(one_line(&nothing), "nothing held here");
+}
+
+#[test]
+fn release_by_id_does_not_read_the_devlab_json_of_the_folder_it_runs_in() {
+    let (sandbox, world) = lab();
+    let a = Agent::start();
+    let (one, _two) = owner_holding_in_two_worktrees(&sandbox, &world, &a);
+    let broken = world.worktree("plain-broken");
+    fs::write(broken.join("devlab.json"), "{").expect("break the project config");
+
+    let by_id = run(for_owner(
+        &sandbox,
+        &broken,
+        a.pid(),
+        &["release", "--lease", "1"],
+    ));
+    let all = run(for_owner(
+        &sandbox,
+        &broken,
+        a.pid(),
+        &["release", "--all-mine"],
+    ));
+
+    assert_eq!(by_id.code, 0, "{by_id:?}");
+    assert!(
+        by_id
+            .stderr
+            .starts_with(&format!("devlab: released lease 1 ({})", one.display())),
+        "{by_id:?}"
+    );
+    assert_eq!(all.code, 0, "{all:?}");
+}
+
+#[test]
+fn factory_lab_release_names_a_file_when_the_leases_it_ends_would_run_the_line_long() {
+    let (sandbox, world) = lab();
+    let a = Agent::start();
+    let_one_owner_hold_both_slots(&sandbox);
+    for name in ["demo-1".repeat(12), "demo-2".repeat(12)] {
+        let wt = world.worktree(&name);
+        let held = native(&sandbox, &wt, a.pid(), &["lab", "acquire", "--no-device"]);
+        assert_eq!(held.code, 0, "{held:?}");
+    }
+    let elsewhere = world.worktree("plain-elsewhere");
+
+    let out = native(
+        &sandbox,
+        &elsewhere,
+        a.pid(),
+        &["lab", "release", "--all-mine"],
+    );
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(out.stdout.chars().count() <= 201, "{out:?}");
+    assert!(
+        out.stdout.starts_with("released 2 leases, list in "),
+        "{out:?}"
+    );
+    let listed = named_file(out.stdout.trim_end());
+    assert!(
+        listed.contains("released lease 1 (") && listed.contains("released lease 2 ("),
+        "{listed}"
+    );
+}
+
+#[test]
+fn a_stack_that_fails_to_stop_still_says_what_the_release_freed() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-stop");
+    let held = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--quiet"],
+    );
+    assert_eq!(held.code, 0, "{held:?}");
+    world.apply("break supabase stop").unwrap();
+
+    let out = owned(&sandbox, &wt, &["release", "--stop-stack"]);
+
+    assert_ne!(out.code, 0, "{out:?}");
+    assert!(
+        out.stderr
+            .starts_with(&format!("devlab: released lease 1 ({})\n", wt.display())),
+        "{out:?}"
+    );
+    assert_eq!(owned(&sandbox, &wt, &["env"]).code, 4);
 }
