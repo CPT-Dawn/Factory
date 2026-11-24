@@ -8,7 +8,8 @@
 //! add to a live subscription. Nothing polls.
 //!
 //! Each lead the daemon spawns gets one `lead-end` in the ledger: `finished` once it has written
-//! its report, `dead` when its agent is gone without one.
+//! its report, `dead` when its agent is gone without one. A lead whose latest start already has an
+//! end in the ledger, whoever logged it, is not given a second.
 //!
 //! A wait on a lead registers itself in the wait registry, so the lead it runs in shows as
 //! waiting, and is answered when an event settles the lead it waits on.
@@ -429,11 +430,12 @@ impl<H: HerdrApi> Leads<H> {
                 format!("slug={}", lead::slug(&name)),
                 format!("outcome={how}"),
             ];
+            // A lead-end the ledger already holds, whoever logged it, is not written again.
             let landed = event::Event::from_args("lead-end", &pairs, None)
                 .map_err(|e| e.to_string())
                 .and_then(|event| {
                     self.ledger
-                        .append(&event)
+                        .append_end(&lead.repo, lead::slug(&name), &event)
                         .map(|_| ())
                         .map_err(|e| e.to_string())
                 });

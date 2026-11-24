@@ -22,6 +22,34 @@ fn named(event: &Fields, field: &str, want: &str) -> bool {
     }
 }
 
+/// Whether the lead `slug` of `repo` owes an end at `path`: its latest start or end there is a
+/// start.
+fn owes_end_in(path: &std::path::Path, repo: &str, slug: &str) -> io::Result<bool> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let mut owes = false;
+    for event in text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        let Value::Object(event) = &event else {
+            continue;
+        };
+        if !(named(event, "repo", repo) && named(event, "slug", slug)) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("lead-start") => owes = true,
+            Some("lead-end") => owes = false,
+            _ => {}
+        }
+    }
+    Ok(owes)
+}
+
 /// The ledger's file. Each event is stamped and written as one line under one lock, so lines
 /// never interleave.
 pub struct Ledger {
@@ -34,29 +62,24 @@ impl Ledger {
     /// is a `lead-start`. A lead with no events owes nothing, since an end without a start
     /// reads as a lead that never began.
     pub fn owes_end(&self, repo: &str, slug: &str) -> io::Result<bool> {
-        let text = match std::fs::read_to_string(&self.path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e),
-        };
-        let mut owes = false;
-        for event in text
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        {
-            let Value::Object(event) = &event else {
-                continue;
-            };
-            if !(named(event, "repo", repo) && named(event, "slug", slug)) {
-                continue;
-            }
-            match event["type"].as_str() {
-                Some("lead-start") => owes = true,
-                Some("lead-end") => owes = false,
-                _ => {}
-            }
+        owes_end_in(&self.path, repo, slug)
+    }
+
+    /// Appends the `lead-end` of the lead `slug` of `repo` unless the ledger already holds
+    /// one for its latest start, whoever wrote it. The check and the write share the lock every
+    /// append takes, so a `lead-end` logged in between cannot slip past. Whether it was written.
+    pub fn append_end(&self, repo: &str, slug: &str, event: &Event) -> io::Result<bool> {
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !owes_end_in(&self.path, repo, slug)? {
+            return Ok(false);
         }
-        Ok(owes)
+        let mut line = Value::Object(event.stamped(clock::now())).to_string();
+        line.push('\n');
+        file.write_all(line.as_bytes())?;
+        Ok(true)
     }
 
     /// The latest `review` event of `label` (in `repo`, when one is named) as it landed.
