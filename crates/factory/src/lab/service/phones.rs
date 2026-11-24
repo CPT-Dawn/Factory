@@ -98,18 +98,19 @@ impl Lab {
     }
 
     /// Has the watcher bring the readiness of the phones `serials` up to date for a grant: a
-    /// probe at most 10 s old is kept when it found the phone ready, any other is made again.
-    /// The grant then reads the store. It waits `within` at most, and never more than 10 s: a
-    /// watcher that is gone or slow leaves the rows as they are, which the grant trusts only
-    /// while they are fresh. Whether the watcher answered in time.
-    pub(super) fn refresh_phones(&self, serials: Vec<String>, by: Instant) -> bool {
+    /// probe that found the phone ready is kept while it is at most 8 s old ([`refresh_again`]),
+    /// any other is made again. The grant then reads the store. It waits until `by` at most,
+    /// and never more than 10 s: a watcher that is gone or slow leaves the rows as they are,
+    /// which the grant trusts only while they are fresh.
+    pub(super) fn refresh_phones(&self, serials: Vec<String>, by: Instant) {
         let (reply, answer) = mpsc::channel();
         let Some(tx) = self.phones.get() else {
-            return false;
+            return;
         };
         let within = by.saturating_duration_since(Instant::now());
-        tx.send(Job::Refresh(serials, by, reply)).is_ok()
-            && answer.recv_timeout(within.min(REFRESH_TIMEOUT)).is_ok()
+        if tx.send(Job::Refresh(serials, by, reply)).is_ok() {
+            let _ = answer.recv_timeout(within.min(REFRESH_TIMEOUT));
+        }
     }
 }
 

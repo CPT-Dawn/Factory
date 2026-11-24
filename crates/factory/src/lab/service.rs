@@ -693,14 +693,13 @@ fn gather_stack(project: Option<&ProjectAsk>) -> Facts {
 /// For a request that may take a phone, has the phone watcher bring up to date the readiness
 /// of each phone adb shows now and no lease holds, waiting for it until `by`: it probes again
 /// one it has not looked at lately. The grant reads the store's rows. Not in a transaction: the
-/// watcher writes the store. Whether the watcher answered by `by`; true when there was nothing
-/// to ask.
-fn refresh_phones(lab: &Lab, p: &AcquireParams, by: Instant) -> bool {
+/// watcher writes the store.
+fn refresh_phones(lab: &Lab, p: &AcquireParams, by: Instant) {
     if p.devices
         .as_ref()
         .is_none_or(|ask| Mode::from_word(&ask.mode) == Mode::Emulator)
     {
-        return true;
+        return;
     }
     let held = lab.write(|c, _| store::taken(c)).unwrap_or_default();
     let free: Vec<String> = lab
@@ -712,7 +711,9 @@ fn refresh_phones(lab: &Lab, p: &AcquireParams, by: Instant) -> bool {
         .filter(|a| a.kind == "phone" && !held.contains(&a.serial))
         .map(|a| a.serial.clone())
         .collect();
-    free.is_empty() || lab.refresh_phones(free, by.into_std())
+    if !free.is_empty() {
+        lab.refresh_phones(free, by.into_std());
+    }
 }
 
 /// Forgets the ready emulators whose unit ended: adb no longer lists them, and they hold a
@@ -1691,15 +1692,13 @@ pub async fn acquire<W, R, S>(
                     if !first && Instant::now() >= deadline {
                         return Ok(None);
                     }
-                    // A ready probe found too old is made again while the wait lasts, and
-                    // the watcher answers; past that, the phone is not known to be ready.
+                    // A ready probe found too old is made again while the wait lasts, a few
+                    // times at most; past that, the phone is not known to be ready.
                     let reprobe = reprobes < REPROBES && Instant::now() < deadline;
                     match try_grant(&lab, &p, waiter, &facts, reprobe)? {
                         Err(Refused::Reprobe) => {
                             reprobes += 1;
-                            if !refresh_phones(&lab, &p, deadline) {
-                                reprobes = REPROBES;
-                            }
+                            refresh_phones(&lab, &p, deadline);
                         }
                         tried => return Ok(Some(tried)),
                     }
