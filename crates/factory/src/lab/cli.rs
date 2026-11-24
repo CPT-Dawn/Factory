@@ -96,8 +96,7 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
         }
         "release" => {
             let (target, stop_stack) = release_args(args)?;
-            let (released, stop_failed) =
-                release(&release_context(stop_stack)?, stop_stack, target)?;
+            let (released, stop_failed) = release(&release_context()?, stop_stack, target)?;
             for line in release_lines(&released, target)? {
                 note(&line);
             }
@@ -278,10 +277,11 @@ pub(super) fn release(
     };
     let stopped = match &held {
         Some(Lease {
+            project: Some(project),
             slot: Some(slot),
             worktree,
             ..
-        }) => Some(stop(worktree, *slot)),
+        }) => Some(stop(project, worktree, *slot)),
         _ => None,
     };
     let released = lease::release(ctx, target)?;
@@ -291,12 +291,20 @@ pub(super) fn release(
     Ok((released, stop_failed))
 }
 
-/// Stops the slot's stack of the project at `worktree` if it runs, and marks it no longer
-/// devlab's to stop.
-fn stop(worktree: &str, slot: u32) -> Result<(), Failure> {
+/// Stops the slot's stack of `held`, the lease's project, at `worktree` if it runs, and marks it
+/// no longer devlab's to stop. A `devlab.json` there that now names another project is refused:
+/// its stack on that slot is not the lease's to stop.
+fn stop(held: &str, worktree: &str, slot: u32) -> Result<(), Failure> {
     let Some(project) = project_config(worktree)? else {
         return Ok(());
     };
+    if project.name != held {
+        return Err(Failure::precondition(format!(
+            "{worktree}/devlab.json names project {}, not {held} the lease held slot {slot} for: \
+             no stack stopped; stop {held}'s with its own devlab.json",
+            project.name
+        )));
+    }
     if let Some(info) = stack::info(&project, worktree, slot)?
         && stack::running(&info.project_id)
     {

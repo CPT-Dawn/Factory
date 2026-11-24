@@ -2652,7 +2652,7 @@ fn factory_lab_release_says_in_one_line_and_in_json_what_is_still_held() {
 }
 
 #[test]
-fn release_by_id_does_not_read_the_devlab_json_of_the_folder_it_runs_in() {
+fn release_by_id_ends_its_lease_whatever_the_devlab_json_of_the_folder_it_runs_in() {
     let (sandbox, world) = lab();
     let a = Agent::start();
     let (one, _two) = owner_holding_in_two_worktrees(&sandbox, &world, &a);
@@ -2735,4 +2735,67 @@ fn a_stack_that_fails_to_stop_still_says_what_the_release_freed() {
         "{out:?}"
     );
     assert_eq!(owned(&sandbox, &wt, &["env"]).code, 4);
+}
+
+#[test]
+fn a_devlab_lease_release_with_stop_stack_from_a_broken_folder_still_ends_or_refuses_it() {
+    let (sandbox, world) = lab();
+    let (a, b) = (Agent::start(), Agent::start());
+    let (one, _two) = owner_holding_in_two_worktrees(&sandbox, &world, &a);
+    let broken = world.worktree("plain-broken");
+    fs::write(broken.join("devlab.json"), "{").expect("break the project config");
+    let by_env = |owner: &Agent| {
+        let mut cmd = for_owner(&sandbox, &broken, owner.pid(), &["release", "--stop-stack"]);
+        cmd.env("DEVLAB_LEASE", "1");
+        run(cmd)
+    };
+
+    let refused = by_env(&b);
+    let ended = by_env(&a);
+
+    assert_eq!(refused.code, 4, "{refused:?}");
+    assert!(refused.stderr.contains("lease 1 belongs to"), "{refused:?}");
+    assert_eq!(ended.code, 0, "{ended:?}");
+    assert!(
+        ended
+            .stderr
+            .starts_with(&format!("devlab: released lease 1 ({})", one.display())),
+        "{ended:?}"
+    );
+}
+
+#[test]
+fn stop_stack_leaves_a_stack_alone_when_the_folder_now_names_another_project() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-switched");
+    let held = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--quiet"],
+    );
+    assert_eq!(held.code, 0, "{held:?}");
+    // The folder now holds project other, whose stack runs on the same slot.
+    let config = fs::read_to_string(wt.join("devlab.json")).expect("read devlab.json");
+    fs::write(
+        wt.join("devlab.json"),
+        config.replace(r#""name": "demo""#, r#""name": "other""#),
+    )
+    .expect("switch the project");
+    fs::write(wt.join("supabase/config.toml"), "project_id = \"other\"\n")
+        .expect("switch the stack");
+    let containers = sandbox.path("world/containers");
+    let mut listed = fs::read_to_string(&containers).unwrap_or_default();
+    listed.push_str("supabase_db_other\n");
+    fs::write(&containers, listed).expect("run project other's stack");
+
+    let out = owned(&sandbox, &wt, &["release", "--stop-stack"]);
+
+    assert_eq!(stack_stops(&sandbox, "other"), 0, "{out:?}");
+    assert_ne!(out.code, 0, "{out:?}");
+    assert!(
+        out.stderr
+            .starts_with(&format!("devlab: released lease 1 ({})\n", wt.display())),
+        "{out:?}"
+    );
+    assert!(out.stderr.contains("other"), "{out:?}");
 }

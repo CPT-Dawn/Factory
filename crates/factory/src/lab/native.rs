@@ -7,7 +7,8 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use factory_core::lab::args::parse_opts;
@@ -110,8 +111,7 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
         }
         "release" => {
             let (target, stop_stack) = cli::release_args(args)?;
-            let (released, stop_failed) =
-                cli::release(&release_context(stop_stack)?, stop_stack, target)?;
+            let (released, stop_failed) = cli::release(&release_context()?, stop_stack, target)?;
             if let Some(failed) = stop_failed {
                 let said = cli::release_lines(&released, target)?.join("; ");
                 return Err(Failure::new(
@@ -300,10 +300,7 @@ fn release_done(released: &Released, target: Target) -> Result<Done, Failure> {
         if held > 0 {
             short.push_str(&format!("; {held} still held"));
         }
-        let file = save(
-            &format!("release-{}-{}.txt", std::process::id(), nanos()),
-            &(lines.join("\n") + "\n"),
-        )?;
+        let file = save_new("release", &(lines.join("\n") + "\n"))?;
         line = format!("{short}, list in {}", file.display());
         let mut done = Done::new(line, json);
         // The path is the point of the line: never cut it.
@@ -313,11 +310,37 @@ fn release_done(released: &Released, target: Target) -> Result<Done, Failure> {
     Ok(Done::new(line, json))
 }
 
-/// The clock's nanoseconds, to tell reports of one pid apart.
-fn nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos())
+/// Writes `text` to a file of its own, `<stem>-<pid>-<n>.txt` in the lab's runtime directory, made
+/// with exclusive creation so no other report is ever overwritten; its path.
+fn save_new(stem: &str, text: &str) -> Result<PathBuf, Failure> {
+    let paths = Paths::from_env()?;
+    paths.create_runtime()?;
+    let dir = paths.runtime.join("lab");
+    let failed = |path: &Path, e: std::io::Error| {
+        Failure::precondition(format!(
+            "cannot write {}: {e}; check XDG_RUNTIME_DIR",
+            path.display()
+        ))
+    };
+    fs::create_dir_all(&dir).map_err(|e| failed(&dir, e))?;
+    for n in 0u32.. {
+        let path = dir.join(format!("{stem}-{}-{n}.txt", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                return file
+                    .write_all(text.as_bytes())
+                    .map(|()| path.clone())
+                    .map_err(|e| failed(&path, e));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(failed(&path, e)),
+        }
+    }
+    unreachable!("a free report name below u32::MAX")
 }
 
 /// Writes `text` to `name` in the lab's runtime directory; its path.

@@ -38,8 +38,9 @@ pub const LEASE: &str = "lab.lease";
 /// caller still holds ([`Released`]) out. A lease named by id that another owner holds is refused.
 pub const RELEASE: &str = "lab.release-leases";
 /// Marks the caller's slot as having its stack stopped, so it stays held whatever happens to
-/// the lease until the stopper's release: [`StopParams`] in, the caller's lease out.
-pub const STOPPING: &str = "lab.stopping";
+/// the lease until the stopper's release: [`StopParams`] in, the caller's lease out. Named
+/// with [`RELEASE`], so a daemon that lacks that release refuses this before a stack stops.
+pub const STOPPING: &str = "lab.stopping-lease";
 /// Drops the leases of owners that exited: no params, out a line per lease and reservation
 /// this call freed (the daemon frees them as their owners exit, and says nothing of those).
 pub const GC: &str = "lab.gc";
