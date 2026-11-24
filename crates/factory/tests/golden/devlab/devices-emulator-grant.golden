@@ -36,7 +36,7 @@ $ a@plain-a devlab status
 1> memory <mem> GB free; watcher active
 ? 0
 $ a@plain-a devlab release
-2> devlab: released lease 1
+2> devlab: released lease 1 (<sandbox>/wt/plain-a)
 ? 0
 $ a@plain-a devlab status
 1> devices

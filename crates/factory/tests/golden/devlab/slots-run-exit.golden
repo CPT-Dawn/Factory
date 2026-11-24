@@ -21,7 +21,7 @@ $ a@demo-a devlab exec -- sh -c 'kill -HUP $$'
 2> devlab: sh killed by SIGHUP after <n> s
 ? 129
 $ a@demo-a devlab release
-2> devlab: released lease 1
+2> devlab: released lease 1 (<sandbox>/wt/demo-a)
 ? 0
 $ a@demo-a devlab exec -- true
 2> devlab: no lease for <sandbox>/wt/demo-a (claude:<a>): run devlab acquire

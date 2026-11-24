@@ -10,11 +10,12 @@ use super::context::{Ctx, context};
 use factory_core::lab::args::parse_opts;
 use factory_core::lab::config::ProjectConfig;
 
-use super::lease;
-use super::wire::Lease;
+use super::lease::{self, Target};
+use super::wire::{Lease, Released};
 use super::{android, reserve, run, stack, status};
 use crate::output::Failure;
 use factory_adapters::adb::AdbCli;
+use factory_core::exit::Exit;
 
 pub(super) const HELP: &str = include_str!("help.txt");
 
@@ -95,9 +96,10 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
             Ok(0)
         }
         "release" => {
-            match release(&context()?, args.iter().any(|a| a == "--stop-stack"))? {
-                Some(dropped) => note(&format!("released lease {}", dropped.id)),
-                None => note("nothing held here"),
+            let (target, stop_stack) = release_args(args)?;
+            let released = release(&context()?, stop_stack, target)?;
+            for line in release_lines(&released, target)? {
+                note(&line);
             }
             Ok(0)
         }
@@ -161,10 +163,103 @@ pub(super) fn prep(
         .collect())
 }
 
-/// Gives the lease back; the lease it gave back, if one was held. With `--stop-stack` the
+/// What `release` ends, from its arguments: `--lease <id>`, `--all-mine`, else this worktree's
+/// lease; and whether `--stop-stack` was given, which only goes with the lease here.
+pub(super) fn release_args(args: &[String]) -> Result<(Target, bool), Failure> {
+    let mut target = Target::Here;
+    let mut stop_stack = false;
+    let mut at = 0;
+    while at < args.len() {
+        let arg = args[at].as_str();
+        let named = match arg {
+            "--stop-stack" => {
+                stop_stack = true;
+                None
+            }
+            "--all-mine" => Some(Target::AllMine),
+            "--lease" => {
+                at += 1;
+                Some(lease_id(args.get(at).map_or("", String::as_str))?)
+            }
+            _ => arg.strip_prefix("--lease=").map(lease_id).transpose()?,
+        };
+        if let Some(named) = named {
+            if target != Target::Here {
+                return Err(Failure::usage(
+                    "devlab release takes one of --lease <id> and --all-mine",
+                ));
+            }
+            target = named;
+        }
+        at += 1;
+    }
+    if stop_stack && target != Target::Here {
+        return Err(Failure::usage(
+            "--stop-stack stops this worktree's stack: run it in the worktree, without --lease or --all-mine",
+        ));
+    }
+    Ok((target, stop_stack))
+}
+
+fn lease_id(text: &str) -> Result<Target, Failure> {
+    text.trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .map(Target::Lease)
+        .ok_or_else(|| Failure::usage(format!("--lease takes a lease id, not \"{text}\"")))
+}
+
+/// What a release says, a line each: the leases it ended, or that there were none (a lease named
+/// by id that isn't held is exit 4), then each lease of the caller still held with the command
+/// that ends it.
+pub(super) fn release_lines(released: &Released, target: Target) -> Result<Vec<String>, Failure> {
+    let mut lines: Vec<String> = released
+        .dropped
+        .iter()
+        .map(|l| format!("released lease {} ({})", l.id, l.worktree))
+        .collect();
+    if lines.is_empty() {
+        lines.push(
+            match target {
+                Target::Here => "nothing held here",
+                Target::AllMine => "nothing held",
+                Target::Lease(id) => {
+                    return Err(Failure::new(Exit::NoLease, format!("no lease {id}")));
+                }
+            }
+            .to_owned(),
+        );
+    }
+    lines.extend(released.still_held.iter().map(still_held));
+    Ok(lines)
+}
+
+/// `still held: lease 1, /path, slot 0, phone SERIAL (Pixel 8): end it with devlab release --lease 1`.
+pub(super) fn still_held(lease: &Lease) -> String {
+    let mut parts = vec![format!("lease {}", lease.id), lease.worktree.clone()];
+    if let Some(slot) = lease.slot {
+        parts.push(format!("slot {slot}"));
+    }
+    for d in &lease.devices {
+        let model = if d.model.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", d.model)
+        };
+        parts.push(format!("{} {}{model}", d.kind, d.serial));
+    }
+    format!(
+        "still held: {}: end it with devlab release --lease {}",
+        parts.join(", "),
+        lease.id
+    )
+}
+
+/// Gives the leases `target` names back. With `--stop-stack` the
 /// stack stops first, its slot held for this call meanwhile, whatever ends the lease, so the next
 /// in the queue never gets a stack being torn down; a stop that fails still gives the lease back.
-pub(super) fn release(ctx: &Ctx, stop_stack: bool) -> Result<Option<Lease>, Failure> {
+pub(super) fn release(ctx: &Ctx, stop_stack: bool, target: Target) -> Result<Released, Failure> {
     let held = if stop_stack {
         lease::stopping(ctx)?
     } else {
@@ -179,13 +274,11 @@ pub(super) fn release(ctx: &Ctx, stop_stack: bool) -> Result<Option<Lease>, Fail
         ) => Some(stop(ctx, project, *slot)),
         _ => None,
     };
-    let Some(dropped) = lease::release(ctx)? else {
-        return Ok(None);
-    };
-    if let Some(stopped) = stopped {
+    let released = lease::release(ctx, target)?;
+    if let Some(stopped) = stopped.filter(|_| !released.dropped.is_empty()) {
         stopped?;
     }
-    Ok(Some(dropped))
+    Ok(released)
 }
 
 /// Stops the slot's stack if it runs, and marks it no longer devlab's to stop.
