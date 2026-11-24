@@ -3,7 +3,9 @@
 
 use std::collections::BTreeSet;
 
-use super::queue::{Holding, QueueEntry, held_by, live_queue, queue_turn};
+use super::queue::{
+    Counts, DeviceNeed, Holding, QueueEntry, devices_held_by, held_by, live_queue, queue_turn,
+};
 use super::slots::{SlotView, pick_slot};
 
 /// The project a request asks a slot of.
@@ -26,6 +28,8 @@ pub struct Ask {
     /// The slot of the lease this worktree and owner already hold, when they hold one: it asks
     /// for no new slot.
     pub existing: Option<Option<u32>>,
+    /// The devices it asks for; none for no device.
+    pub devices: Option<DeviceNeed>,
     /// Why the devices it asks for are not to be had now, when they are not: it waits once its
     /// turn in the queue comes, before any slot is looked at.
     pub devices_wait: Option<String>,
@@ -50,6 +54,8 @@ pub enum Decision {
     Grant { slot: Option<u32>, new: bool },
     /// Not yet, and why.
     Wait(String),
+    /// Never: it asks for more than its owner may ever hold. Why.
+    Refuse(String),
 }
 
 /// The cap a request is held to: none when its lease exists, so it asks for no new slot.
@@ -63,6 +69,14 @@ pub fn request_cap(project: Option<&ProjectAsk>, existing: bool) -> Option<u32> 
 
 /// Serves `ask` now, or says why it waits. `now` is seconds since the epoch.
 pub fn decide(ask: &Ask, board: &Board, now: i64) -> Decision {
+    if let Some(d) = &ask.devices
+        && d.want > d.cap
+    {
+        return Decision::Refuse(format!(
+            "asks for {} devices; one owner may hold at most {} (maxDevicesPerOwner)",
+            d.want, d.cap
+        ));
+    }
     // Every entry is read live: one a lease serves by now asks for no new slot, the asker's
     // own entry as the request itself sees it.
     let queue: Vec<QueueEntry> = live_queue(&board.queue, &board.leases)
@@ -75,12 +89,17 @@ pub fn decide(ask: &Ask, board: &Board, now: i64) -> Decision {
                 project: ask.project.as_ref().map(|p| p.name.clone()),
                 cap: request_cap(ask.project.as_ref(), ask.existing.is_some()),
                 max_slots: ask.project.as_ref().map_or(0, |p| p.max_slots),
+                devices: ask.devices,
                 ..e
             }
         })
         .collect();
-    let held = held_by(&board.leases);
-    if let Some(why) = queue_turn(&queue, ask.waiter, &held, now) {
+    let (slots, devices) = (held_by(&board.leases), devices_held_by(&board.leases));
+    let counts = Counts {
+        slots: &slots,
+        devices: &devices,
+    };
+    if let Some(why) = queue_turn(&queue, ask.waiter, &counts, now) {
         return Decision::Wait(why);
     }
     if let Some(why) = &ask.devices_wait {
@@ -124,6 +143,7 @@ pub fn decide(ask: &Ask, board: &Board, now: i64) -> Decision {
 mod tests {
     use super::*;
     use crate::lab::config::slot_cap;
+    use crate::lab::devices::Mode;
     use crate::lab::queue::waiter_capped;
     use proptest::prelude::*;
 
@@ -151,6 +171,7 @@ mod tests {
             project: Some(PROJECT.to_owned()),
             cap: Some(cap),
             max_slots,
+            devices: None,
         }
     }
 
@@ -160,6 +181,7 @@ mod tests {
             id: i64::from(slot) + 1,
             project: Some(PROJECT.to_owned()),
             slot: Some(slot),
+            devices: 0,
             worktree: format!("wt{wt}"),
             owner: owner(o),
             owner_label: format!("claude:{o}"),
@@ -176,6 +198,7 @@ mod tests {
                 has_stack: false,
             }),
             existing,
+            devices: None,
             devices_wait: None,
         }
     }
@@ -302,6 +325,7 @@ mod tests {
             waiter: 1,
             project: None,
             existing: None,
+            devices: None,
             devices_wait: None,
         };
         assert_eq!(
@@ -323,6 +347,181 @@ mod tests {
         assert_eq!(
             decide(&no_phone, &b, 0),
             Decision::Wait("no free phone: 1 phone(s) busy".to_owned())
+        );
+    }
+
+    fn need(mode: Mode, lacks: u32, short: bool) -> DeviceNeed {
+        DeviceNeed {
+            mode,
+            want: lacks,
+            lacks,
+            cap: 2,
+            short,
+        }
+    }
+
+    /// Waiter `id` of owner `o` asking for `devices`, with no project.
+    fn device_entry(id: i64, o: usize, devices: Option<DeviceNeed>) -> QueueEntry {
+        QueueEntry {
+            project: None,
+            cap: None,
+            max_slots: 0,
+            devices,
+            ..entry(id, o, o, 1, 2)
+        }
+    }
+
+    fn device_ask(waiter: i64, devices: Option<DeviceNeed>) -> Ask {
+        Ask {
+            waiter,
+            project: None,
+            existing: None,
+            devices,
+            devices_wait: None,
+        }
+    }
+
+    const NEW: Decision = Decision::Grant {
+        slot: None,
+        new: true,
+    };
+
+    #[test]
+    fn a_phone_waiter_short_of_a_phone_lets_a_waiter_for_no_device_go_first() {
+        let phone_waiter = device_entry(1, 0, Some(need(Mode::Phone, 1, true)));
+        let b = board(vec![], vec![phone_waiter, entry(2, 1, 1, 1, 2)], 2);
+        assert_eq!(
+            decide(&ask(2, 2, 1, None), &b, 0),
+            Decision::Grant {
+                slot: Some(0),
+                new: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_phone_waiter_short_of_a_phone_lets_an_emulator_waiter_go_first() {
+        let phone_waiter = device_entry(1, 0, Some(need(Mode::Phone, 1, true)));
+        let emulator = Some(need(Mode::Emulator, 1, false));
+        let b = board(vec![], vec![phone_waiter, device_entry(2, 1, emulator)], 2);
+        assert_eq!(decide(&device_ask(2, emulator), &b, 0), NEW);
+    }
+
+    /// A waiter queued only behind a device-short waiter it competes with waits on those devices
+    /// too, though some are free for it: it steps aside for a request that needs none of them.
+    #[test]
+    fn a_waiter_held_behind_a_device_short_one_steps_aside_too() {
+        let phone_waiter = device_entry(1, 0, Some(need(Mode::Phone, 1, true)));
+        let any_waiter = device_entry(2, 1, Some(need(Mode::Any, 1, false)));
+        let emulator = Some(need(Mode::Emulator, 1, false));
+        for (asker, devices) in [(None, None), (Some(Mode::Emulator), emulator)] {
+            let b = board(
+                vec![],
+                vec![
+                    phone_waiter.clone(),
+                    any_waiter.clone(),
+                    device_entry(3, 2, devices),
+                ],
+                2,
+            );
+            let expected = match asker {
+                // An emulator competes with any device: it keeps its place behind the second.
+                Some(_) => {
+                    Decision::Wait("queued behind claude:1 @ wt1 (waiting since 0 min)".to_owned())
+                }
+                None => NEW,
+            };
+            assert_eq!(
+                decide(&device_ask(3, devices), &b, 0),
+                expected,
+                "{asker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn waiters_for_the_same_devices_keep_their_order() {
+        for (short_of, mine) in [
+            (Mode::Phone, Mode::Phone),
+            (Mode::Phone, Mode::Any),
+            (Mode::Any, Mode::Emulator),
+        ] {
+            let first = device_entry(1, 0, Some(need(short_of, 1, true)));
+            let mine = Some(need(mine, 1, false));
+            let b = board(vec![], vec![first, device_entry(2, 1, mine)], 2);
+            assert_eq!(
+                decide(&device_ask(2, mine), &b, 0),
+                Decision::Wait("queued behind claude:0 @ wt0 (waiting since 0 min)".to_owned()),
+                "{short_of:?} then {mine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_waiter_not_short_of_devices_keeps_its_place() {
+        let first = device_entry(1, 0, Some(need(Mode::Phone, 1, false)));
+        let b = board(vec![], vec![first, entry(2, 1, 1, 1, 2)], 2);
+        assert_eq!(
+            decide(&ask(2, 2, 1, None), &b, 0),
+            Decision::Wait("queued behind claude:0 @ wt0 (waiting since 0 min)".to_owned())
+        );
+    }
+
+    /// Owner 0's lease holding `devices` devices, with no slot.
+    fn devices_lease(id: i64, o: usize, devices: u32) -> Holding {
+        Holding {
+            id,
+            project: None,
+            slot: None,
+            devices,
+            worktree: format!("wt{id}"),
+            owner: owner(o),
+            owner_label: format!("claude:{o}"),
+        }
+    }
+
+    #[test]
+    fn an_owner_at_its_device_cap_waits_naming_it_and_steps_aside_for_other_owners() {
+        let phone = Some(need(Mode::Phone, 1, false));
+        let leases = vec![devices_lease(1, 0, 1), devices_lease(2, 0, 1)];
+        let b = board(
+            leases,
+            vec![device_entry(1, 0, phone), device_entry(2, 1, phone)],
+            2,
+        );
+        assert_eq!(
+            decide(&device_ask(1, phone), &b, 0),
+            Decision::Wait(
+                "owner claude:0 already holds 2 device(s); 1 more would pass its cap of 2 (maxDevicesPerOwner; waits for one of its own leases to end)"
+                    .to_owned()
+            )
+        );
+        assert_eq!(decide(&device_ask(2, phone), &b, 0), NEW);
+    }
+
+    #[test]
+    fn a_top_up_within_what_the_owner_has_left_is_served() {
+        let phone = Some(need(Mode::Phone, 1, false));
+        let b = board(
+            vec![devices_lease(1, 0, 1)],
+            vec![device_entry(1, 0, phone)],
+            2,
+        );
+        assert_eq!(decide(&device_ask(1, phone), &b, 0), NEW);
+    }
+
+    #[test]
+    fn a_request_for_more_devices_than_the_cap_is_refused_whatever_is_free() {
+        let three = Some(DeviceNeed {
+            want: 3,
+            ..need(Mode::Any, 3, false)
+        });
+        let b = board(vec![], vec![device_entry(1, 0, three)], 2);
+        assert_eq!(
+            decide(&device_ask(1, three), &b, 0),
+            Decision::Refuse(
+                "asks for 3 devices; one owner may hold at most 2 (maxDevicesPerOwner)".to_owned()
+            )
         );
     }
 
@@ -387,7 +586,7 @@ mod tests {
                         let a = ask(id, self.max_slots, self.cap, self.existing(o, wt));
                         match decide(&a, &board, 0) {
                             Decision::Grant { slot, new } => Some((at, o, wt, slot, new)),
-                            Decision::Wait(_) => None,
+                            Decision::Wait(_) | Decision::Refuse(_) => None,
                         }
                     });
                 let Some((at, o, wt, slot, new)) = served else {

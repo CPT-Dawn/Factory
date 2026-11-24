@@ -23,6 +23,7 @@ use factory_adapters::emulator::{EmulatorSpec, Emulators, SystemdEmulators};
 use factory_core::event::{Event, Fields};
 use factory_core::exit::Exit;
 use factory_core::lab::args::{LONGEST_WAIT, wait_span};
+use factory_core::lab::config::device_cap;
 use factory_core::lab::devices::{
     Attached, EmulatorView, HeldBy, Mode, Plan, PlanInput, Unready, device_rows, plan_devices,
     shown_since,
@@ -32,6 +33,7 @@ use factory_core::lab::emulator::{
 };
 use factory_core::lab::grant::{self, Ask, Decision};
 use factory_core::lab::js_number;
+use factory_core::lab::queue::{DeviceNeed, QueueEntry, devices_held_by, over_device_cap};
 use factory_core::lab::ready::{Readiness, for_grant};
 use factory_core::lab::run::{End, Phase};
 use factory_core::lab::slots::{SlotView, slot_host_ports, slot_project_id};
@@ -973,13 +975,15 @@ enum Refused {
     /// A free phone's ready probe is more than 10 s old: have it probed again, and look again.
     /// Nothing the look did is kept.
     Reprobe,
+    /// It is never served, for this: it gives up at once (exit 75).
+    Never(String),
 }
 
 impl Refused {
     /// What the wait says; a look that asks for no [`Refused::Reprobe`] gets none.
     fn why(self) -> String {
         match self {
-            Refused::Wait(why) => why,
+            Refused::Wait(why) | Refused::Never(why) => why,
             Refused::Reprobe => "a phone is being probed again".to_owned(),
         }
     }
@@ -1093,6 +1097,7 @@ fn insert(c: &Connection, p: &AcquireParams, now: i64) -> rusqlite::Result<(i64,
             client_start: p.client.as_ref().map(|client| client.start.clone()),
         },
     )?;
+    activity::forget_waiter(c, id)?;
     Ok((id, deadline_ms))
 }
 
@@ -1118,12 +1123,29 @@ fn grant_board(
     facts: &Facts,
     stopping: &keeper::Stopping,
 ) -> rusqlite::Result<grant::Board> {
-    let mut leases: Vec<_> = store::leases(c)?.iter().map(Lease::holding).collect();
+    // An emulator counts against its owner's device cap from its grant, booted or not.
+    let booting = store::booting_per_lease(c)?;
+    let mut leases: Vec<_> = store::leases(c)?
+        .iter()
+        .map(|l| {
+            let mut held = l.holding();
+            let boots = booting.get(&l.id).copied().unwrap_or(0);
+            held.devices = held.devices.saturating_add(boots);
+            held
+        })
+        .collect();
     leases.extend(reservations::all(c)?.iter().map(|r| r.holding()));
     let rows = store::slots(c)?;
+    let asks = activity::asks(c)?;
     Ok(grant::Board {
         leases,
-        queue: store::waiters(c)?.iter().map(Waiter::entry).collect(),
+        queue: store::waiters(c)?
+            .iter()
+            .map(|w| QueueEntry {
+                devices: asks.get(&w.id).copied(),
+                ..w.entry()
+            })
+            .collect(),
         slots: project.map_or_else(Vec::new, |project| {
             (0..project.max_slots)
                 .map(|slot| {
@@ -1179,7 +1201,7 @@ fn try_grant(
     facts: &Facts,
     reprobe: bool,
 ) -> Answer<Result<Taken, Refused>> {
-    lab.write(|c, now| {
+    let looked = lab.write(|c, now| {
         // Devices are planned from the list adb shows as this transaction runs, never from
         // one read before the probes. A stream that ends marks its list stale under the
         // store's lock, so not while this runs: none is granted from a list its stream stopped
@@ -1273,32 +1295,33 @@ fn try_grant(
             Ok(planned) => (planned, None),
             Err(why) => (None, Some(why)),
         };
+        let devices = p.devices.as_ref().map(|ask| {
+            device_need(
+                ask,
+                lease.as_ref(),
+                attached.as_deref(),
+                devices_wait.is_some(),
+            )
+        });
+        let board = grant_board(c, p.project.as_ref(), &p.worktree, facts, &stopping)?;
+        // An owner at its device cap waits for one of its own leases, not for a device: the
+        // keeper takes none from anyone for it.
+        let capped = devices
+            .is_some_and(|d| over_device_cap(&d, devices_held_by(&board.leases)(&p.owner.key())));
         // A request short of devices that waits says which it needs, so the keeper may take
         // them from a lease that runs nothing (#57); it looks as soon as the request first says
         // so. One that won't wait takes nothing from anyone.
-        let need = match (&p.devices, &devices_wait) {
-            (Some(ask), Some(why)) if why != ADB_RESTARTING && p.wait_sec > 0.0 => {
-                let usable = |serial: &str| {
-                    attached
-                        .iter()
-                        .flatten()
-                        .any(|a| a.serial == serial && a.state == "device")
-                };
-                let have = lease
-                    .iter()
-                    .flat_map(|l| &l.devices)
-                    .filter(|d| usable(&d.serial))
-                    .count();
-                let have = u32::try_from(have).unwrap_or(u32::MAX);
-                Some((ask.mode.as_str(), ask.want.saturating_sub(have)))
+        let reclaim = match (&devices, &devices_wait) {
+            (Some(d), Some(why)) if why != ADB_RESTARTING && p.wait_sec > 0.0 && !capped => {
+                Some((d.mode.as_str(), d.lacks))
             }
             _ => None,
         };
-        let board = grant_board(c, p.project.as_ref(), &p.worktree, facts, &stopping)?;
         let ask = Ask {
             waiter,
             project: project_ask(p),
             existing: lease.as_ref().map(|l| l.slot),
+            devices,
             devices_wait,
         };
         let (slot, new) = match grant::decide(&ask, &board, now) {
@@ -1308,10 +1331,20 @@ fn try_grant(
                 }
                 c.execute_batch("RELEASE claim")?;
                 // After the claim is undone, so a waiter with a reservation keeps its need.
-                if activity::set_need(c, waiter, need)? {
+                // What it asks of devices tells the waiters behind it whether it is in their way
+                // (#58): when that changes, they look again.
+                let reclaims = activity::set_need(c, waiter, reclaim)?;
+                if activity::set_ask(c, waiter, devices)? || reclaims {
                     lab.notify();
                 }
                 return Ok(Err(Refused::Wait(why)));
+            }
+            Decision::Refuse(why) => {
+                if claimed.is_some() {
+                    c.execute_batch("ROLLBACK TO claim")?;
+                }
+                c.execute_batch("RELEASE claim")?;
+                return Ok(Err(Refused::Never(why)));
             }
             Decision::Grant { slot, new } => (slot, new),
         };
@@ -1369,7 +1402,7 @@ fn try_grant(
                 reused.push(serial.clone());
             }
             for idx in free_indexes(&used, plan.boot) {
-                store::insert_emulator(c, idx, &serial_of(idx, ask.port_base))?;
+                store::insert_emulator(c, idx, &serial_of(idx, ask.port_base), lease.id)?;
                 boots.push(idx);
             }
         }
@@ -1394,7 +1427,51 @@ fn try_grant(
             reused,
             from,
         }))
-    })
+    })?;
+    match looked {
+        Err(Refused::Never(message)) => Err(ErrorBody {
+            code: Exit::Busy.code(),
+            message,
+        }),
+        looked => Ok(looked),
+    }
+}
+
+/// What request `ask` asks of devices, as a look sees it: with lease `lease` (when it has one)
+/// and adb's list `seen` (none: stale); `short`: no free device of its kind was there.
+fn device_need(
+    ask: &DeviceAsk,
+    lease: Option<&Lease>,
+    seen: Option<&[Attached]>,
+    short: bool,
+) -> DeviceNeed {
+    let usable = |serial: &str| {
+        seen.into_iter()
+            .flatten()
+            .any(|a| a.serial == serial && a.state == "device")
+    };
+    let have = lease
+        .iter()
+        .flat_map(|l| &l.devices)
+        .filter(|d| usable(&d.serial))
+        .count();
+    let have = u32::try_from(have).unwrap_or(u32::MAX);
+    // All phones but one, of those adb lists in any state; while its list is stale, only a cap
+    // the configs set holds.
+    let cap = match seen {
+        Some(seen) => {
+            let phones = seen.iter().filter(|a| a.kind == "phone").count();
+            device_cap(u32::try_from(phones).unwrap_or(u32::MAX), ask.max_per_owner)
+        }
+        None => ask.max_per_owner.map_or(u32::MAX, |cap| cap.max(1)),
+    };
+    DeviceNeed {
+        mode: Mode::from_word(&ask.mode),
+        want: ask.want,
+        lacks: ask.want.saturating_sub(have),
+        cap,
+        short,
+    }
 }
 
 fn emulator_device(serial: &str) -> LeaseDevice {

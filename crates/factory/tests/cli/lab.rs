@@ -494,6 +494,8 @@ fn an_emulator_a_dead_daemon_left_booting_is_stopped_and_forgotten_never_ready()
 #[test]
 fn a_pair_whose_emulator_fails_to_boot_gives_back_its_phone_too() {
     let (sandbox, world) = lab();
+    // A phone and an emulator: over the one device a lab of one phone leaves an owner.
+    write_machine_config(&sandbox, r#""maxDevicesPerOwner": 2"#);
     let wt = world.worktree("plain-a");
     world
         .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
@@ -545,6 +547,8 @@ fn a_failed_emulator_boot_frees_the_slot_for_the_next_owner() {
 #[test]
 fn a_top_up_whose_emulator_fails_to_boot_gives_the_whole_lease_back() {
     let (sandbox, world) = lab();
+    // A phone and an emulator: over the one device a lab of one phone leaves an owner.
+    write_machine_config(&sandbox, r#""maxDevicesPerOwner": 2"#);
     let wt = world.worktree("plain-a");
     world
         .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
@@ -573,6 +577,8 @@ fn a_top_up_whose_emulator_fails_to_boot_gives_the_whole_lease_back() {
 #[test]
 fn a_phone_unplugged_while_its_pair_boots_gives_the_acquire_exit_76() {
     let (sandbox, world) = lab();
+    // A phone and an emulator: over the one device a lab of one phone leaves an owner.
+    write_machine_config(&sandbox, r#""maxDevicesPerOwner": 2"#);
     let wt = world.worktree("plain-a");
     world
         .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
@@ -593,6 +599,31 @@ fn a_phone_unplugged_while_its_pair_boots_gives_the_acquire_exit_76() {
         ),
         "{out:?}"
     );
+}
+
+/// An emulator counts against its owner's `maxDevicesPerOwner` from its grant, not only once
+/// it has booted: one owner can't take the lab's last phone beside it while it boots.
+#[test]
+fn an_emulator_still_booting_counts_against_its_owners_device_cap() {
+    let (sandbox, world) = lab();
+    let (a, b) = (world.worktree("plain-a"), world.worktree("plain-b"));
+    // One phone: a cap of one device per owner.
+    world
+        .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
+        .unwrap();
+    world.apply("stall emulator-5580").unwrap();
+    let child = boot_in_background(&sandbox, &a, "--emulator");
+
+    let more = owned(&sandbox, &b, &["acquire", "--phone", "--wait", "2"]);
+    fs::write(sandbox.path("world/stalled"), "").unwrap();
+    let booted = finish(child);
+
+    assert_eq!(more.code, 75, "{more:?}");
+    assert!(
+        more.stderr.contains("its cap of 1 (maxDevicesPerOwner"),
+        "{more:?}"
+    );
+    assert_eq!(booted.code, 0, "{booted:?}");
 }
 
 /// `devlab` run in `dir` for the owner process `pid`.
@@ -1100,6 +1131,8 @@ fn factory_lab_reserve_help_is_there_where_its_refusal_points() {
 #[test]
 fn a_failed_boot_takes_back_nothing_another_lease_was_granted_since() {
     let (sandbox, world) = lab();
+    // A phone and an emulator: over the one device a lab of one phone leaves an owner.
+    write_machine_config(&sandbox, r#""maxDevicesPerOwner": 2"#);
     let (a, b) = (world.worktree("plain-a"), world.worktree("plain-b"));
     world
         .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")

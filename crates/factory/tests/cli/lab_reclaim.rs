@@ -218,6 +218,8 @@ fn an_offline_phone_is_not_reclaimed_and_its_lease_is_told_it_is_offline() {
 #[test]
 fn a_lease_that_lost_one_of_two_phones_is_whole_again_once_it_asks_for_one() {
     let (sandbox, world) = one_phone();
+    // Both phones to one owner: over the default cap of all phones but one.
+    write_machine_config(&sandbox, r#""deviceIdleMin": 0, "maxDevicesPerOwner": 2"#);
     world
         .apply("plug FAKEPHONE02 device usb:1-2 model:Pixel_7")
         .unwrap();

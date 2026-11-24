@@ -77,6 +77,7 @@ pub fn plan(ask: &Reserve, board: &Board, now: i64) -> Plan {
             waiter: ask.waiter,
             project: Some(ask.project.clone()),
             existing: None,
+            devices: None,
             devices_wait: None,
         };
         match decide(&one, &board, now) {
@@ -88,6 +89,7 @@ pub fn plan(ask: &Reserve, board: &Board, now: i64) -> Plan {
                     worktree: String::new(),
                     project: Some(ask.project.name.clone()),
                     slot: Some(slot),
+                    devices: 0,
                     owner: ask.owner.clone(),
                     owner_label: ask.owner_label.clone(),
                 });
@@ -95,7 +97,7 @@ pub fn plan(ask: &Reserve, board: &Board, now: i64) -> Plan {
             }
             Decision::Grant { slot: None, .. } => break,
             Decision::Wait(why) if slots.is_empty() => return Plan::Wait(why),
-            Decision::Wait(_) => break,
+            Decision::Wait(_) | Decision::Refuse(_) => break,
         }
     }
     Plan::Granted(slots)
@@ -185,6 +187,7 @@ mod tests {
             worktree: String::new(),
             project: Some("demo".to_owned()),
             slot: Some(slot),
+            devices: 0,
             owner: owner.to_owned(),
             owner_label: format!("claude:{}", owner.split(':').next().unwrap_or("")),
         }
@@ -223,6 +226,7 @@ mod tests {
                 project: Some("demo".to_owned()),
                 cap: Some(2),
                 max_slots,
+                devices: None,
             }],
             slots: (0..max_slots)
                 .map(|s| SlotView {
@@ -306,6 +310,7 @@ mod tests {
                 project: Some("demo".to_owned()),
                 cap: Some(2),
                 max_slots: 2,
+                devices: None,
             },
         );
         assert_eq!(

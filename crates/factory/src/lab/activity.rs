@@ -1,8 +1,13 @@
 //! What each lease does, for the idle reclaim (#57): the device asks of the waiters short of
 //! devices, the `devlab exec` calls running on a lease, and the devices waiters took from leases
-//! that ran nothing. Written by the daemon alone, in the lab's short transactions.
+//! that ran nothing. And what each waiter asks of devices as its last look found it, for the
+//! queue (#58). Written by the daemon alone, in the lab's short transactions.
 
-use rusqlite::{Connection, params};
+use std::collections::BTreeMap;
+
+use factory_core::lab::devices::Mode;
+use factory_core::lab::queue::DeviceNeed;
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::wire::{Process, ReclaimedDevice};
 
@@ -11,6 +16,14 @@ CREATE TABLE IF NOT EXISTS waiter_devices (
   waiter INTEGER PRIMARY KEY,
   mode TEXT NOT NULL,
   want INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS waiter_asks (
+  waiter INTEGER PRIMARY KEY,
+  mode TEXT NOT NULL,
+  want INTEGER NOT NULL,
+  lacks INTEGER NOT NULL,
+  cap INTEGER NOT NULL,
+  short INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS execs (
   pid INTEGER NOT NULL,
@@ -63,6 +76,61 @@ pub fn needs(c: &Connection) -> rusqlite::Result<Vec<(String, u32)>> {
     let mut q = c.prepare("SELECT mode, want FROM waiter_devices ORDER BY waiter")?;
     q.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect()
+}
+
+/// Forgets all that was recorded of waiter `waiter`: a new waiter may get the id of one gone.
+pub fn forget_waiter(c: &Connection, waiter: i64) -> rusqlite::Result<()> {
+    c.execute("DELETE FROM waiter_devices WHERE waiter = ?1", [waiter])?;
+    c.execute("DELETE FROM waiter_asks WHERE waiter = ?1", [waiter])?;
+    Ok(())
+}
+
+/// Records what waiter `waiter` asks of devices as its look found it (none: no device); true
+/// when that changed, so the waiters behind it should look again.
+pub fn set_ask(c: &Connection, waiter: i64, ask: Option<DeviceNeed>) -> rusqlite::Result<bool> {
+    let had = c
+        .query_row(
+            "SELECT * FROM waiter_asks WHERE waiter = ?1",
+            [waiter],
+            ask_row,
+        )
+        .optional()?;
+    if had == ask {
+        return Ok(false);
+    }
+    match ask {
+        Some(d) => c.execute(
+            "INSERT OR REPLACE INTO waiter_asks (waiter, mode, want, lacks, cap, short)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![waiter, d.mode.as_str(), d.want, d.lacks, d.cap, d.short],
+        )?,
+        None => c.execute("DELETE FROM waiter_asks WHERE waiter = ?1", [waiter])?,
+    };
+    Ok(true)
+}
+
+/// What each waiter still waiting asks of devices, by waiter. The asks of waiters that are gone
+/// or were granted are forgotten.
+pub fn asks(c: &Connection) -> rusqlite::Result<BTreeMap<i64, DeviceNeed>> {
+    c.execute(
+        "DELETE FROM waiter_asks
+         WHERE waiter NOT IN (SELECT id FROM waiters WHERE granted IS NULL)",
+        [],
+    )?;
+    let mut q = c.prepare("SELECT * FROM waiter_asks")?;
+    q.query_map([], |row| Ok((row.get("waiter")?, ask_row(row)?)))?
+        .collect()
+}
+
+fn ask_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceNeed> {
+    let mode: String = row.get("mode")?;
+    Ok(DeviceNeed {
+        mode: Mode::from_word(&mode),
+        want: row.get("want")?,
+        lacks: row.get("lacks")?,
+        cap: row.get("cap")?,
+        short: row.get("short")?,
+    })
 }
 
 /// One `devlab exec` running on a lease.
