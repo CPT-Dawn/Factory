@@ -34,11 +34,13 @@ pub const RUN_RESUME: &str = "lab.run.resume";
 pub const RUN_END_ID: u64 = u64::MAX;
 /// The caller's lease, touched: [`FindParams`] in, `Option<Lease>` out.
 pub const LEASE: &str = "lab.lease";
-/// Drops the caller's lease: [`ReleaseParams`] in, the lease it dropped (`Option<Lease>`) out.
-pub const RELEASE: &str = "lab.release";
+/// Drops the caller's lease, or all of them: [`ReleaseParams`] in, what it dropped and what the
+/// caller still holds ([`Released`]) out. A lease named by id that another owner holds is refused.
+pub const RELEASE: &str = "lab.release-leases";
 /// Marks the caller's slot as having its stack stopped, so it stays held whatever happens to
-/// the lease until the stopper's release: [`StopParams`] in, the caller's lease out.
-pub const STOPPING: &str = "lab.stopping";
+/// the lease until the stopper's release: [`StopParams`] in, the caller's lease out. Named
+/// with [`RELEASE`], so a daemon that lacks that release refuses this before a stack stops.
+pub const STOPPING: &str = "lab.stopping-lease";
 /// Drops the leases of owners that exited: no params, out a line per lease and reservation
 /// this call freed (the daemon frees them as their owners exit, and says nothing of those).
 pub const GC: &str = "lab.gc";
@@ -261,6 +263,16 @@ pub struct ReleaseParams {
     /// The stopper whose marks [`STOPPING`] set: they go with the lease.
     #[serde(default)]
     pub stopper: Option<Process>,
+    /// Every lease of the caller's owner goes, not one.
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// What a release did: the leases it dropped, and the caller's leases still held after it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Released {
+    pub dropped: Vec<Lease>,
+    pub still_held: Vec<Lease>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

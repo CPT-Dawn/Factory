@@ -45,9 +45,9 @@ use super::reservations;
 use super::store::{self, RunRow, Store};
 use super::wire::{
     AcquireParams, Board, DeviceAsk, DeviceLine, FindParams, GC, Granted, LEASE, Lease,
-    LeaseDevice, Process, ProjectAsk, RECEIVED, RELEASE, RUN_END, RUN_END_ID, RUN_START,
-    ReleaseParams, RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING, SlotParams, StopParams,
-    UNRESERVE, Waiter,
+    LeaseDevice, Owner, Process, ProjectAsk, RECEIVED, RELEASE, RUN_END, RUN_END_ID, RUN_START,
+    ReleaseParams, Released, RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING, SlotParams,
+    StopParams, UNRESERVE, Waiter,
 };
 use super::{android, host};
 use crate::ledger::Ledger;
@@ -439,36 +439,75 @@ fn state_of<'a>(seen: &'a [Attached], serial: &str) -> Option<&'a str> {
         .map(|a| a.state.as_str())
 }
 
-fn release(lab: &Lab, p: ReleaseParams) -> Answer<Option<Lease>> {
-    let (dropped, unstopped) = lab.write(|c, now| {
+fn release(lab: &Lab, p: ReleaseParams) -> Answer<Released> {
+    let released = lab.write(|c, now| {
         let f = &p.find;
-        let lease = store::find_lease(c, &f.worktree, &f.owner, f.lease)?;
-        if let Some(lease) = &lease {
+        let mine = |l: &Lease| held_by(l, &f.owner);
+        let dropped = if p.all {
+            store::leases(c)?.into_iter().filter(mine).collect()
+        } else {
+            match own_lease(c, f)? {
+                Ok(found) => found.into_iter().collect(),
+                Err(refused) => return Ok(Err(refused)),
+            }
+        };
+        for lease in &dropped {
             store::drop_lease(c, lease, now)?;
         }
         let unstopped = match &p.stopper {
             Some(stopper) => store::clear_stopping(c, stopper)?,
             None => 0,
         };
-        Ok((lease, unstopped))
+        let still_held = store::leases(c)?.into_iter().filter(mine).collect();
+        Ok(Ok((
+            Released {
+                dropped,
+                still_held,
+            },
+            unstopped,
+        )))
     })?;
-    if dropped.is_some() || unstopped > 0 {
+    let (released, unstopped) = released?;
+    if !released.dropped.is_empty() || unstopped > 0 {
         lab.notify();
     }
-    if let Some(lease) = &dropped {
-        keeper::take_back_reverses(
-            lab.attached.borrow().clone().as_deref(),
-            std::slice::from_ref(lease),
-        );
+    keeper::take_back_reverses(lab.attached.borrow().clone().as_deref(), &released.dropped);
+    Ok(released)
+}
+
+fn held_by(lease: &Lease, owner: &Owner) -> bool {
+    lease.owner_pid == owner.pid && lease.owner_start == owner.start
+}
+
+/// The caller's lease, found as `find_lease` does; a lease named by id that another owner holds
+/// is refused instead.
+fn own_lease(c: &Connection, f: &FindParams) -> rusqlite::Result<Result<Option<Lease>, ErrorBody>> {
+    let lease = store::find_lease(c, &f.worktree, &f.owner, f.lease)?;
+    Ok(match lease {
+        Some(lease) if f.lease.is_some() && !held_by(&lease, &f.owner) => Err(not_yours(&lease)),
+        found => Ok(found),
+    })
+}
+
+/// The refusal of a lease named by id that another owner holds.
+fn not_yours(lease: &Lease) -> ErrorBody {
+    ErrorBody {
+        code: Exit::NoLease.code(),
+        message: format!(
+            "lease {} belongs to {} ({}), not to you: it stays held; ask its owner to release it",
+            lease.id, lease.owner_label, lease.worktree
+        ),
     }
-    Ok(dropped)
 }
 
 /// The caller's lease, its slot marked as stopping for `p.stopper`.
 fn stopping(lab: &Lab, p: StopParams) -> Answer<Option<Lease>> {
     lab.write(|c, _| {
         let f = &p.find;
-        let lease = store::find_lease(c, &f.worktree, &f.owner, f.lease)?;
+        let lease = match own_lease(c, f)? {
+            Ok(lease) => lease,
+            Err(refused) => return Ok(Err(refused)),
+        };
         if let Some(Lease {
             project: Some(project),
             slot: Some(slot),
@@ -477,8 +516,8 @@ fn stopping(lab: &Lab, p: StopParams) -> Answer<Option<Lease>> {
         {
             store::mark_stopping(c, project, *slot, &p.stopper)?;
         }
-        Ok(lease)
-    })
+        Ok(Ok(lease))
+    })?
 }
 
 fn status(lab: &Lab, seen: &[Attached]) -> Answer<Board> {
