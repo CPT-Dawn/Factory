@@ -144,6 +144,7 @@ impl Lab {
             ),
         );
         self.sandbox.fake("unshare", "exit 0");
+        self.sandbox.fake("bwrap", crate::support::BWRAP_PASSES);
     }
 
     fn review(&self, args: &[&str]) -> Run {

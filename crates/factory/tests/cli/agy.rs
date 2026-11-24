@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
 
-use crate::support::{Sandbox, finish, spawn};
+use crate::support::{BWRAP_PASSES, Sandbox, finish, spawn};
 
 const CLEAN_REPORT: &str = r#"## Standards
 
@@ -121,10 +121,12 @@ fn codex_writes(report: &str) -> String {
     )
 }
 
-/// A sandbox whose user namespaces work, so agy's sandbox is active.
+/// A sandbox whose user namespaces work and whose write guard starts, so agy's sandbox is
+/// active.
 fn sandboxed() -> Sandbox {
     let sandbox = Sandbox::new();
     sandbox.fake("unshare", "exit 0");
+    sandbox.fake("bwrap", BWRAP_PASSES);
     sandbox
 }
 
@@ -539,6 +541,194 @@ fn agy_reviews_a_throwaway_checkout_of_the_head_so_its_writes_leave_the_callers_
     assert_eq!(
         fs::read_to_string(sandbox.reviews().join("t1.md")).unwrap(),
         CLEAN_REPORT
+    );
+}
+
+/// A guard's own arguments and the command it runs: `argv` split at its first `--`.
+fn guarded(argv: &[String]) -> (&[String], &[String]) {
+    let at = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(argv.len());
+    (&argv[..at], argv.get(at + 1..).unwrap_or_default())
+}
+
+/// The guard calls that ran `program`.
+fn guards_of(sandbox: &Sandbox, program: &str) -> Vec<Vec<String>> {
+    sandbox
+        .calls("bwrap")
+        .into_iter()
+        .filter(|argv| {
+            guarded(argv)
+                .1
+                .first()
+                .is_some_and(|first| first == program)
+        })
+        .collect()
+}
+
+/// The paths each `flag` of a guard mounts, as its `(source, target)` pairs.
+fn mounts(guard: &[String], flag: &str) -> Vec<(String, String)> {
+    guard
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| *arg == flag)
+        .filter_map(|(at, _)| Some((guard.get(at + 1)?.clone(), guard.get(at + 2)?.clone())))
+        .collect()
+}
+
+#[test]
+fn agy_reviews_inside_a_write_guard_that_leaves_only_its_checkout_its_log_and_its_state_writable() {
+    let sandbox = sandboxed();
+    let repo = sandbox.repo();
+    sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let runs = guards_of(&sandbox, "agy");
+    assert_eq!(runs.len(), 1, "the review runs under the guard: {runs:?}");
+    let (guard, program) = guarded(&runs[0]);
+    assert_eq!(
+        program[1..],
+        reviews_run(&sandbox)[0],
+        "agy runs under it as it would bare"
+    );
+    assert_eq!(
+        guard[..3],
+        ["--ro-bind", "/", "/"],
+        "the whole filesystem is read-only first: {guard:?}"
+    );
+    let path = |rel: &str| sandbox.path(rel).display().to_string();
+    let mut writable: Vec<String> = mounts(guard, "--bind")
+        .into_iter()
+        .map(|(source, target)| {
+            assert_eq!(source, target, "{guard:?}");
+            target
+        })
+        .collect();
+    writable.sort();
+    let mut expected = vec![
+        agys_cwd(&sandbox).display().to_string(),
+        sandbox
+            .reviews()
+            .join("t1.agy.run.log")
+            .display()
+            .to_string(),
+    ];
+    expected.sort();
+    assert_eq!(
+        writable, expected,
+        "its checkout and its own log: {guard:?}"
+    );
+    let state: Vec<(String, String)> = [
+        path("home/.gemini"),
+        path("config/antigravity"),
+        path("home/.cache/antigravity"),
+    ]
+    .into_iter()
+    .map(|dir| (dir.clone(), dir))
+    .collect();
+    assert_eq!(
+        mounts(guard, "--bind-try"),
+        state,
+        "agy's own state: {guard:?}"
+    );
+    let tmpfs: Vec<&String> = guard
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| *arg == "--tmpfs")
+        .filter_map(|(at, _)| guard.get(at + 1))
+        .collect();
+    assert!(
+        tmpfs.contains(&&path("run")),
+        "the runtime dir and its sockets are hidden: {guard:?}"
+    );
+    let rebound = mounts(guard, "--ro-bind-try");
+    assert!(
+        rebound.contains(&(path("run/bus"), path("run/bus"))),
+        "but the session bus, for agy's login: {guard:?}"
+    );
+    assert!(
+        rebound.contains(&("/dev/null".to_owned(), "/run/docker.sock".to_owned())),
+        "Docker's socket is masked: {guard:?}"
+    );
+}
+
+#[test]
+fn a_write_guard_that_cannot_start_skips_agy_and_codex_reviews() {
+    let sandbox = Sandbox::new();
+    agy_then_codex(&sandbox);
+    let repo = sandbox.repo();
+    sandbox.fake("unshare", "exit 0");
+    sandbox.fake(
+        "bwrap",
+        "echo 'bwrap: setting up uid map: Permission denied' >&2\nexit 1",
+    );
+    sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+
+    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(
+        reviews_run(&sandbox).is_empty(),
+        "agy never reviews unguarded"
+    );
+    let shown = shown(&out.stdout);
+    assert_eq!(shown["backend"], "codex", "{shown}");
+    assert_eq!(shown["skipped"][0]["backend"], "agy", "{shown}");
+    assert_eq!(
+        shown["skipped"][0]["reason"],
+        "its sandbox is not active (its write guard can't start: bwrap: setting up uid map: Permission denied)",
+        "{shown}"
+    );
+    let probes = sandbox.calls("bwrap");
+    assert_eq!(probes.len(), 1, "{probes:?}");
+    assert_eq!(
+        guarded(&probes[0]).1,
+        ["unshare", "--user", "--map-root-user", "true"],
+        "the probe starts a user namespace inside the guard, as agy's sandbox will"
+    );
+}
+
+#[test]
+fn with_no_user_namespaces_an_agy_only_chain_refuses_the_review_in_one_line() {
+    let sandbox = Sandbox::new();
+    configure(&sandbox, "[[review.backend]]\ncli = \"agy\"\n");
+    let repo = sandbox.repo();
+    sandbox.fake(
+        "unshare",
+        "echo 'unshare: unshare failed: Operation not permitted' >&2\nexit 1",
+    );
+    sandbox.fake("bwrap", BWRAP_PASSES);
+    sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(out.stdout, "", "{out:?}");
+    assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
+    assert!(
+        out.stderr
+            .starts_with("factory: code-review: no review backend can take the "),
+        "{out:?}"
+    );
+    assert!(
+        out.stderr.contains(
+            "agy its sandbox is not active (unprivileged user namespaces are unavailable: \
+             unshare: unshare failed: Operation not permitted)"
+        ),
+        "{out:?}"
+    );
+    assert!(
+        reviews_run(&sandbox).is_empty(),
+        "agy never reviews unguarded"
+    );
+    assert!(
+        sandbox.calls("bwrap").is_empty(),
+        "nothing runs under a guard: {:?}",
+        sandbox.calls("bwrap")
     );
 }
 

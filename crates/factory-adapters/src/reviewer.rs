@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::git::{Checkout, Git, Repo, Repos};
+use crate::guard;
 use crate::process::{self, RunError};
 
 /// One review for a backend to run.
@@ -205,8 +206,9 @@ pub enum AgyAuth {
 
 /// Antigravity, headless: `agy -p` in plan mode inside its sandbox, with writes, URLs and MCP
 /// denied, JSON output, a print timeout, and no paid credits. It reviews a throwaway detached
-/// checkout of the head, so a terminal command that writes changes nothing of the caller's;
-/// its review is kept only when its own log says its sandbox started.
+/// checkout of the head, so a terminal command that writes changes nothing of the caller's,
+/// under a write guard ([`guard`]) that leaves it nothing else to write but its own log and
+/// agy's state; its review is kept only when its own log says its sandbox started.
 ///
 /// With no model configured it runs the model chosen in agy, and its quota is that model's
 /// group: the label agy's `/model` saved under `model` in
@@ -314,7 +316,11 @@ impl Agy {
 
     /// agy as its auth runs it: the subscription login never sees an API key.
     fn command(&self) -> Command {
-        let mut cmd = Command::new("agy");
+        self.as_its_auth(Command::new("agy"))
+    }
+
+    /// `cmd`, which runs agy, as its auth runs it.
+    fn as_its_auth(&self, mut cmd: Command) -> Command {
         if self.auth == AgyAuth::Subscription {
             cmd.env_remove("GEMINI_API_KEY");
         }
@@ -454,8 +460,9 @@ impl Reviewer for Agy {
         let own_log = job.stream.with_extension("run.log");
         File::create(&own_log).map_err(ReviewerError::Files)?;
         // Dropped, so removed, however the review ends.
-        let (_checkout, within) = self.checkout(job)?;
-        let mut cmd = self.command();
+        let (checkout, within) = self.checkout(job)?;
+        // Under the write guard, which leaves it its checkout, its own log and agy's state.
+        let mut cmd = self.as_its_auth(guard::command("agy", &[checkout.dir(), own_log.as_path()]));
         cmd.arg("-p")
             .arg(prompt)
             .args(["--mode", "plan", "--sandbox", "--add-dir"])
@@ -542,21 +549,26 @@ fn sweep_checkouts(dir: &Path, repo: &dyn Repo) {
 }
 
 /// Whether unprivileged user namespaces are available, which agy's sandbox needs: without
-/// them `--sandbox` silently does nothing.
+/// them `--sandbox` silently does nothing. And whether the write guard ([`guard`]) a review
+/// runs under starts, with agy's sandbox able to start inside it.
 pub trait Namespaces: fmt::Debug + Send + Sync {
     /// `Ok`, or why they are unavailable, in the probe's own words.
     fn user_namespaces(&self) -> Result<(), String>;
+    /// `Ok`, or why the guard can't start, in the probe's own words.
+    fn guard(&self) -> Result<(), String>;
 }
 
-/// The probe through `unshare --user --map-root-user true`.
+/// The probes through `unshare --user --map-root-user true`, bare and under the guard.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Unshare;
 
-impl Namespaces for Unshare {
-    fn user_namespaces(&self) -> Result<(), String> {
-        let mut cmd = Command::new("unshare");
-        cmd.args(["--user", "--map-root-user", "true"])
-            .stdin(Stdio::null())
+/// The arguments that make `unshare` start a user namespace and do nothing in it.
+const UNSHARE_PROBE: [&str; 3] = ["--user", "--map-root-user", "true"];
+
+impl Unshare {
+    /// Runs `cmd`, a probe whose program is `program`: `Ok`, or what it said.
+    fn probe(mut cmd: Command, program: &str) -> Result<(), String> {
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         match process::run(cmd, AGY_CHECK_TIMEOUT) {
@@ -566,30 +578,57 @@ impl Namespaces for Unshare {
                 let said = stderr.lines().find(|line| !line.trim().is_empty());
                 Err(match (said, output.status.code()) {
                     (Some(said), _) => said.trim().to_owned(),
-                    (None, Some(code)) => format!("unshare exited {code}"),
-                    (None, None) => "unshare was killed by a signal".to_owned(),
+                    (None, Some(code)) => format!("{program} exited {code}"),
+                    (None, None) => format!("{program} was killed by a signal"),
                 })
             }
-            Err(e) => Err(format!("unshare: {e}")),
+            Err(e) => Err(format!("{program}: {e}")),
         }
     }
 }
 
-/// A probe that answers as it was told: `None` for available, else the reason they are not.
-#[derive(Clone, Debug, Default)]
-pub struct FakeNamespaces(pub Option<String>);
-
-impl Namespaces for FakeNamespaces {
+impl Namespaces for Unshare {
     fn user_namespaces(&self) -> Result<(), String> {
-        self.0.clone().map_or(Ok(()), Err)
+        let mut cmd = Command::new("unshare");
+        cmd.args(UNSHARE_PROBE);
+        Unshare::probe(cmd, "unshare")
+    }
+
+    fn guard(&self) -> Result<(), String> {
+        let mut cmd = guard::command("unshare", &[]);
+        cmd.args(UNSHARE_PROBE);
+        Unshare::probe(cmd, guard::BWRAP)
     }
 }
 
-/// Whether agy's sandbox would be active, as `namespaces` says.
+/// A probe that answers as it was told: `None` for available, else the reason they are not;
+/// the same for the guard.
+#[derive(Clone, Debug, Default)]
+pub struct FakeNamespaces {
+    pub namespaces: Option<String>,
+    pub guard: Option<String>,
+}
+
+impl Namespaces for FakeNamespaces {
+    fn user_namespaces(&self) -> Result<(), String> {
+        self.namespaces.clone().map_or(Ok(()), Err)
+    }
+
+    fn guard(&self) -> Result<(), String> {
+        self.guard.clone().map_or(Ok(()), Err)
+    }
+}
+
+/// Whether agy's sandbox would be active, and its write guard start, as `namespaces` says.
 fn sandbox_active(namespaces: &dyn Namespaces) -> Result<(), ReviewerError> {
     namespaces.user_namespaces().map_err(|why| {
         ReviewerError::NoSandbox(format!(
             "its sandbox is not active (unprivileged user namespaces are unavailable: {why})"
+        ))
+    })?;
+    namespaces.guard().map_err(|why| {
+        ReviewerError::NoSandbox(format!(
+            "its sandbox is not active (its write guard can't start: {why})"
         ))
     })
 }
@@ -819,7 +858,10 @@ mod seams {
         )
         .with(
             Arc::new(repo.clone()),
-            Arc::new(FakeNamespaces(namespaces.map(str::to_owned))),
+            Arc::new(FakeNamespaces {
+                namespaces: namespaces.map(str::to_owned),
+                guard: None,
+            }),
         )
     }
 
@@ -867,7 +909,10 @@ mod seams {
 
     #[test]
     fn no_user_namespaces_sends_the_review_on_in_the_probes_words() {
-        let off = FakeNamespaces(Some("unshare: Operation not permitted".to_owned()));
+        let off = FakeNamespaces {
+            namespaces: Some("unshare: Operation not permitted".to_owned()),
+            guard: None,
+        };
         match sandbox_active(&off) {
             Err(ReviewerError::NoSandbox(why)) => assert_eq!(
                 why,
@@ -876,6 +921,22 @@ mod seams {
             ),
             other => panic!("expected NoSandbox, got {other:?}"),
         }
-        assert!(sandbox_active(&FakeNamespaces(None)).is_ok());
+        assert!(sandbox_active(&FakeNamespaces::default()).is_ok());
+    }
+
+    #[test]
+    fn a_guard_that_cannot_start_sends_the_review_on_in_the_probes_words() {
+        let off = FakeNamespaces {
+            namespaces: None,
+            guard: Some("bwrap: No such file or directory".to_owned()),
+        };
+        match sandbox_active(&off) {
+            Err(ReviewerError::NoSandbox(why)) => assert_eq!(
+                why,
+                "its sandbox is not active (its write guard can't start: \
+                 bwrap: No such file or directory)"
+            ),
+            other => panic!("expected NoSandbox, got {other:?}"),
+        }
     }
 }

@@ -45,7 +45,12 @@ pub const FAKED_TOOLS: &[&str] = &[
     "emulator",
     "notify-send",
     "unshare",
+    "bwrap",
 ];
+
+/// A fake `bwrap` that puts up no guard: it runs the command after its `--` as it is.
+pub const BWRAP_PASSES: &str =
+    "while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"";
 
 /// How long any one process a test runs may take before the test fails.
 pub const DEADLINE: Duration = Duration::from_secs(30);
