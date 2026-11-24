@@ -105,6 +105,9 @@ pub fn pre_tool(input: &Value, escape: bool) -> PreTool {
             if let Some(reason) = package_manager(command, escape) {
                 return PreTool::Block(reason);
             }
+            if let Some(reason) = machine_wide_kill(command) {
+                return PreTool::Block(reason);
+            }
             match git_actions(command) {
                 actions if actions.is_empty() => PreTool::Allow,
                 actions => PreTool::Check(actions),
@@ -144,16 +147,18 @@ pub fn repl_misuse(code: &str) -> Option<String> {
     ))
 }
 
-/// The most characters of a tool result the post-tool hook lets pass without a word.
-pub const RESULT_LIMIT: usize = 12_000;
+/// The most characters of a tool result the post-tool hook lets pass without a word. The REPL
+/// itself cuts each part of its result at 30k, so a limit near that only speaks to the large ones.
+pub const RESULT_LIMIT: usize = 20_000;
 
 /// The post-tool rule over Claude Code's hook input: one line for a result over
-/// [`RESULT_LIMIT`] characters, which tells the agent to read less next time.
+/// [`RESULT_LIMIT`] characters, worded as a fact about it (Claude Code hands it to the model
+/// beside the result, and advises facts over orders).
 pub fn post_tool(input: &Value) -> Option<String> {
     let chars = text_chars(input.get("tool_response")?);
     (chars > RESULT_LIMIT).then(|| {
         format!(
-            "That result was {chars} characters: next time locate with rg -n and read only the line range you need."
+            "That result was {chars} characters; results this size read cheaper in slices: locate with rg -n and read the line range, or keep it in a REPL variable and return a slice."
         )
     })
 }
@@ -794,10 +799,9 @@ pub fn package_manager(command: &str, escape: bool) -> Option<String> {
     if escape {
         return None;
     }
-    let found = all_parts(command).iter().find_map(|part| match part {
-        Part::Command(words) => manager_in(words),
-        _ => None,
-    })?;
+    let found = commands(command)
+        .iter()
+        .find_map(|words| manager_in(words))?;
     let fix = if found == "npx" {
         "bunx".to_owned()
     } else {
@@ -806,6 +810,99 @@ pub fn package_manager(command: &str, escape: bool) -> Option<String> {
     Some(format!(
         "{found} is not used here: run it with {fix}, or put {ESCAPE}=1 in front of the command to use {found} this once."
     ))
+}
+
+/// The refusal for a command that kills processes by pattern: `pkill -f` and `killall` match
+/// every agent's processes on the machine, and the pattern can match the caller's own shell. No
+/// escape: the damage lands on other agents, not on the one that asks.
+pub fn machine_wide_kill(command: &str) -> Option<String> {
+    commands(command)
+        .iter()
+        .any(|words| {
+            shell::invocation(words).is_some_and(|call| match call.program {
+                "killall" => true,
+                "pkill" => matches_full_command_line(call.args),
+                _ => false,
+            })
+        })
+        .then(|| {
+            "pkill -f and killall reach every agent's processes on this machine; kill the PID you started (note $! when you start it, or list candidates with pgrep -af <pattern> and kill only yours)."
+                .to_owned()
+        })
+}
+
+/// pkill's short options that take a value: the rest of the group, or else the next word.
+const PKILL_VALUE_SHORT: &str = "FGPUgOqrstu";
+
+/// pkill's long options that take a value, which getopt matches by any unambiguous prefix.
+const PKILL_VALUE_LONG: &[&str] = &[
+    "cgroup",
+    "euid",
+    "group",
+    "ns",
+    "nslist",
+    "older",
+    "parent",
+    "pgroup",
+    "pidfile",
+    "queue",
+    "runstates",
+    "session",
+    "signal",
+    "terminal",
+    "uid",
+];
+
+/// Whether pkill's arguments include `-f` (alone or inside a group such as `-9f`) or `--full`
+/// (or a prefix of it), reading the value of each option that takes one (`-u -f` names a user)
+/// and stopping at a `--` that is not such a value.
+fn matches_full_command_line(args: &[String]) -> bool {
+    let mut words = args.iter();
+    while let Some(arg) = words.next() {
+        if arg == "--" {
+            return false;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, has_value) = match long.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (long, false),
+            };
+            if !name.is_empty() && "full".starts_with(name) {
+                return true;
+            }
+            let takes = !name.is_empty()
+                && PKILL_VALUE_LONG
+                    .iter()
+                    .any(|option| option.starts_with(name));
+            if takes && !has_value {
+                words.next();
+            }
+        } else if let Some(group) = arg.strip_prefix('-') {
+            for (at, flag) in group.char_indices() {
+                if flag == 'f' {
+                    return true;
+                }
+                if PKILL_VALUE_SHORT.contains(flag) {
+                    if at + flag.len_utf8() == group.len() {
+                        words.next();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The words of every simple command in a command line, those inside `bash -c '…'` included.
+fn commands(command: &str) -> Vec<shell::Words> {
+    all_parts(command)
+        .into_iter()
+        .filter_map(|part| match part {
+            Part::Command(words) => Some(words),
+            _ => None,
+        })
+        .collect()
 }
 
 fn manager_in(words: &[String]) -> Option<&'static str> {

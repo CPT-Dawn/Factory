@@ -101,6 +101,99 @@ fn the_package_manager_block_is_one_line_with_the_fix() {
 }
 
 #[test]
+fn pre_tool_blocks_a_machine_wide_kill_wherever_it_sits() {
+    for command in [
+        "pkill -f 'claude -p --input-format stream-json'",
+        "pkill -f \"target/debug/factory daemon\"",
+        "pkill --full factory",
+        "pkill --ful factory",
+        "pkill -9f factory",
+        "pkill -fx factory",
+        "pkill -TERM -f factory",
+        "pkill -u me -f factory",
+        "killall claude",
+        "killall -9 factory",
+        "/usr/bin/killall node",
+        "cd x && pkill -f y",
+        "true; killall y",
+        "ps aux | pkill -f y",
+        "sudo pkill -f y",
+        "sudo -u root killall y",
+        "env X=1 pkill -f y",
+        "bash -c 'pkill -f y'",
+        "sh -c \"cd x && killall y\"",
+        "(pkill -f y)",
+        "echo $(pkill -f y)",
+        "pkill \\\n  -f y",
+        // A bare `--` that is an option's value ends nothing.
+        "pkill -u -- -f y",
+        "pkill --uid -- -f y",
+        "pkill -nf y",
+    ] {
+        let reason = blocked(&bash(command), false);
+        assert!(reason.is_some(), "{command:?} should be blocked");
+        // No escape variable reaches this far: a kill hits other agents, not only this one.
+        assert!(
+            blocked(&bash(command), true).is_some(),
+            "{command:?} with the escape"
+        );
+    }
+}
+
+#[test]
+fn pre_tool_lets_a_kill_of_one_pid_through() {
+    for command in [
+        "kill 123",
+        "kill -9 123",
+        "kill $!",
+        "pkill factory",
+        "pkill -9 factory",
+        "pkill -u me factory",
+        "pkill -x factory",
+        // `-f` and `f` here are the values of -u, -U and -s.
+        "pkill -u -f factory",
+        "pkill -uf factory",
+        "pkill --uid f factory",
+        "pkill --session -f factory",
+        "pgrep -af factory",
+        "pkill -- -f",
+        "echo pkill -f y",
+        "echo 'killall y'",
+        "man killall",
+        "git commit -m 'no more pkill -f'",
+        "rg killall src",
+        "ls killall-notes",
+        "cd pkill && ls",
+        "killall_helper x",
+    ] {
+        assert!(
+            matches!(
+                pre_tool(&bash(command), false),
+                PreTool::Allow | PreTool::Check(_)
+            ),
+            "{command:?} should pass"
+        );
+    }
+}
+
+#[test]
+fn the_kill_block_is_one_line_naming_what_to_do_instead() {
+    for command in ["pkill -f x", "killall x"] {
+        let reason = blocked(&bash(command), false).unwrap();
+        assert!(!reason.contains('\n'), "{reason}");
+        assert!(reason.chars().count() <= 200, "{reason}");
+        assert!(
+            reason.contains("pkill -f") && reason.contains("killall"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("$!") && reason.contains("pgrep -af"),
+            "{reason}"
+        );
+    }
+}
+
+#[test]
 fn other_tools_and_shapes_pass_untouched() {
     for call in [
         json!({}),
@@ -195,34 +288,36 @@ fn result(response: Value) -> Value {
 
 #[test]
 fn post_tool_answers_a_result_over_the_limit_with_one_line() {
-    assert_eq!(RESULT_LIMIT, 12_000);
-    let over = "x".repeat(12_001);
+    assert_eq!(RESULT_LIMIT, 20_000);
+    let over = "x".repeat(20_001);
     // (response, the characters in all its strings)
     for (response, chars) in [
         (
             json!({"stdout": over, "stderr": "", "interrupted": false}),
-            12_001,
+            20_001,
         ),
         // The parts add up.
         (
-            json!({"stdout": "x".repeat(6_000), "stderr": "y".repeat(6_001)}),
-            12_001,
+            json!({"stdout": "x".repeat(10_000), "stderr": "y".repeat(10_001)}),
+            20_001,
         ),
         (
             json!({"type": "text", "file": {"filePath": "/a", "content": over}}),
-            12_007,
+            20_007,
         ),
-        (json!(over), 12_001),
+        (json!(over), 20_001),
         (
-            json!([{"type": "text", "text": "x".repeat(7_000)}, {"type": "text", "text": "x".repeat(5_001)}]),
-            12_009,
+            json!([{"type": "text", "text": "x".repeat(12_000)}, {"type": "text", "text": "x".repeat(8_001)}]),
+            20_009,
         ),
     ] {
         let line = post_tool(&result(response.clone()))
             .unwrap_or_else(|| panic!("{} should be answered", preview(&response)));
         assert!(!line.contains('\n'), "{line}");
         assert!(line.chars().count() <= 200, "{line}");
-        assert!(line.contains("rg -n"), "{line}");
+        assert!(line.contains("rg -n") && line.contains("slice"), "{line}");
+        // A fact about the result, not an order to the agent.
+        assert!(line.starts_with("That result was "), "{line}");
         assert!(line.contains(&chars.to_string()), "{line}");
     }
 }
@@ -234,12 +329,12 @@ fn preview(value: &Value) -> String {
 #[test]
 fn post_tool_says_nothing_to_a_result_within_the_limit() {
     for response in [
-        json!({"stdout": "x".repeat(12_000), "stderr": ""}),
+        json!({"stdout": "x".repeat(20_000), "stderr": ""}),
         // Characters count, not bytes.
-        json!({"stdout": "é".repeat(7_000)}),
+        json!({"stdout": "é".repeat(12_000)}),
         json!({"stdout": "", "interrupted": true, "isImage": false}),
         // Keys and numbers are not output.
-        json!({"a".repeat(13_000): 1}),
+        json!({"a".repeat(21_000): 1}),
         json!(null),
         json!("short"),
     ] {
