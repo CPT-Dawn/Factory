@@ -1126,9 +1126,6 @@ fn try_grant(
             }
             _ => None,
         };
-        if activity::set_need(c, waiter, need)? {
-            lab.notify();
-        }
         let board = grant_board(c, p.project.as_ref(), &p.worktree, facts, &stopping)?;
         let ask = Ask {
             waiter,
@@ -1142,6 +1139,10 @@ fn try_grant(
                     c.execute_batch("ROLLBACK TO claim")?;
                 }
                 c.execute_batch("RELEASE claim")?;
+                // After the claim is undone, so a waiter with a reservation keeps its need.
+                if activity::set_need(c, waiter, need)? {
+                    lab.notify();
+                }
                 return Ok(Err(why));
             }
             Decision::Grant { slot, new } => (slot, new),
