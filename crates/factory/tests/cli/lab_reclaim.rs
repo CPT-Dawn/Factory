@@ -387,7 +387,12 @@ fn an_idle_emulator_adb_shows_offline_does_not_stand_in_for_one_an_idle_lease_ho
     assert_eq!(owned_by(&sandbox, &wt_c, &c, &["release"]).code, 0);
     world.apply(&format!("plug {idle} offline")).unwrap();
 
-    let taken = owned_by(&sandbox, &wt_b, &b, &["acquire", "--emulator", "--wait", "20"]);
+    let taken = owned_by(
+        &sandbox,
+        &wt_b,
+        &b,
+        &["acquire", "--emulator", "--wait", "20"],
+    );
 
     assert_eq!(taken.code, 0, "{taken:?}");
     assert_eq!(serial_of(&taken), serial_of(&held), "{taken:?}");

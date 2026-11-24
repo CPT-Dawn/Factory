@@ -1509,7 +1509,7 @@ fn gc_has_nothing_to_say_of_leases_the_daemon_already_freed() {
 }
 
 /// A lead that reserved a slot and exited: the keeper watches leases' owners, not reservations',
-/// so only a write that finds the reservation frees it, and a `gc` that is the next call does.
+/// so only a write that finds the reservation frees it; whichever does, the next `gc` says so.
 fn orphaned_reservations(sandbox: &Sandbox, world: &World) -> (PathBuf, Vec<u32>) {
     let (mut a, mut b) = (Agent::start(), Agent::start());
     let [wa, wb] = ["demo-a", "demo-b"].map(|n| world.worktree(n));
@@ -1584,6 +1584,27 @@ fn gc_names_a_file_with_the_reservations_it_freed_itself() {
     }
     // Said once: the next gc finds nothing.
     let again = run(devlab(&sandbox, &wa, &["gc"]));
+    assert_eq!((again.code, again.stdout.as_str()), (0, ""), "{again:?}");
+}
+
+#[test]
+fn gc_says_a_reservation_another_call_freed_first_once() {
+    let (sandbox, world) = lab();
+    let (wa, pids) = orphaned_reservations(&sandbox, &world);
+    // Any call finds the leads gone and frees their reservations, as the daemon's own looks do.
+    assert_eq!(run(devlab(&sandbox, &wa, &["status"])).code, 0);
+
+    let gc = run(devlab(&sandbox, &wa, &["gc"]));
+    let again = run(devlab(&sandbox, &wa, &["gc"]));
+
+    assert_eq!(gc.code, 0, "{gc:?}");
+    assert_eq!(gc.stdout.lines().count(), 2, "{gc:?}");
+    for (line, pid) in gc.stdout.lines().zip(&pids) {
+        assert!(
+            line.ends_with(&format!("(sleep:{pid}, owner exited)")),
+            "{line}"
+        );
+    }
     assert_eq!((again.code, again.stdout.as_str()), (0, ""), "{again:?}");
 }
 

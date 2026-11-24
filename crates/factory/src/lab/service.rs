@@ -100,6 +100,8 @@ pub struct Lab {
     /// clock that steps can't make an old ready probe count (#63). Written with the phone's
     /// readiness row and read beside it, under the store's lock.
     marks: Mutex<HashMap<String, Mark>>,
+    /// The lines of the reservations writes dropped since the last `gc` was told them.
+    untold: Mutex<Vec<String>>,
     /// The waiters whose callers are connected to this daemon; the rest are kept for callers
     /// that come back after a restart, until they can't.
     callers: Mutex<HashSet<i64>>,
@@ -208,6 +210,7 @@ impl Lab {
             tracking: Once::new(),
             phones: OnceLock::new(),
             marks: Mutex::new(HashMap::new()),
+            untold: Mutex::new(Vec::new()),
             watched: Mutex::new(HashSet::new()),
             stopping: Mutex::new(keeper::Stopping::default()),
             callers: Mutex::new(HashSet::new()),
@@ -320,14 +323,24 @@ impl Lab {
     /// followed them are recorded as `daemon-stopped`. The reverses the dropped leases' devices
     /// were given are taken back beside it, after the transaction.
     fn write<T>(&self, work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>) -> Answer<T> {
-        self.write_telling(work).map(|(out, _)| out)
+        self.write_inner(false, work).map(|(out, _)| out)
     }
 
-    /// [`Lab::write`], and a line for each lease and reservation this very write dropped
-    /// because its owner exited: what `devlab gc` reports. One the keeper dropped earlier is
-    /// not told again.
+    /// [`Lab::write`], and a line for each lease this very write dropped because its owner
+    /// exited, and for each reservation dropped since the last such call: what `devlab gc`
+    /// reports. A lease the keeper dropped earlier is not told again. A reservation is freed by
+    /// whichever write finds its lead gone or its time up, most often one the daemon makes on its
+    /// own: the next `gc` tells it, once (#63).
     fn write_telling<T>(
         &self,
+        work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>,
+    ) -> Answer<(T, Vec<String>)> {
+        self.write_inner(true, work)
+    }
+
+    fn write_inner<T>(
+        &self,
+        tell: bool,
         work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>,
     ) -> Answer<(T, Vec<String>)> {
         let mut store = self
@@ -366,6 +379,17 @@ impl Lab {
                 code: Exit::Precondition.code(),
                 message: format!("lab store {}: {e}; retry", self.path.display()),
             })?;
+        let notify = !freed.is_empty() || !unreserved.is_empty();
+        // Under the store's lock, so no gc misses a reservation another write just dropped.
+        let unreserved = {
+            let mut untold = lock_ignoring_poison(&self.untold);
+            untold.extend(unreserved.iter().cloned());
+            if tell {
+                std::mem::take(&mut *untold)
+            } else {
+                Vec::new()
+            }
+        };
         drop(store);
         let _ = self.wake.send(());
         let lines: Vec<String> = freed
@@ -373,7 +397,7 @@ impl Lab {
             .map(|l| format!("lease {} ({}, owner exited)", l.id, l.owner_label))
             .chain(unreserved)
             .collect();
-        if !lines.is_empty() || unstopped > 0 || !ended.is_empty() {
+        if notify || unstopped > 0 || !ended.is_empty() {
             self.notify();
         }
         let freed: Vec<Lease> = freed.into_iter().chain(ended).collect();
