@@ -51,15 +51,16 @@ pub struct Attached {
     pub model: String,
 }
 
-/// Since which frame of adb's stream each device in `now`, frame number `frame`, has been shown
-/// as it is shown now, by serial: `before` is the frame before and `since` its answer. A
-/// device that appears or changes state is shown from `frame` on.
+/// Since when adb has shown each device in `now`, a list it showed at `at`, as it shows it
+/// now, by serial: `before` is the list it showed before and `since` its answer. A device
+/// that appears or changes state is shown from `at` on; a list after a gap in the stream has
+/// an empty `before`, since a device may have been plugged in again meanwhile.
 pub fn shown_since(
     before: &[Attached],
-    since: &BTreeMap<String, u64>,
+    since: &BTreeMap<String, i64>,
     now: &[Attached],
-    frame: u64,
-) -> BTreeMap<String, u64> {
+    at: i64,
+) -> BTreeMap<String, i64> {
     now.iter()
         .map(|a| {
             let kept = before
@@ -67,7 +68,7 @@ pub fn shown_since(
                 .any(|b| b.serial == a.serial && b.state == a.state)
                 .then(|| since.get(&a.serial).copied())
                 .flatten();
-            (a.serial.clone(), kept.unwrap_or(frame))
+            (a.serial.clone(), kept.unwrap_or(at))
         })
         .collect()
 }

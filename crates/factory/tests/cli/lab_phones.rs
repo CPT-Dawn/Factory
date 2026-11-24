@@ -139,6 +139,46 @@ fn a_phone_wait_ends_when_it_is_due_though_a_probe_is_still_answering() {
 }
 
 #[test]
+fn a_request_with_no_wait_does_not_wait_for_a_probe_still_answering() {
+    let (sandbox, world, wt) = plugged(&["FAKEPHONE01"], &[PIXEL_1]);
+    world.apply("slow FAKEPHONE01").unwrap();
+    world.apply("unlock FAKEPHONE01").unwrap();
+
+    let started = Instant::now();
+    let refused = owned(&sandbox, &wt, &["acquire", "--phone", "--wait", "0"]);
+    let took = started.elapsed();
+
+    assert_eq!(refused.code, 75, "{refused:?}");
+    assert!(
+        refused.stderr.contains(
+            "gave up after 0 s: no free phone: 0 phone(s) busy, 1 locked (unlock it once)"
+        ),
+        "{refused:?}"
+    );
+    assert!(took < Duration::from_millis(1500), "took {took:?}");
+}
+
+#[test]
+fn a_phone_back_after_adb_s_stream_ended_is_not_granted_on_a_probe_from_before() {
+    let (sandbox, world, wt) = plugged(&[], &[PIXEL_3]);
+    // While no stream follows adb, the phone is plugged in again and shows its lock screen,
+    // which a probe finds only 6 s on. adb's next list is the same as its last.
+    world.restart_trackers(|| {
+        world.apply("slow FAKEPHONE03").unwrap();
+        world.apply("lock FAKEPHONE03").unwrap();
+    });
+
+    let got = owned(&sandbox, &wt, &["acquire", "--phone", "--wait", "0"]);
+
+    assert_eq!(got.code, 75, "{got:?}");
+    assert!(
+        got.stderr
+            .contains("gave up after 0 s: no free phone: 0 phone(s) busy, 1 offline"),
+        "{got:?}"
+    );
+}
+
+#[test]
 fn while_the_watcher_lags_a_replugged_phone_is_not_granted_on_its_old_probe() {
     let (sandbox, world, wt) = plugged(&[], &[PIXEL_3]);
     // The watcher spends 6 s on the next phone plugged in; meanwhile adb's lists go on.

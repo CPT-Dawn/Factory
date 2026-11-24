@@ -3,7 +3,7 @@
 
 use factory_core::lab::ready::{
     Probe, Readiness, Urgency, after, auth_timeout_warning, check_line, for_grant, judge, notice,
-    probe_again, unplugged,
+    probe_again, refresh_again, unplugged,
 };
 
 /// A phone on USB power with stay-awake set, awake and unlocked.
@@ -298,4 +298,11 @@ fn a_grant_believes_a_usable_phone_s_probe_and_a_ready_one_for_10_s() {
     );
     // Too old to grant on: the grant has it probed again.
     assert_eq!(for_grant("device", Some((Readiness::Ready, 10_001))), None);
+}
+
+#[test]
+fn a_grant_s_refresh_probes_a_ready_phone_again_2_s_before_its_probe_is_too_old() {
+    assert!(!refresh_again(Readiness::Ready, 8_000));
+    assert!(refresh_again(Readiness::Ready, 8_001));
+    assert!(refresh_again(Readiness::Locked, 0));
 }

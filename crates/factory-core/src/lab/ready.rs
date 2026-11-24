@@ -22,6 +22,16 @@ pub fn probe_again(was: Readiness, age_ms: i64) -> bool {
     was != Readiness::Ready || age_ms > GRANT_FRESH_MS
 }
 
+/// How long before its [GRANT_FRESH_MS] are up a grant's refresh probes a ready phone again,
+/// so that the probe is still fresh when the grant reads it.
+pub const GRANT_MARGIN_MS: i64 = 2_000;
+
+/// Whether a grant's refresh probes a phone again: as [probe_again], and a ready one already
+/// once its probe, `age_ms` old, is due within [GRANT_MARGIN_MS].
+pub fn refresh_again(was: Readiness, age_ms: i64) -> bool {
+    probe_again(was, age_ms.saturating_add(GRANT_MARGIN_MS))
+}
+
 /// What a grant takes a phone to be: `state` is how adb shows it now, `probed` what the last
 /// probe of it found and that probe's age in ms, when one was made since adb has shown it so.
 /// A phone adb can't use is what adb says, whatever was probed before; one it can use is what
@@ -39,7 +49,7 @@ pub fn for_grant(state: &str, probed: Option<(Readiness, i64)>) -> Option<Readin
     }
     match probed {
         None => Some(Readiness::Offline),
-        Some((Readiness::Ready, age_ms)) if age_ms > GRANT_FRESH_MS => None,
+        Some((Readiness::Ready, age_ms)) if probe_again(Readiness::Ready, age_ms) => None,
         Some((readiness, _)) => Some(readiness),
     }
 }

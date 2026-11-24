@@ -6,7 +6,6 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -16,7 +15,7 @@ use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{Attached, LOCK_PROBE, prep_command};
 use factory_core::lab::ready::{
     AUTH_TIMEOUT_PROBE, BATTERY_PROBE, Notice, POWER_PROBE, Probe, Readiness, STAY_ON_PROBE, after,
-    auth_timeout_warning, judge, notice, probe_again, unplugged,
+    auth_timeout_warning, judge, notice, refresh_again, unplugged,
 };
 
 use super::super::check::PhoneCheck;
@@ -34,11 +33,15 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 /// What the watcher thread is asked to do.
 pub enum Job {
     /// adb's stream showed this list.
-    Frame(u64, Vec<Attached>),
+    Frame(Vec<Attached>),
+    /// adb's stream ended: whatever it shows next, the phones on it may have been plugged in
+    /// again meanwhile.
+    StreamEnded,
     /// `devlab check`: the phones named (every phone when none), answered on the sender.
     Check(Vec<String>, mpsc::Sender<Vec<PhoneCheck>>),
     /// A grant: bring these phones' readiness up to date, then answer on the sender.
-    Refresh(Vec<String>, mpsc::Sender<()>),
+    /// It is wanted by the instant given, and nothing is probed after it.
+    Refresh(Vec<String>, Instant, mpsc::Sender<()>),
 }
 
 impl Lab {
@@ -67,9 +70,16 @@ impl Lab {
 
     /// Tells the watcher what adb's stream showed; called before the list is told to anyone
     /// else, so anything that saw the list is answered after the watcher has it.
-    pub(super) fn saw_phones(&self, list: &[Attached], frame: u64) {
+    pub(super) fn saw_phones(&self, list: &[Attached]) {
         if let Some(tx) = self.phones.get() {
-            let _ = tx.send(Job::Frame(frame, list.to_vec()));
+            let _ = tx.send(Job::Frame(list.to_vec()));
+        }
+    }
+
+    /// Tells the watcher adb's stream ended, before the next one shows a list.
+    pub(super) fn phone_stream_ended(&self) {
+        if let Some(tx) = self.phones.get() {
+            let _ = tx.send(Job::StreamEnded);
         }
     }
 
@@ -91,15 +101,15 @@ impl Lab {
     /// probe at most 10 s old is kept when it found the phone ready, any other is made again.
     /// The grant then reads the store. It waits `within` at most, and never more than 10 s: a
     /// watcher that is gone or slow leaves the rows as they are, which the grant trusts only
-    /// while they are fresh.
-    pub(super) fn refresh_phones(&self, serials: Vec<String>, within: Duration) {
+    /// while they are fresh. Whether the watcher answered in time.
+    pub(super) fn refresh_phones(&self, serials: Vec<String>, by: Instant) -> bool {
         let (reply, answer) = mpsc::channel();
         let Some(tx) = self.phones.get() else {
-            return;
+            return false;
         };
-        if tx.send(Job::Refresh(serials, reply)).is_ok() {
-            let _ = answer.recv_timeout(within.min(REFRESH_TIMEOUT));
-        }
+        let within = by.saturating_duration_since(Instant::now());
+        tx.send(Job::Refresh(serials, by, reply)).is_ok()
+            && answer.recv_timeout(within.min(REFRESH_TIMEOUT)).is_ok()
     }
 }
 
@@ -138,17 +148,18 @@ impl Watcher {
         let mut next = Instant::now() + every(&config());
         loop {
             match jobs.recv_timeout(next.saturating_duration_since(Instant::now())) {
-                Ok(Job::Frame(number, list)) => {
+                Ok(Job::Frame(list)) => {
                     self.frame(list);
-                    // Its rows are written: a grant may believe them of the phones it lists.
-                    self.lab.phones_handled.store(number, Ordering::SeqCst);
+                    // Its probes are written: a request waiting for a phone looks again.
                     self.lab.notify();
                 }
+                // The next list's phones are all new to it: each is prepped and probed again.
+                Ok(Job::StreamEnded) => self.shown.clear(),
                 Ok(Job::Check(serials, reply)) => {
                     let _ = reply.send(self.check(&serials));
                 }
-                Ok(Job::Refresh(serials, reply)) => {
-                    self.refresh(&serials);
+                Ok(Job::Refresh(serials, by, reply)) => {
+                    self.refresh(&serials, by);
                     let _ = reply.send(());
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -196,13 +207,16 @@ impl Watcher {
                 );
                 self.probe(phone);
             } else {
-                self.record(phone, judge(&unprobed(phone)), None);
+                self.record(phone, judge(&unprobed(phone)), None, now_ms());
             }
         }
     }
 
     /// Probes `phone` and records what it found.
     fn probe(&mut self, phone: &Attached) -> Option<ReadyRow> {
+        // A probe is as old as its start: one begun before the phone was plugged in again is
+        // not about it.
+        let at = now_ms();
         let shell = |cmd: &str| self.adb.shell(&phone.serial, cmd);
         let probe = Probe {
             state: phone.state.clone(),
@@ -226,7 +240,7 @@ impl Watcher {
         } else {
             None
         };
-        self.record(phone, readiness, warning)
+        self.record(phone, readiness, warning, at)
     }
 
     /// Whether adb's latest list still shows `serial` as `device`.
@@ -242,12 +256,14 @@ impl Watcher {
             })
     }
 
-    /// Keeps `phone`'s readiness, and posts the notification a change of it earns.
+    /// Keeps `phone`'s readiness, found at `at` (ms since the epoch), and posts the
+    /// notification a change of it earns.
     fn record(
         &mut self,
         phone: &Attached,
         readiness: Readiness,
         warning: Option<&str>,
+        at: i64,
     ) -> Option<ReadyRow> {
         let written = self.lab.write(|c, _| {
             let before = readiness::get(c, &phone.serial)?.map(|r| r.known);
@@ -256,7 +272,7 @@ impl Watcher {
                 model: phone.model.clone(),
                 known: after(before, readiness),
                 warning: warning.map(str::to_owned),
-                probed_ms: now_ms(),
+                probed_ms: at,
             };
             readiness::put(c, &row)?;
             Ok((
@@ -316,17 +332,55 @@ impl Watcher {
         match kept {
             Some(row) => Some(row),
             None if phone.state == "device" => self.probe(phone),
-            None => self.record(phone, judge(&unprobed(phone)), None),
+            None => self.record(phone, judge(&unprobed(phone)), None, now_ms()),
         }
     }
 
-    /// Brings the rows of `serials` up to date for a grant.
-    fn refresh(&mut self, serials: &[String]) {
-        for serial in serials {
-            if let Some(phone) = self.shown.iter().find(|p| &p.serial == serial).cloned() {
-                self.current(&phone, probe_again);
+    /// Brings the rows of `serials` up to date for a grant that reads them right after, by
+    /// `by` and within [REFRESH_TIMEOUT]: no probe starts after.
+    fn refresh(&mut self, serials: &[String], by: Instant) {
+        let by = by.min(Instant::now() + REFRESH_TIMEOUT);
+        let phones: Vec<Attached> = serials
+            .iter()
+            .filter_map(|s| self.shown.iter().find(|p| &p.serial == s).cloned())
+            .collect();
+        for phone in &phones {
+            if Instant::now() >= by {
+                return;
+            }
+            self.current(phone, refresh_again);
+        }
+        // Probing one phone can take long enough for another's ready probe to come due: it is
+        // made again too, while there is time.
+        loop {
+            let mut probed = false;
+            for phone in &phones {
+                if Instant::now() >= by {
+                    return;
+                }
+                if self.lapsing(phone) {
+                    self.probe(phone);
+                    probed = true;
+                }
+            }
+            if !probed {
+                return;
             }
         }
+    }
+
+    /// Whether `phone`, as adb can use it, has a ready probe a grant will soon find too old.
+    fn lapsing(&self, phone: &Attached) -> bool {
+        phone.state == "device"
+            && self
+                .lab
+                .write(|c, _| readiness::get(c, &phone.serial))
+                .ok()
+                .flatten()
+                .is_some_and(|r| {
+                    r.known.readiness == Readiness::Ready
+                        && refresh_again(r.known.readiness, now_ms() - r.probed_ms)
+                })
     }
 
     /// `devlab check`: each phone from a probe at most [`FRESH_MS`] old, probed again when
