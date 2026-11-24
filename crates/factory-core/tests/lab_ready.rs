@@ -2,7 +2,8 @@
 //! notification each change of that earns.
 
 use factory_core::lab::ready::{
-    Probe, Readiness, Urgency, after, auth_timeout_warning, check_line, judge, notice, unplugged,
+    Probe, Readiness, Urgency, after, auth_timeout_warning, check_line, for_grant, judge, notice,
+    probe_again, refresh_again, unplugged,
 };
 
 /// A phone on USB power with stay-awake set, awake and unlocked.
@@ -257,4 +258,51 @@ fn an_authorization_timeout_left_on_is_a_warning_on_a_ready_phone() {
         warning.contains("Disable adb authorization timeout"),
         "{warning}"
     );
+}
+
+#[test]
+fn a_grant_probes_a_ready_phone_again_after_10_s_and_one_that_is_not_ready_every_time() {
+    assert!(!probe_again(Readiness::Ready, 0));
+    assert!(!probe_again(Readiness::Ready, 10_000));
+    assert!(probe_again(Readiness::Ready, 10_001));
+    assert!(probe_again(Readiness::Locked, 0));
+    assert!(probe_again(Readiness::Offline, 5_000));
+}
+
+#[test]
+fn a_grant_takes_a_phone_adb_cannot_use_as_adb_shows_it_whatever_its_last_probe_found() {
+    assert_eq!(
+        for_grant("unauthorized", Some((Readiness::Locked, 0))),
+        Some(Readiness::Unauthorized)
+    );
+    assert_eq!(
+        for_grant("unauthorized", None),
+        Some(Readiness::Unauthorized)
+    );
+    assert_eq!(
+        for_grant("offline", Some((Readiness::Ready, 0))),
+        Some(Readiness::Offline)
+    );
+}
+
+#[test]
+fn a_grant_believes_a_usable_phone_s_probe_and_a_ready_one_for_10_s() {
+    assert_eq!(for_grant("device", None), Some(Readiness::Offline));
+    assert_eq!(
+        for_grant("device", Some((Readiness::Locked, 60_000))),
+        Some(Readiness::Locked)
+    );
+    assert_eq!(
+        for_grant("device", Some((Readiness::Ready, 10_000))),
+        Some(Readiness::Ready)
+    );
+    // Too old to grant on: the grant has it probed again.
+    assert_eq!(for_grant("device", Some((Readiness::Ready, 10_001))), None);
+}
+
+#[test]
+fn a_grant_s_refresh_probes_a_ready_phone_again_2_s_before_its_probe_is_too_old() {
+    assert!(!refresh_again(Readiness::Ready, 8_000));
+    assert!(refresh_again(Readiness::Ready, 8_001));
+    assert!(refresh_again(Readiness::Locked, 0));
 }

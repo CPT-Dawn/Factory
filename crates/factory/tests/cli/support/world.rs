@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::{DEADLINE, Sandbox, kill_group};
-use rustix::process::Signal;
+use rustix::process::{Pid, Signal, kill_process};
 
 /// Where the fixtures live: the transcripts, the fakes, the machine config and the project.
 pub fn fixtures() -> PathBuf {
@@ -45,6 +45,7 @@ const STATE_FILES: &[&str] = &[
     "asleep",
     "power",
     "settings",
+    "slow",
 ];
 
 /// How often a wait on a file looks again.
@@ -86,6 +87,7 @@ impl World {
     /// - `unplug <serial>`: adb no longer lists it,
     /// - `lock <serial>`: its lock screen stays up; `unlock <serial>`: it is unlocked,
     /// - `asleep <serial>`: its screen is off until something wakes it,
+    /// - `slow <serial>`: it takes 6 s to answer whether its lock screen shows,
     /// - `setting <serial> <key> <value>`: a global setting of the phone, such as
     ///   `stay_on_while_plugged_in`, is changed on it,
     /// - `power <serial> AC|USB|Wireless`: the power source it is on,
@@ -109,6 +111,7 @@ impl World {
             ["lock", serial] => self.append("locked", serial),
             ["unlock", serial] => self.remove("locked", |line| line == *serial),
             ["asleep", serial] => self.append("asleep", serial),
+            ["slow", serial] => self.append("slow", serial),
             ["setting", serial, key, value] => {
                 self.remove("settings", |line| {
                     line.split_whitespace().take(2).eq([*serial, *key])
@@ -162,6 +165,46 @@ impl World {
                 .collect();
             panic!("adb track-devices never streamed the world's devices: {streams:?}");
         }
+    }
+
+    /// Ends each `adb track-devices -l` running on the world, as an adb server that goes away
+    /// does, runs `meanwhile`, and waits until a stream the daemon starts after has streamed
+    /// the world's devices.
+    pub fn restart_trackers(&self, meanwhile: impl FnOnce()) {
+        let streams = || -> Vec<String> {
+            fs::read_dir(&self.dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    name.strip_prefix("tracked.").map(str::to_owned)
+                })
+                .filter(|pid| process_runs(pid))
+                .collect()
+        };
+        let ended = streams();
+        assert!(!ended.is_empty(), "no adb track-devices runs on the world");
+        for pid in &ended {
+            if let Some(pid) = pid.parse().ok().and_then(Pid::from_raw) {
+                let _ = kill_process(pid, Signal::TERM);
+            }
+        }
+        assert!(
+            poll_until(|| ended.iter().all(|pid| !process_runs(pid))),
+            "adb track-devices {ended:?} would not end"
+        );
+        meanwhile();
+        let devices = self.read("devices");
+        let devices = devices.trim_end_matches('\n');
+        assert!(
+            poll_until(|| streams().iter().any(|pid| {
+                !ended.contains(pid)
+                    && fs::read_to_string(self.dir.join(format!("tracked.{pid}")))
+                        .is_ok_and(|shown| shown == devices)
+            })),
+            "the daemon never streamed the world's devices again"
+        );
     }
 
     /// A worktree named `name` under the sandbox, made on first use. One whose name starts

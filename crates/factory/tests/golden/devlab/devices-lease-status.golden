@@ -3,7 +3,6 @@
 # running on a lease is its command until it ends.
 plug FAKEPHONE01 device usb:1-1 product:shiba model:Pixel_8 device:shiba transport_id:1
 plug FAKEPHONE02 device usb:1-2 product:panther model:Pixel_7 device:panther transport_id:2
-lock FAKEPHONE02
 $ a@plain-a devlab acquire --phone --quiet
 1> export DEVLAB_LEASE=1
 1> export ANDROID_SERIAL=FAKEPHONE01
@@ -17,8 +16,8 @@ $ b@plain-b devlab acquire --phone --quiet
 1> export DEVLAB_SERIALS=FAKEPHONE02
 1> export DEVLAB_KINDS=phone
 1> export DEVLAB_ABIS=arm64-v8a
-2> devlab: FAKEPHONE02: lock screen still showing: set the phone's screen lock to None or Swipe
 ? 0
+lock FAKEPHONE02
 & r a@plain-a exec devlab exec -- sh -c 'echo started; sleep 30'
 until r started
 $ a@plain-a devlab status

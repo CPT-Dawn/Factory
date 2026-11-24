@@ -1049,7 +1049,7 @@ fn factory_lab_preps_and_watches_as_devlab_does_in_one_line_each() {
     );
     assert_eq!(
         named_file(&both),
-        "FAKEPHONE01: ready\nFAKEPHONE03: lock screen still showing: set the phone's screen lock to None or Swipe\n"
+        "FAKEPHONE01: ready\nFAKEPHONE03: lock screen still showing: unlock the phone once\n"
     );
     let json = one_json(&lab(&["prep", "--json", "FAKEPHONE03"]));
     assert_eq!(json["devices"][0]["serial"], "FAKEPHONE03", "{json}");

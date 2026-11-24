@@ -12,6 +12,48 @@ pub const POWER_PROBE: &str = "dumpsys power | grep -E 'mWakefulness=' | head -1
 /// The shell line that prints adb's authorization timeout; `0` when it is off.
 pub const AUTH_TIMEOUT_PROBE: &str = "settings get global adb_allowed_connection_time";
 
+/// How old, in ms, a probe of a ready phone may be for a grant to rest on it.
+pub const GRANT_FRESH_MS: i64 = 10_000;
+
+/// Whether a grant probes a phone again: its last probe, which found it `was`, is `age_ms` old.
+/// One that is ready is believed for [GRANT_FRESH_MS]; one that is not is always probed, so a
+/// request sees the phone its owner has just unlocked.
+pub fn probe_again(was: Readiness, age_ms: i64) -> bool {
+    was != Readiness::Ready || age_ms > GRANT_FRESH_MS
+}
+
+/// How long before its [GRANT_FRESH_MS] are up a grant's refresh probes a ready phone again,
+/// so that the probe is still fresh when the grant reads it.
+pub const GRANT_MARGIN_MS: i64 = 2_000;
+
+/// Whether a grant's refresh probes a phone again: as [probe_again], and a ready one already
+/// once its probe, `age_ms` old, is due within [GRANT_MARGIN_MS].
+pub fn refresh_again(was: Readiness, age_ms: i64) -> bool {
+    probe_again(was, age_ms.saturating_add(GRANT_MARGIN_MS))
+}
+
+/// What a grant takes a phone to be: `state` is how adb shows it now, `probed` what the last
+/// probe of it found and that probe's age in ms, when one was made since adb has shown it so.
+/// A phone adb can't use is what adb says, whatever was probed before; one it can use is what
+/// its probe found, or offline before any. None: a ready probe more than [GRANT_FRESH_MS] old,
+/// which the grant has made again before it believes the phone ready.
+pub fn for_grant(state: &str, probed: Option<(Readiness, i64)>) -> Option<Readiness> {
+    if state != "device" {
+        return Some(judge(&Probe {
+            state: state.to_owned(),
+            stay_on: None,
+            battery: None,
+            power: None,
+            lock: None,
+        }));
+    }
+    match probed {
+        None => Some(Readiness::Offline),
+        Some((Readiness::Ready, age_ms)) if probe_again(Readiness::Ready, age_ms) => None,
+        Some((readiness, _)) => Some(readiness),
+    }
+}
+
 /// What a phone is, as far as running unattended goes. Serialized as its [`Readiness::word`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
