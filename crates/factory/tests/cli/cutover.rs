@@ -350,7 +350,7 @@ fn after_the_cutover_devlab_on_path_passes_every_golden_transcript() {
             .collect()
     });
 
-    assert_eq!(transcript::ALL.len(), 16);
+    assert_eq!(transcript::ALL.len(), 17);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 

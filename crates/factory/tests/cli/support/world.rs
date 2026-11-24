@@ -89,7 +89,7 @@ impl World {
     ///   `stay_on_while_plugged_in`, is changed on it,
     /// - `power <serial> AC|USB|Wireless`: the power source it is on,
     /// - `stall <serial>`: the emulator never finishes booting,
-    /// - `break <operation>` / `mend <operation>`: `supabase start` or `systemd-run` fails,
+    /// - `break <operation>` / `mend <operation>`: `supabase start`, `supabase stop` or `systemd-run` fails,
     ///   or works again.
     pub fn apply(&self, step: &str) -> Result<(), String> {
         let words: Vec<&str> = step.split_whitespace().collect();

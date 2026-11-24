@@ -15,7 +15,9 @@ Some record behaviour the owner chose to change from today's devlab (#38), so re
 today's devlab shows the difference: `cli-usage` (other negative waits are refused, and help names the
 daemon as the watcher, not a systemd unit), `devices-emulator-failure` (an emulator that fails to boot, exit 77,
 gives its lease back: `devlab env` then exits 4) and `slots-release` (`devlab gc` reports only the leases it freed
-itself, not those the daemon freed first). `slots-wait-default` is parity regained: `--wait -1`
+itself, not those the daemon freed first). `devices-run-lease-end` (#53): a run gives back the
+lease it made when its command ends, unless `--keep`, where today's devlab kept it; `cli-usage`'s
+help says so. `slots-wait-default` is parity regained: `--wait -1`
 is the configured default wait, as in today's devlab, so the call queues.
 
 ## Replaying

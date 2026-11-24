@@ -127,7 +127,8 @@ pub fn gc(
 }
 
 /// Turns reservation `id` of `project` into a lease of `worktree` for `owner`, when there is
-/// such a reservation: the slot it held, held by the new lease now. The caller claims the slot.
+/// such a reservation: the slot it held, held by the new lease now, and the reservation as it
+/// was. The caller claims the slot.
 pub fn claim(
     c: &Connection,
     id: i64,
@@ -135,7 +136,7 @@ pub fn claim(
     worktree: &str,
     owner: &Owner,
     now: i64,
-) -> rusqlite::Result<Option<Lease>> {
+) -> rusqlite::Result<Option<(Lease, Reservation)>> {
     let Some(r) = all(c)?
         .into_iter()
         .find(|r| r.id == id && r.project == project)
@@ -143,7 +144,37 @@ pub fn claim(
         return Ok(None);
     };
     c.execute("DELETE FROM reservations WHERE id = ?1", [r.id])?;
-    store::insert_lease(c, Some(project), worktree, owner, Some(r.slot), now).map(Some)
+    let lease = store::insert_lease(c, Some(project), worktree, owner, Some(r.slot), now)?;
+    Ok(Some((lease, r)))
+}
+
+/// Puts back reservation `r` that a lease was made from, under its own id, once that lease
+/// ended: its slot is spoken for again. A slot a lease or another reservation holds by then
+/// stays as it is.
+pub fn restore(c: &Connection, r: &Reservation) -> rusqlite::Result<()> {
+    let put = c.execute(
+        "INSERT OR IGNORE INTO reservations
+           (id, project, slot, worktree, owner_pid, owner_start, owner_label, created)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+         WHERE NOT EXISTS (SELECT 1 FROM leases WHERE project = ?2 AND slot = ?3)",
+        params![
+            r.id,
+            r.project,
+            r.slot,
+            r.worktree,
+            r.owner_pid,
+            r.owner_start,
+            r.owner_label,
+            r.created
+        ],
+    )?;
+    if put > 0 {
+        c.execute(
+            "UPDATE slots SET idle_since = NULL WHERE project = ?1 AND slot = ?2",
+            params![r.project, r.slot],
+        )?;
+    }
+    Ok(())
 }
 
 /// Records how long a lease ran, for the ETAs of its project.

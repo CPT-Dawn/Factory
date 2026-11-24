@@ -46,9 +46,9 @@ use super::reservations;
 use super::store::{self, RunRow, Store};
 use super::wire::{
     AcquireParams, Board, DeviceAsk, DeviceLine, FindParams, GC, Granted, LEASE, Lease,
-    LeaseDevice, Process, ProjectAsk, RECEIVED, RELEASE, RUN_END, RUN_END_ID, RUN_START,
-    ReleaseParams, RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING, SlotParams, StopParams,
-    UNRESERVE, Waiter,
+    LeaseDevice, Owner, Process, ProjectAsk, RECEIVED, RELEASE, RUN_END, RUN_END_ID, RUN_START,
+    RUN_STOPPING, ReleaseParams, Released, Reservation, RunAsk, RunEnd, RunResume, SLOT, STATUS,
+    STOPPING, SlotParams, StopParams, UNRESERVE, Waiter,
 };
 use super::{android, host};
 use crate::ledger::Ledger;
@@ -209,7 +209,7 @@ impl Lab {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = now();
-        let (freed, unreserved, unstopped, orphans, out) = store
+        let (freed, unreserved, unstopped, (orphans, ended), out) = store
             .write(|c| {
                 let (freed, unreserved) = store::gc(c, now, &host::alive)?;
                 let unstopped = store::clear_dead_stoppers(c, &host::alive)?;
@@ -223,11 +223,15 @@ impl Lab {
                 )?;
                 let orphans =
                     store::take_orphan_runs(c, &|id| attached.contains(&id), &host::alive)?;
+                let mut ended = Vec::new();
+                for run in &orphans {
+                    ended.extend(store::end_run_lease(c, run.id, now)?);
+                }
                 Ok((
                     freed,
                     unreserved,
                     unstopped + pruned,
-                    orphans,
+                    (orphans, ended),
                     work(c, now)?,
                 ))
             })
@@ -254,9 +258,10 @@ impl Lab {
             .map(|l| format!("lease {} ({}, owner exited)", l.id, l.owner_label))
             .chain(unreserved)
             .collect();
-        if !lines.is_empty() || unstopped > 0 {
+        if !lines.is_empty() || unstopped > 0 || !ended.is_empty() {
             self.notify();
         }
+        let freed: Vec<Lease> = freed.into_iter().chain(ended).collect();
         if !freed.is_empty() {
             keeper::take_back_reverses_on_thread(self.attached.borrow().clone(), freed);
         }
@@ -447,36 +452,75 @@ fn state_of<'a>(seen: &'a [Attached], serial: &str) -> Option<&'a str> {
         .map(|a| a.state.as_str())
 }
 
-fn release(lab: &Lab, p: ReleaseParams) -> Answer<Option<Lease>> {
-    let (dropped, unstopped) = lab.write(|c, now| {
+fn release(lab: &Lab, p: ReleaseParams) -> Answer<Released> {
+    let released = lab.write(|c, now| {
         let f = &p.find;
-        let lease = store::find_lease(c, &f.worktree, &f.owner, f.lease)?;
-        if let Some(lease) = &lease {
+        let mine = |l: &Lease| held_by(l, &f.owner);
+        let dropped = if p.all {
+            store::leases(c)?.into_iter().filter(mine).collect()
+        } else {
+            match own_lease(c, f)? {
+                Ok(found) => found.into_iter().collect(),
+                Err(refused) => return Ok(Err(refused)),
+            }
+        };
+        for lease in &dropped {
             store::drop_lease(c, lease, now)?;
         }
         let unstopped = match &p.stopper {
             Some(stopper) => store::clear_stopping(c, stopper)?,
             None => 0,
         };
-        Ok((lease, unstopped))
+        let still_held = store::leases(c)?.into_iter().filter(mine).collect();
+        Ok(Ok((
+            Released {
+                dropped,
+                still_held,
+            },
+            unstopped,
+        )))
     })?;
-    if dropped.is_some() || unstopped > 0 {
+    let (released, unstopped) = released?;
+    if !released.dropped.is_empty() || unstopped > 0 {
         lab.notify();
     }
-    if let Some(lease) = &dropped {
-        keeper::take_back_reverses(
-            lab.attached.borrow().clone().as_deref(),
-            std::slice::from_ref(lease),
-        );
+    keeper::take_back_reverses(lab.attached.borrow().clone().as_deref(), &released.dropped);
+    Ok(released)
+}
+
+fn held_by(lease: &Lease, owner: &Owner) -> bool {
+    lease.owner_pid == owner.pid && lease.owner_start == owner.start
+}
+
+/// The caller's lease, found as `find_lease` does; a lease named by id that another owner holds
+/// is refused instead.
+fn own_lease(c: &Connection, f: &FindParams) -> rusqlite::Result<Result<Option<Lease>, ErrorBody>> {
+    let lease = store::find_lease(c, &f.worktree, &f.owner, f.lease)?;
+    Ok(match lease {
+        Some(lease) if f.lease.is_some() && !held_by(&lease, &f.owner) => Err(not_yours(&lease)),
+        found => Ok(found),
+    })
+}
+
+/// The refusal of a lease named by id that another owner holds.
+fn not_yours(lease: &Lease) -> ErrorBody {
+    ErrorBody {
+        code: Exit::NoLease.code(),
+        message: format!(
+            "lease {} belongs to {} ({}), not to you: it stays held; ask its owner to release it",
+            lease.id, lease.owner_label, lease.worktree
+        ),
     }
-    Ok(dropped)
 }
 
 /// The caller's lease, its slot marked as stopping for `p.stopper`.
 fn stopping(lab: &Lab, p: StopParams) -> Answer<Option<Lease>> {
     lab.write(|c, _| {
         let f = &p.find;
-        let lease = store::find_lease(c, &f.worktree, &f.owner, f.lease)?;
+        let lease = match own_lease(c, f)? {
+            Ok(lease) => lease,
+            Err(refused) => return Ok(Err(refused)),
+        };
         if let Some(Lease {
             project: Some(project),
             slot: Some(slot),
@@ -485,8 +529,8 @@ fn stopping(lab: &Lab, p: StopParams) -> Answer<Option<Lease>> {
         {
             store::mark_stopping(c, project, *slot, &p.stopper)?;
         }
-        Ok(lease)
-    })
+        Ok(Ok(lease))
+    })?
 }
 
 fn status(lab: &Lab, seen: &[Attached]) -> Answer<Board> {
@@ -760,6 +804,7 @@ fn fresh_run(p: &AcquireParams, id: i64) -> RunRow {
     let ask = p.run.clone().unwrap_or(RunAsk {
         command: String::new(),
         session: None,
+        keep: false,
     });
     RunRow {
         id,
@@ -862,6 +907,21 @@ fn grant_board(
     })
 }
 
+/// A run's request (its run kept under the waiter's id) gets lease `lease`, new to it: the lease
+/// ends with the run unless the run keeps it (`--keep`). `from`: the reservation it was made from.
+fn ends_with_run(
+    c: &Connection,
+    p: &AcquireParams,
+    waiter: i64,
+    lease: &Lease,
+    from: Option<&Reservation>,
+) -> rusqlite::Result<()> {
+    match &p.run {
+        Some(run) if !run.keep => store::end_with_run(c, waiter, lease.id, from),
+        _ => Ok(()),
+    }
+}
+
 /// The lease granted, or why the request waits.
 fn try_grant(
     lab: &Lab,
@@ -874,14 +934,16 @@ fn try_grant(
         // A reservation of the caller's project is used once: it becomes the caller's lease,
         // without a turn in the queue. One that is gone (used, released or its lead exited)
         // asks for a slot the normal way.
-        let mut claimed = false;
+        let mut claimed = None;
         if lease.is_none()
             && let (Some(id), Some(project)) = (p.reservation, &p.project)
+            && let Some((made, from)) =
+                reservations::claim(c, id, &project.name, &p.worktree, &p.owner, now)?
         {
-            lease = reservations::claim(c, id, &project.name, &p.worktree, &p.owner, now)?;
-            claimed = lease.is_some();
+            lease = Some(made);
+            claimed = Some(from);
         }
-        if claimed
+        if claimed.is_some()
             && p.devices.is_none()
             && let (Some(lease), Some(project)) = (&lease, &p.project)
         {
@@ -891,6 +953,7 @@ fn try_grant(
             };
             store::touch(c, lease.id, now)?;
             store::delete_waiter(c, waiter)?;
+            ends_with_run(c, p, waiter, lease, claimed.as_ref())?;
             return Ok(Ok(Taken {
                 granted: Granted {
                     lease: lease.clone(),
@@ -929,7 +992,9 @@ fn try_grant(
             Decision::Wait(why) => return Ok(Err(why)),
             Decision::Grant { slot, new } => (slot, new),
         };
-        let fresh = new || lease.is_none() || claimed;
+        let fresh = new || lease.is_none() || claimed.is_some();
+        // The slot goes back to the reservation only from the lease it was made into.
+        let from = claimed.filter(|_| !new);
         let lease = match lease {
             Some(lease) if !new => lease,
             _ => store::insert_lease(
@@ -945,6 +1010,9 @@ fn try_grant(
             (Some(project), Some(slot)) => store::claim_slot(c, &project.name, slot, &p.worktree)?,
             _ => None,
         };
+        if fresh {
+            ends_with_run(c, p, waiter, &lease, from.as_ref())?;
+        }
         let (mut boots, mut phones, mut reused) = (Vec::new(), Vec::new(), Vec::new());
         if let (Some(Planned { plan, used }), Some(ask)) = (planned, &p.devices) {
             for serial in &plan.phones {
@@ -1705,6 +1773,9 @@ impl Run {
     {
         tokio::pin!(stopping);
         let mut first = first;
+        // A signal stopped devlab while its command runs: the run's end, should the connection
+        // close before devlab says the command is gone.
+        let mut stopped: Option<RunEnd> = None;
         loop {
             let line = match first.take() {
                 Some(line) => line,
@@ -1712,6 +1783,10 @@ impl Run {
                     line = lines.next_line() => match line {
                         Ok(Some(line)) => line,
                         _ => {
+                            if let Some(end) = stopped {
+                                self.record(end.outcome, &end.phase).await;
+                                return;
+                            }
                             let phase = if self.row.started_ms.is_some() {
                                 Phase::Running
                             } else {
@@ -1742,6 +1817,10 @@ impl Run {
                 }
                 return;
             }
+            if request.method == RUN_STOPPING {
+                stopped = serde_json::from_value(request.params).ok().or(stopped);
+                continue;
+            }
             if request.method == RUN_START && self.row.started_ms.is_none() {
                 let ms = now_ms();
                 self.row.started_ms = Some(ms);
@@ -1757,9 +1836,25 @@ impl Run {
     async fn record(&self, outcome: String, phase: &str) {
         if self.kept {
             let (lab, id) = (Arc::clone(&self.lab), self.row.id);
-            let taken = blocking(move || lab.write(|c, _| store::take_run(c, id))).await;
-            if matches!(taken, Ok(None)) {
-                return;
+            let taken = blocking(move || {
+                lab.write(|c, now| {
+                    let Some(run) = store::take_run(c, id)? else {
+                        return Ok(None);
+                    };
+                    Ok(Some((run, store::end_run_lease(c, id, now)?)))
+                })
+            })
+            .await;
+            match taken {
+                Ok(None) => return,
+                Ok(Some((_, Some(ended)))) => {
+                    self.lab.notify();
+                    keeper::take_back_reverses_on_thread(
+                        self.lab.attached.borrow().clone(),
+                        vec![ended],
+                    );
+                }
+                _ => {}
             }
         }
         let (ledger, row, phase) = (

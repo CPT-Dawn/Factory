@@ -47,7 +47,7 @@ $ b@demo-c devlab status
 1> memory <mem> GB free; watcher active
 ? 0
 $ a@demo-a devlab release
-2> devlab: released lease 1
+2> devlab: released lease 1 (<sandbox>/wt/demo-a)
 ? 0
 wait later
 1> export DEVLAB_PROJECT=demo

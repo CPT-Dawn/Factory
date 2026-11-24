@@ -5,10 +5,15 @@ $ a@plain-a devlab
 1> Agents: lease before touching adb, an emulator or a local stack; never pick a serial or port yourself.
 1>   devlab run [opts] -- <cmd...>   lease (or reuse this worktree's lease), then run cmd with its env:
 1>                                   ANDROID_SERIAL, DEVLAB_SERIALS, slot ports, SUPABASE_URL, ...
+1>                                   A lease the run made ends when cmd does, whatever its exit or
+1>                                   signal (a reserved slot goes back to its reservation); a lease
+1>                                   it found (from acquire or run --keep) stays.
 1>   devlab acquire [opts]           lease and print the env as export lines: eval "$(devlab acquire)"
 1>   devlab env                      print the current lease's export lines
 1>   devlab exec -- <cmd...>         run cmd in the current lease (fails fast if a device was unplugged)
-1>   devlab release [--stop-stack]   give everything back (also automatic when the agent exits)
+1>   devlab release [--stop-stack]   give back this worktree's lease and list your others still held
+1>   devlab release --lease <id>     give back that lease of yours from any folder (also: DEVLAB_LEASE)
+1>   devlab release --all-mine       give back every lease of yours (leases also end when the agent exits)
 1>   devlab status [--json]          devices, holders, stack slots, queue, memory
 1>   devlab check [serial...]        can each phone run unattended, and what to do if not (exit 10)
 1>
@@ -19,6 +24,7 @@ $ a@plain-a devlab
 1>   --stack        start the slot's local stack too (quiet; log path on failure)
 1>   --wait SEC     how long to queue for a free device or slot (default 480); 0 = do not wait;
 1>                  seconds, or 90s, 9m or 1h
+1>   --keep         run only: keep the lease the run made once cmd ends (devlab release ends it)
 1>
 1> A lease belongs to the calling agent (or your terminal) and this worktree; every command from the
 1> same agent in the same worktree finds it again. Subagents count as their lead: one owner may hold at
@@ -40,10 +46,15 @@ $ a@plain-a devlab help
 1> Agents: lease before touching adb, an emulator or a local stack; never pick a serial or port yourself.
 1>   devlab run [opts] -- <cmd...>   lease (or reuse this worktree's lease), then run cmd with its env:
 1>                                   ANDROID_SERIAL, DEVLAB_SERIALS, slot ports, SUPABASE_URL, ...
+1>                                   A lease the run made ends when cmd does, whatever its exit or
+1>                                   signal (a reserved slot goes back to its reservation); a lease
+1>                                   it found (from acquire or run --keep) stays.
 1>   devlab acquire [opts]           lease and print the env as export lines: eval "$(devlab acquire)"
 1>   devlab env                      print the current lease's export lines
 1>   devlab exec -- <cmd...>         run cmd in the current lease (fails fast if a device was unplugged)
-1>   devlab release [--stop-stack]   give everything back (also automatic when the agent exits)
+1>   devlab release [--stop-stack]   give back this worktree's lease and list your others still held
+1>   devlab release --lease <id>     give back that lease of yours from any folder (also: DEVLAB_LEASE)
+1>   devlab release --all-mine       give back every lease of yours (leases also end when the agent exits)
 1>   devlab status [--json]          devices, holders, stack slots, queue, memory
 1>   devlab check [serial...]        can each phone run unattended, and what to do if not (exit 10)
 1>
@@ -54,6 +65,7 @@ $ a@plain-a devlab help
 1>   --stack        start the slot's local stack too (quiet; log path on failure)
 1>   --wait SEC     how long to queue for a free device or slot (default 480); 0 = do not wait;
 1>                  seconds, or 90s, 9m or 1h
+1>   --keep         run only: keep the lease the run made once cmd ends (devlab release ends it)
 1>
 1> A lease belongs to the calling agent (or your terminal) and this worktree; every command from the
 1> same agent in the same worktree finds it again. Subagents count as their lead: one owner may hold at
