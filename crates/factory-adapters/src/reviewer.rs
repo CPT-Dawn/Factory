@@ -344,14 +344,14 @@ impl Agy {
         cmd.args(["-p", "/usage", "--output-format", "json"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let unready = |why: String| ReviewerError::NoUsage(format!("its usage query {why}"));
-        let output = process::run(cmd, AGY_CHECK_TIMEOUT).map_err(|e| unready(e.to_string()))?;
+        let no_usage = |why: String| ReviewerError::NoUsage(format!("its usage query {why}"));
+        let output = process::run(cmd, AGY_CHECK_TIMEOUT).map_err(|e| no_usage(e.to_string()))?;
         if !output.status.success() {
             let code = output
                 .status
                 .code()
                 .map_or("by a signal".to_owned(), |code| code.to_string());
-            return Err(unready(format!("exited {code}")));
+            return Err(no_usage(format!("exited {code}")));
         }
         let usage = String::from_utf8_lossy(&output.stdout).into_owned();
         // A cache that can't be written only costs the next review another query. It is
