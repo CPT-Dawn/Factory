@@ -220,7 +220,7 @@ pub fn waiting(c: &Connection, waiter: i64, why: &str) -> rusqlite::Result<()> {
 
 /// The `lab-wait` of waiter `waiter`, which asked for `asked` and ends its wait now (`now`,
 /// in seconds): granted, or given up. Its reason is `why`, else the last it waited for
-/// ([`waiting`]), which is forgotten.
+/// ([`waiting`]), kept until the request is gone: a grant handed over after a restart says it too.
 pub fn wait_event(
     c: &Connection,
     waiter: i64,
@@ -243,7 +243,6 @@ pub fn wait_event(
             |row| row.get(0),
         )
         .optional()?;
-    c.execute("DELETE FROM wait_reasons WHERE waiter = ?1", [waiter])?;
     let why = why.map(str::to_owned).or(kept).unwrap_or_default();
     let seconds = u64::try_from(now.saturating_sub(created.unwrap_or(now))).unwrap_or(0);
     Ok(if granted {

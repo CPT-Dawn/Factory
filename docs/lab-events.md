@@ -32,8 +32,9 @@ and counts, never its text.
 | `lab-reclaim` | `lease`, `kind`, `model`, `idle_minutes`, `waiter` (the oldest waiter short of that kind, whom the queue serves first: join it to that waiter's `lab-wait`) |
 | `lab-readiness` | `model`, `phone` (short id), `from` (`none` when first seen), `to`, `notified=true|false` (the change earned a notification and notifications are on; whether notify-send then delivered it is in the daemon's log) |
 
-The last reason a request waited for is kept in `lab.db`, so a wait that runs out across a
-daemon restart still says what it waited for. A lease granted before its clock was kept counts
+The last reason a request waited for is kept in `lab.db` until the request is gone, so a wait
+that runs out across a daemon restart, or a grant handed over after one, still says what it
+waited for. A lease granted before its clock was kept counts
 from when it was made, and the commands run on it from the first one this daemon saw.
 
 A reclaim takes a device from a lease and leaves the lease held, so `lab-reclaim` is the record

@@ -1867,10 +1867,17 @@ pub async fn acquire<W, R, S>(
             granted,
         }) => {
             let _attached = Present(Arc::clone(&lab), waiter);
-            // Its grant was never handed over: it is told now, waited until now.
+            // Its grant was never handed over: it is told now, waited until now, for the
+            // reason it last waited for. One the store can't say is not told, not told empty.
             let waited = lab
                 .write(|c, now| events::wait_event(c, waiter, &asked(&p), true, None, now))
-                .unwrap_or_default();
+                .map_err(|e| {
+                    eprintln!(
+                        "factory: lab: cannot read the wait of request {waiter}: {}; its lab-wait is not written",
+                        e.message
+                    );
+                })
+                .ok();
             let place = (waiter, *granted, true);
             deliver(
                 &lab,
@@ -1995,7 +2002,7 @@ pub async fn acquire<W, R, S>(
                 );
                 let lease = taken.granted.lease.clone();
                 let from = taken.from.clone();
-                let waited = taken.waited.clone();
+                let waited = Some(taken.waited.clone());
                 match settle(&lab, &p, taken, writer, id).await {
                     Ok(lease) => {
                         let granted = Granted {
@@ -2164,7 +2171,7 @@ async fn deliver<W, R, S>(
     writer: &mut W,
     lines: &mut Lines<R>,
     id: Option<u64>,
-    ((waiter, granted, fresh), waited): ((i64, Granted, bool), Fields),
+    ((waiter, granted, fresh), waited): ((i64, Granted, bool), Option<Fields>),
     run: Option<Run>,
     mut stopping: Pin<&mut S>,
 ) where
@@ -2183,7 +2190,7 @@ async fn deliver<W, R, S>(
     )
     .await;
     // The caller has its grant: only now was the request granted.
-    if matches!(receipt, Receipt::Received { .. }) {
+    if let (Receipt::Received { .. }, Some(waited)) = (&receipt, waited) {
         lab.log("lab-wait", waited);
     }
     let Some(mut run) = run else { return };

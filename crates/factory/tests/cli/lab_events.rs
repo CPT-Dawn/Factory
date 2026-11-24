@@ -318,6 +318,12 @@ fn a_grant_handed_over_after_a_restart_says_the_last_reason_its_wait_had() {
     let (second, queued) = ask(&sandbox, &wt, b.pid(), caller.pid(), "queued");
     assert!(queued["queued"].is_i64(), "{queued}");
 
+    // It has waited for its slot, and said so, before the slot is free.
+    let note = next_with(&second, "note");
+    assert!(
+        note.to_string().contains("slots of solo are held"),
+        "{note}"
+    );
     // The holder leaves, the place goes to b, and the daemon stops before b says it has it.
     a.exit();
     let granted = next_with(&second, "result");
@@ -332,8 +338,7 @@ fn a_grant_handed_over_after_a_restart_says_the_last_reason_its_wait_had() {
     let grants = await_events(&sandbox, "lab-wait", 2, |e| e["action"] == "granted");
     assert_eq!(grants.len(), 2, "{grants:?}");
     let resumed = &grants[1];
-    assert_eq!(resumed["wait"], "slot-cap", "{resumed}");
-    assert_eq!(resumed["cap"], 1, "{resumed}");
+    assert_eq!(resumed["wait"], "slots", "{resumed}");
     assert!(resumed["seconds"].is_u64(), "{resumed}");
 }
 

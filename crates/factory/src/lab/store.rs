@@ -670,6 +670,8 @@ pub fn prune_waiters(
 
 /// Whether there was such a waiter.
 pub fn delete_waiter(c: &Connection, id: i64) -> rusqlite::Result<bool> {
+    // What it last waited for goes with it.
+    c.execute("DELETE FROM wait_reasons WHERE waiter = ?1", [id])?;
     Ok(c.execute("DELETE FROM waiters WHERE id = ?1", [id])? > 0)
 }
 
