@@ -1,6 +1,7 @@
 # A run gives back the lease it made when its command ends (#53): owner b gets the phone at once
 # that owner a's run used. A run --keep keeps its lease for the next exec,
-# and a run in a lease it found (here acquire's) leaves it for the next exec too.
+# and a run in a lease it found (here acquire's) leaves it for the next exec too. A run whose
+# command fails, or a signal kills, gives its lease back all the same.
 plug FAKEPHONE01 device usb:1-1 product:shiba model:Pixel_8 device:shiba transport_id:1
 $ a@plain-a devlab run --phone -- true
 2> devlab: lease 1, phone FAKEPHONE01 (Pixel 8)
@@ -35,4 +36,29 @@ $ a@plain-a devlab run -- true
 2> devlab: lease 4, phone FAKEPHONE01 (Pixel 8)
 ? 0
 $ a@plain-a devlab exec -- true
+? 0
+$ a@plain-a devlab release
+2> devlab: released lease 4
+? 0
+$ a@plain-a devlab run --phone --quiet -- sh -c 'exit 3'
+? 3
+$ b@plain-b devlab acquire --phone --wait 0 --quiet
+1> export DEVLAB_LEASE=6
+1> export ANDROID_SERIAL=FAKEPHONE01
+1> export DEVLAB_SERIALS=FAKEPHONE01
+1> export DEVLAB_KINDS=phone
+1> export DEVLAB_ABIS=arm64-v8a
+? 0
+$ b@plain-b devlab release
+2> devlab: released lease 6
+? 0
+$ a@plain-a devlab run --phone --quiet -- sh -c 'kill -KILL $$'
+2> devlab: sh killed by SIGKILL after <n> s
+? 137
+$ b@plain-b devlab acquire --phone --wait 0 --quiet
+1> export DEVLAB_LEASE=8
+1> export ANDROID_SERIAL=FAKEPHONE01
+1> export DEVLAB_SERIALS=FAKEPHONE01
+1> export DEVLAB_KINDS=phone
+1> export DEVLAB_ABIS=arm64-v8a
 ? 0

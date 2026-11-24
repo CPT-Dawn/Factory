@@ -25,6 +25,11 @@ pub const RUN_START: &str = "lab.run.start";
 /// of the queue, and the acquire is answered with an error. Sent as [`RUN_END_ID`] once the run
 /// has its grant, it is answered `true` once recorded; sent as a notification, it is not.
 pub const RUN_END: &str = "lab.run.end";
+/// A notification on a run's connection, unanswered: a signal stopped devlab while its command
+/// runs, [`RunEnd`] saying how. The command, still running, keeps the run's lease until
+/// [`RUN_END`] says it is gone; a connection that closes before then is recorded with this end,
+/// not `lost`.
+pub const RUN_STOPPING: &str = "lab.run.stopping";
 /// Picks up the run of a devlab process whose daemon went away: [`RunResume`] in, `true` out
 /// once the daemon follows it on this connection, as it did on the acquire's. A run the daemon
 /// doesn't keep, or that another connection follows, is refused.

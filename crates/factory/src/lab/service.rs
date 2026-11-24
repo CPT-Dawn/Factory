@@ -46,8 +46,8 @@ use super::store::{self, RunRow, Store};
 use super::wire::{
     AcquireParams, Board, DeviceAsk, DeviceLine, FindParams, GC, Granted, LEASE, Lease,
     LeaseDevice, Process, ProjectAsk, RECEIVED, RELEASE, RUN_END, RUN_END_ID, RUN_START,
-    ReleaseParams, Reservation, RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING, SlotParams,
-    StopParams, UNRESERVE, Waiter,
+    RUN_STOPPING, ReleaseParams, Reservation, RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING,
+    SlotParams, StopParams, UNRESERVE, Waiter,
 };
 use super::{android, host};
 use crate::ledger::Ledger;
@@ -1726,6 +1726,9 @@ impl Run {
     {
         tokio::pin!(stopping);
         let mut first = first;
+        // A signal stopped devlab while its command runs: the run's end, should the connection
+        // close before devlab says the command is gone.
+        let mut stopped: Option<RunEnd> = None;
         loop {
             let line = match first.take() {
                 Some(line) => line,
@@ -1733,6 +1736,10 @@ impl Run {
                     line = lines.next_line() => match line {
                         Ok(Some(line)) => line,
                         _ => {
+                            if let Some(end) = stopped {
+                                self.record(end.outcome, &end.phase).await;
+                                return;
+                            }
                             let phase = if self.row.started_ms.is_some() {
                                 Phase::Running
                             } else {
@@ -1762,6 +1769,10 @@ impl Run {
                     .await;
                 }
                 return;
+            }
+            if request.method == RUN_STOPPING {
+                stopped = serde_json::from_value(request.params).ok().or(stopped);
+                continue;
             }
             if request.method == RUN_START && self.row.started_ms.is_none() {
                 let ms = now_ms();

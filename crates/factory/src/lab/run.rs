@@ -38,7 +38,7 @@ use super::context::Ctx;
 use super::lease::{self, apply_reverses, lease_env, me, wake};
 use super::wire::{
     ACQUIRE, AcquireParams, Granted, Lease, RECEIVED, RUN_END, RUN_END_ID, RUN_RESUME, RUN_START,
-    RunAsk, RunEnd, RunResume,
+    RUN_STOPPING, RunAsk, RunEnd, RunResume,
 };
 use crate::client::{self, Session};
 use crate::output::Failure;
@@ -153,8 +153,10 @@ pub fn run(
     let waited = wait_for(child);
     let mut state = watch.lock();
     if let Some(signal) = state.stopped {
+        state.child = None;
         drop(state);
-        watch.settle();
+        // Only once the command is gone does the run end, and its lease with it (#53).
+        watch.end(End::Stopped(signal), Phase::Running);
         return Ok(signal_code(signal));
     }
     let since = state.child.take().map_or_else(Instant::now, |c| c.since);
@@ -418,6 +420,8 @@ fn keep(state: &(Mutex<State>, Condvar), session: Session, paths: &Paths) {
         }
         if let Some((end, phase)) = s.end {
             send_end(s.link.as_ref(), end, phase);
+        } else if let (Some(signal), Some(_)) = (s.stopped, &s.child) {
+            send_stopping(s.link.as_ref(), signal);
         }
         drop(s);
         reader = session.into_reader();
@@ -433,7 +437,8 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 }
 
 /// devlab got `signal`: it says so before anything else. While the command runs, the command
-/// gets the signal too, and the main thread exits once it is gone; while queued, the run leaves
+/// gets the signal too, the daemon hears the run is stopping, and the main thread ends the run
+/// and exits once the command is gone (the lease is held until then); while queued, the run leaves
 /// the queue, and exits when the daemon has taken it out, or after [`LEAVE_GRACE`]. Once the
 /// command is over, it only cuts short the wait for the daemon to record the run's end.
 fn stopped(
@@ -468,8 +473,7 @@ fn stopped(
             let _ = pidfd_send_signal(pidfd, sig);
         }
         if first {
-            send_end(s.link.as_ref(), End::Stopped(signal), Phase::Running);
-            s.end = Some((End::Stopped(signal), Phase::Running));
+            send_stopping(s.link.as_ref(), signal);
         }
         return;
     }
@@ -486,6 +490,20 @@ fn stopped(
     drop(s);
     thread::sleep(LEAVE_GRACE);
     std::process::exit(i32::from(signal_code(signal)));
+}
+
+/// Tells the daemon a signal stopped devlab while its command runs: the run's end, should
+/// devlab be killed before the command is gone.
+fn send_stopping(link: Option<&UnixStream>, signal: i32) {
+    notify(
+        link,
+        0,
+        RUN_STOPPING,
+        &RunEnd {
+            outcome: End::Stopped(signal).outcome(),
+            phase: Phase::Running.word().to_owned(),
+        },
+    );
 }
 
 fn send_end(link: Option<&UnixStream>, end: End, phase: Phase) {

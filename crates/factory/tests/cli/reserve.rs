@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::{Child, Command};
 
 use crate::lab::{await_waiter, devlab, lab, stop_daemon, write_machine_config};
-use crate::support::world::World;
+use crate::support::world::{World, poll_until};
 use crate::support::{Run, Sandbox, finish, run, spawn};
 
 /// A long-lived process standing in for an agent: the owner of what its calls lease.
@@ -259,6 +259,53 @@ fn a_run_gives_its_slot_back_to_the_reservation_it_came_from_for_the_next_run() 
         "{second:?}"
     );
     assert!(!second.stderr.contains("waiting:"), "{second:?}");
+}
+
+#[test]
+fn a_run_whose_owner_exits_still_gives_its_slot_back_to_the_reservation() {
+    let (sandbox, world) = lab();
+    let (lead, _other, wt) = lead_and_a_full_board(&sandbox, &world);
+    let id = reservation(&as_agent(&sandbox, &wt, &lead, &["reserve"]));
+    let (mut child, dir) = (Agent::new(), world.worktree("demo-child"));
+    let script = "touch started; while [ ! -e go ]; do sleep 0.05; done";
+    let suite = [
+        "run",
+        "--no-device",
+        "--stack",
+        "--quiet",
+        "--",
+        "sh",
+        "-c",
+        script,
+    ];
+    let running = spawn(call(
+        &sandbox,
+        &dir,
+        &child,
+        &[("DEVLAB_RESERVATION", id.as_str())],
+        &suite,
+    ));
+    assert!(
+        poll_until(|| dir.join("started").exists()),
+        "the command never started"
+    );
+
+    // The run's owner exits: the gc ends its lease before the run does.
+    child.exit();
+    assert_eq!(as_agent(&sandbox, &wt, &lead, &["gc"]).code, 0);
+    let status = as_agent(&sandbox, &wt, &lead, &["status"]).stdout;
+    assert!(
+        status.contains(&format!("reserved by {} (reservation {id})", lead.label())),
+        "{status}"
+    );
+
+    std::fs::write(dir.join("go"), "").expect("write go");
+    assert_eq!(finish(running).code, 0);
+    let status = as_agent(&sandbox, &wt, &lead, &["status"]).stdout;
+    assert!(
+        status.contains(&format!("reserved by {} (reservation {id})", lead.label())),
+        "{status}"
+    );
 }
 
 #[test]

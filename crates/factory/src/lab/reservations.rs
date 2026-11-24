@@ -149,12 +149,14 @@ pub fn claim(
 }
 
 /// Puts back reservation `r` that a lease was made from, under its own id, once that lease
-/// ended: its slot is spoken for again. A slot something else holds by then stays as it is.
+/// ended: its slot is spoken for again. A slot a lease or another reservation holds by then
+/// stays as it is.
 pub fn restore(c: &Connection, r: &Reservation) -> rusqlite::Result<()> {
     let put = c.execute(
         "INSERT OR IGNORE INTO reservations
            (id, project, slot, worktree, owner_pid, owner_start, owner_label, created)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+         WHERE NOT EXISTS (SELECT 1 FROM leases WHERE project = ?2 AND slot = ?3)",
         params![
             r.id,
             r.project,
