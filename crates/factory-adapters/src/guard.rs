@@ -91,6 +91,13 @@ fn bus_path(address: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Where `path` lives once its symlinks are followed, since bwrap can't mount on a symlink: the
+/// link reads through the read-only root to the writable mount. A path that isn't there stays
+/// as it is, for a `-try` mount to skip.
+fn real(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// bwrap's arguments up to and including its `--`. Later mounts win, so the read-only root
 /// comes first and what is given back after it.
 fn args(env: &Env, writable: &[&Path]) -> Vec<OsString> {
@@ -117,10 +124,11 @@ fn args(env: &Env, writable: &[&Path]) -> Vec<OsString> {
         mount("--ro-bind-try", Path::new("/dev/null"), Path::new(socket));
     }
     if let Some(runtime) = &env.runtime {
-        args.extend(["--tmpfs".into(), runtime.into()]);
+        args.extend(["--tmpfs".into(), real(runtime).into()]);
     }
     let mut mount = |flag: &str, path: &Path| {
-        args.extend([flag.into(), path.into(), path.into()]);
+        let path = real(path);
+        args.extend([flag.into(), path.clone().into(), path.into()]);
     };
     if let Some(bus) = env.bus() {
         mount("--ro-bind-try", &bus);

@@ -733,6 +733,27 @@ fn with_no_user_namespaces_an_agy_only_chain_refuses_the_review_in_one_line() {
 }
 
 #[test]
+fn agys_state_behind_a_symlink_is_given_back_where_it_lives() {
+    let sandbox = sandboxed();
+    let repo = sandbox.repo();
+    let dotfiles = sandbox.path("home/dotfiles/gemini");
+    fs::create_dir_all(&dotfiles).unwrap();
+    std::os::unix::fs::symlink(&dotfiles, sandbox.path("home/.gemini")).unwrap();
+    sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let runs = guards_of(&sandbox, "agy");
+    let (guard, _) = guarded(&runs[0]);
+    let real = fs::canonicalize(&dotfiles).unwrap().display().to_string();
+    assert!(
+        mounts(guard, "--bind-try").contains(&(real.clone(), real)),
+        "bwrap can't mount on a symlink: {guard:?}"
+    );
+}
+
+#[test]
 fn agy_reviews_from_the_same_subdirectory_of_its_checkout() {
     let sandbox = sandboxed();
     let repo = sandbox.repo();
