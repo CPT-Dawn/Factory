@@ -342,6 +342,18 @@ pub struct Granted {
     pub lease: Lease,
     /// The worktree the slot ran before this grant, if it ran one.
     pub previous: Option<String>,
+    /// The schema the slot's stack last ran, when the daemon has a record of it.
+    #[serde(default)]
+    pub schema: Option<SlotSchema>,
+}
+
+/// The schema a slot's stack last ran, whether or not it runs now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotSchema {
+    /// The worktree whose lease last started the slot's stack.
+    pub worktree: String,
+    /// That worktree's newest migration when the record was made, if it had one.
+    pub head: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

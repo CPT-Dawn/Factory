@@ -19,7 +19,7 @@ use super::cli::{self, HELP, Stack};
 use super::context::{Ctx, context, release_context};
 use super::lease::Target;
 use super::wire::{Board, Lease, Released};
-use super::{lease, reserve, run, status};
+use super::{check, lease, reserve, run, status};
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 
@@ -69,7 +69,7 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
             let file = save("help.txt", HELP)?;
             Done::new(
                 format!(
-                    "factory lab: acquire, run, exec, env, release, stack, status, gc, reserve, prep, watch; usage in {}",
+                    "factory lab: acquire, run, exec, env, release, stack, status, check, gc, reserve, prep, watch; usage in {}",
                     file.display()
                 ),
                 json!({ "help": HELP, "helpFile": file }),
@@ -152,6 +152,10 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
                 }
             }
         }
+        "check" => {
+            let phones = check::phones(args)?;
+            return Ok(Verb::Ran(check_done(&phones)?, check::code(&phones)));
+        }
         "prep" => prep_done(&cli::prep(&context()?, args)?)?,
         "watch" => Done::new(cli::WATCH, json!({ "watcher": "daemon" })),
         other => {
@@ -161,6 +165,26 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
         }
     };
     Ok(Verb::Done(done))
+}
+
+/// devlab's line for one phone; for more, how many are ready, the file holding the line of each;
+/// every phone as JSON. The exit says whether all are ready.
+fn check_done(phones: &[check::PhoneCheck]) -> Result<Done, Failure> {
+    let mut json = check::to_json(phones);
+    let line = match check::lines(phones).as_slice() {
+        [one] => one.clone(),
+        many => {
+            let file = save("check.txt", &(many.join("\n") + "\n"))?;
+            json["checkFile"] = json!(file);
+            let ready = phones.iter().filter(|p| p.ready()).count();
+            format!(
+                "{ready} of {} phones ready; each in {}",
+                phones.len(),
+                file.display()
+            )
+        }
+    };
+    Ok(Done::new(line, json))
 }
 
 /// `FAKEPHONE01: ready` for one device; for more, how many and how many warned, the file

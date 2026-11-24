@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::reservations;
 use super::wire::{
-    AcquireParams, Granted, Lease, LeaseDevice, Owner, Process, Reservation, SlotRow, Waiter,
+    AcquireParams, Granted, Lease, LeaseDevice, Owner, Process, Reservation, SlotRow, SlotSchema,
+    Waiter,
 };
+use super::{readiness, reservations, stack};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS leases (
@@ -32,6 +33,17 @@ CREATE TABLE IF NOT EXISTS slots (
   idle_since INTEGER,
   PRIMARY KEY (project, slot)
 );
+CREATE TABLE IF NOT EXISTS slot_schemas (
+  project TEXT NOT NULL,
+  slot INTEGER NOT NULL,
+  worktree TEXT NOT NULL,
+  head TEXT,
+  PRIMARY KEY (project, slot)
+);
+-- A stack an earlier daemon started and has not stopped ran its last worktree's schema. A
+-- stack this daemon starts is recorded as it starts, so this adds nothing once a record exists.
+INSERT OR IGNORE INTO slot_schemas (project, slot, worktree)
+  SELECT project, slot, last_worktree FROM slots WHERE stack_ours = 1 AND last_worktree IS NOT NULL;
 CREATE TABLE IF NOT EXISTS stoppers (
   project TEXT NOT NULL,
   slot INTEGER NOT NULL,
@@ -120,6 +132,7 @@ impl Store {
         }
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(reservations::SCHEMA)?;
+        conn.execute_batch(readiness::SCHEMA)?;
         if version < VERSION {
             conn.pragma_update(None, "user_version", VERSION)?;
         }
@@ -385,7 +398,17 @@ pub fn place(c: &Connection, p: &AcquireParams) -> rusqlite::Result<Option<Place
     };
     let granted = match granted {
         Some(id) => match lease(c, id)? {
-            Some(lease) => Some(Granted { lease, previous }),
+            Some(lease) => {
+                let schema = match (&lease.project, lease.slot) {
+                    (Some(project), Some(slot)) => slot_schema(c, project, slot)?,
+                    _ => None,
+                };
+                Some(Granted {
+                    lease,
+                    previous,
+                    schema,
+                })
+            }
             None => {
                 delete_waiter(c, waiter.id)?;
                 return Ok(None);
@@ -431,9 +454,10 @@ pub fn find_lease(
     .transpose()
 }
 
-/// Forgets a lease; its slot and its emulators start idling, its phones are free. A run's lease
-/// made from a reservation ([`end_with_run`]) gives that reservation its slot back, however the
-/// lease ends.
+/// Forgets a lease; its slot and its emulators start idling, its phones are free. A lease whose
+/// worktree started the slot's stack records that worktree's newest migration as it ends, so
+/// that one added during the lease counts. A run's lease made from a reservation
+/// ([`end_with_run`]) gives that reservation its slot back, however the lease ends.
 pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<()> {
     let from: Option<Option<String>> = c
         .query_row(
@@ -460,6 +484,15 @@ pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<(
             "UPDATE slots SET idle_since = ?1 WHERE project = ?2 AND slot = ?3",
             params![now, project, slot],
         )?;
+        let ran: bool = c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM slot_schemas
+                            WHERE project = ?1 AND slot = ?2 AND worktree = ?3)",
+            params![project, slot, lease.worktree],
+            |row| row.get(0),
+        )?;
+        if ran {
+            record_schema(c, project, slot, &lease.worktree)?;
+        }
     }
     c.execute("DELETE FROM leases WHERE id = ?1", [lease.id])?;
     c.execute("DELETE FROM run_leases WHERE lease = ?1", [lease.id])?;
@@ -626,7 +659,8 @@ pub fn insert_lease(
     })
 }
 
-/// Marks a slot held by `worktree`; returns the worktree it ran before.
+/// Marks a slot held by `worktree`; returns the worktree of the lease that held it last, whether
+/// or not that lease ran its stack (see [`slot_schema`] for the schema it holds).
 pub fn claim_slot(
     c: &Connection,
     project: &str,
@@ -693,6 +727,9 @@ pub fn clear_dead_stoppers(
     Ok(cleared)
 }
 
+/// Marks the slot's stack as devlab's to stop, or not. A stack devlab starts runs the schema
+/// of the worktree whose lease holds the slot: that worktree is recorded as the slot's schema
+/// (see [`slot_schema`]), and stays so when the stack stops or another lease holds the slot.
 pub fn set_stack_ours(
     c: &Connection,
     project: &str,
@@ -702,6 +739,48 @@ pub fn set_stack_ours(
     c.execute(
         "UPDATE slots SET stack_ours = ?3 WHERE project = ?1 AND slot = ?2",
         params![project, slot, ours],
+    )?;
+    let holder: Option<String> = c
+        .query_row(
+            "SELECT worktree FROM leases WHERE project = ?1 AND slot = ?2",
+            params![project, slot],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(worktree) = holder.filter(|_| ours) {
+        record_schema(c, project, slot, &worktree)?;
+    }
+    Ok(())
+}
+
+/// The schema the slot's stack last ran: the worktree whose lease last started it, and that
+/// worktree's newest migration when that lease ended. None when devlab never ran the slot's
+/// stack.
+pub fn slot_schema(
+    c: &Connection,
+    project: &str,
+    slot: u32,
+) -> rusqlite::Result<Option<SlotSchema>> {
+    c.query_row(
+        "SELECT worktree, head FROM slot_schemas WHERE project = ?1 AND slot = ?2",
+        params![project, slot],
+        |row| {
+            Ok(SlotSchema {
+                worktree: row.get(0)?,
+                head: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Records `worktree`'s schema, up to its newest migration as its files show it now, as the
+/// slot's. Reading them is no external command: it may run in the transaction.
+fn record_schema(c: &Connection, project: &str, slot: u32, worktree: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO slot_schemas (project, slot, worktree, head) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (project, slot) DO UPDATE SET worktree = excluded.worktree, head = excluded.head",
+        params![project, slot, worktree, stack::migration_head(worktree)],
     )?;
     Ok(())
 }

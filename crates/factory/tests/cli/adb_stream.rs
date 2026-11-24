@@ -18,7 +18,7 @@ use crate::support::{Sandbox, kill_group, run};
 /// exists (its pid is then in `adb/probe.pid`, and that of a child it left running in
 /// `adb/probe-child.pid`), and notes each call's pid in `adb/probes`. While `adb/chatty` exists,
 /// it says far more than a pipe holds before its list.
-fn adb_playing(sandbox: &Sandbox, script: &str) -> PathBuf {
+pub(super) fn adb_playing(sandbox: &Sandbox, script: &str) -> PathBuf {
     let dir = sandbox.path("adb");
     fs::create_dir_all(&dir).expect("create the adb dir");
     let body = format!(
@@ -51,7 +51,7 @@ exit 0"#,
     dir
 }
 
-const PHONE_A: &str = "PHONEA01 device usb:1-1 model:Pixel_8";
+pub(super) const PHONE_A: &str = "PHONEA01 device usb:1-1 model:Pixel_8";
 const PHONE_B: &str = "PHONEB02 device usb:1-2 model:Pixel_9";
 
 fn setup(sandbox: Sandbox) -> (Sandbox, PathBuf) {
