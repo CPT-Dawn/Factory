@@ -158,3 +158,107 @@ fn a_slot_last_used_by_another_worktree_warns_of_its_schema_with_its_stack_stopp
         "{out:?}"
     );
 }
+
+/// Writes the migrations dir of `worktree`'s supabase project: these files, and a directory.
+fn migrations(worktree: &Path, files: &[&str], dirs: &[&str]) -> PathBuf {
+    let dir = worktree.join("supabase/migrations");
+    fs::create_dir_all(&dir).unwrap();
+    for name in files {
+        fs::write(dir.join(name), "").unwrap();
+    }
+    for name in dirs {
+        fs::create_dir_all(dir.join(name)).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn a_lease_that_ends_records_the_newest_migration_of_its_worktree_with_the_slots_schema() {
+    let (sandbox, world) = lab();
+    let (a, b) = (world.worktree("demo-a"), world.worktree("demo-b"));
+    let dir = migrations(&a, &["20260101_a.sql", "README.md"], &["zzz.sql"]);
+    assert_eq!(
+        owned(&sandbox, &a, &["acquire", "--no-device", "--stack"]).code,
+        0
+    );
+    // A migration added during the lease is the head its end records.
+    fs::write(dir.join("20260102_b.sql"), "").unwrap();
+    assert_eq!(owned(&sandbox, &a, &["release"]).code, 0);
+
+    let out = owned(&sandbox, &b, &["acquire", "--no-device"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(
+        out.stderr.contains(
+            "slot 0's stack last ran demo-a's schema, up to 20260102_b.sql: reset it if your migrations differ"
+        ),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_stack_stopped_by_its_lease_keeps_the_head_that_lease_ran() {
+    let (sandbox, world) = lab();
+    let (a, b) = (world.worktree("demo-a"), world.worktree("demo-b"));
+    let dir = migrations(&a, &["20260101_a.sql"], &[]);
+    assert_eq!(
+        owned(&sandbox, &a, &["acquire", "--no-device", "--stack"]).code,
+        0
+    );
+    fs::write(dir.join("20260102_b.sql"), "").unwrap();
+    assert_eq!(owned(&sandbox, &a, &["release", "--stop-stack"]).code, 0);
+
+    let out = owned(&sandbox, &b, &["acquire", "--no-device"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(
+        out.stderr
+            .contains("slot 0's stack last ran demo-a's schema, up to 20260102_b.sql:"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_lease_that_never_ran_the_slots_stack_leaves_the_schema_to_the_worktree_that_did() {
+    let (sandbox, world) = lab();
+    let (a, b, c) = (
+        world.worktree("demo-a"),
+        world.worktree("demo-b"),
+        world.worktree("demo-c"),
+    );
+    assert_eq!(
+        owned(&sandbox, &a, &["acquire", "--no-device", "--stack"]).code,
+        0
+    );
+    assert_eq!(owned(&sandbox, &a, &["release", "--stop-stack"]).code, 0);
+    assert_eq!(owned(&sandbox, &b, &["acquire", "--no-device"]).code, 0);
+    assert_eq!(owned(&sandbox, &b, &["release"]).code, 0);
+
+    let out = owned(&sandbox, &c, &["acquire", "--no-device"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(
+        out.stderr
+            .contains("slot 0's stack last ran demo-a's schema:"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_running_stack_devlab_has_no_schema_record_of_warns_of_the_slots_last_worktree() {
+    let (sandbox, world) = lab();
+    let (a, b) = (world.worktree("demo-a"), world.worktree("demo-b"));
+    // Started outside devlab, or by a daemon from before the slot's schema was recorded.
+    fs::write(sandbox.path("world/containers"), "supabase_db_demo\n").unwrap();
+    assert_eq!(owned(&sandbox, &a, &["acquire", "--no-device"]).code, 0);
+    assert_eq!(owned(&sandbox, &a, &["release"]).code, 0);
+
+    let out = owned(&sandbox, &b, &["acquire", "--no-device"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(
+        out.stderr
+            .contains("slot 0's stack last ran demo-a's schema:"),
+        "{out:?}"
+    );
+}

@@ -14,7 +14,6 @@ use std::collections::{BTreeSet, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -79,11 +78,8 @@ pub struct Lab {
     store: Mutex<Store>,
     /// Bumped on every change a waiter could be waiting for.
     changed: watch::Sender<u64>,
-    /// What `adb track-devices` showed last; none until its first list.
-    attached: watch::Sender<Option<Vec<Attached>>>,
-    /// Whether adb's track stream is down (it ended and no list has followed): `attached` is
-    /// then stale, and no device is granted from it. Read before `attached`, written after it.
-    adb_down: AtomicBool,
+    /// What `adb track-devices` showed last, and whether its stream still follows it.
+    attached: watch::Sender<DeviceList>,
     /// Starts the one device tracker, on the first call that needs the device list.
     tracking: Once,
     /// The waiters whose callers are connected to this daemon; the rest are kept for callers
@@ -95,6 +91,27 @@ pub struct Lab {
     stopping: Mutex<keeper::Stopping>,
     /// Where runs no daemon can follow any more are recorded.
     ledger: Arc<Ledger>,
+}
+
+/// What `adb track-devices` showed last, and whether its stream still follows it: one value,
+/// so that a reader never pairs a list with another moment's word on it.
+#[derive(Clone, Default)]
+struct DeviceList {
+    /// The list the stream showed last; none until its first.
+    shown: Option<Vec<Attached>>,
+    /// The stream that showed it ended and no list has followed yet.
+    stale: bool,
+}
+
+impl DeviceList {
+    /// The list, while a stream still follows it.
+    fn live(&self) -> Option<Vec<Attached>> {
+        if self.stale {
+            None
+        } else {
+            Some(self.shown.clone().unwrap_or_default())
+        }
+    }
 }
 
 /// The lock, whether or not a thread panicked while it held it.
@@ -114,8 +131,7 @@ impl Lab {
             path: path.to_owned(),
             store: Mutex::new(store),
             changed: watch::Sender::new(0),
-            attached: watch::Sender::new(None),
-            adb_down: AtomicBool::new(false),
+            attached: watch::Sender::new(DeviceList::default()),
             tracking: Once::new(),
             watched: Mutex::new(HashSet::new()),
             stopping: Mutex::new(keeper::Stopping::default()),
@@ -153,8 +169,8 @@ impl Lab {
     async fn attached(self: &Arc<Self>) -> Vec<Attached> {
         self.track();
         let mut seen = self.attached.subscribe();
-        let _ = tokio::time::timeout(FIRST_LIST, seen.wait_for(Option::is_some)).await;
-        self.attached.borrow().clone().unwrap_or_default()
+        let _ = tokio::time::timeout(FIRST_LIST, seen.wait_for(|d| d.shown.is_some())).await;
+        self.attached.borrow().shown.clone().unwrap_or_default()
     }
 
     /// Starts following `adb track-devices`, once: each list it shows is told to waiters.
@@ -168,23 +184,22 @@ impl Lab {
                     android::track_forever(
                         &tracker,
                         tracker.pace,
-                        // The list is published before the stream counts as up again, and it
-                        // counts as down before anything else is told it ended: a reader that
-                        // finds it up, having read that first, then reads a list at least as new.
                         &|list| {
-                            lab.attached.send_replace(Some(list));
-                            lab.adb_down.store(false, Ordering::SeqCst);
+                            lab.attached.send_replace(DeviceList {
+                                shown: Some(list),
+                                stale: false,
+                            });
                             lab.notify();
                         },
                         &|| {
-                            lab.adb_down.store(true, Ordering::SeqCst);
+                            lab.attached.send_modify(|d| d.stale = true);
                             lab.notify();
                         },
                         &|| {
-                            lab.attached.send_if_modified(|list| {
-                                let unknown = list.is_none();
+                            lab.attached.send_if_modified(|d| {
+                                let unknown = d.shown.is_none();
                                 if unknown {
-                                    *list = Some(Vec::new());
+                                    d.shown = Some(Vec::new());
                                 }
                                 unknown
                             });
@@ -193,7 +208,7 @@ impl Lab {
                     )
                 });
             if spawned.is_err() {
-                self.attached.send_replace(Some(Vec::new()));
+                self.attached.send_modify(|d| d.shown = Some(Vec::new()));
             }
         });
     }
@@ -267,7 +282,7 @@ impl Lab {
             self.notify();
         }
         if !freed.is_empty() {
-            keeper::take_back_reverses_on_thread(self.attached.borrow().clone(), freed);
+            keeper::take_back_reverses_on_thread(self.attached.borrow().shown.clone(), freed);
         }
         Ok((out, lines))
     }
@@ -295,7 +310,7 @@ impl Lab {
         })?;
         if let Some(held) = dropped {
             self.notify();
-            keeper::take_back_reverses_on_thread(self.attached.borrow().clone(), vec![held]);
+            keeper::take_back_reverses_on_thread(self.attached.borrow().shown.clone(), vec![held]);
         }
         Ok(())
     }
@@ -472,7 +487,7 @@ fn release(lab: &Lab, p: ReleaseParams) -> Answer<Option<Lease>> {
     }
     if let Some(lease) = &dropped {
         keeper::take_back_reverses(
-            lab.attached.borrow().clone().as_deref(),
+            lab.attached.borrow().shown.clone().as_deref(),
             std::slice::from_ref(lease),
         );
     }
@@ -545,7 +560,7 @@ fn status(lab: &Lab, seen: &[Attached]) -> Answer<Board> {
 }
 
 fn slot(lab: &Lab, p: SlotParams) -> Answer<()> {
-    lab.write(|c, _| store::set_stack_ours(c, &p.project, p.slot, p.stack_ours, p.head.as_deref()))
+    lab.write(|c, _| store::set_stack_ours(c, &p.project, p.slot, p.stack_ours))
 }
 
 /// What a grant needs from outside the store, gathered before its transaction.
@@ -553,10 +568,6 @@ struct Facts {
     listening: BTreeSet<u32>,
     /// Whether each slot's stack runs, by slot.
     running: Vec<bool>,
-    /// What adb lists; empty when the request asks for no device.
-    attached: Vec<Attached>,
-    /// Whether adb's track stream is down, so that `attached` is stale.
-    adb_down: bool,
     mem_available_mb: i64,
 }
 
@@ -568,7 +579,6 @@ fn gather(lab: &Lab, p: &AcquireParams, attached: Vec<Attached>) -> Facts {
         0
     };
     Facts {
-        attached,
         mem_available_mb,
         ..gather_stack(p.project.as_ref())
     }
@@ -593,8 +603,6 @@ fn gather_stack(project: Option<&ProjectAsk>) -> Facts {
     Facts {
         listening: host::listening_ports(),
         running,
-        attached: Vec::new(),
-        adb_down: false,
         mem_available_mb: 0,
     }
 }
@@ -722,7 +730,7 @@ enum Queued {
         resumed: bool,
     },
     /// Granted before the daemon could answer it.
-    Granted { id: i64, granted: Granted },
+    Granted { id: i64, granted: Box<Granted> },
 }
 
 /// Queues the request, or takes back the place it had if it is still its own: the one it names,
@@ -737,7 +745,7 @@ fn enqueue(lab: &Lab, p: &AcquireParams) -> Answer<(Queued, Option<RunRow>)> {
                 granted: Some(granted),
             }) => Queued::Granted {
                 id: waiter.id,
-                granted,
+                granted: Box::new(granted),
             },
             Some(store::Place { waiter, .. }) => Queued::Waiting {
                 id: waiter.id,
@@ -899,12 +907,17 @@ fn try_grant(
                 Some(slot) => store::claim_slot(c, &project.name, slot, &p.worktree)?,
                 None => None,
             };
+            let schema = match lease.slot {
+                Some(slot) => store::slot_schema(c, &project.name, slot)?,
+                None => None,
+            };
             store::touch(c, lease.id, now)?;
             store::delete_waiter(c, waiter)?;
             return Ok(Ok(Taken {
                 granted: Granted {
                     lease: lease.clone(),
                     previous,
+                    schema,
                 },
                 fresh: true,
                 boots: Vec::new(),
@@ -913,19 +926,25 @@ fn try_grant(
             }));
         }
         let stopping = lock_ignoring_poison(&lab.stopping).clone();
-        let planned = match &p.devices {
-            // No device is granted from a list adb stopped updating: the request waits for the
-            // stream to show one again. A request for no device goes on.
-            Some(_) if facts.adb_down => Err(ADB_RESTARTING.to_owned()),
-            Some(ask) => plan(
+        // Devices are planned from the list adb shows as this transaction runs, never from
+        // one read before the probes: none is granted from a list its stream stopped
+        // following, and the request waits for the stream to show one again. A request for
+        // no device goes on.
+        let attached = match &p.devices {
+            Some(_) => lab.attached.borrow().live(),
+            None => Some(Vec::new()),
+        };
+        let planned = match (&p.devices, &attached) {
+            (Some(_), None) => Err(ADB_RESTARTING.to_owned()),
+            (Some(ask), Some(attached)) => plan(
                 c,
                 ask,
                 lease.as_ref(),
-                &facts.attached,
+                attached,
                 facts.mem_available_mb,
                 &stopping,
             )?,
-            None => Ok(None),
+            (None, _) => Ok(None),
         };
         let (planned, devices_wait) = match planned {
             Ok(planned) => (planned, None),
@@ -954,16 +973,19 @@ fn try_grant(
                 now,
             )?,
         };
-        let previous = match (&p.project, lease.slot) {
-            (Some(project), Some(slot)) => store::claim_slot(c, &project.name, slot, &p.worktree)?,
-            _ => None,
+        let (previous, schema) = match (&p.project, lease.slot) {
+            (Some(project), Some(slot)) => (
+                store::claim_slot(c, &project.name, slot, &p.worktree)?,
+                store::slot_schema(c, &project.name, slot)?,
+            ),
+            _ => (None, None),
         };
         let (mut boots, mut phones, mut reused) = (Vec::new(), Vec::new(), Vec::new());
         if let (Some(Planned { plan, used }), Some(ask)) = (planned, &p.devices) {
             for serial in &plan.phones {
-                let model = facts
-                    .attached
+                let model = attached
                     .iter()
+                    .flatten()
                     .find(|a| a.serial == *serial)
                     .map_or_else(String::new, |a| a.model.clone());
                 store::insert_lease_device(
@@ -999,7 +1021,11 @@ fn try_grant(
         }
         let lease = store::lease(c, lease.id)?.unwrap_or(lease);
         Ok(Ok(Taken {
-            granted: Granted { lease, previous },
+            granted: Granted {
+                lease,
+                previous,
+                schema,
+            },
             fresh,
             boots,
             phones,
@@ -1326,7 +1352,7 @@ pub async fn acquire<W, R, S>(
             granted,
         }) => {
             let _attached = Present(Arc::clone(&lab), waiter);
-            let place = (waiter, granted, true);
+            let place = (waiter, *granted, true);
             deliver(&lab, writer, lines, id, place, run, stopping.as_mut()).await;
             return;
         }
@@ -1394,9 +1420,6 @@ pub async fn acquire<W, R, S>(
     let mut said = String::new();
     loop {
         let mut changed = lab.changed.subscribe();
-        // Whether the stream is down is read before the list, so that a list read after it is
-        // at least as new as the stream's last word: see [`Lab::track`].
-        let adb_down = lab.adb_down.load(Ordering::SeqCst);
         let seen = if p.devices.is_some() {
             lab.attached().await
         } else {
@@ -1405,10 +1428,7 @@ pub async fn acquire<W, R, S>(
         let tried = {
             let (lab, p) = (Arc::clone(&lab), Arc::clone(&p));
             blocking(move || {
-                let facts = Facts {
-                    adb_down,
-                    ..gather(&lab, &p, seen)
-                };
+                let facts = gather(&lab, &p, seen);
                 try_grant(&lab, &p, waiter, &facts)
             })
             .await
@@ -1417,11 +1437,20 @@ pub async fn acquire<W, R, S>(
             Ok(Ok(taken)) => {
                 lab.notify();
                 lab.watch_owner(&taken.granted.lease);
-                let (fresh, previous) = (taken.fresh, taken.granted.previous.clone());
+                let (fresh, previous, schema) = (
+                    taken.fresh,
+                    taken.granted.previous.clone(),
+                    taken.granted.schema.clone(),
+                );
                 let lease = taken.granted.lease.clone();
                 match settle(&lab, &p, taken, writer, id).await {
                     Ok(lease) => {
-                        let place = (waiter, Granted { lease, previous }, fresh);
+                        let granted = Granted {
+                            lease,
+                            previous,
+                            schema,
+                        };
+                        let place = (waiter, granted, fresh);
                         deliver(&lab, writer, lines, id, place, run, stopping.as_mut()).await;
                     }
                     Err(mut body) => {

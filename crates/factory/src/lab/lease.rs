@@ -16,7 +16,7 @@ use super::host::proc;
 use super::stack;
 use super::wire::{
     ACQUIRE, AcquireParams, DeviceAsk, GC, Granted, LEASE, Lease, Process, ProjectAsk, RECEIVED,
-    RELEASE, ReleaseParams, RunAsk, SLOT, STOPPING, SlotParams, StackAsk, StopParams,
+    RELEASE, ReleaseParams, RunAsk, SLOT, STOPPING, SlotParams, SlotSchema, StackAsk, StopParams,
 };
 use crate::client;
 use crate::output::Failure;
@@ -114,19 +114,32 @@ pub fn take(
     if let (Some(p), Some(slot)) = (&ctx.project, lease.slot) {
         stack::prepare_workdir(p, &ctx.worktree, slot)?;
         let info = stack::info(p, &ctx.worktree, slot)?;
-        if let Some(previous) = &granted.previous
-            && info.is_some()
-            && *previous != ctx.worktree
-        {
+        // A slot with no record of its schema (a stack devlab never ran, or one an earlier
+        // daemon left) is taken to run its last worktree's while its stack runs.
+        let schema = match (granted.schema, &info) {
+            (Some(schema), Some(_)) => Some(schema),
+            (None, Some(info)) => granted
+                .previous
+                .filter(|previous| *previous != ctx.worktree && stack::running(&info.project_id))
+                .map(|worktree| SlotSchema {
+                    worktree,
+                    head: None,
+                }),
+            (_, None) => None,
+        };
+        if let Some(schema) = schema.filter(|s| s.worktree != ctx.worktree) {
+            let head = schema
+                .head
+                .map_or_else(String::new, |head| format!(", up to {head}"));
             warn(&format!(
-                "slot {slot}'s stack last ran {}'s schema: reset it if your migrations differ",
-                base_name(previous)
+                "slot {slot}'s stack last ran {}'s schema{head}: reset it if your migrations differ",
+                base_name(&schema.worktree)
             ));
         }
         if opts.stack && info.is_some() {
             let env = lease_env(&lease, Some(p))?;
             if stack::up(p, &ctx.worktree, slot, &env, &ctx.cfg)? == stack::Up::Started {
-                stack_started(p, &ctx.worktree, slot)?;
+                stack_ours(&p.name, slot, true)?;
             }
         }
     }
@@ -267,22 +280,6 @@ pub fn stack_ours(project: &str, slot: u32, ours: bool) -> Result<(), Failure> {
             project: project.to_owned(),
             slot,
             stack_ours: ours,
-            head: None,
-        },
-    )
-}
-
-/// Records that devlab started the slot's stack from `worktree`: its schema is that
-/// worktree's, up to its newest migration, whether the stack runs or stops.
-pub fn stack_started(p: &ProjectConfig, worktree: &str, slot: u32) -> Result<(), Failure> {
-    client::call(
-        &paths()?,
-        SLOT,
-        &SlotParams {
-            project: p.name.clone(),
-            slot,
-            stack_ours: true,
-            head: stack::migration_head(p, worktree),
         },
     )
 }

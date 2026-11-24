@@ -6,8 +6,10 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::reservations;
-use super::wire::{AcquireParams, Granted, Lease, LeaseDevice, Owner, Process, SlotRow, Waiter};
+use super::wire::{
+    AcquireParams, Granted, Lease, LeaseDevice, Owner, Process, SlotRow, SlotSchema, Waiter,
+};
+use super::{reservations, stack};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS leases (
@@ -37,9 +39,6 @@ CREATE TABLE IF NOT EXISTS slot_schemas (
   head TEXT,
   PRIMARY KEY (project, slot)
 );
--- Slots whose stack an earlier daemon started and has not stopped ran their last worktree's schema.
-INSERT OR IGNORE INTO slot_schemas (project, slot, worktree)
-  SELECT project, slot, last_worktree FROM slots WHERE stack_ours = 1 AND last_worktree IS NOT NULL;
 CREATE TABLE IF NOT EXISTS stoppers (
   project TEXT NOT NULL,
   slot INTEGER NOT NULL,
@@ -388,7 +387,17 @@ pub fn place(c: &Connection, p: &AcquireParams) -> rusqlite::Result<Option<Place
     };
     let granted = match granted {
         Some(id) => match lease(c, id)? {
-            Some(lease) => Some(Granted { lease, previous }),
+            Some(lease) => {
+                let schema = match (&lease.project, lease.slot) {
+                    (Some(project), Some(slot)) => slot_schema(c, project, slot)?,
+                    _ => None,
+                };
+                Some(Granted {
+                    lease,
+                    previous,
+                    schema,
+                })
+            }
             None => {
                 delete_waiter(c, waiter.id)?;
                 return Ok(None);
@@ -434,7 +443,10 @@ pub fn find_lease(
     .transpose()
 }
 
-/// Forgets a lease; its slot and its emulators start idling, its phones are free.
+/// Forgets a lease; its slot and its emulators start idling, its phones are free. A lease that
+/// held the slot while devlab's stack ran there, or whose worktree's schema the slot holds,
+/// records its worktree's schema as the slot's as it ends: migrations added during the lease
+/// count.
 pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<()> {
     c.execute(
         "UPDATE emulators SET idle_since = ?1
@@ -447,6 +459,16 @@ pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<(
             "UPDATE slots SET idle_since = ?1 WHERE project = ?2 AND slot = ?3",
             params![now, project, slot],
         )?;
+        let ran: bool = c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM slots WHERE project = ?1 AND slot = ?2 AND stack_ours = 1)
+                 OR EXISTS (SELECT 1 FROM slot_schemas
+                            WHERE project = ?1 AND slot = ?2 AND worktree = ?3)",
+            params![project, slot, lease.worktree],
+            |row| row.get(0),
+        )?;
+        if ran {
+            record_schema(c, project, slot, &lease.worktree)?;
+        }
     }
     c.execute("DELETE FROM leases WHERE id = ?1", [lease.id])?;
     reservations::record_lease_end(c, lease, now)
@@ -568,8 +590,7 @@ pub fn insert_lease(
     })
 }
 
-/// Marks a slot held by `worktree`; returns the worktree whose schema the slot's stack last
-/// ran (see [`set_stack_ours`]), whether or not that stack runs now.
+/// Marks a slot held by `worktree`; returns the worktree it ran before.
 pub fn claim_slot(
     c: &Connection,
     project: &str,
@@ -581,9 +602,7 @@ pub fn claim_slot(
         params![project, slot],
     )?;
     let previous: Option<String> = c.query_row(
-        "SELECT (SELECT worktree FROM slot_schemas s WHERE s.project = slots.project
-                                                       AND s.slot = slots.slot)
-         FROM slots WHERE project = ?1 AND slot = ?2",
+        "SELECT last_worktree FROM slots WHERE project = ?1 AND slot = ?2",
         params![project, slot],
         |row| row.get(0),
     )?;
@@ -638,31 +657,66 @@ pub fn clear_dead_stoppers(
     Ok(cleared)
 }
 
-/// Marks the slot's stack as devlab's to stop, or not. Devlab starts a stack for the lease
-/// that holds the slot, so a stack it starts also records that worktree, and the newest
-/// migration (`head`) the caller read there, as the schema the slot now holds; the record
-/// stays when the stack stops, for the next lease to be warned.
+/// Marks the slot's stack as devlab's to stop, or not. A stack devlab starts runs the schema
+/// of the worktree whose lease holds the slot, and so does one that lease stops: either is
+/// recorded as the slot's schema (see [`slot_schema`]). The keeper, stopping an idle stack no
+/// lease holds, changes no record.
 pub fn set_stack_ours(
     c: &Connection,
     project: &str,
     slot: u32,
     ours: bool,
-    head: Option<&str>,
 ) -> rusqlite::Result<()> {
+    let (was_ours, holder) = c
+        .query_row(
+            "SELECT stack_ours,
+                    (SELECT worktree FROM leases l WHERE l.project = slots.project
+                                                     AND l.slot = slots.slot)
+             FROM slots WHERE project = ?1 AND slot = ?2",
+            params![project, slot],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+        .unwrap_or((false, None));
     c.execute(
         "UPDATE slots SET stack_ours = ?3 WHERE project = ?1 AND slot = ?2",
         params![project, slot, ours],
     )?;
-    if ours {
-        c.execute(
-            "INSERT INTO slot_schemas (project, slot, worktree, head)
-             SELECT project, slot, last_worktree, ?3 FROM slots
-             WHERE project = ?1 AND slot = ?2 AND last_worktree IS NOT NULL
-             ON CONFLICT (project, slot)
-             DO UPDATE SET worktree = excluded.worktree, head = excluded.head",
-            params![project, slot, head],
-        )?;
+    if let Some(worktree) = holder.filter(|_| ours || was_ours) {
+        record_schema(c, project, slot, &worktree)?;
     }
+    Ok(())
+}
+
+/// The schema the slot's stack last ran: the worktree whose lease last held the slot while
+/// devlab's stack ran there, and that worktree's newest migration when its lease ended. None
+/// when devlab never ran the slot's stack.
+pub fn slot_schema(
+    c: &Connection,
+    project: &str,
+    slot: u32,
+) -> rusqlite::Result<Option<SlotSchema>> {
+    c.query_row(
+        "SELECT worktree, head FROM slot_schemas WHERE project = ?1 AND slot = ?2",
+        params![project, slot],
+        |row| {
+            Ok(SlotSchema {
+                worktree: row.get(0)?,
+                head: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Records `worktree`'s schema, up to its newest migration as its files show it now, as the
+/// slot's. Reading them is no external command: it may run in the transaction.
+fn record_schema(c: &Connection, project: &str, slot: u32, worktree: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO slot_schemas (project, slot, worktree, head) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (project, slot) DO UPDATE SET worktree = excluded.worktree, head = excluded.head",
+        params![project, slot, worktree, stack::migration_head(worktree)],
+    )?;
     Ok(())
 }
 
@@ -802,65 +856,4 @@ pub fn take_orphan_runs(
         orphans.push(run);
     }
     Ok(orphans)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn open(dir: &tempfile::TempDir) -> Store {
-        Store::open(&dir.path().join("lab.db")).unwrap()
-    }
-
-    /// What `claim_slot` says the slot's stack last ran, for a lease of `worktree`.
-    fn claim(store: &mut Store, worktree: &str) -> Option<String> {
-        store.write(|c| claim_slot(c, "demo", 0, worktree)).unwrap()
-    }
-
-    #[test]
-    fn a_slot_remembers_the_schema_of_a_stack_started_there_after_the_stack_stops() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = open(&dir);
-        assert_eq!(claim(&mut store, "/w/a"), None);
-        store
-            .write(|c| set_stack_ours(c, "demo", 0, true, Some("20260101_x.sql")))
-            .unwrap();
-        store
-            .write(|c| set_stack_ours(c, "demo", 0, false, None))
-            .unwrap();
-
-        assert_eq!(claim(&mut store, "/w/b").as_deref(), Some("/w/a"));
-        let head: Option<String> = store
-            .write(|c| c.query_row("SELECT head FROM slot_schemas", [], |row| row.get(0)))
-            .unwrap();
-        assert_eq!(head.as_deref(), Some("20260101_x.sql"));
-    }
-
-    #[test]
-    fn a_slot_whose_stack_never_started_has_no_schema_to_warn_of() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = open(&dir);
-        assert_eq!(claim(&mut store, "/w/a"), None);
-        assert_eq!(claim(&mut store, "/w/b"), None);
-    }
-
-    #[test]
-    fn a_stack_an_earlier_daemon_started_and_left_running_keeps_its_worktree_as_its_schema() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = open(&dir);
-        store
-            .write(|c| {
-                c.execute(
-                    "INSERT INTO slots (project, slot, last_worktree, stack_ours)
-                     VALUES ('demo', 0, '/w/a', 1)",
-                    [],
-                )
-            })
-            .unwrap();
-        drop(store);
-
-        let mut store = open(&dir);
-
-        assert_eq!(claim(&mut store, "/w/b").as_deref(), Some("/w/a"));
-    }
 }

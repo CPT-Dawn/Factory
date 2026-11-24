@@ -169,7 +169,7 @@ impl Lab {
             Ok(None) => Err(format!("{worktree}/devlab.json is gone")),
             Err(f) => Err(f.message),
         };
-        let _ = self.write(|c, _| store::set_stack_ours(c, &row.project, row.slot, false, None));
+        let _ = self.write(|c, _| store::set_stack_ours(c, &row.project, row.slot, false));
         lock_ignoring_poison(&self.stopping)
             .slots
             .remove(&(row.project.clone(), row.slot));

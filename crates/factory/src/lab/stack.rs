@@ -15,7 +15,7 @@ use factory_core::lab::slots::{
     Env, StackInfo, patch_supabase_config, project_id_of, read_supabase_ports, slot_project_id,
 };
 
-use super::context::devlab_state;
+use super::context::{devlab_state, project_config};
 use super::host::mem_available_mb;
 use crate::output::Failure;
 
@@ -110,17 +110,20 @@ pub fn prepare_workdir(p: &ProjectConfig, worktree: &str, slot: u32) -> Result<(
     Ok(())
 }
 
-/// The name of the newest `.sql` migration in the worktree's supabase dir; none when it has none.
-pub fn migration_head(p: &ProjectConfig, worktree: &str) -> Option<String> {
+/// The name of the newest `.sql` migration of the worktree's supabase project; none when it has
+/// none, or when its devlab.json is gone or names no supabase dir. It reads files and runs no
+/// command, so the daemon's store reads it inside a transaction.
+pub fn migration_head(worktree: &str) -> Option<String> {
+    let p = project_config(worktree).ok()??;
     let dir = Path::new(worktree)
-        .join(&p.supabase.as_ref()?.dir)
+        .join(&p.supabase?.dir)
         .join("migrations");
     fs::read_dir(dir)
         .ok()?
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let name = entry.file_name().into_string().ok()?;
-            (name.ends_with(".sql") && entry.path().is_file()).then_some(name)
+            (name.ends_with(".sql") && entry.file_type().ok()?.is_file()).then_some(name)
         })
         .max()
 }
@@ -205,33 +208,4 @@ pub fn down(p: &ProjectConfig, project_id: &str, cwd: &str) -> Result<(), Failur
         ));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use factory_core::lab::config::project_config;
-
-    #[test]
-    fn the_migration_head_is_the_newest_migration_name_or_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let worktree = dir.path().to_str().unwrap();
-        let p = project_config("devlab.json", r#"{"name":"demo","supabase":"db"}"#).unwrap();
-        assert_eq!(migration_head(&p, worktree), None);
-
-        let migrations = dir.path().join("db/migrations");
-        fs::create_dir_all(&migrations).unwrap();
-        assert_eq!(migration_head(&p, worktree), None);
-        for name in ["20260102_b.sql", "20260101_a.sql", ".keep", "README.md"] {
-            fs::write(migrations.join(name), "").unwrap();
-        }
-        fs::create_dir(migrations.join("zzz.sql")).unwrap();
-        assert_eq!(
-            migration_head(&p, worktree).as_deref(),
-            Some("20260102_b.sql")
-        );
-
-        let none = project_config("devlab.json", r#"{"name":"demo"}"#).unwrap();
-        assert_eq!(migration_head(&none, worktree), None);
-    }
 }
