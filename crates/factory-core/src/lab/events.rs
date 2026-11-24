@@ -8,7 +8,7 @@
 //!
 //! Every field is a flat value; the numbers are all in the ledger's numeric list. No field names
 //! a device serial ([`short_id`] stands in for it), a home path (a worktree is its basename) or
-//! a user (the home dir's name is shown as `~`). A wait's reason is kept as its kind and counts ([`wait_reason`]), never its text.
+//! a user (a worktree named as the user or their home dir is shown as `~`). A wait's reason is kept as its kind and counts ([`wait_reason`]), never its text.
 
 use std::sync::LazyLock;
 
@@ -28,8 +28,8 @@ pub struct LeaseFacts {
     pub owner_label: String,
     /// The worktree's path; the event keeps its basename.
     pub worktree: String,
-    /// The home dir, whose name (most often the user's) no event shows.
-    pub home: Option<String>,
+    /// Names no event shows: the user's, and their home dir's.
+    pub private: Vec<String>,
     /// `(kind, model)` of each device it holds; a model may be empty.
     pub devices: Vec<(String, String)>,
     pub slot: Option<u32>,
@@ -75,11 +75,7 @@ fn lease_fields(f: &LeaseFacts, action: &str) -> Fields {
         put(&mut out, "project", project.as_str());
     }
     put(&mut out, "owner", f.owner_label.as_str());
-    put(
-        &mut out,
-        "worktree",
-        worktree_name(&f.worktree, f.home.as_deref()),
-    );
+    put(&mut out, "worktree", worktree_name(&f.worktree, &f.private));
     if !f.devices.is_empty() {
         let devices: Vec<String> = f
             .devices
@@ -104,13 +100,14 @@ fn lease_fields(f: &LeaseFacts, action: &str) -> Fields {
     out
 }
 
-/// A worktree as an event names it: its basename, or `~` for the home dir and for any dir
-/// named as the home dir is, which is most often the user's name.
-fn worktree_name<'a>(path: &'a str, home: Option<&str>) -> &'a str {
+/// A worktree as an event names it: its basename, or `~` when that is one of the `private`
+/// names (the user's, their home dir's).
+fn worktree_name<'a>(path: &'a str, private: &[String]) -> &'a str {
     let name = base_name(path);
-    match home.map(base_name) {
-        Some(home) if !home.is_empty() && name == home => "~",
-        _ => name,
+    if private.iter().any(|p| !p.is_empty() && p == name) {
+        "~"
+    } else {
+        name
     }
 }
 

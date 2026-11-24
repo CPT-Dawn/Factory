@@ -1,9 +1,12 @@
 //! The lab's events on their way to the stats ledger (#62). Each is queued in `lab.db` by the
-//! transaction that makes it true, so one rolled back is never told, and the daemon appends the
-//! queue to the ledger once the transaction commits ([`take`]). And each lease's clock: when
+//! transaction that makes it true, so one rolled back is never told, and the ledger's thread
+//! appends the queue once it commits ([`drain`]). And each lease's clock: when
 //! it began, and how long commands have run on it, for its `idle_seconds`.
 
-use factory_core::event::Fields;
+use std::sync::LazyLock;
+
+use factory_core::event::{Event, Fields};
+use factory_core::lab::base_name;
 use factory_core::lab::events::{self as event, LeaseEnd, LeaseFacts, spans};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
@@ -11,6 +14,7 @@ use serde_json::Value;
 use super::service::now_ms;
 use super::store;
 use super::wire::Lease;
+use crate::ledger::Ledger;
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS lab_events (
@@ -41,24 +45,62 @@ pub fn queue(c: &Connection, kind: &str, fields: &Fields) -> rusqlite::Result<()
     Ok(())
 }
 
-/// Takes the queued events, oldest first.
-pub fn take(c: &Connection) -> rusqlite::Result<Vec<(String, Fields)>> {
-    let mut q = c.prepare("SELECT kind, fields FROM lab_events ORDER BY id")?;
-    let rows: Vec<(String, String)> = q
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+/// Appends the queued events to `ledger`, oldest first, and then forgets them: a daemon that
+/// stops before forgetting them appends them again (once more, at worst) from its next start,
+/// and none is lost. Run on the ledger's own thread and connection, outside any lab call. One
+/// the ledger won't take costs a log line ([`append`]) and is forgotten.
+pub fn drain(c: &Connection, ledger: &Ledger) -> rusqlite::Result<()> {
+    let mut q = c.prepare("SELECT id, kind, fields FROM lab_events ORDER BY id")?;
+    let rows: Vec<(i64, String, String)> = q
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    if rows.is_empty() {
-        return Ok(Vec::new());
+    let Some(last) = rows.last().map(|(id, _, _)| *id) else {
+        return Ok(());
+    };
+    for (_, kind, text) in rows {
+        if let Ok(Value::Object(fields)) = serde_json::from_str(&text) {
+            append(ledger, &kind, fields);
+        }
     }
-    c.execute("DELETE FROM lab_events", [])?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|(kind, text)| match serde_json::from_str(&text) {
-            Ok(Value::Object(fields)) => Some((kind, fields)),
-            _ => None,
-        })
-        .collect())
+    c.execute("DELETE FROM lab_events WHERE id <= ?1", [last])?;
+    Ok(())
 }
+
+/// Appends one lab event to the ledger. One that can't be written costs a log line and
+/// nothing else: no lab command fails with the ledger.
+fn append(ledger: &Ledger, kind: &str, fields: Fields) {
+    let landed = Event::new(kind, fields).map(|event| ledger.append(&event));
+    if !matches!(landed, Ok(Ok(_))) {
+        eprintln!("factory: lab: cannot write a {kind} event to the ledger");
+    }
+}
+
+/// The names a worktree may not be shown by: the user's, and their home dir's, from the
+/// environment and from `/etc/passwd`, so a daemon started without `HOME` hides them too.
+static PRIVATE: LazyLock<Vec<String>> = LazyLock::new(|| {
+    let mut names: Vec<String> = ["USER", "LOGNAME"]
+        .iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .collect();
+    let mut homes: Vec<String> = std::env::var("HOME").ok().into_iter().collect();
+    let uid = rustix::process::getuid().as_raw().to_string();
+    if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
+        for entry in passwd
+            .lines()
+            .map(|line| line.split(':').collect::<Vec<_>>())
+        {
+            if entry.get(2) == Some(&uid.as_str()) {
+                names.extend(entry.first().map(|name| (*name).to_owned()));
+                homes.extend(entry.get(5).map(|home| (*home).to_owned()));
+            }
+        }
+    }
+    names.extend(homes.iter().map(|home| base_name(home).to_owned()));
+    names.retain(|name| !name.is_empty() && name != "/");
+    names.sort();
+    names.dedup();
+    names
+});
 
 /// What the ledger says of lease `lease` as the store holds it now, with `booting` more
 /// emulators on their way to it.
@@ -82,7 +124,7 @@ fn facts(c: &Connection, lease: &Lease, booting: u32) -> rusqlite::Result<LeaseF
         project: lease.project.clone(),
         owner_label: lease.owner_label.clone(),
         worktree: lease.worktree.clone(),
-        home: std::env::var("HOME").ok().filter(|home| !home.is_empty()),
+        private: PRIVATE.clone(),
         devices,
         slot: lease.slot,
         reservation,

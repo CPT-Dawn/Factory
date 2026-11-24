@@ -31,7 +31,7 @@ fn facts() -> LeaseFacts {
         project: Some("demo".to_owned()),
         owner_label: "claude:4242".to_owned(),
         worktree: "/tmp/sandbox/worktrees/demo-a".to_owned(),
-        home: Some("/home/someone".to_owned()),
+        private: vec!["someone".to_owned()],
         devices: vec![
             ("phone".to_owned(), "Pixel_8".to_owned()),
             ("emulator".to_owned(), String::new()),
@@ -246,7 +246,7 @@ fn a_short_id_is_the_first_8_hex_of_the_serials_sha256() {
 }
 
 #[test]
-fn a_worktree_that_is_the_home_dir_or_named_like_it_is_shown_as_a_tilde() {
+fn a_worktree_named_as_the_user_or_their_home_dir_is_shown_as_a_tilde() {
     let at = |worktree: &str| {
         let f = LeaseFacts {
             worktree: worktree.to_owned(),

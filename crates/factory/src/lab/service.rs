@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use factory_adapters::adb::{Adb, AdbCli, AdbTrack};
 use factory_adapters::docker::{Containers, Docker};
 use factory_adapters::emulator::{EmulatorSpec, Emulators, SystemdEmulators};
-use factory_core::event::{Event, Fields};
+use factory_core::event::Fields;
 use factory_core::exit::Exit;
 use factory_core::lab::args::{LONGEST_WAIT, wait_span};
 use factory_core::lab::config::device_cap;
@@ -101,11 +101,9 @@ pub struct Lab {
     watched: Mutex<HashSet<String>>,
     /// What the keeper is stopping because it idled; no grant hands it out meanwhile.
     stopping: Mutex<keeper::Stopping>,
-    /// Where runs no daemon can follow any more are recorded.
-    ledger: Arc<Ledger>,
-    /// The lab's events on their way to the ledger, which one thread writes, so that no lab
+    /// Tells the ledger's thread that events are queued: it alone appends them, so no lab
     /// call waits on the ledger (#62).
-    events: mpsc::Sender<(String, Fields)>,
+    wake: mpsc::Sender<()>,
 }
 
 /// What `adb track-devices` showed last, and whether its stream still follows it: one value,
@@ -145,13 +143,25 @@ impl Lab {
     pub fn open(path: &Path, ledger: Arc<Ledger>) -> Result<Lab, String> {
         let store =
             Store::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        let (events, queued) = mpsc::channel::<(String, Fields)>();
-        let writer = Arc::clone(&ledger);
+        // The ledger's thread, on its own connection: it appends what the lab's transactions
+        // queued, when told to and at least every few seconds, so a backlog an earlier daemon
+        // left goes out too.
+        let reader = Connection::open(path)
+            .and_then(|c| c.busy_timeout(Duration::from_secs(15)).map(|()| c))
+            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let (wake, woken) = mpsc::channel::<()>();
         let spawned = std::thread::Builder::new()
             .name("lab-ledger".to_owned())
             .spawn(move || {
-                for (kind, fields) in queued {
-                    append_event(&writer, &kind, fields);
+                loop {
+                    if let Err(e) = events::drain(&reader, &ledger) {
+                        eprintln!("factory: lab: cannot read the events to log: {e}");
+                    }
+                    if let Err(mpsc::RecvTimeoutError::Disconnected) =
+                        woken.recv_timeout(Duration::from_secs(5))
+                    {
+                        return;
+                    }
                 }
             });
         if let Err(e) = spawned {
@@ -167,8 +177,7 @@ impl Lab {
             watched: Mutex::new(HashSet::new()),
             stopping: Mutex::new(keeper::Stopping::default()),
             callers: Mutex::new(HashSet::new()),
-            ledger,
-            events,
+            wake,
         })
     }
 
@@ -282,7 +291,7 @@ impl Lab {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = now();
-        let (freed, unreserved, unstopped, (orphans, ended), (out, queued)) = store
+        let (freed, unreserved, unstopped, ended, out) = store
             .write(|c| {
                 let (freed, unreserved) = store::gc(c, now, &host::alive)?;
                 let unstopped = store::clear_dead_stoppers(c, &host::alive)?;
@@ -299,37 +308,22 @@ impl Lab {
                 let mut ended = Vec::new();
                 for run in &orphans {
                     ended.extend(store::end_run_lease(c, run.id, now)?);
+                    let phase = if run.started_ms.is_some() {
+                        Phase::Running
+                    } else {
+                        Phase::Queued
+                    };
+                    let fields = run_fields(run, End::DaemonStopped.outcome(), phase.word());
+                    events::queue(c, "lab-run", &fields)?;
                 }
-                let out = work(c, now)?;
-                Ok((
-                    freed,
-                    unreserved,
-                    unstopped + pruned,
-                    (orphans, ended),
-                    (out, events::take(c)?),
-                ))
+                Ok((freed, unreserved, unstopped + pruned, ended, work(c, now)?))
             })
             .map_err(|e| ErrorBody {
                 code: Exit::Precondition.code(),
                 message: format!("lab store {}: {e}; retry", self.path.display()),
             })?;
         drop(store);
-        for (kind, fields) in queued {
-            self.log(&kind, fields);
-        }
-        for run in &orphans {
-            let phase = if run.started_ms.is_some() {
-                Phase::Running
-            } else {
-                Phase::Queued
-            };
-            append_run(
-                &self.ledger,
-                run,
-                End::DaemonStopped.outcome(),
-                phase.word(),
-            );
-        }
+        let _ = self.wake.send(());
         let lines: Vec<String> = freed
             .iter()
             .map(|l| format!("lease {} ({}, owner exited)", l.id, l.owner_label))
@@ -345,10 +339,10 @@ impl Lab {
         Ok((out, lines))
     }
 
-    /// Hands one lab event to the ledger's writer; no lab call waits for it to land.
+    /// Queues one lab event for the ledger's thread, outside any other change.
     fn log(&self, kind: &str, fields: Fields) {
-        if let Err(mpsc::SendError((kind, fields))) = self.events.send((kind.to_owned(), fields)) {
-            append_event(&self.ledger, &kind, fields);
+        if let Err(e) = self.write(|c, _| events::queue(c, kind, &fields)) {
+            eprintln!("factory: lab: cannot queue a {kind} event: {}", e.message);
         }
     }
 
@@ -1873,8 +1867,21 @@ pub async fn acquire<W, R, S>(
             granted,
         }) => {
             let _attached = Present(Arc::clone(&lab), waiter);
+            // Its grant was never handed over: it is told now, waited until now.
+            let waited = lab
+                .write(|c, now| events::wait_event(c, waiter, &asked(&p), true, None, now))
+                .unwrap_or_default();
             let place = (waiter, *granted, true);
-            deliver(&lab, writer, lines, id, place, run, stopping.as_mut()).await;
+            deliver(
+                &lab,
+                writer,
+                lines,
+                id,
+                (place, waited),
+                run,
+                stopping.as_mut(),
+            )
+            .await;
             return;
         }
         Err(body) => {
@@ -1991,14 +1998,22 @@ pub async fn acquire<W, R, S>(
                 let waited = taken.waited.clone();
                 match settle(&lab, &p, taken, writer, id).await {
                     Ok(lease) => {
-                        lab.log("lab-wait", waited);
                         let granted = Granted {
                             lease,
                             previous,
                             schema,
                         };
                         let place = (waiter, granted, fresh);
-                        deliver(&lab, writer, lines, id, place, run, stopping.as_mut()).await;
+                        deliver(
+                            &lab,
+                            writer,
+                            lines,
+                            id,
+                            (place, waited),
+                            run,
+                            stopping.as_mut(),
+                        )
+                        .await;
                     }
                     Err(mut body) => {
                         // An emulator that would not boot (exit 77), or a device of a fresh lease
@@ -2149,7 +2164,7 @@ async fn deliver<W, R, S>(
     writer: &mut W,
     lines: &mut Lines<R>,
     id: Option<u64>,
-    (waiter, granted, fresh): (i64, Granted, bool),
+    ((waiter, granted, fresh), waited): ((i64, Granted, bool), Fields),
     run: Option<Run>,
     mut stopping: Pin<&mut S>,
 ) where
@@ -2167,6 +2182,10 @@ async fn deliver<W, R, S>(
         &mut stopping,
     )
     .await;
+    // The caller has its grant: only now was the request granted.
+    if matches!(receipt, Receipt::Received { .. }) {
+        lab.log("lab-wait", waited);
+    }
     let Some(mut run) = run else { return };
     match receipt {
         Receipt::Received { then } => {
@@ -2394,13 +2413,8 @@ impl Run {
                 Err(_) => {}
             }
         }
-        let (ledger, row, phase) = (
-            Arc::clone(&self.lab.ledger),
-            self.row.clone(),
-            phase.to_owned(),
-        );
-        let _ =
-            tokio::task::spawn_blocking(move || append_run(&ledger, &row, outcome, &phase)).await;
+        let (lab, fields) = (Arc::clone(&self.lab), run_fields(&self.row, outcome, phase));
+        let _ = tokio::task::spawn_blocking(move || lab.log("lab-run", fields)).await;
     }
 }
 
@@ -2465,20 +2479,8 @@ pub async fn resume_run<W, R, S>(
     run.follow(writer, lines, None, stopping).await;
 }
 
-/// Appends one lab event to the ledger. One that can't be written costs a log line and
-/// nothing else: no lab command fails with the ledger.
-fn append_event(ledger: &Ledger, kind: &str, fields: Fields) {
-    let landed = Event::new(kind, fields).map(|event| ledger.append(&event));
-    if !matches!(landed, Ok(Ok(_))) {
-        let _ = writeln!(
-            std::io::stderr(),
-            "factory: lab: cannot write a {kind} event to the ledger"
-        );
-    }
-}
-
-/// Appends the `lab-run` event of `run`, ended with `outcome` in `phase`.
-fn append_run(ledger: &Ledger, run: &RunRow, outcome: String, phase: &str) {
+/// The `lab-run` event of `run`, ended with `outcome` in `phase`.
+fn run_fields(run: &RunRow, outcome: String, phase: &str) -> Fields {
     let now = now_ms();
     let secs = |since: i64| u64::try_from(now.saturating_sub(since) / 1000).unwrap_or(0);
     let mut fields = Fields::new();
@@ -2503,14 +2505,7 @@ fn append_run(ledger: &Ledger, run: &RunRow, outcome: String, phase: &str) {
     if let Some(session) = &run.session {
         fields.insert("session".to_owned(), session.clone().into());
     }
-    let landed = Event::new("lab-run", fields).map(|event| ledger.append(&event));
-    if !matches!(landed, Ok(Ok(_))) {
-        let _ = writeln!(
-            std::io::stderr(),
-            "factory: lab: cannot record a run of {} in the ledger",
-            run.worktree
-        );
-    }
+    fields
 }
 
 async fn blocking<T: Send + 'static>(
