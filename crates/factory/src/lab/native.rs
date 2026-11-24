@@ -302,6 +302,8 @@ fn release_done(released: &Released, target: Target) -> Result<Done, Failure> {
         }
         let file = save_new("release", &(lines.join("\n") + "\n"))?;
         line = format!("{short}, list in {}", file.display());
+        let mut json = json;
+        json["releasedFile"] = json!(file);
         let mut done = Done::new(line, json);
         // The path is the point of the line: never cut it.
         done.whole = true;
@@ -313,16 +315,7 @@ fn release_done(released: &Released, target: Target) -> Result<Done, Failure> {
 /// Writes `text` to a file of its own, `<stem>-<pid>-<n>.txt` in the lab's runtime directory, made
 /// with exclusive creation so no other report is ever overwritten; its path.
 fn save_new(stem: &str, text: &str) -> Result<PathBuf, Failure> {
-    let paths = Paths::from_env()?;
-    paths.create_runtime()?;
-    let dir = paths.runtime.join("lab");
-    let failed = |path: &Path, e: std::io::Error| {
-        Failure::precondition(format!(
-            "cannot write {}: {e}; check XDG_RUNTIME_DIR",
-            path.display()
-        ))
-    };
-    fs::create_dir_all(&dir).map_err(|e| failed(&dir, e))?;
+    let dir = lab_dir()?;
     for n in 0u32.. {
         let path = dir.join(format!("{stem}-{}-{n}.txt", std::process::id()));
         match fs::OpenOptions::new()
@@ -334,28 +327,34 @@ fn save_new(stem: &str, text: &str) -> Result<PathBuf, Failure> {
                 return file
                     .write_all(text.as_bytes())
                     .map(|()| path.clone())
-                    .map_err(|e| failed(&path, e));
+                    .map_err(|e| unwritable(&path, &e));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(failed(&path, e)),
+            Err(e) => return Err(unwritable(&path, &e)),
         }
     }
     unreachable!("a free report name below u32::MAX")
 }
 
-/// Writes `text` to `name` in the lab's runtime directory; its path.
+/// Writes `text` to `name` in the lab's runtime directory, over what was there; its path.
 fn save(name: &str, text: &str) -> Result<PathBuf, Failure> {
+    let path = lab_dir()?.join(name);
+    fs::write(&path, text).map_err(|e| unwritable(&path, &e))?;
+    Ok(path)
+}
+
+/// The lab's runtime directory, made if missing.
+fn lab_dir() -> Result<PathBuf, Failure> {
     let paths = Paths::from_env()?;
     paths.create_runtime()?;
     let dir = paths.runtime.join("lab");
-    let path = dir.join(name);
-    fs::create_dir_all(&dir)
-        .and_then(|()| fs::write(&path, text))
-        .map_err(|e| {
-            Failure::precondition(format!(
-                "cannot write {}: {e}; check XDG_RUNTIME_DIR",
-                path.display()
-            ))
-        })?;
-    Ok(path)
+    fs::create_dir_all(&dir).map_err(|e| unwritable(&dir, &e))?;
+    Ok(dir)
+}
+
+fn unwritable(path: &Path, e: &std::io::Error) -> Failure {
+    Failure::precondition(format!(
+        "cannot write {}: {e}; check XDG_RUNTIME_DIR",
+        path.display()
+    ))
 }

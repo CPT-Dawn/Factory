@@ -2715,6 +2715,36 @@ fn factory_lab_release_names_a_file_when_the_leases_it_ends_would_run_the_line_l
 }
 
 #[test]
+fn factory_lab_release_json_names_the_file_its_long_line_would_name() {
+    let (sandbox, world) = lab();
+    let a = Agent::start();
+    let_one_owner_hold_both_slots(&sandbox);
+    for name in ["demo-1".repeat(12), "demo-2".repeat(12)] {
+        let wt = world.worktree(&name);
+        let held = native(&sandbox, &wt, a.pid(), &["lab", "acquire", "--no-device"]);
+        assert_eq!(held.code, 0, "{held:?}");
+    }
+    let elsewhere = world.worktree("plain-elsewhere");
+
+    let out = native(
+        &sandbox,
+        &elsewhere,
+        a.pid(),
+        &["lab", "release", "--all-mine", "--json"],
+    );
+
+    let json = one_json(&out);
+    let file = json["releasedFile"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no releasedFile in {json}"));
+    let listed = fs::read_to_string(file).expect("read the release list");
+    assert!(
+        listed.contains("released lease 1 (") && listed.contains("released lease 2 ("),
+        "{listed}"
+    );
+}
+
+#[test]
 fn a_stack_that_fails_to_stop_still_says_what_the_release_freed() {
     let (sandbox, world) = lab();
     let wt = world.worktree("demo-stop");

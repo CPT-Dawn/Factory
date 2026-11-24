@@ -34,8 +34,8 @@ pub fn context() -> Result<Ctx, Failure> {
 }
 
 /// The context of a release: a `devlab.json` here that can't be read counts as none, so one that
-/// is broken in another folder can't keep a release by id from ending or refusing its lease. A
-/// release reads no project from it: `--stop-stack` reads the held lease's own worktree's.
+/// is broken in another folder can't keep a release by id from ending or refusing its lease.
+/// `--stop-stack` resolves its teardown from the held lease's own worktree, not from this one.
 pub fn release_context() -> Result<Ctx, Failure> {
     context_with(false)
 }
