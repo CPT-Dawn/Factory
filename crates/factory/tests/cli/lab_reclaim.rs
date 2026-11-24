@@ -338,3 +338,57 @@ fn a_lease_that_lost_one_of_two_phones_is_whole_again_once_it_asks_for_one() {
     assert_eq!(again.code, 0, "{again:?}");
     assert_eq!(exec.code, 0, "{exec:?}");
 }
+
+#[test]
+fn a_lease_whose_phone_is_reclaimed_keeps_its_stack_slot() {
+    let (sandbox, world) = one_phone();
+    let (a, b, c) = (Owner::new(), Owner::new(), Owner::new());
+    let [wt_a, wt_b, wt_c] = ["demo-a", "plain-b", "demo-c"].map(|n| world.worktree(n));
+    let held = owned_by(&sandbox, &wt_a, &a, &["acquire", "--phone", "--quiet"]);
+    assert!(held.stdout.contains("DEVLAB_SLOT=0"), "{held:?}");
+
+    let taken = owned_by(&sandbox, &wt_b, &b, &["acquire", "--phone", "--wait", "60"]);
+    assert!(
+        taken.stdout.contains("ANDROID_SERIAL=FAKEPHONE01"),
+        "{taken:?}"
+    );
+    // Its lease still holds slot 0 of demo: the next lease of demo gets slot 1.
+    let next = owned_by(&sandbox, &wt_c, &c, &["acquire", "--no-device", "--quiet"]);
+    assert!(next.stdout.contains("DEVLAB_SLOT=1"), "{next:?}");
+    let status = owned_by(&sandbox, &wt_a, &a, &["status"]);
+    assert!(status.stdout.contains("lease 1 demo-a"), "{status:?}");
+}
+
+/// The `ANDROID_SERIAL` an acquire printed.
+fn serial_of(out: &Run) -> String {
+    out.stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("export ANDROID_SERIAL="))
+        .unwrap_or_else(|| panic!("no ANDROID_SERIAL in {out:?}"))
+        .trim_matches('\'')
+        .to_owned()
+}
+
+#[test]
+fn an_idle_emulator_adb_shows_offline_does_not_stand_in_for_one_an_idle_lease_holds() {
+    let (sandbox, world) = lab();
+    write_machine_config(
+        &sandbox,
+        r#""deviceIdleMin": 0, "maxEmulators": 2, "emulatorIdleMin": 60"#,
+    );
+    let (a, b, c) = (Owner::new(), Owner::new(), Owner::new());
+    let [wt_a, wt_b, wt_c] = ["plain-a", "plain-b", "plain-c"].map(|n| world.worktree(n));
+    let held = owned_by(&sandbox, &wt_a, &a, &["acquire", "--emulator", "--quiet"]);
+    assert_eq!(held.code, 0, "{held:?}");
+    let other = owned_by(&sandbox, &wt_c, &c, &["acquire", "--emulator", "--quiet"]);
+    assert_eq!(other.code, 0, "{other:?}");
+    // The second emulator idles, free, but adb can't reach it.
+    let idle = serial_of(&other);
+    assert_eq!(owned_by(&sandbox, &wt_c, &c, &["release"]).code, 0);
+    world.apply(&format!("plug {idle} offline")).unwrap();
+
+    let taken = owned_by(&sandbox, &wt_b, &b, &["acquire", "--emulator", "--wait", "20"]);
+
+    assert_eq!(taken.code, 0, "{taken:?}");
+    assert_eq!(serial_of(&taken), serial_of(&held), "{taken:?}");
+}
