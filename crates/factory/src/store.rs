@@ -17,7 +17,7 @@ use crate::output::Failure;
 use crate::protocol::{NotifyOn, SessionParam};
 
 /// The schema version this daemon writes, kept in `PRAGMA user_version`.
-const VERSION: i64 = 5;
+const VERSION: i64 = 6;
 
 pub struct Store {
     db: Connection,
@@ -61,7 +61,8 @@ impl Store {
                  name TEXT PRIMARY KEY,
                  repo TEXT NOT NULL,
                  report TEXT NOT NULL,
-                 ended INTEGER NOT NULL DEFAULT 0
+                 ended INTEGER NOT NULL DEFAULT 0,
+                 spawn INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS monitor (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -108,37 +109,48 @@ impl Store {
                  lead_pane TEXT,
                  lead_report TEXT
              );
-             PRAGMA user_version = 5;",
+             PRAGMA user_version = 6;",
         )
         .map_err(cannot)?;
+        // Schema 6 numbers each spawn of a lead's name, so a settlement closes only its own.
+        if !has_column(&db, "lead", "spawn").map_err(cannot)? {
+            db.execute_batch("ALTER TABLE lead ADD COLUMN spawn INTEGER NOT NULL DEFAULT 0")
+                .map_err(cannot)?;
+        }
         Ok(Store { db })
     }
 
     /// Records that the lead `name` was spawned in `repo` and will leave its final report at
-    /// `report`; its end is not in the ledger yet.
-    pub fn lead_started(&self, name: &str, repo: &str, report: &str) -> rusqlite::Result<()> {
-        self.db.execute(
-            "INSERT INTO lead (name, repo, report, ended) VALUES (?1, ?2, ?3, 0)
-             ON CONFLICT (name) DO UPDATE SET repo = ?2, report = ?3, ended = 0",
+    /// `report`; its end is not in the ledger yet. Returns which spawn of that name this is.
+    pub fn lead_started(&self, name: &str, repo: &str, report: &str) -> rusqlite::Result<i64> {
+        self.db.query_row(
+            "INSERT INTO lead (name, repo, report, ended, spawn) VALUES (?1, ?2, ?3, 0, 1)
+             ON CONFLICT (name) DO UPDATE SET repo = ?2, report = ?3, ended = 0, spawn = spawn + 1
+             RETURNING spawn",
             params![name, repo, report],
+            |row| row.get(0),
+        )
+    }
+
+    /// Records that the end of the `spawn`th spawn of the lead `name` is in the ledger. A later
+    /// spawn of that name keeps its own record.
+    pub fn lead_ended(&self, name: &str, spawn: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE lead SET ended = 1 WHERE name = ?1 AND spawn = ?2",
+            params![name, spawn],
         )?;
         Ok(())
     }
 
-    /// Records that the end of the lead `name` is in the ledger.
-    pub fn lead_ended(&self, name: &str) -> rusqlite::Result<()> {
-        self.db
-            .execute("UPDATE lead SET ended = 1 WHERE name = ?1", params![name])?;
-        Ok(())
-    }
-
-    /// The leads spawned whose end is not in the ledger yet, as (name, repo, report).
-    pub fn leads_running(&self) -> rusqlite::Result<Vec<(String, String, String)>> {
+    /// The leads spawned whose end is not in the ledger yet, as (name, repo, report, spawn).
+    pub fn leads_running(&self) -> rusqlite::Result<Vec<(String, String, String, i64)>> {
         let mut rows = self
             .db
-            .prepare("SELECT name, repo, report FROM lead WHERE ended = 0 ORDER BY name")?;
-        rows.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect()
+            .prepare("SELECT name, repo, report, spawn FROM lead WHERE ended = 0 ORDER BY name")?;
+        rows.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect()
     }
 
     /// Every backend's recorded quota; one never recorded is unknown.
@@ -508,4 +520,13 @@ fn quota_of(state: &str, until: Option<i64>) -> Quota {
         ("available", _) => Quota::Available,
         _ => Quota::Unknown,
     }
+}
+
+/// Whether `table` has a column named `column`.
+fn has_column(db: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut rows = db.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names: Vec<String> = rows
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(names.iter().any(|name| name == column))
 }

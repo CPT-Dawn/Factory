@@ -95,6 +95,8 @@ struct Unfinished {
     /// Which run of its slug this is, by the count of `lead-start` events in the ledger when it
     /// began: an end is written only for the run it belongs to.
     run: usize,
+    /// Which spawn of its name this is in the database: only that spawn's row is marked ended.
+    spawn: i64,
 }
 
 struct Lead {
@@ -139,7 +141,7 @@ impl<H: HerdrApi> Leads<H> {
         // The ledger says which still owe their end: a daemon that stopped between keeping a
         // lead and writing its start, or between writing its end and keeping that, owes none.
         let mut unfinished = BTreeMap::new();
-        for (name, repo, report) in running {
+        for (name, repo, report, spawn) in running {
             let standing = ledger.standing(&repo, lead::slug(&name)).map_err(|e| {
                 Failure::precondition(format!(
                     "cannot read {}: {e}; check FACTORY_STATE",
@@ -147,7 +149,7 @@ impl<H: HerdrApi> Leads<H> {
                 ))
             })?;
             if !standing.owes {
-                if let Err(e) = store.lead_ended(&name) {
+                if let Err(e) = store.lead_ended(&name, spawn) {
                     eprintln!("factory: cannot mark {name} ended in the database: {e}");
                 }
                 continue;
@@ -158,6 +160,7 @@ impl<H: HerdrApi> Leads<H> {
                     repo,
                     report: PathBuf::from(report),
                     run: standing.starts,
+                    spawn,
                 },
             );
         }
@@ -345,9 +348,10 @@ impl<H: HerdrApi> Leads<H> {
         .map(|(key, value)| format!("{key}={value}"));
         // Kept before the event is written: a daemon that stops after it still owes the end,
         // and one that stops before it owes none, which the ledger shows on restart.
-        if started.is_ok() {
-            self.keep(&name, &params.repo_name, &report);
-        }
+        let spawn = match started {
+            Ok(_) => self.keep(&name, &params.repo_name, &report),
+            Err(_) => 0,
+        };
         let event = event::Event::from_args("lead-start", &pairs, params.session.as_deref())
             .map_err(|e| Failure::usage(e.to_string()))?;
         let run = self
@@ -374,6 +378,7 @@ impl<H: HerdrApi> Leads<H> {
                 repo: params.repo_name.clone(),
                 report: report.clone(),
                 run,
+                spawn,
             },
         );
         self.bump();
@@ -387,17 +392,20 @@ impl<H: HerdrApi> Leads<H> {
     }
 
     /// Keeps `name` in the database as running, so a restarted daemon still owes its end.
-    fn keep(&self, name: &str, repo: &str, report: &Path) {
+    /// Keeps the lead `name` in the database and returns which spawn of that name it is, 0 when
+    /// it could not be kept.
+    fn keep(&self, name: &str, repo: &str, report: &Path) -> i64 {
         let kept = self
             .store
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .lead_started(name, repo, &report.to_string_lossy());
-        if let Err(e) = kept {
+        kept.unwrap_or_else(|e| {
             eprintln!(
                 "factory: cannot keep {name} in the database: {e}; its end is lost on a restart"
             );
-        }
+            0
+        })
     }
 
     /// Writes the `lead-end` of every spawned lead that has finished or died, once each, whenever the
@@ -454,7 +462,7 @@ impl<H: HerdrApi> Leads<H> {
                         .store
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .lead_ended(&name);
+                        .lead_ended(&name, lead.spawn);
                     if let Err(e) = kept {
                         eprintln!("factory: cannot mark {name} ended in the database: {e}");
                     }
