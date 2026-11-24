@@ -452,12 +452,18 @@ impl<H: HerdrApi> Leads<H> {
         let unread = std::mem::take(&mut self.lock().unread);
         let mut still = BTreeMap::new();
         for (name, lead) in unread {
-            match lead.standing(&self.ledger, &name) {
-                // A respawn of the name since has its own record, and settles this one's row.
-                Ok(Some(owed)) => {
-                    self.lock().unfinished.entry(name).or_insert(owed);
-                }
-                Ok(None) => {
+            // A lead that owes nothing is marked ended under the ledger's lock, as a settlement
+            // is: a respawn of its name keeps its own row under that lock too.
+            let read = self
+                .ledger
+                .with_standing(&lead.repo, lead::slug(&name), |standing| {
+                    if standing.owes {
+                        return Some(Unfinished {
+                            repo: lead.repo.clone(),
+                            report: lead.report.clone(),
+                            run: standing.starts,
+                        });
+                    }
                     let ended = self
                         .store
                         .lock()
@@ -466,7 +472,14 @@ impl<H: HerdrApi> Leads<H> {
                     if let Err(e) = ended {
                         eprintln!("factory: cannot mark {name} ended in the database: {e}");
                     }
+                    None
+                });
+            match read {
+                // A respawn of the name since has its own record, and settles this one's row.
+                Ok(Some(owed)) => {
+                    self.lock().unfinished.entry(name).or_insert(owed);
                 }
+                Ok(None) => {}
                 Err(_) => {
                     still.insert(name, lead);
                 }

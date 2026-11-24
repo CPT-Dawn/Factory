@@ -109,6 +109,21 @@ impl Ledger {
         standing_in(&self.path, repo, slug)
     }
 
+    /// Where the lead `slug` of `repo` stands, handed to `then` under the lock every append
+    /// takes: what `then` records of it, no start or end logged beside it can contradict.
+    pub fn with_standing<T>(
+        &self,
+        repo: &str,
+        slug: &str,
+        then: impl FnOnce(Standing) -> T,
+    ) -> io::Result<T> {
+        let _file = self
+            .file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(then(standing_in(&self.path, repo, slug)?))
+    }
+
     /// Appends the `lead-start` of the lead `slug` of `repo` and says which run of that slug it
     /// is. The run is counted, and `keep` called, under the same lock as the write, so a start
     /// logged beside it cannot take its number and a settlement of an earlier run, which holds
