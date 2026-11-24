@@ -31,6 +31,7 @@ use factory_core::lab::devices::{
 use factory_core::lab::emulator::{
     Boot, Settle, State, after_restart, boot_step, booting_note, free_indexes, serial_of, unit_name,
 };
+use factory_core::lab::events::{Asked, LeaseEnd};
 use factory_core::lab::grant::{self, Ask, Decision};
 use factory_core::lab::js_number;
 use factory_core::lab::queue::{DeviceNeed, QueueEntry, devices_held_by, over_device_cap};
@@ -53,7 +54,7 @@ use super::wire::{
     RELEASE, RUN_END, RUN_END_ID, RUN_START, RUN_STOPPING, ReleaseParams, Released, Reservation,
     RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING, SlotParams, StopParams, UNRESERVE, Waiter,
 };
-use super::{activity, readiness, reservations};
+use super::{activity, events, readiness, reservations};
 use super::{android, host};
 use crate::ledger::Ledger;
 use crate::output::Failure;
@@ -265,7 +266,7 @@ impl Lab {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = now();
-        let (freed, unreserved, unstopped, (orphans, ended), out) = store
+        let (freed, unreserved, unstopped, (orphans, ended), (out, queued)) = store
             .write(|c| {
                 let (freed, unreserved) = store::gc(c, now, &host::alive)?;
                 let unstopped = store::clear_dead_stoppers(c, &host::alive)?;
@@ -283,12 +284,13 @@ impl Lab {
                 for run in &orphans {
                     ended.extend(store::end_run_lease(c, run.id, now)?);
                 }
+                let out = work(c, now)?;
                 Ok((
                     freed,
                     unreserved,
                     unstopped + pruned,
                     (orphans, ended),
-                    work(c, now)?,
+                    (out, events::take(c)?),
                 ))
             })
             .map_err(|e| ErrorBody {
@@ -296,6 +298,9 @@ impl Lab {
                 message: format!("lab store {}: {e}; retry", self.path.display()),
             })?;
         drop(store);
+        for (kind, fields) in queued {
+            self.log(&kind, fields);
+        }
         for run in &orphans {
             let phase = if run.started_ms.is_some() {
                 Phase::Running
@@ -324,6 +329,29 @@ impl Lab {
         Ok((out, lines))
     }
 
+    /// Appends one lab event to the ledger. One that can't be written costs a log line and
+    /// nothing else: no lab command waits on the ledger or fails with it.
+    fn log(&self, kind: &str, fields: Fields) {
+        let landed = Event::new(kind, fields).map(|event| self.ledger.append(&event));
+        if !matches!(landed, Ok(Ok(_))) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "factory: lab: cannot write a {kind} event to the ledger"
+            );
+        }
+    }
+
+    /// Ends request `waiter`, which gave up waiting for `why`, and tells the ledger so.
+    fn give_up(&self, waiter: i64, p: &AcquireParams, why: &str) {
+        let gone = self.write(|c, now| {
+            events::wait_ended(c, waiter, &asked(p), false, why, now)?;
+            store::delete_waiter(c, waiter)
+        });
+        if let Ok(true) = gone {
+            self.notify();
+        }
+    }
+
     fn callers(&self) -> std::sync::MutexGuard<'_, HashSet<i64>> {
         self.callers
             .lock()
@@ -341,7 +369,7 @@ impl Lab {
         let dropped = self.write(|c, now| {
             let held = store::lease(c, lease)?;
             if let Some(held) = &held {
-                store::drop_lease(c, held, now)?;
+                store::drop_lease(c, held, now, LeaseEnd::SettleFailed)?;
                 if let Some(from) = from {
                     reservations::restore(c, from, now)?;
                 }
@@ -361,7 +389,7 @@ impl Lab {
     fn settle(&self, waiter: i64, to_drop: Option<&Lease>) -> Answer<()> {
         self.write(|c, now| {
             if let Some(lease) = to_drop {
-                store::drop_lease(c, lease, now)?;
+                store::drop_lease(c, lease, now, LeaseEnd::SettleFailed)?;
             }
             store::delete_waiter(c, waiter)
         })?;
@@ -566,7 +594,7 @@ fn release(lab: &Lab, p: ReleaseParams) -> Answer<Released> {
             }
         };
         for lease in &dropped {
-            store::drop_lease(c, lease, now)?;
+            store::drop_lease(c, lease, now, LeaseEnd::Release)?;
         }
         let unstopped = match &p.stopper {
             Some(stopper) => store::clear_stopping(c, stopper)?,
@@ -1114,6 +1142,15 @@ fn insert(c: &Connection, p: &AcquireParams, now: i64) -> rusqlite::Result<(i64,
     Ok((id, deadline_ms))
 }
 
+/// What request `p` asks for, as its `lab-wait` says it.
+fn asked(p: &AcquireParams) -> Asked {
+    Asked {
+        mode: p.devices.as_ref().map(|d| d.mode.clone()),
+        count: p.devices.as_ref().map_or(0, |d| d.want),
+        stack: p.project.is_some(),
+    }
+}
+
 fn project_ask(p: &AcquireParams) -> Option<grant::ProjectAsk> {
     p.project.as_ref().map(grant_project)
 }
@@ -1213,6 +1250,7 @@ fn try_grant(
     waiter: i64,
     facts: &Facts,
     reprobe: bool,
+    last_why: &str,
 ) -> Answer<Result<Taken, Refused>> {
     let looked = lab.write(|c, now| {
         // Probes are timed in ms, a lease in seconds.
@@ -1274,6 +1312,9 @@ fn try_grant(
                 None => None,
             };
             store::touch(c, lease.id, now)?;
+            let reservation = claimed.as_ref().map(|r| r.id);
+            events::lease_began(c, lease.id, reservation, 0)?;
+            events::wait_ended(c, waiter, &asked(p), true, last_why, now)?;
             store::delete_waiter(c, waiter)?;
             ends_with_run(c, p, waiter, lease, claimed.as_ref())?;
             return Ok(Ok(Taken {
@@ -1366,6 +1407,7 @@ fn try_grant(
         c.execute_batch("RELEASE claim")?;
         let fresh = new || lease.is_none() || claimed.is_some();
         // The slot goes back to the reservation only from the lease it was made into.
+        let claimed_from = claimed.clone();
         let from = claimed.filter(|_| !new);
         let lease = match lease {
             Some(lease) if !new => lease,
@@ -1422,6 +1464,12 @@ fn try_grant(
             }
         }
         store::touch(c, lease.id, now)?;
+        if fresh {
+            let reservation = claimed_from.as_ref().map(|r| r.id);
+            let booting = u32::try_from(boots.len()).unwrap_or(u32::MAX);
+            events::lease_began(c, lease.id, reservation, booting)?;
+        }
+        events::wait_ended(c, waiter, &asked(p), true, last_why, now)?;
         // A grant that boots emulators can't be handed to a caller again after a restart: the
         // daemon that comes back stops them, so the place goes now, as it did before.
         if fresh && boots.is_empty() {
@@ -1842,7 +1890,7 @@ pub async fn acquire<W, R, S>(
     }
     // A wait that ran out while the daemon was away takes nothing that came free meanwhile.
     if resumed && deadline_ms.is_some_and(|ms| ms <= now_ms()) {
-        lab.remove_waiter(waiter);
+        lab.give_up(waiter, &p, "the wait ran out while the daemon restarted");
         let body = ErrorBody {
             code: Exit::Busy.code(),
             message: format!(
@@ -1886,7 +1934,7 @@ pub async fn acquire<W, R, S>(
             } else {
                 Vec::new()
             };
-            let (lab, p) = (Arc::clone(&lab), Arc::clone(&p));
+            let (lab, p, last_why) = (Arc::clone(&lab), Arc::clone(&p), said.clone());
             blocking(move || {
                 let facts = gather(&lab, &p, seen, deadline);
                 let mut reprobes = 0;
@@ -1897,7 +1945,7 @@ pub async fn acquire<W, R, S>(
                     // A ready probe found too old is made again while the wait lasts, a few
                     // times at most; past that, the phone is not known to be ready.
                     let reprobe = reprobes < REPROBES && Instant::now() < deadline;
-                    match try_grant(&lab, &p, waiter, &facts, reprobe)? {
+                    match try_grant(&lab, &p, waiter, &facts, reprobe, &last_why)? {
                         Err(Refused::Reprobe) => {
                             reprobes += 1;
                             refresh_phones(&lab, &p, deadline);
@@ -1993,7 +2041,7 @@ pub async fn acquire<W, R, S>(
             }
         };
         if Instant::now() >= deadline {
-            lab.remove_waiter(waiter);
+            lab.give_up(waiter, &p, &why);
             let body = ErrorBody {
                 code: Exit::Busy.code(),
                 message: format!("gave up after {} s: {why}", js_number(p.wait_sec)),

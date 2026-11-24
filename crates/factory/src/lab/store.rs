@@ -11,7 +11,9 @@ use super::wire::{
     AcquireParams, Granted, Lease, LeaseDevice, Owner, Process, Reservation, SlotRow, SlotSchema,
     Waiter,
 };
-use super::{activity, readiness, reservations, stack};
+use factory_core::lab::events::LeaseEnd;
+
+use super::{activity, events, readiness, reservations, stack};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS leases (
@@ -139,6 +141,7 @@ impl Store {
         conn.execute_batch(reservations::SCHEMA)?;
         conn.execute_batch(readiness::SCHEMA)?;
         conn.execute_batch(activity::SCHEMA)?;
+        conn.execute_batch(events::SCHEMA)?;
         if version < VERSION {
             conn.pragma_update(None, "user_version", VERSION)?;
         }
@@ -488,8 +491,15 @@ pub fn find_lease(
 /// Forgets a lease; its slot and its emulators start idling, its phones are free. A lease whose
 /// worktree started the slot's stack records that worktree's newest migration as it ends, so
 /// that one added during the lease counts. A run's lease made from a reservation
-/// ([`end_with_run`]) gives that reservation its slot back, however the lease ends.
-pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<()> {
+/// ([`end_with_run`]) gives that reservation its slot back, however the lease ends. Its end,
+/// for `reason`, is queued for the ledger.
+pub fn drop_lease(
+    c: &Connection,
+    lease: &Lease,
+    now: i64,
+    reason: LeaseEnd,
+) -> rusqlite::Result<()> {
+    events::lease_ended(c, lease, reason)?;
     let from: Option<Option<String>> = c
         .query_row(
             "SELECT reservation FROM run_leases WHERE lease = ?1",
@@ -571,7 +581,7 @@ pub fn end_run_lease(c: &Connection, run: i64, now: i64) -> rusqlite::Result<Opt
         c.execute("DELETE FROM run_leases WHERE run = ?1", [run])?;
         return Ok(None);
     };
-    drop_lease(c, &held, now)?;
+    drop_lease(c, &held, now, LeaseEnd::RunEnd)?;
     Ok(Some(held))
 }
 
@@ -585,7 +595,7 @@ pub fn gc(
     let mut freed = Vec::new();
     for lease in leases(c)? {
         if !alive(lease.owner_pid, &lease.owner_start) {
-            drop_lease(c, &lease, now)?;
+            drop_lease(c, &lease, now, LeaseEnd::OwnerExit)?;
             freed.push(lease);
         }
     }
@@ -649,7 +659,7 @@ pub fn prune_waiters(
             continue;
         }
         if let Some(lease) = granted.map(|id| lease(c, id)).transpose()?.flatten() {
-            drop_lease(c, &lease, now_ms / 1000)?;
+            drop_lease(c, &lease, now_ms / 1000, LeaseEnd::SettleFailed)?;
         }
         if delete_waiter(c, w.id)? {
             pruned += 1;
@@ -926,7 +936,21 @@ pub fn run_started(c: &Connection, id: i64, ms: i64) -> rusqlite::Result<()> {
         "UPDATE runs SET started_ms = COALESCE(started_ms, ?2) WHERE id = ?1",
         params![id, ms],
     )?;
+    if let Some(lease) = run_lease(c, id)? {
+        events::commands_changed(c, lease)?;
+    }
     Ok(())
+}
+
+/// The lease run `id` runs on, if it has one.
+fn run_lease(c: &Connection, id: i64) -> rusqlite::Result<Option<i64>> {
+    Ok(
+        c.query_row("SELECT lease FROM runs WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .flatten(),
+    )
 }
 
 /// Takes the run out of the store, to record its end: none when it was taken already.
@@ -934,8 +958,11 @@ pub fn take_run(c: &Connection, id: i64) -> rusqlite::Result<Option<RunRow>> {
     let run = c
         .query_row("SELECT * FROM runs WHERE id = ?1", [id], run_row)
         .optional()?;
-    if run.is_some() {
+    if let Some(run) = &run {
         c.execute("DELETE FROM runs WHERE id = ?1", [id])?;
+        if let Some(lease) = run.lease {
+            events::commands_changed(c, lease)?;
+        }
     }
     Ok(run)
 }
@@ -955,6 +982,9 @@ pub fn take_orphan_runs(
             continue;
         }
         c.execute("DELETE FROM runs WHERE id = ?1", [run.id])?;
+        if let Some(lease) = run.lease {
+            events::commands_changed(c, lease)?;
+        }
         orphans.push(run);
     }
     Ok(orphans)

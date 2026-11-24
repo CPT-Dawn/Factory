@@ -1,0 +1,187 @@
+//! The lab's events on their way to the stats ledger (#62). Each is queued in `lab.db` by the
+//! transaction that makes it true, so one rolled back is never told, and the daemon appends the
+//! queue to the ledger once the transaction commits ([`take`]). And each lease's clock: when
+//! it began, and how long commands have run on it, for its `idle_seconds`.
+
+use factory_core::event::Fields;
+use factory_core::lab::events::{self as event, LeaseEnd, LeaseFacts, spans};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::Value;
+
+use super::service::now_ms;
+use super::store;
+use super::wire::Lease;
+
+pub const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS lab_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  fields TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lease_clocks (
+  lease INTEGER PRIMARY KEY,
+  start_ms INTEGER NOT NULL,
+  busy_ms INTEGER NOT NULL DEFAULT 0,
+  busy_since INTEGER,
+  reservation INTEGER
+);
+";
+
+/// Queues event `kind` with `fields` for the ledger.
+pub fn queue(c: &Connection, kind: &str, fields: &Fields) -> rusqlite::Result<()> {
+    let text = Value::Object(fields.clone()).to_string();
+    c.execute(
+        "INSERT INTO lab_events (kind, fields) VALUES (?1, ?2)",
+        params![kind, text],
+    )?;
+    Ok(())
+}
+
+/// Takes the queued events, oldest first.
+pub fn take(c: &Connection) -> rusqlite::Result<Vec<(String, Fields)>> {
+    let mut q = c.prepare("SELECT kind, fields FROM lab_events ORDER BY id")?;
+    let rows: Vec<(String, String)> = q
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    c.execute("DELETE FROM lab_events", [])?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(kind, text)| match serde_json::from_str(&text) {
+            Ok(Value::Object(fields)) => Some((kind, fields)),
+            _ => None,
+        })
+        .collect())
+}
+
+/// What the ledger says of lease `lease` as the store holds it now, with `booting` more
+/// emulators on their way to it.
+fn facts(c: &Connection, lease: &Lease, booting: u32) -> rusqlite::Result<LeaseFacts> {
+    let reservation: Option<i64> = c
+        .query_row(
+            "SELECT reservation FROM lease_clocks WHERE lease = ?1",
+            [lease.id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let mut devices: Vec<(String, String)> = store::lease_devices(c, lease.id)?
+        .into_iter()
+        .map(|d| (d.kind, d.model))
+        .collect();
+    devices.extend((0..booting).map(|_| ("emulator".to_owned(), String::new())));
+    Ok(LeaseFacts {
+        id: lease.id,
+        project: lease.project.clone(),
+        owner_label: lease.owner_label.clone(),
+        worktree: lease.worktree.clone(),
+        devices,
+        slot: lease.slot,
+        reservation,
+    })
+}
+
+/// Lease `id` was granted, made from reservation `reservation` if one, with `booting`
+/// emulators still to boot: its clock starts and its `lab-lease start` is queued.
+pub fn lease_began(
+    c: &Connection,
+    id: i64,
+    reservation: Option<i64>,
+    booting: u32,
+) -> rusqlite::Result<()> {
+    let Some(lease) = store::lease(c, id)? else {
+        return Ok(());
+    };
+    c.execute(
+        "INSERT OR REPLACE INTO lease_clocks (lease, start_ms, reservation) VALUES (?1, ?2, ?3)",
+        params![id, now_ms(), reservation],
+    )?;
+    queue(
+        c,
+        "lab-lease",
+        &event::lease_start(&facts(c, &lease, booting)?),
+    )
+}
+
+/// Lease `lease` ends for `reason`: its `lab-lease end` is queued and its clock forgotten.
+/// Called before its devices are let go.
+pub fn lease_ended(c: &Connection, lease: &Lease, reason: LeaseEnd) -> rusqlite::Result<()> {
+    let now = now_ms();
+    let clock: Option<(i64, i64, Option<i64>)> = c
+        .query_row(
+            "SELECT start_ms, busy_ms, busy_since FROM lease_clocks WHERE lease = ?1",
+            [lease.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    // A lease granted before its clock was kept began when it was made, and ran nothing known.
+    let (start, busy, since) = clock.unwrap_or((lease.created.saturating_mul(1000), 0, None));
+    let (seconds, idle) = spans(start, busy, since, now);
+    let fields = event::lease_end(&facts(c, lease, 0)?, seconds, idle, reason);
+    queue(c, "lab-lease", &fields)?;
+    c.execute("DELETE FROM lease_clocks WHERE lease = ?1", [lease.id])?;
+    Ok(())
+}
+
+/// Brings lease `lease`'s clock up to date with the commands running on it now: its execs and
+/// its started run. Called after each starts or ends.
+pub fn commands_changed(c: &Connection, lease: i64) -> rusqlite::Result<()> {
+    let running: i64 = c.query_row(
+        "SELECT (SELECT COUNT(*) FROM execs WHERE lease = ?1)
+              + (SELECT COUNT(*) FROM runs WHERE lease = ?1 AND started_ms IS NOT NULL)",
+        [lease],
+        |row| row.get(0),
+    )?;
+    let now = now_ms();
+    if running > 0 {
+        c.execute(
+            "UPDATE lease_clocks SET busy_since = COALESCE(busy_since, ?2) WHERE lease = ?1",
+            params![lease, now],
+        )?;
+    } else {
+        c.execute(
+            "UPDATE lease_clocks SET busy_ms = busy_ms + MAX(0, ?2 - busy_since), busy_since = NULL
+             WHERE lease = ?1 AND busy_since IS NOT NULL",
+            params![lease, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// Waiter `waiter`, which asked for `asked`, ends its wait now (`now`, in seconds): granted,
+/// or given up waiting for `why`; `why` empty: it never waited. Its `lab-wait` is queued.
+pub fn wait_ended(
+    c: &Connection,
+    waiter: i64,
+    asked: &event::Asked,
+    granted: bool,
+    why: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let created: Option<i64> = c
+        .query_row(
+            "SELECT created FROM waiters WHERE id = ?1",
+            [waiter],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let seconds = u64::try_from(now.saturating_sub(created.unwrap_or(now))).unwrap_or(0);
+    let fields = if granted {
+        event::wait_granted(asked, seconds, Some(why).filter(|w| !w.is_empty()))
+    } else {
+        event::wait_gave_up(asked, seconds, why)
+    };
+    queue(c, "lab-wait", &fields)
+}
+
+/// The oldest waiter short of a device `kind` can serve: who a reclaimed device goes to.
+pub fn waiter_for(c: &Connection, kind: &str) -> rusqlite::Result<Option<i64>> {
+    c.query_row(
+        "SELECT waiter FROM waiter_devices WHERE mode = ?1 OR mode = 'any' ORDER BY waiter LIMIT 1",
+        [kind],
+        |row| row.get(0),
+    )
+    .optional()
+}

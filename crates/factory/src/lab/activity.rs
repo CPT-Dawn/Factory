@@ -9,6 +9,7 @@ use factory_core::lab::devices::Mode;
 use factory_core::lab::queue::DeviceNeed;
 use rusqlite::{Connection, OptionalExtension, params};
 
+use super::events;
 use super::wire::{Process, ReclaimedDevice};
 
 pub const SCHEMA: &str = "
@@ -146,14 +147,20 @@ pub fn begin_exec(c: &Connection, e: &Exec) -> rusqlite::Result<()> {
         "INSERT OR REPLACE INTO execs (pid, start, lease, command) VALUES (?1, ?2, ?3, ?4)",
         params![e.client.pid, e.client.start, e.lease, e.command],
     )?;
-    Ok(())
+    events::commands_changed(c, e.lease)
 }
 
 /// Ends the exec of `client`; the lease it ran on, if it was counted.
 pub fn end_exec(c: &Connection, client: &Process) -> rusqlite::Result<Option<i64>> {
     let mut q = c.prepare("DELETE FROM execs WHERE pid = ?1 AND start = ?2 RETURNING lease")?;
-    let mut rows = q.query_map(params![client.pid, client.start], |row| row.get(0))?;
-    rows.next().transpose()
+    let lease: Option<i64> = q
+        .query_map(params![client.pid, client.start], |row| row.get(0))?
+        .next()
+        .transpose()?;
+    if let Some(lease) = lease {
+        events::commands_changed(c, lease)?;
+    }
+    Ok(lease)
 }
 
 /// The execs still running, oldest first; those whose process exited are forgotten.

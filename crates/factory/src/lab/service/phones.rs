@@ -13,6 +13,7 @@ use factory_adapters::adb::{Adb, AdbCli};
 use factory_adapters::desktop::{Desktop, NotifySend, PostError};
 use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{Attached, LOCK_PROBE, prep_command};
+use factory_core::lab::events as event;
 use factory_core::lab::ready::{
     AUTH_TIMEOUT_PROBE, BATTERY_PROBE, EpochMs, Notice, POWER_PROBE, Probe, Readiness,
     STAY_ON_PROBE, after, auth_timeout_warning, judge, notice, refresh_again, unplugged,
@@ -289,22 +290,23 @@ impl Watcher {
             Ok((
                 row,
                 notice(&name(&phone.model, &phone.serial), before, readiness),
-                before.is_none_or(|k| k.readiness != readiness),
+                before.map(|k| k.readiness),
             ))
         });
-        let (row, said, changed) = written.ok()?;
-        if let Some(said) = said {
-            self.post(&said);
-        }
+        let (row, said, was) = written.ok()?;
+        let changed = was != Some(readiness);
+        let notified = said.is_some_and(|said| self.post(&said));
         if changed {
+            let fields = event::readiness(&phone.model, &phone.serial, was, readiness, notified);
+            self.lab.log("lab-readiness", fields);
             // A request waiting for a phone looks again.
             self.lab.notify();
         }
         Some(row)
     }
 
-    /// Logs `n`, and posts it when the machine config has notifications on.
-    fn post(&mut self, n: &Notice) {
+    /// Logs `n`, and posts it when the machine config has notifications on; whether it was.
+    fn post(&mut self, n: &Notice) -> bool {
         let body = if n.body.is_empty() {
             String::new()
         } else {
@@ -312,13 +314,13 @@ impl Watcher {
         };
         eprintln!("factory: lab: {}{body}", n.summary);
         if !config().notify {
-            return;
+            return false;
         }
         match self
             .desktop
             .post("devlab", n.urgency.word(), &n.summary, &n.body)
         {
-            Ok(()) => {}
+            Ok(()) => return true,
             Err(PostError::Missing) => {
                 if !self.said_missing {
                     eprintln!(
@@ -329,6 +331,7 @@ impl Watcher {
             }
             Err(PostError::Failed(e)) => eprintln!("factory: lab: {e}"),
         }
+        false
     }
 
     /// `phone`'s row: the kept one unless `stale` says, of its readiness and its age in ms, that
