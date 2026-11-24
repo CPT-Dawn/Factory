@@ -219,6 +219,49 @@ fn a_reservation_is_handed_to_a_child_through_the_environment_and_its_acquire_us
 }
 
 #[test]
+fn a_run_gives_its_slot_back_to_the_reservation_it_came_from_for_the_next_run() {
+    let (sandbox, world) = lab();
+    let (lead, _other, wt) = lead_and_a_full_board(&sandbox, &world);
+    let id = reservation(&as_agent(&sandbox, &wt, &lead, &["reserve"]));
+    let (child, dir) = (Agent::new(), world.worktree("demo-child"));
+    let suite = [
+        "run",
+        "--no-device",
+        "--stack",
+        "--",
+        "sh",
+        "-c",
+        "echo \"slot $DEVLAB_SLOT\"",
+    ];
+    let reserved = [("DEVLAB_RESERVATION", id.as_str())];
+
+    let first = run(call(&sandbox, &dir, &child, &reserved, &suite));
+    assert_eq!(
+        (first.code, first.stdout.as_str()),
+        (0, "slot 1\n"),
+        "{first:?}"
+    );
+    // The slot is the lead's reservation again, under the same id: nobody else gets it.
+    let status = as_agent(&sandbox, &wt, &lead, &["status"]).stdout;
+    assert!(
+        status.contains(&format!("reserved by {} (reservation {id})", lead.label())),
+        "{status}"
+    );
+    let outsider = Agent::new();
+    let ask = ["acquire", "--no-device", "--quiet", "--wait", "0"];
+    let shut_out = as_agent(&sandbox, &world.worktree("demo-outsider"), &outsider, &ask);
+    assert_eq!(shut_out.code, 75, "{shut_out:?}");
+    // The next run takes it at once.
+    let second = run(call(&sandbox, &dir, &child, &reserved, &suite));
+    assert_eq!(
+        (second.code, second.stdout.as_str()),
+        (0, "slot 1\n"),
+        "{second:?}"
+    );
+    assert!(!second.stderr.contains("waiting:"), "{second:?}");
+}
+
+#[test]
 fn status_shows_a_reserved_slot_as_the_leads() {
     let (sandbox, world) = lab();
     let (lead, _other, wt) = lead_and_a_full_board(&sandbox, &world);

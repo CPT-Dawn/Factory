@@ -46,8 +46,8 @@ use super::store::{self, RunRow, Store};
 use super::wire::{
     AcquireParams, Board, DeviceAsk, DeviceLine, FindParams, GC, Granted, LEASE, Lease,
     LeaseDevice, Process, ProjectAsk, RECEIVED, RELEASE, RUN_END, RUN_END_ID, RUN_START,
-    ReleaseParams, RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING, SlotParams, StopParams,
-    UNRESERVE, Waiter,
+    ReleaseParams, Reservation, RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING, SlotParams,
+    StopParams, UNRESERVE, Waiter,
 };
 use super::{android, host};
 use crate::ledger::Ledger;
@@ -203,7 +203,7 @@ impl Lab {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = now();
-        let (freed, unreserved, unstopped, orphans, out) = store
+        let (freed, unreserved, unstopped, (orphans, ended), out) = store
             .write(|c| {
                 let (freed, unreserved) = store::gc(c, now, &host::alive)?;
                 let unstopped = store::clear_dead_stoppers(c, &host::alive)?;
@@ -217,11 +217,15 @@ impl Lab {
                 )?;
                 let orphans =
                     store::take_orphan_runs(c, &|id| attached.contains(&id), &host::alive)?;
+                let mut ended = Vec::new();
+                for run in &orphans {
+                    ended.extend(store::end_run_lease(c, run.id, now)?);
+                }
                 Ok((
                     freed,
                     unreserved,
                     unstopped + pruned,
-                    orphans,
+                    (orphans, ended),
                     work(c, now)?,
                 ))
             })
@@ -248,9 +252,10 @@ impl Lab {
             .map(|l| format!("lease {} ({}, owner exited)", l.id, l.owner_label))
             .chain(unreserved)
             .collect();
-        if !lines.is_empty() || unstopped > 0 {
+        if !lines.is_empty() || unstopped > 0 || !ended.is_empty() {
             self.notify();
         }
+        let freed: Vec<Lease> = freed.into_iter().chain(ended).collect();
         if !freed.is_empty() {
             keeper::take_back_reverses_on_thread(self.attached.borrow().clone(), freed);
         }
@@ -752,6 +757,7 @@ fn fresh_run(p: &AcquireParams, id: i64) -> RunRow {
     let ask = p.run.clone().unwrap_or(RunAsk {
         command: String::new(),
         session: None,
+        keep: false,
     });
     RunRow {
         id,
@@ -854,6 +860,21 @@ fn grant_board(
     })
 }
 
+/// A run's request (its run kept under the waiter's id) gets lease `lease`, new to it: the lease
+/// ends with the run unless the run keeps it (`--keep`). `from`: the reservation it was made from.
+fn ends_with_run(
+    c: &Connection,
+    p: &AcquireParams,
+    waiter: i64,
+    lease: &Lease,
+    from: Option<&Reservation>,
+) -> rusqlite::Result<()> {
+    match &p.run {
+        Some(run) if !run.keep => store::end_with_run(c, waiter, lease.id, from),
+        _ => Ok(()),
+    }
+}
+
 /// The lease granted, or why the request waits.
 fn try_grant(
     lab: &Lab,
@@ -866,14 +887,16 @@ fn try_grant(
         // A reservation of the caller's project is used once: it becomes the caller's lease,
         // without a turn in the queue. One that is gone (used, released or its lead exited)
         // asks for a slot the normal way.
-        let mut claimed = false;
+        let mut claimed = None;
         if lease.is_none()
             && let (Some(id), Some(project)) = (p.reservation, &p.project)
+            && let Some((made, from)) =
+                reservations::claim(c, id, &project.name, &p.worktree, &p.owner, now)?
         {
-            lease = reservations::claim(c, id, &project.name, &p.worktree, &p.owner, now)?;
-            claimed = lease.is_some();
+            lease = Some(made);
+            claimed = Some(from);
         }
-        if claimed
+        if claimed.is_some()
             && p.devices.is_none()
             && let (Some(lease), Some(project)) = (&lease, &p.project)
         {
@@ -883,6 +906,7 @@ fn try_grant(
             };
             store::touch(c, lease.id, now)?;
             store::delete_waiter(c, waiter)?;
+            ends_with_run(c, p, waiter, lease, claimed.as_ref())?;
             return Ok(Ok(Taken {
                 granted: Granted {
                     lease: lease.clone(),
@@ -921,7 +945,9 @@ fn try_grant(
             Decision::Wait(why) => return Ok(Err(why)),
             Decision::Grant { slot, new } => (slot, new),
         };
-        let fresh = new || lease.is_none() || claimed;
+        let fresh = new || lease.is_none() || claimed.is_some();
+        // The slot goes back to the reservation only from the lease it was made into.
+        let from = claimed.filter(|_| !new);
         let lease = match lease {
             Some(lease) if !new => lease,
             _ => store::insert_lease(
@@ -937,6 +963,9 @@ fn try_grant(
             (Some(project), Some(slot)) => store::claim_slot(c, &project.name, slot, &p.worktree)?,
             _ => None,
         };
+        if fresh {
+            ends_with_run(c, p, waiter, &lease, from.as_ref())?;
+        }
         let (mut boots, mut phones, mut reused) = (Vec::new(), Vec::new(), Vec::new());
         if let (Some(Planned { plan, used }), Some(ask)) = (planned, &p.devices) {
             for serial in &plan.phones {
@@ -1749,9 +1778,25 @@ impl Run {
     async fn record(&self, outcome: String, phase: &str) {
         if self.kept {
             let (lab, id) = (Arc::clone(&self.lab), self.row.id);
-            let taken = blocking(move || lab.write(|c, _| store::take_run(c, id))).await;
-            if matches!(taken, Ok(None)) {
-                return;
+            let taken = blocking(move || {
+                lab.write(|c, now| {
+                    let Some(run) = store::take_run(c, id)? else {
+                        return Ok(None);
+                    };
+                    Ok(Some((run, store::end_run_lease(c, id, now)?)))
+                })
+            })
+            .await;
+            match taken {
+                Ok(None) => return,
+                Ok(Some((_, Some(ended)))) => {
+                    self.lab.notify();
+                    keeper::take_back_reverses_on_thread(
+                        self.lab.attached.borrow().clone(),
+                        vec![ended],
+                    );
+                }
+                _ => {}
             }
         }
         let (ledger, row, phase) = (

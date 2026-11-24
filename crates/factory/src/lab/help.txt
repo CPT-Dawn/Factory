@@ -3,6 +3,9 @@ devlab: lease this PC's phones, emulators and local stack slots, one holder at a
 Agents: lease before touching adb, an emulator or a local stack; never pick a serial or port yourself.
   devlab run [opts] -- <cmd...>   lease (or reuse this worktree's lease), then run cmd with its env:
                                   ANDROID_SERIAL, DEVLAB_SERIALS, slot ports, SUPABASE_URL, ...
+                                  A lease the run made ends when cmd does, whatever its exit or
+                                  signal (a reserved slot goes back to its reservation); a lease
+                                  it found (from acquire or run --keep) stays.
   devlab acquire [opts]           lease and print the env as export lines: eval "$(devlab acquire)"
   devlab env                      print the current lease's export lines
   devlab exec -- <cmd...>         run cmd in the current lease (fails fast if a device was unplugged)
@@ -16,6 +19,7 @@ Options for run/acquire:
   --stack        start the slot's local stack too (quiet; log path on failure)
   --wait SEC     how long to queue for a free device or slot (default 480); 0 = do not wait;
                  seconds, or 90s, 9m or 1h
+  --keep         run only: keep the lease the run made once cmd ends (devlab release ends it)
 
 A lease belongs to the calling agent (or your terminal) and this worktree; every command from the
 same agent in the same worktree finds it again. Subagents count as their lead: one owner may hold at

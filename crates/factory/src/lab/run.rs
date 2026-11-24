@@ -56,8 +56,15 @@ const SETTLE_TIMEOUT: Duration = client::RESUME_TIMEOUT.saturating_add(client::A
 
 /// `devlab run`: queues for the lease, takes it, runs `argv` in it (its devices woken and the
 /// project's ports reversed onto them) and returns its exit code
-/// (128 + the signal that ended it, or that stopped devlab).
-pub fn run(ctx: &Ctx, opts: &Opts, quiet: bool, argv: &[String]) -> Result<u8, Failure> {
+/// (128 + the signal that ended it, or that stopped devlab). A lease the run made ends with it,
+/// however it ends, unless `keep`; one it found (an acquire's, an earlier `--keep`) stays.
+pub fn run(
+    ctx: &Ctx,
+    opts: &Opts,
+    quiet: bool,
+    keep: bool,
+    argv: &[String],
+) -> Result<u8, Failure> {
     let Some(program) = argv.first() else {
         return Err(Failure::usage("devlab run [opts] -- <cmd...>"));
     };
@@ -66,6 +73,7 @@ pub fn run(ctx: &Ctx, opts: &Opts, quiet: bool, argv: &[String]) -> Result<u8, F
         session: std::env::var("CLAUDE_CODE_SESSION_ID")
             .ok()
             .filter(|id| !id.is_empty()),
+        keep,
     };
     let (params, listen) = lease::ask(ctx, opts, Some(ask))?;
     let paths = lease::paths()?;

@@ -216,6 +216,9 @@ pub struct RunAsk {
     pub command: String,
     /// The Claude Code session it runs in, `CLAUDE_CODE_SESSION_ID`.
     pub session: Option<String>,
+    /// `--keep`: a lease the run makes outlives it. Without it, that lease ends with the run.
+    #[serde(default)]
+    pub keep: bool,
 }
 
 /// How a run ended, in the ledger's words: [`factory_core::lab::run::End::outcome`] and

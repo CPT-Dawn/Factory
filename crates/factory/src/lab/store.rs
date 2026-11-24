@@ -7,7 +7,9 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::reservations;
-use super::wire::{AcquireParams, Granted, Lease, LeaseDevice, Owner, Process, SlotRow, Waiter};
+use super::wire::{
+    AcquireParams, Granted, Lease, LeaseDevice, Owner, Process, Reservation, SlotRow, Waiter,
+};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS leases (
@@ -73,6 +75,11 @@ CREATE TABLE IF NOT EXISTS runs (
   started_ms INTEGER,
   lease INTEGER,
   slot INTEGER
+);
+CREATE TABLE IF NOT EXISTS run_leases (
+  run INTEGER PRIMARY KEY,
+  lease INTEGER NOT NULL,
+  reservation TEXT
 );
 CREATE TABLE IF NOT EXISTS emulators (
   idx INTEGER PRIMARY KEY,
@@ -439,7 +446,52 @@ pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<(
         )?;
     }
     c.execute("DELETE FROM leases WHERE id = ?1", [lease.id])?;
+    c.execute("DELETE FROM run_leases WHERE lease = ?1", [lease.id])?;
     reservations::record_lease_end(c, lease, now)
+}
+
+/// Lease `lease` ends with run `run`: the run made it and didn't ask to keep it. `from` is the
+/// reservation it was made from, which gets its slot back then.
+pub fn end_with_run(
+    c: &Connection,
+    run: i64,
+    lease: i64,
+    from: Option<&Reservation>,
+) -> rusqlite::Result<()> {
+    let from = from
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    c.execute(
+        "INSERT OR REPLACE INTO run_leases (run, lease, reservation) VALUES (?1, ?2, ?3)",
+        params![run, lease, from],
+    )?;
+    Ok(())
+}
+
+/// Run `run` ended: the lease that ends with it ([`end_with_run`]) is dropped, and the
+/// reservation it was made from, if any, holds its slot again, under the same id. The lease
+/// dropped, if it was still there.
+pub fn end_run_lease(c: &Connection, run: i64, now: i64) -> rusqlite::Result<Option<Lease>> {
+    let ending: Option<(i64, Option<String>)> = c
+        .query_row(
+            "SELECT lease, reservation FROM run_leases WHERE run = ?1",
+            [run],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((id, from)) = ending else {
+        return Ok(None);
+    };
+    c.execute("DELETE FROM run_leases WHERE run = ?1", [run])?;
+    let Some(held) = lease(c, id)? else {
+        return Ok(None);
+    };
+    drop_lease(c, &held, now)?;
+    if let Some(from) = from.and_then(|text| serde_json::from_str::<Reservation>(&text).ok()) {
+        reservations::restore(c, &from)?;
+    }
+    Ok(Some(held))
 }
 
 /// Drops every lease and reservation whose owner exited: the leases as they were, with their

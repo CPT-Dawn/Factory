@@ -214,7 +214,16 @@ fn run_and_exec_keep_devlab_alive_as_the_parent_of_the_command() {
     let ran = owned(
         &sandbox,
         &wt,
-        &["run", "--no-device", "--quiet", "--", "sh", "-c", parent],
+        &[
+            "run",
+            "--no-device",
+            "--quiet",
+            "--keep",
+            "--",
+            "sh",
+            "-c",
+            parent,
+        ],
     );
     let held = owned(&sandbox, &wt, &["exec", "--", "sh", "-c", parent]);
 
@@ -1972,7 +1981,8 @@ fn a_run_a_daemon_stop_cut_off_for_good_is_recorded_as_daemon_stopped_not_lost()
     let event = the_lab_run(&sandbox);
     assert_eq!(event["outcome"], "daemon-stopped", "{event}");
     assert_eq!(event["phase"], "running", "{event}");
-    assert_eq!(leases_on(&after).len(), 1, "{after}");
+    // The lease the run made ends with it, however it ended (#53).
+    assert!(leases_on(&after).is_empty(), "{after}");
 }
 
 #[test]
