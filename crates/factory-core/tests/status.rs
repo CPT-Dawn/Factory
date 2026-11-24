@@ -60,6 +60,7 @@ fn backend(name: &str, quota: QuotaState, resets: Option<&str>, running: u32, of
         resets: resets
             .and_then(Timestamp::parse)
             .map(Timestamp::unix_millis),
+        reason: None,
         running,
         concurrency: of,
         when_busy: "queue".to_owned(),

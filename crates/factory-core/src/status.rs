@@ -102,6 +102,9 @@ pub struct Backend {
     pub quota: QuotaState,
     /// When a cooldown ends, in milliseconds since the epoch.
     pub resets: Option<i64>,
+    /// Why its quota is unknown, when a review could not read it (agy's usage answer).
+    #[serde(default)]
+    pub reason: Option<String>,
     pub running: u32,
     pub concurrency: u32,
     /// `queue` or `next`.
@@ -319,6 +322,10 @@ fn review(status: &Status, rows: &mut Vec<String>) {
             "  {:<width$}  {quota}, {}/{} running",
             backend.name, backend.running, backend.concurrency
         ));
+        // Why it is unknown, under it: a row of its own keeps the reason within the columns.
+        if let (QuotaState::Unknown, Some(why)) = (backend.quota, &backend.reason) {
+            rows.push(format!("    {why}"));
+        }
     }
 }
 

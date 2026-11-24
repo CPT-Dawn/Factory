@@ -19,7 +19,9 @@ use tokio::sync::Notify;
 
 use crate::clock;
 use crate::output::Failure;
-use crate::protocol::{AcquireParams, AcquireResult, BackendSlots, MISMATCH, Outcome, QuotaParams};
+use crate::protocol::{
+    AcquireParams, AcquireResult, BackendSlots, MISMATCH, Outcome, QuotaParam, QuotaParams,
+};
 use crate::store::Store;
 
 pub struct Router {
@@ -32,6 +34,9 @@ pub struct Router {
 #[derive(Default)]
 struct State {
     quotas: HashMap<String, Quota>,
+    /// Why a backend's quota is unknown, as the review that could not read it said. Kept in
+    /// memory only: the next review that tries the backend says again.
+    unknown: HashMap<String, String>,
     running: HashMap<String, u32>,
 }
 
@@ -46,6 +51,7 @@ impl Router {
             store: Mutex::new(store),
             state: Mutex::new(State {
                 quotas: quotas.into_iter().collect(),
+                unknown: HashMap::new(),
                 running: HashMap::new(),
             }),
             changed: Notify::new(),
@@ -124,17 +130,22 @@ impl Router {
                     .copied()
                     .unwrap_or(Quota::Unknown)
                     .at(now);
-                let (quota, resets) = match quota {
-                    Quota::Unknown => (QuotaState::Unknown, None),
-                    Quota::Available => (QuotaState::Available, None),
+                let (quota, resets, reason) = match quota {
+                    Quota::Unknown => (
+                        QuotaState::Unknown,
+                        None,
+                        state.unknown.get(&backend.name).cloned(),
+                    ),
+                    Quota::Available => (QuotaState::Available, None, None),
                     Quota::CoolingDown { until } => {
-                        (QuotaState::Cooling, Some(until.unix_millis()))
+                        (QuotaState::Cooling, Some(until.unix_millis()), None)
                     }
                 };
                 status::Backend {
                     name: backend.name.clone(),
                     quota,
                     resets,
+                    reason,
                     running: state.running.get(&backend.name).copied().unwrap_or(0),
                     concurrency: backend.concurrency,
                     when_busy: match WhenBusy::from(backend.when_busy) {
@@ -159,7 +170,8 @@ impl Router {
     }
 
     /// Records what a review learned of a backend's quota, in the database, then in the
-    /// router. A finished review leaves a cooldown another review hit meanwhile in place.
+    /// router. A finished review, or one that could not read the quota, leaves a cooldown
+    /// another review hit meanwhile in place.
     pub fn record(&self, params: Value) -> Outcome {
         let params: QuotaParams = match serde_json::from_value(params) {
             Ok(params) => params,
@@ -171,7 +183,7 @@ impl Router {
             .get(&params.backend)
             .copied()
             .unwrap_or(Quota::Unknown);
-        let quota = known.learn(params.quota.into(), clock::now());
+        let quota = known.learn((&params.quota).into(), clock::now());
         if let Err(e) = lock(&self.store).set_quota(&params.backend, quota) {
             return refuse(
                 Exit::Precondition,
@@ -182,6 +194,14 @@ impl Router {
             );
         }
         state.quotas.insert(params.backend.clone(), quota);
+        match (&params.quota, quota) {
+            (QuotaParam::Unknown { reason }, Quota::Unknown) => {
+                state.unknown.insert(params.backend.clone(), reason.clone());
+            }
+            _ => {
+                state.unknown.remove(&params.backend);
+            }
+        }
         drop(state);
         self.changed.notify_waiters();
         Outcome::Result(serde_json::to_value(params).unwrap_or(Value::Null))

@@ -98,7 +98,7 @@ fn json_gives_every_field_of_every_section() {
         .collect();
     assert_eq!(
         names,
-        ["agy-gemini", "agy-argon", "agy-claude", "codex", "claude"],
+        ["agy-gemini", "agy-claude", "codex", "claude"],
         "the default backends: {shown}"
     );
     assert_eq!(
@@ -107,6 +107,7 @@ fn json_gives_every_field_of_every_section() {
             "concurrency",
             "name",
             "quota",
+            "reason",
             "resets",
             "running",
             "when_busy"

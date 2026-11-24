@@ -4,7 +4,14 @@ use std::fs;
 
 use serde_json::Value;
 
+use crate::router::configure;
 use crate::support::Sandbox;
+
+/// Codex the one backend, so a test about Codex's review meets no agy pool on the way: an agy
+/// whose usage can't be read is skipped with a line on stderr.
+fn codex_only(sandbox: &Sandbox) {
+    configure(sandbox, "[[review.backend]]\ncli = \"codex\"\n");
+}
 
 pub(crate) const CLEAN_REPORT: &str = r#"## Standards
 
@@ -54,6 +61,7 @@ pub(crate) fn codex_writes(report: &str) -> String {
 fn a_clean_review_prints_one_line_naming_the_report_and_exits_0() {
     let sandbox = Sandbox::new();
     let repo = sandbox.repo();
+    codex_only(&sandbox);
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
 
     let out = sandbox.factory_in(&repo, &["review", "main", "t1-r1"]);
@@ -107,6 +115,7 @@ fn a_report_path_past_the_line_limit_is_shown_whole_so_a_shim_can_read_it() {
 fn blocking_findings_follow_the_line_and_exit_10() {
     let sandbox = Sandbox::new();
     let repo = sandbox.repo();
+    codex_only(&sandbox);
     sandbox.fake("codex", &codex_writes(FINDINGS_REPORT));
 
     let out = sandbox.factory_in(&repo, &["review", "main", "t1-r1"]);
@@ -698,6 +707,7 @@ fn a_fix_round_bundles_only_the_diff_since_the_previous_reviews_head() {
 fn a_fix_round_without_a_reviewed_head_reviews_the_whole_diff_and_says_so() {
     let sandbox = Sandbox::new();
     let repo = sandbox.repo();
+    codex_only(&sandbox);
     let previous = sandbox.path("t1-r1.md");
     fs::write(&previous, "a lacks a test\nVERDICT: findings\n").unwrap();
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));

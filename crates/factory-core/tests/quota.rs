@@ -211,9 +211,13 @@ fn an_unreadable_reset_cools_the_backend_down_for_an_hour() {
     assert_eq!(Reset::Unknown.until(at(T10_00), 3600), at(T11_00));
 }
 
-/// What `agy -p /usage --output-format json` printed on 2026-11-23, with 14% of the Gemini
-/// five-hour bucket left.
+/// What `agy -p /usage --output-format json` printed on 2026-11-24 (agy 1.5.15), with 70% of
+/// the Gemini five-hour bucket left: Argon is one of the "Gemini Models".
 const AGY_USAGE: &str = include_str!("fixtures/agy-usage.json");
+
+/// What it printed on 2026-11-23, in the old shape: Gemini 4 Argon a group of its own, which
+/// lists no models.
+const AGY_USAGE_OLD: &str = include_str!("fixtures/agy-usage-2026-11-23.json");
 
 /// The real usage with these buckets' `remaining_fraction` set to 0.
 fn agy_usage_with_empty(ids: &[&str]) -> String {
@@ -239,13 +243,13 @@ fn agy_usage_with_empty(ids: &[&str]) -> String {
 fn agys_usage_says_whether_a_model_groups_buckets_have_quota_left() {
     let gemini = "Gemini Models";
     let cases = [
-        ("14% left", AGY_USAGE.to_owned(), gemini, AgyUsage::Left),
+        ("70% left", AGY_USAGE.to_owned(), gemini, AgyUsage::Left),
         (
             "five-hour empty",
             agy_usage_with_empty(&["gemini-5h"]),
             gemini,
             AgyUsage::Empty {
-                until: Timestamp::parse("2026-11-23T05:21:20Z").unwrap(),
+                until: Timestamp::parse("2026-11-24T03:32:03Z").unwrap(),
             },
         ),
         (
@@ -253,7 +257,7 @@ fn agys_usage_says_whether_a_model_groups_buckets_have_quota_left() {
             agy_usage_with_empty(&["gemini-5h", "gemini-weekly"]),
             gemini,
             AgyUsage::Empty {
-                until: Timestamp::parse("2026-11-30T00:21:20Z").unwrap(),
+                until: Timestamp::parse("2026-11-30T22:32:03Z").unwrap(),
             },
         ),
         (
@@ -293,23 +297,72 @@ fn agys_usage_that_names_no_buckets_for_the_group_is_unreadable() {
 }
 
 #[test]
-fn an_agy_model_draws_on_its_groups_quota() {
+fn an_agy_model_draws_on_the_group_whose_model_list_names_it() {
     let cases = [
         ("gemini-4-neon", "Gemini Models"),
         ("gemini-4-neon-high", "Gemini Models"),
+        ("gemini-4-argon-high", "Gemini Models"),
+        ("gemini-4-argon-low", "Gemini Models"),
+        ("gemini-4-carbon-medium", "Gemini Models"),
+        ("gemini-4-hydrogen-high", "Gemini Models"),
         ("gemini-3.8-flash-low", "Gemini Models"),
-        ("gemini-4-argon-high", "Gemini 4 Argon"),
-        ("claude-opus-5-5-thinking", "Claude and GPT models"),
+        ("claude-opus-5-5-high", "Claude and GPT models"),
+        ("claude-sonnet-5-5-thinking", "Claude and GPT models"),
         ("gpt-oss-120b-medium", "Claude and GPT models"),
         // Labels, as agy's `/model` saves them in its settings.
         ("Gemini 4 Neon (High)", "Gemini Models"),
-        ("Gemini 4 Argon (Low)", "Gemini 4 Argon"),
+        ("Gemini 4 Argon (Low)", "Gemini Models"),
         ("Claude Opus 5.5 (Thinking)", "Claude and GPT models"),
         ("GPT-OSS 120B (Medium)", "Claude and GPT models"),
     ];
     for (model, group) in cases {
-        assert_eq!(quota::agy_group(model), group, "{model}");
+        assert_eq!(quota::agy_group(AGY_USAGE, model), group, "{model}");
     }
+}
+
+#[test]
+fn in_the_old_answer_argon_draws_on_the_group_named_for_it() {
+    let cases = [
+        ("gemini-4-argon-high", "Gemini 4 Argon"),
+        ("Gemini 4 Argon (Low)", "Gemini 4 Argon"),
+        ("gemini-4-neon-high", "Gemini Models"),
+        ("gemini-3.8-flash-high", "Gemini Models"),
+        ("claude-opus-5-5-high", "Claude and GPT models"),
+    ];
+    for (model, group) in cases {
+        assert_eq!(quota::agy_group(AGY_USAGE_OLD, model), group, "{model}");
+    }
+}
+
+#[test]
+fn an_answer_that_lists_no_models_leaves_the_group_to_the_static_map() {
+    let unlisted = r#"{"command": {"data": {"groups": [
+        {"name": "Gemini Models", "buckets": []},
+        {"name": "Claude and GPT models", "buckets": []}]}}}"#;
+    let cases = [
+        ("gemini-4-neon-high", "Gemini Models"),
+        ("gemini-4-argon-high", "Gemini Models"),
+        ("Gemini 4 Argon (High)", "Gemini Models"),
+        ("claude-opus-5-5-high", "Claude and GPT models"),
+        ("GPT-OSS 120B (Medium)", "Claude and GPT models"),
+    ];
+    for usage in [unlisted, "not json", "{}"] {
+        for (model, group) in cases {
+            assert_eq!(quota::agy_group(usage, model), group, "{model} in {usage}");
+        }
+    }
+}
+
+#[test]
+fn a_model_no_list_names_falls_back_to_the_static_map() {
+    assert_eq!(
+        quota::agy_group(AGY_USAGE, "gemini-5-zinc-high"),
+        "Gemini Models"
+    );
+    assert_eq!(
+        quota::agy_group(AGY_USAGE, "claude-haiku-5-low"),
+        "Claude and GPT models"
+    );
 }
 
 #[test]
@@ -332,7 +385,10 @@ fn with_no_model_configured_agy_draws_on_the_model_its_settings_chose_else_its_d
     for (settings, model) in cases {
         assert_eq!(quota::agy_chosen_model(settings), model, "{settings:?}");
     }
-    assert_eq!(quota::agy_group(quota::AGY_DEFAULT_MODEL), "Gemini Models");
+    assert_eq!(
+        quota::agy_group(AGY_USAGE, quota::AGY_DEFAULT_MODEL),
+        "Gemini Models"
+    );
 }
 
 #[test]
