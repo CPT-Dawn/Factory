@@ -1,6 +1,8 @@
 //! Phones and emulators: what adb says is attached, which devices a request is granted, and how
 //! the devices show in status. devlab's device planner, kept apart from adb and the store.
 
+use std::collections::BTreeMap;
+
 /// Which devices a request takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -47,6 +49,28 @@ pub struct Attached {
     pub kind: &'static str,
     /// The `model:` property with its underscores as spaces; empty when adb gave none.
     pub model: String,
+}
+
+/// Since when adb has shown each device in `now`, a list it showed at `at`, as it shows it
+/// now, by serial: `before` is the list it showed before and `since` its answer. A device
+/// that appears or changes state is shown from `at` on; a list after a gap in the stream has
+/// an empty `before`, since a device may have been plugged in again meanwhile.
+pub fn shown_since(
+    before: &[Attached],
+    since: &BTreeMap<String, i64>,
+    now: &[Attached],
+    at: i64,
+) -> BTreeMap<String, i64> {
+    now.iter()
+        .map(|a| {
+            let kept = before
+                .iter()
+                .any(|b| b.serial == a.serial && b.state == a.state)
+                .then(|| since.get(&a.serial).copied())
+                .flatten();
+            (a.serial.clone(), kept.unwrap_or(at))
+        })
+        .collect()
 }
 
 /// The devices in `adb devices -l` text, or in a frame of `adb track-devices -l`: one
@@ -193,7 +217,7 @@ pub struct PlanInput {
     /// Devices still wanted, beyond those the lease holds.
     pub want: u32,
     pub mode: Mode,
-    /// Phones attached as `device` and held by nobody, by serial.
+    /// Phones that are ready and held by nobody, by serial.
     pub free_phones: Vec<String>,
     /// Emulators devlab booted, attached and held by nobody.
     pub idle_emulators: Vec<String>,
@@ -205,9 +229,36 @@ pub struct PlanInput {
     pub mem_available_mb: i64,
     pub host_floor_mb: i64,
     pub emulator_ram_mb: i64,
-    /// Phones attached but not authorized, to explain a wait.
-    pub unauthorized: u32,
+    /// The free phones that are not ready, to explain a wait.
+    pub unready: Unready,
     pub busy_phones: u32,
+}
+
+/// How many free phones are attached but not ready, by what is wrong with each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Unready {
+    pub locked: u32,
+    pub asleep: u32,
+    pub stay_awake_off: u32,
+    pub offline: u32,
+    pub unauthorized: u32,
+}
+
+impl Unready {
+    /// What a wait says of them, each kind after the busy phones: `, 1 locked (unlock it once)`.
+    fn wait_details(self) -> String {
+        [
+            (self.locked, "locked (unlock it once)"),
+            (self.asleep, "asleep (wake it)"),
+            (self.stay_awake_off, "stay-awake off (replug it)"),
+            (self.offline, "offline"),
+            (self.unauthorized, "unauthorized (tap Allow on the phone)"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!(", {n} {what}"))
+        .collect()
+    }
 }
 
 /// The devices a request is granted.
@@ -219,7 +270,7 @@ pub struct Plan {
     pub boot: u32,
 }
 
-/// All or nothing: free phones first, then idle emulators, then new emulators while the
+/// All or nothing: free ready phones first, then idle emulators, then new emulators while the
 /// emulator cap and the memory floor allow; else why the request waits.
 pub fn plan_devices(p: &PlanInput) -> Result<Plan, String> {
     let take = |from: &[String], n: u32| -> Vec<String> {
@@ -232,14 +283,11 @@ pub fn plan_devices(p: &PlanInput) -> Result<Plan, String> {
     };
     let mut need = p.want - u32::try_from(phones.len()).unwrap_or(p.want);
     let why = || {
-        let mut why = format!("{} phone(s) busy", p.busy_phones);
-        if p.unauthorized > 0 {
-            why.push_str(&format!(
-                ", {} unauthorized (tap Allow on the phone)",
-                p.unauthorized
-            ));
-        }
-        why
+        format!(
+            "{} phone(s) busy{}",
+            p.busy_phones,
+            p.unready.wait_details()
+        )
     };
     if need > 0 && p.mode == Mode::Phone {
         return Err(format!("no free phone: {}", why()));
@@ -280,6 +328,42 @@ pub struct Held {
     pub state: Option<String>,
 }
 
+/// A device taken off its lease, which ran nothing for `idle_min` minutes, for a waiter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reclaimed {
+    pub serial: String,
+    pub kind: String,
+    pub model: String,
+    pub idle_min: i64,
+}
+
+/// Why a lease can't be used because a device was taken from it for a waiter; none when none
+/// was. Exit 76 says it.
+pub fn reclaimed_lost(reclaimed: &[Reclaimed]) -> Option<String> {
+    let gone: Vec<String> = reclaimed
+        .iter()
+        .map(|d| {
+            format!(
+                "{} {}{} was reclaimed after {} min idle",
+                d.kind,
+                d.serial,
+                in_parens(&d.model),
+                d.idle_min
+            )
+        })
+        .collect();
+    (!gone.is_empty()).then(|| format!("{}: run devlab acquire to replace it", gone.join("; ")))
+}
+
+/// ` (<model>)`, or nothing for no model.
+fn in_parens(model: &str) -> String {
+    if model.is_empty() {
+        String::new()
+    } else {
+        format!(" ({model})")
+    }
+}
+
 /// Why a lease can't be used because a device it holds is gone or not usable; none when every
 /// device is attached as `device`. Exit 76 says it.
 pub fn lost(held: &[Held]) -> Option<String> {
@@ -287,15 +371,11 @@ pub fn lost(held: &[Held]) -> Option<String> {
         .iter()
         .filter(|d| d.state.as_deref() != Some("device"))
         .map(|d| {
-            let model = if d.model.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", d.model)
-            };
             format!(
-                "{} {}{model} is {}",
+                "{} {}{} is {}",
                 d.kind,
                 d.serial,
+                in_parens(&d.model),
                 d.state.as_deref().unwrap_or("unplugged")
             )
         })
@@ -304,7 +384,8 @@ pub fn lost(held: &[Held]) -> Option<String> {
 }
 
 /// The shell line that readies a device for unattended runs: the screen stays on while it has
-/// power, animations off when asked, then it is woken and a non-secure keyguard lifted.
+/// power, animations off when asked, adb's authorization timeout off where the phone allows
+/// it, then it is woken and a non-secure keyguard lifted. Nothing in it turns a screen off.
 pub fn prep_command(stay_awake: bool, animations_off: bool) -> String {
     let mut cmds: Vec<String> = Vec::new();
     if stay_awake {
@@ -319,6 +400,7 @@ pub fn prep_command(stay_awake: bool, animations_off: bool) -> String {
             cmds.push(format!("settings put global {key} 0"));
         }
     }
+    cmds.push("settings put global adb_allowed_connection_time 0".to_owned());
     cmds.push(WAKE.to_owned());
     cmds.join("; ")
 }
@@ -331,8 +413,7 @@ pub const LOCK_PROBE: &str = "dumpsys window | grep -E 'mDreamingLockscreen=true
 
 /// The warning for a device whose [LOCK_PROBE] printed `probe`.
 pub fn lock_warning(probe: &str) -> Option<&'static str> {
-    (!probe.trim().is_empty())
-        .then_some("lock screen still showing: set the phone's screen lock to None or Swipe")
+    (!probe.trim().is_empty()).then_some("lock screen still showing: unlock the phone once")
 }
 
 /// The warning after a prep: whether adb ran its [prep_command], and what its [LOCK_PROBE]
@@ -534,10 +615,63 @@ mod tests {
             plan_devices(&PlanInput {
                 mode: Mode::Phone,
                 busy_phones: 2,
-                unauthorized: 1,
+                unready: Unready {
+                    unauthorized: 1,
+                    ..Unready::default()
+                },
                 ..base()
             }),
             Err("no free phone: 2 phone(s) busy, 1 unauthorized (tap Allow on the phone)".into())
+        );
+    }
+
+    #[test]
+    fn a_phone_wait_counts_each_kind_of_phone_that_is_not_ready_apart() {
+        assert_eq!(
+            plan_devices(&PlanInput {
+                mode: Mode::Phone,
+                busy_phones: 1,
+                unready: Unready {
+                    locked: 1,
+                    asleep: 2,
+                    stay_awake_off: 1,
+                    offline: 1,
+                    unauthorized: 1,
+                },
+                ..base()
+            }),
+            Err(
+                "no free phone: 1 phone(s) busy, 1 locked (unlock it once), 2 asleep (wake it), \
+                 1 stay-awake off (replug it), 1 offline, 1 unauthorized (tap Allow on the phone)"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn a_locked_phone_is_skipped_by_default_and_an_emulator_stands_in() {
+        // The caller leaves a phone that is not ready out of `free_phones`.
+        let plan = plan_devices(&PlanInput {
+            mode: Mode::Any,
+            unready: Unready {
+                locked: 1,
+                ..Unready::default()
+            },
+            ..base()
+        })
+        .unwrap();
+        assert_eq!((plan.phones.len(), plan.boot), (0, 1));
+        assert_eq!(
+            plan_devices(&PlanInput {
+                mode: Mode::Any,
+                emulators_running: 2,
+                unready: Unready {
+                    locked: 1,
+                    ..Unready::default()
+                },
+                ..base()
+            }),
+            Err("no free phone (0 phone(s) busy, 1 locked (unlock it once)) and the emulator cap (2) is reached".into())
         );
     }
 
@@ -644,6 +778,21 @@ mod tests {
     }
 
     #[test]
+    fn a_device_reclaimed_for_a_waiter_is_lost_saying_how_long_its_lease_idled() {
+        let gone = Reclaimed {
+            serial: "FAKEPHONE01".into(),
+            kind: "phone".into(),
+            model: "Pixel 8".into(),
+            idle_min: 12,
+        };
+        assert_eq!(
+            reclaimed_lost(&[gone]).unwrap(),
+            "phone FAKEPHONE01 (Pixel 8) was reclaimed after 12 min idle: run devlab acquire to replace it"
+        );
+        assert_eq!(reclaimed_lost(&[]), None);
+    }
+
+    #[test]
     fn rows_join_what_adb_lists_what_leases_hold_and_what_devlab_runs() {
         let attached = parse_devices_l(
             "FAKEPHONE01 offline usb:1-1\nemulator-5580 device model:sdk_gphone64_x86_64\n",
@@ -684,8 +833,14 @@ mod tests {
     fn prep_lifts_the_keyguard_and_reads_the_lock_screen() {
         assert_eq!(
             prep_command(true, false),
-            "settings put global stay_on_while_plugged_in 7; input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard"
+            "settings put global stay_on_while_plugged_in 7; settings put global adb_allowed_connection_time 0; input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard"
         );
+        // adb's authorization timeout goes off whether or not the screen is kept on.
+        assert_eq!(
+            prep_command(false, false),
+            "settings put global adb_allowed_connection_time 0; input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard"
+        );
+        assert!(!prep_command(true, true).contains("KEYCODE_POWER"));
         assert_eq!(lock_warning("\n"), None);
         assert!(lock_warning("  mDreamingLockscreen=true").is_some());
     }

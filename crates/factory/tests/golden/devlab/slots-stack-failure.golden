@@ -65,7 +65,7 @@ $ c@demo-c devlab acquire --no-device --quiet
 1> export DEVLAB_LEASE=2
 ? 0
 $ a@demo-a devlab release
-2> devlab: released lease 1
+2> devlab: released lease 1 (<sandbox>/wt/demo-a)
 ? 0
 $ b@demo-b devlab acquire --no-device
 1> export DEVLAB_PROJECT=demo
@@ -86,6 +86,9 @@ $ b@demo-b devlab acquire --no-device
 ? 0
 $ b@demo-b devlab status
 1> devices: none attached
+1> leases
+1>   lease 2 demo-c (claude:<c>): age 0m, idle 0m
+1>   lease 3 demo-b (claude:<b>): age 0m, idle 0m
 1> stack slots
 1>   demo 0   up (demo)                    lease 3 demo-b
 1>   demo 1   down                         lease 2 demo-c
@@ -93,10 +96,12 @@ $ b@demo-b devlab status
 1> memory <mem> GB free; watcher active
 ? 0
 $ b@demo-b devlab release --stop-stack
-2> devlab: released lease 3
+2> devlab: released lease 3 (<sandbox>/wt/demo-b)
 ? 0
 $ b@demo-b devlab status
 1> devices: none attached
+1> leases
+1>   lease 2 demo-c (claude:<c>): age 0m, idle 0m
 1> stack slots
 1>   demo 0   down                         free (last: demo-b)
 1>   demo 1   down                         lease 2 demo-c

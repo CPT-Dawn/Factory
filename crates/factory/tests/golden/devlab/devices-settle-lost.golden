@@ -1,0 +1,15 @@
+# A phone unplugged between its grant and its prep (#59): acquire exits 76 and gives the fresh
+# lease back, so env then finds none.
+plug FAKEPHONE01 device usb:1-1 model:Pixel_8
+yank FAKEPHONE01
+$ a@plain-a devlab acquire --quiet
+2> devlab: FAKEPHONE01: adb could not reach it: plug it in and allow USB debugging, then devlab prep
+2> devlab: phone FAKEPHONE01 (Pixel 8) is unplugged: run devlab acquire to replace it
+? 76
+$ a@plain-a devlab env
+2> devlab: no lease for <sandbox>/wt/plain-a (claude:<a>): run devlab acquire
+? 4
+$ a@plain-a devlab status
+1> devices: none attached
+1> memory <mem> GB free; watcher active
+? 0

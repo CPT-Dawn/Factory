@@ -427,6 +427,7 @@ port = 54327
             name: "peekabus".to_owned(),
             max_slots: 3,
             max_slots_per_owner: None,
+            max_devices_per_owner: None,
             slot_stride: 100,
             ports: vec![
                 ("API_PORT".to_owned(), 8787),

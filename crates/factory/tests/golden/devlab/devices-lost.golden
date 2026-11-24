@@ -22,6 +22,8 @@ $ a@plain-a devlab env
 $ a@plain-a devlab status
 1> devices
 1>   FAKEPHONE01        phone    Pixel 8        offline      lease 1 plain-a (claude:<a>)
+1> leases
+1>   lease 1 plain-a (claude:<a>): age 0m, idle 0m
 1> memory <mem> GB free; watcher active
 ? 0
 plug FAKEPHONE02 device usb:1-2 model:Pixel_7
@@ -37,5 +39,7 @@ $ a@plain-a devlab status
 1> devices
 1>   FAKEPHONE01        phone    -              offline      free
 1>   FAKEPHONE02        phone    Pixel 7        ready        lease 1 plain-a (claude:<a>)
+1> leases
+1>   lease 1 plain-a (claude:<a>): age 0m, idle 0m
 1> memory <mem> GB free; watcher active
 ? 0

@@ -30,17 +30,22 @@ $ b@plain-b devlab acquire --wait 0
 $ a@plain-a devlab status
 1> devices
 1>   emulator-5580      emulator sdk gphone64 x ready        lease 1 plain-a (claude:<a>)
+1> leases
+1>   lease 1 plain-a (claude:<a>): age 0m, idle 0m
+1>   lease 2 demo-c (claude:<c>): age 0m, idle 0m
 1> stack slots
 1>   demo 0   down                         lease 2 demo-c
 1>   demo per owner (cap 1 of 2): claude:<c> 1/1 at cap
 1> memory <mem> GB free; watcher active
 ? 0
 $ a@plain-a devlab release
-2> devlab: released lease 1
+2> devlab: released lease 1 (<sandbox>/wt/plain-a)
 ? 0
 $ a@plain-a devlab status
 1> devices
 1>   emulator-5580      emulator sdk gphone64 x ready        idle 0m
+1> leases
+1>   lease 2 demo-c (claude:<c>): age 0m, idle 0m
 1> stack slots
 1>   demo 0   down                         lease 2 demo-c
 1>   demo per owner (cap 1 of 2): claude:<c> 1/1 at cap
@@ -63,6 +68,24 @@ $ b@plain-b devlab status --json
 1>       "model": "sdk gphone64 x86 64",
 1>       "state": "ready",
 1>       "holder": "lease 3 plain-b (claude:<b>)"
+1>     }
+1>   ],
+1>   "leases": [
+1>     {
+1>       "id": 2,
+1>       "worktree": "demo-c",
+1>       "owner": "claude:<c>",
+1>       "ageMin": 0,
+1>       "idleMin": 0,
+1>       "running": null
+1>     },
+1>     {
+1>       "id": 3,
+1>       "worktree": "plain-b",
+1>       "owner": "claude:<b>",
+1>       "ageMin": 0,
+1>       "idleMin": 0,
+1>       "running": null
 1>     }
 1>   ],
 1>   "slots": [

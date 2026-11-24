@@ -1,13 +1,17 @@
 //! The lease store: `lab.db`, written by the daemon alone. Every write is one short
 //! `BEGIN IMMEDIATE` transaction, and no external command runs while one is open.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::reservations;
-use super::wire::{AcquireParams, Granted, Lease, LeaseDevice, Owner, Process, SlotRow, Waiter};
+use super::wire::{
+    AcquireParams, Granted, Lease, LeaseDevice, Owner, Process, Reservation, SlotRow, SlotSchema,
+    Waiter,
+};
+use super::{activity, readiness, reservations, stack};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS leases (
@@ -30,6 +34,17 @@ CREATE TABLE IF NOT EXISTS slots (
   idle_since INTEGER,
   PRIMARY KEY (project, slot)
 );
+CREATE TABLE IF NOT EXISTS slot_schemas (
+  project TEXT NOT NULL,
+  slot INTEGER NOT NULL,
+  worktree TEXT NOT NULL,
+  head TEXT,
+  PRIMARY KEY (project, slot)
+);
+-- A stack an earlier daemon started and has not stopped ran its last worktree's schema. A
+-- stack this daemon starts is recorded as it starts, so this adds nothing once a record exists.
+INSERT OR IGNORE INTO slot_schemas (project, slot, worktree)
+  SELECT project, slot, last_worktree FROM slots WHERE stack_ours = 1 AND last_worktree IS NOT NULL;
 CREATE TABLE IF NOT EXISTS stoppers (
   project TEXT NOT NULL,
   slot INTEGER NOT NULL,
@@ -74,11 +89,20 @@ CREATE TABLE IF NOT EXISTS runs (
   lease INTEGER,
   slot INTEGER
 );
+CREATE TABLE IF NOT EXISTS run_leases (
+  run INTEGER PRIMARY KEY,
+  lease INTEGER NOT NULL,
+  reservation TEXT
+);
 CREATE TABLE IF NOT EXISTS emulators (
   idx INTEGER PRIMARY KEY,
   serial TEXT NOT NULL,
   state TEXT NOT NULL,
   idle_since INTEGER
+);
+CREATE TABLE IF NOT EXISTS emulator_boots (
+  idx INTEGER PRIMARY KEY,
+  lease INTEGER NOT NULL
 );
 ";
 
@@ -94,7 +118,7 @@ pub struct EmulatorRow {
 }
 /// The schema's version, in `PRAGMA user_version`. Version 0 kept waiters only while the
 /// daemon that queued them ran, so their table is rebuilt; `stoppers` is new. Version 2 adds
-/// `runs`.
+/// `runs`. `run_leases` (#53) needs no new version: `SCHEMA` makes it on every open.
 const VERSION: i64 = 2;
 
 pub struct Store {
@@ -113,6 +137,8 @@ impl Store {
         }
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(reservations::SCHEMA)?;
+        conn.execute_batch(readiness::SCHEMA)?;
+        conn.execute_batch(activity::SCHEMA)?;
         if version < VERSION {
             conn.pragma_update(None, "user_version", VERSION)?;
         }
@@ -145,12 +171,14 @@ fn lease_row(row: &Row<'_>) -> rusqlite::Result<Lease> {
         created: row.get("created")?,
         touched: row.get("touched")?,
         devices: Vec::new(),
+        reclaimed: Vec::new(),
     })
 }
 
 /// The lease with the devices it holds.
 fn with_devices(c: &Connection, mut lease: Lease) -> rusqlite::Result<Lease> {
     lease.devices = lease_devices(c, lease.id)?;
+    lease.reclaimed = activity::reclaimed(c, lease.id)?;
     Ok(lease)
 }
 
@@ -246,12 +274,29 @@ pub fn emulators(c: &Connection) -> rusqlite::Result<Vec<EmulatorRow>> {
     .collect()
 }
 
-pub fn insert_emulator(c: &Connection, idx: u32, serial: &str) -> rusqlite::Result<()> {
+/// Records emulator `idx` booting for lease `lease`, which counts it as held until it has
+/// booted (or is forgotten).
+pub fn insert_emulator(c: &Connection, idx: u32, serial: &str, lease: i64) -> rusqlite::Result<()> {
     c.execute(
         "INSERT INTO emulators (idx, serial, state) VALUES (?1, ?2, 'booting')",
         params![idx, serial],
     )?;
+    c.execute(
+        "INSERT OR REPLACE INTO emulator_boots (idx, lease) VALUES (?1, ?2)",
+        params![idx, lease],
+    )?;
     Ok(())
+}
+
+/// The emulators each lease has booting, by lease id.
+pub fn booting_per_lease(c: &Connection) -> rusqlite::Result<BTreeMap<i64, u32>> {
+    let mut q = c.prepare(
+        "SELECT b.lease, COUNT(*) FROM emulator_boots b
+         JOIN emulators e ON e.idx = b.idx AND e.state = 'booting'
+         GROUP BY b.lease",
+    )?;
+    q.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect()
 }
 
 /// Marks a booting emulator ready, idle since `idle_since` (none: a lease holds it).
@@ -264,6 +309,7 @@ pub fn set_emulator_ready(
         "UPDATE emulators SET state = 'ready', idle_since = ?2 WHERE idx = ?1 AND state = 'booting'",
         params![idx, idle_since],
     )?;
+    c.execute("DELETE FROM emulator_boots WHERE idx = ?1", params![idx])?;
     Ok(())
 }
 
@@ -292,6 +338,11 @@ pub fn delete_emulator(c: &Connection, idx: u32, state: &str) -> rusqlite::Resul
     c.execute(
         "DELETE FROM emulators WHERE idx = ?1 AND state = ?2",
         params![idx, state],
+    )?;
+    c.execute(
+        "DELETE FROM emulator_boots WHERE idx = ?1
+         AND NOT EXISTS (SELECT 1 FROM emulators WHERE idx = ?1)",
+        params![idx],
     )?;
     Ok(())
 }
@@ -378,7 +429,17 @@ pub fn place(c: &Connection, p: &AcquireParams) -> rusqlite::Result<Option<Place
     };
     let granted = match granted {
         Some(id) => match lease(c, id)? {
-            Some(lease) => Some(Granted { lease, previous }),
+            Some(lease) => {
+                let schema = match (&lease.project, lease.slot) {
+                    (Some(project), Some(slot)) => slot_schema(c, project, slot)?,
+                    _ => None,
+                };
+                Some(Granted {
+                    lease,
+                    previous,
+                    schema,
+                })
+            }
             None => {
                 delete_waiter(c, waiter.id)?;
                 return Ok(None);
@@ -424,8 +485,25 @@ pub fn find_lease(
     .transpose()
 }
 
-/// Forgets a lease; its slot and its emulators start idling, its phones are free.
+/// Forgets a lease; its slot and its emulators start idling, its phones are free. A lease whose
+/// worktree started the slot's stack records that worktree's newest migration as it ends, so
+/// that one added during the lease counts. A run's lease made from a reservation
+/// ([`end_with_run`]) gives that reservation its slot back, however the lease ends.
 pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<()> {
+    let from: Option<Option<String>> = c
+        .query_row(
+            "SELECT reservation FROM run_leases WHERE lease = ?1",
+            [lease.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let from = from
+        .flatten()
+        .map(|text| serde_json::from_str::<Reservation>(&text))
+        .transpose()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
     c.execute(
         "UPDATE emulators SET idle_since = ?1
          WHERE serial IN (SELECT serial FROM lease_devices WHERE lease_id = ?2)",
@@ -437,9 +515,64 @@ pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<(
             "UPDATE slots SET idle_since = ?1 WHERE project = ?2 AND slot = ?3",
             params![now, project, slot],
         )?;
+        let ran: bool = c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM slot_schemas
+                            WHERE project = ?1 AND slot = ?2 AND worktree = ?3)",
+            params![project, slot, lease.worktree],
+            |row| row.get(0),
+        )?;
+        if ran {
+            record_schema(c, project, slot, &lease.worktree)?;
+        }
     }
     c.execute("DELETE FROM leases WHERE id = ?1", [lease.id])?;
+    c.execute("DELETE FROM run_leases WHERE lease = ?1", [lease.id])?;
+    activity::forget_lease(c, lease.id)?;
+    if let Some(from) = &from {
+        reservations::restore(c, from, now)?;
+    }
     reservations::record_lease_end(c, lease, now)
+}
+
+/// Lease `lease` ends with run `run`: the run made it and didn't ask to keep it. `from` is the
+/// reservation it was made from, which gets its slot back then.
+pub fn end_with_run(
+    c: &Connection,
+    run: i64,
+    lease: i64,
+    from: Option<&Reservation>,
+) -> rusqlite::Result<()> {
+    let from = from
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    c.execute(
+        "INSERT OR REPLACE INTO run_leases (run, lease, reservation) VALUES (?1, ?2, ?3)",
+        params![run, lease, from],
+    )?;
+    Ok(())
+}
+
+/// Run `run` ended: the lease that ends with it ([`end_with_run`]) is dropped, and the
+/// reservation it was made from, if any, holds its slot again, under the same id
+/// ([`drop_lease`]). The lease dropped, if it was still there.
+pub fn end_run_lease(c: &Connection, run: i64, now: i64) -> rusqlite::Result<Option<Lease>> {
+    let ending: Option<i64> = c
+        .query_row(
+            "SELECT lease FROM run_leases WHERE run = ?1",
+            [run],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(id) = ending else {
+        return Ok(None);
+    };
+    let Some(held) = lease(c, id)? else {
+        c.execute("DELETE FROM run_leases WHERE run = ?1", [run])?;
+        return Ok(None);
+    };
+    drop_lease(c, &held, now)?;
+    Ok(Some(held))
 }
 
 /// Drops every lease and reservation whose owner exited: the leases as they were, with their
@@ -555,10 +688,12 @@ pub fn insert_lease(
         created: now,
         touched: now,
         devices: Vec::new(),
+        reclaimed: Vec::new(),
     })
 }
 
-/// Marks a slot held by `worktree`; returns the worktree it ran before.
+/// Marks a slot held by `worktree`; returns the worktree of the lease that held it last, whether
+/// or not that lease ran its stack (see [`slot_schema`] for the schema it holds).
 pub fn claim_slot(
     c: &Connection,
     project: &str,
@@ -625,6 +760,9 @@ pub fn clear_dead_stoppers(
     Ok(cleared)
 }
 
+/// Marks the slot's stack as devlab's to stop, or not. A stack devlab starts runs the schema
+/// of the worktree whose lease holds the slot: that worktree is recorded as the slot's schema
+/// (see [`slot_schema`]), and stays so when the stack stops or another lease holds the slot.
 pub fn set_stack_ours(
     c: &Connection,
     project: &str,
@@ -634,6 +772,48 @@ pub fn set_stack_ours(
     c.execute(
         "UPDATE slots SET stack_ours = ?3 WHERE project = ?1 AND slot = ?2",
         params![project, slot, ours],
+    )?;
+    let holder: Option<String> = c
+        .query_row(
+            "SELECT worktree FROM leases WHERE project = ?1 AND slot = ?2",
+            params![project, slot],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(worktree) = holder.filter(|_| ours) {
+        record_schema(c, project, slot, &worktree)?;
+    }
+    Ok(())
+}
+
+/// The schema the slot's stack last ran: the worktree whose lease last started it, and that
+/// worktree's newest migration when that lease ended. None when devlab never ran the slot's
+/// stack.
+pub fn slot_schema(
+    c: &Connection,
+    project: &str,
+    slot: u32,
+) -> rusqlite::Result<Option<SlotSchema>> {
+    c.query_row(
+        "SELECT worktree, head FROM slot_schemas WHERE project = ?1 AND slot = ?2",
+        params![project, slot],
+        |row| {
+            Ok(SlotSchema {
+                worktree: row.get(0)?,
+                head: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Records `worktree`'s schema, up to its newest migration as its files show it now, as the
+/// slot's. Reading them is no external command: it may run in the transaction.
+fn record_schema(c: &Connection, project: &str, slot: u32, worktree: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO slot_schemas (project, slot, worktree, head) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (project, slot) DO UPDATE SET worktree = excluded.worktree, head = excluded.head",
+        params![project, slot, worktree, stack::migration_head(worktree)],
     )?;
     Ok(())
 }
@@ -689,6 +869,10 @@ pub fn begin_run(c: &Connection, fresh: &RunRow) -> rusqlite::Result<RunRow> {
         if kept.id != fresh.id {
             c.execute(
                 "UPDATE runs SET id = ?1 WHERE id = ?2",
+                params![fresh.id, kept.id],
+            )?;
+            c.execute(
+                "UPDATE run_leases SET run = ?1 WHERE run = ?2",
                 params![fresh.id, kept.id],
             )?;
             kept.id = fresh.id;

@@ -2,11 +2,11 @@
 
 use std::collections::BTreeMap;
 
-use factory_core::lab::ago;
 use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{DeviceRow, device_line};
 use factory_core::lab::queue::{Holding, held_by, live_queue, owner_slot_counts, waiter_capped};
 use factory_core::lab::slots::slot_project_id;
+use factory_core::lab::{ago, js_round};
 use serde::Serialize;
 
 use super::context::{self, project_config};
@@ -22,6 +22,7 @@ use factory_core::lab::base_name;
 #[serde(rename_all = "camelCase")]
 struct Report {
     devices: Vec<DeviceLine>,
+    leases: Vec<LeaseLine>,
     slots: Vec<SlotLine>,
     owners: Vec<OwnerLine>,
     waiting: Vec<String>,
@@ -30,6 +31,20 @@ struct Report {
     watcher: &'static str,
     #[serde(rename = "memAvailableMB")]
     mem_available_mb: i64,
+}
+
+/// One lease: how old it is, how long it has run nothing, and what it runs (#57).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LeaseLine {
+    id: i64,
+    worktree: String,
+    owner: String,
+    /// Minutes since it was granted.
+    age_min: i64,
+    /// Minutes it has run nothing: 0 while it runs a command.
+    idle_min: i64,
+    running: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -86,13 +101,31 @@ pub fn screen(board: &Board) -> Result<String, Failure> {
     } else {
         out.push("devices".to_owned());
         for d in &report.devices {
+            // A phone adb calls ready shows its readiness (#55): locked, asleep, …
+            let state = match &d.readiness {
+                Some(word) if d.kind == "phone" && d.state == "ready" => word.clone(),
+                _ => d.state.clone(),
+            };
             out.push(device_line(&DeviceRow {
                 serial: d.serial.clone(),
                 kind: d.kind.clone(),
                 model: d.model.clone(),
-                state: d.state.clone(),
+                state,
                 holder: d.holder.clone(),
             }));
+        }
+    }
+    if !report.leases.is_empty() {
+        out.push("leases".to_owned());
+        for l in &report.leases {
+            let running = l
+                .running
+                .as_deref()
+                .map_or_else(String::new, |command| format!(", running {command}"));
+            out.push(format!(
+                "  lease {} {} ({}): age {}m, idle {}m{running}",
+                l.id, l.worktree, l.owner, l.age_min, l.idle_min
+            ));
         }
     }
     if !report.slots.is_empty() {
@@ -269,12 +302,42 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
             format!("{} for {}{capped}", w.label, ago(board.now, w.created))
         })
         .collect();
+    let leases = board
+        .leases
+        .iter()
+        .map(|l| {
+            let running = board
+                .running
+                .iter()
+                .find(|r| r.lease == l.id)
+                .map(|r| r.command.clone());
+            LeaseLine {
+                id: l.id,
+                worktree: base_name(&l.worktree).to_owned(),
+                owner: l.owner_label.clone(),
+                age_min: minutes(board.now, l.created),
+                idle_min: if running.is_some() {
+                    0
+                } else {
+                    minutes(board.now, l.touched)
+                },
+                running,
+            }
+        })
+        .collect();
     Report {
         devices: board.devices.clone(),
+        leases,
         slots,
         owners,
         waiting,
         watcher: "active",
         mem_available_mb: mem_available_mb(),
     }
+}
+
+/// Whole minutes from `then` to `now`, rounded as [`ago`] rounds them.
+fn minutes(now: i64, then: i64) -> i64 {
+    #[allow(clippy::cast_precision_loss)]
+    js_round((now - then) as f64 / 60.0)
 }

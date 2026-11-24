@@ -38,6 +38,9 @@ $ d@demo-d devlab acquire --no-device --wait 0
 ? 75
 $ d@demo-d devlab status
 1> devices: none attached
+1> leases
+1>   lease 1 demo-a (claude:<a>): age 0m, idle 0m
+1>   lease 2 demo-b (claude:<b>): age 0m, idle 0m
 1> stack slots
 1>   demo 0   down                         lease 1 demo-a
 1>   demo 1   down                         lease 2 demo-b
@@ -46,7 +49,7 @@ $ d@demo-d devlab status
 1> memory <mem> GB free; watcher active
 ? 0
 $ a@demo-a devlab release
-2> devlab: released lease 1
+2> devlab: released lease 1 (<sandbox>/wt/demo-a)
 ? 0
 wait q
 1> export DEVLAB_PROJECT=demo
@@ -67,6 +70,9 @@ wait q
 ? 0
 $ d@demo-d devlab status
 1> devices: none attached
+1> leases
+1>   lease 2 demo-b (claude:<b>): age 0m, idle 0m
+1>   lease 3 demo-c (claude:<c>): age 0m, idle 0m
 1> stack slots
 1>   demo 0   down                         lease 3 demo-c
 1>   demo 1   down                         lease 2 demo-b

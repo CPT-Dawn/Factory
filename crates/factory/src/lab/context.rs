@@ -30,11 +30,26 @@ impl Ctx {
 }
 
 pub fn context() -> Result<Ctx, Failure> {
+    context_with(true)
+}
+
+/// The context of a release: a `devlab.json` here that can't be read counts as none, so one that
+/// is broken in another folder can't keep a release by id from ending or refusing its lease.
+/// `--stop-stack` resolves its teardown from the held lease's own worktree, not from this one.
+pub fn release_context() -> Result<Ctx, Failure> {
+    context_with(false)
+}
+
+fn context_with(project_needed: bool) -> Result<Ctx, Failure> {
     let cfg = machine_config()?;
     let cwd = std::env::current_dir()
         .map_err(|e| Failure::precondition(format!("cannot read the working directory: {e}")))?;
     let worktree = toplevel(&cwd).unwrap_or_else(|| cwd.to_string_lossy().into_owned());
-    let project = project_config(&worktree)?;
+    let project = if project_needed {
+        project_config(&worktree)?
+    } else {
+        project_config(&worktree).ok().flatten()
+    };
     let owner = find_owner(&cfg.owner_names);
     Ok(Ctx {
         cfg,

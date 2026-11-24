@@ -33,7 +33,7 @@ $ b@demo-b devlab acquire --no-device --quiet
 1> export DEVLAB_LEASE=2
 ? 0
 $ a@demo-a devlab release
-2> devlab: released lease 1
+2> devlab: released lease 1 (<sandbox>/wt/demo-a)
 ? 0
 $ a@demo-a devlab release
 2> devlab: nothing held here

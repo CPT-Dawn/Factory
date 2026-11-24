@@ -14,6 +14,15 @@ use super::queue::{Holding, held_by};
 pub const DEFAULT_LEASE_SECS: i64 = 30 * 60;
 /// No ETA is shorter than this: a slot due now may still be a minute from the next grant.
 pub const MIN_ETA_SECS: i64 = 60;
+/// How long a reservation lasts after it was made or last used (#59).
+pub const UNUSED_SECS: i64 = 2 * 3600;
+
+/// A reservation made at `created` and last used at `used` (when a run gave its slot back) has
+/// expired at `now`: nobody used it for [`UNUSED_SECS`]. Seconds since the epoch.
+pub fn expired(created: i64, used: Option<i64>, now: i64) -> bool {
+    let since = used.map_or(created, |used| used.max(created));
+    now - since >= UNUSED_SECS
+}
 
 /// One reserve request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +77,7 @@ pub fn plan(ask: &Reserve, board: &Board, now: i64) -> Plan {
             waiter: ask.waiter,
             project: Some(ask.project.clone()),
             existing: None,
+            devices: None,
             devices_wait: None,
         };
         match decide(&one, &board, now) {
@@ -79,6 +89,7 @@ pub fn plan(ask: &Reserve, board: &Board, now: i64) -> Plan {
                     worktree: String::new(),
                     project: Some(ask.project.name.clone()),
                     slot: Some(slot),
+                    devices: 0,
                     owner: ask.owner.clone(),
                     owner_label: ask.owner_label.clone(),
                 });
@@ -86,7 +97,7 @@ pub fn plan(ask: &Reserve, board: &Board, now: i64) -> Plan {
             }
             Decision::Grant { slot: None, .. } => break,
             Decision::Wait(why) if slots.is_empty() => return Plan::Wait(why),
-            Decision::Wait(_) => break,
+            Decision::Wait(_) | Decision::Refuse(_) => break,
         }
     }
     Plan::Granted(slots)
@@ -176,6 +187,7 @@ mod tests {
             worktree: String::new(),
             project: Some("demo".to_owned()),
             slot: Some(slot),
+            devices: 0,
             owner: owner.to_owned(),
             owner_label: format!("claude:{}", owner.split(':').next().unwrap_or("")),
         }
@@ -214,6 +226,7 @@ mod tests {
                 project: Some("demo".to_owned()),
                 cap: Some(2),
                 max_slots,
+                devices: None,
             }],
             slots: (0..max_slots)
                 .map(|s| SlotView {
@@ -297,6 +310,7 @@ mod tests {
                 project: Some("demo".to_owned()),
                 cap: Some(2),
                 max_slots: 2,
+                devices: None,
             },
         );
         assert_eq!(
@@ -385,5 +399,27 @@ mod tests {
             args(&["--lots", "2"]),
             Err("unknown option --lots; factory lab reserve --help".to_owned())
         );
+    }
+
+    #[test]
+    fn the_gc_frees_a_reservation_nobody_used_for_two_hours() {
+        const NOW: i64 = 1_800_000_000;
+        const H: i64 = 3600;
+        // (made, last used, expired): last used is when a run gave its slot back.
+        let cases = [
+            (NOW, None, false),
+            (NOW - H, None, false),
+            (NOW - 2 * H + 1, None, false),
+            (NOW - 2 * H, None, true),
+            (NOW - 3 * H, None, true),
+            (NOW - 3 * H, Some(NOW - H), false),
+            (NOW - 3 * H, Some(NOW - 3 * H), true),
+            (NOW - 5 * H, Some(NOW - 3 * H), true),
+            // A use stamped before it was made (a clock step) counts from when it was made.
+            (NOW - H, Some(NOW - 3 * H), false),
+        ];
+        for (made, used, gone) in cases {
+            assert_eq!(expired(made, used, NOW), gone, "{made} {used:?}");
+        }
     }
 }

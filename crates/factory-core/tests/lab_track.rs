@@ -4,7 +4,9 @@
 
 use std::time::Duration;
 
-use factory_core::lab::devices::{ListFraming, restart_delay, same_devices};
+use std::collections::BTreeMap;
+
+use factory_core::lab::devices::{Attached, ListFraming, restart_delay, same_devices, shown_since};
 
 const BASE: Duration = Duration::from_secs(3);
 const CAP: Duration = Duration::from_secs(60);
@@ -107,4 +109,37 @@ fn a_device_whose_model_differs_differs() {
         b"FAKEPHONE01\tdevice model:Pixel_8\n",
         "List of devices attached\nFAKEPHONE01 device model:Pixel_9\n"
     ));
+}
+
+fn phone(serial: &str, state: &str) -> Attached {
+    Attached {
+        serial: serial.to_owned(),
+        state: state.to_owned(),
+        kind: "phone",
+        model: String::new(),
+    }
+}
+
+#[test]
+fn a_device_is_shown_since_the_list_it_appeared_or_changed_state_in() {
+    let one = [phone("A", "device")];
+    let since_1 = shown_since(&[], &BTreeMap::new(), &one, 1);
+    assert_eq!(since_1, BTreeMap::from([("A".to_owned(), 1)]));
+
+    let two = [phone("A", "device"), phone("B", "unauthorized")];
+    let since_2 = shown_since(&one, &since_1, &two, 2);
+    assert_eq!(
+        since_2,
+        BTreeMap::from([("A".to_owned(), 1), ("B".to_owned(), 2)])
+    );
+
+    // A is unplugged and B allowed; then A comes back: a new attachment, from the 4th list.
+    let three = [phone("B", "device")];
+    let since_3 = shown_since(&two, &since_2, &three, 3);
+    assert_eq!(since_3, BTreeMap::from([("B".to_owned(), 3)]));
+    let four = [phone("A", "device"), phone("B", "device")];
+    assert_eq!(
+        shown_since(&three, &since_3, &four, 4),
+        BTreeMap::from([("A".to_owned(), 4), ("B".to_owned(), 3)])
+    );
 }

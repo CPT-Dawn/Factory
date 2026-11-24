@@ -5,11 +5,17 @@ $ a@plain-a devlab
 1> Agents: lease before touching adb, an emulator or a local stack; never pick a serial or port yourself.
 1>   devlab run [opts] -- <cmd...>   lease (or reuse this worktree's lease), then run cmd with its env:
 1>                                   ANDROID_SERIAL, DEVLAB_SERIALS, slot ports, SUPABASE_URL, ...
+1>                                   A lease the run made ends when cmd does, whatever its exit or
+1>                                   signal (a reserved slot goes back to its reservation); a lease
+1>                                   it found (from acquire or run --keep) stays.
 1>   devlab acquire [opts]           lease and print the env as export lines: eval "$(devlab acquire)"
 1>   devlab env                      print the current lease's export lines
 1>   devlab exec -- <cmd...>         run cmd in the current lease (fails fast if a device was unplugged)
-1>   devlab release [--stop-stack]   give everything back (also automatic when the agent exits)
+1>   devlab release [--stop-stack]   give back this worktree's lease and list your others still held
+1>   devlab release --lease <id>     give back that lease of yours from any folder (also: DEVLAB_LEASE)
+1>   devlab release --all-mine       give back every lease of yours (leases also end when the agent exits)
 1>   devlab status [--json]          devices, holders, stack slots, queue, memory
+1>   devlab check [serial...]        can each phone run unattended, and what to do if not (exit 10)
 1>
 1> Options for run/acquire:
 1>   --devices N    devices to hold (default 1); --pair is 2; --no-device holds only a stack slot
@@ -18,12 +24,15 @@ $ a@plain-a devlab
 1>   --stack        start the slot's local stack too (quiet; log path on failure)
 1>   --wait SEC     how long to queue for a free device or slot (default 480); 0 = do not wait;
 1>                  seconds, or 90s, 9m or 1h
+1>   --keep         run only: keep the lease the run made once cmd ends (devlab release ends it)
 1>
 1> A lease belongs to the calling agent (or your terminal) and this worktree; every command from the
 1> same agent in the same worktree finds it again. Subagents count as their lead: one owner may hold at
 1> most maxSlotsPerOwner stack slots of a project (default: all but one), even when no one else waits.
 1> Over the cap it queues, naming the cap, and steps aside for other owners until one of its own
-1> leases ends. Leased devices: ANDROID_SERIAL is set, so plain adb,
+1> leases ends. Devices count alike: at most maxDevicesPerOwner phones and emulators (default: all
+1> phones but one); a request for more is refused (exit 75). A request waiting for a phone lets requests
+1> that need none go first. Leased devices: ANDROID_SERIAL is set, so plain adb,
 1> maestro and expo commands reach only them. Phone builds' fixed ports reach your slot through adb reverse.
 1>
 1> Exit codes: 2 usage, 3 config, 4 no lease, 75 nothing free in time, 76 a leased device went away,
@@ -31,7 +40,7 @@ $ a@plain-a devlab
 1>
 1> Also: devlab stack up|down|status, devlab prep [serial...], devlab watch (the daemon is the watcher), devlab gc.
 1> Config: ~/.config/devlab/config.json (machine), devlab.json at a repo root (ports, stack, reverse,
-1> maxSlotsPerOwner, which wins over the machine's).
+1> maxSlotsPerOwner and maxDevicesPerOwner, which win over the machine's).
 ? 0
 $ a@plain-a devlab help
 1> devlab: lease this PC's phones, emulators and local stack slots, one holder at a time.
@@ -39,11 +48,17 @@ $ a@plain-a devlab help
 1> Agents: lease before touching adb, an emulator or a local stack; never pick a serial or port yourself.
 1>   devlab run [opts] -- <cmd...>   lease (or reuse this worktree's lease), then run cmd with its env:
 1>                                   ANDROID_SERIAL, DEVLAB_SERIALS, slot ports, SUPABASE_URL, ...
+1>                                   A lease the run made ends when cmd does, whatever its exit or
+1>                                   signal (a reserved slot goes back to its reservation); a lease
+1>                                   it found (from acquire or run --keep) stays.
 1>   devlab acquire [opts]           lease and print the env as export lines: eval "$(devlab acquire)"
 1>   devlab env                      print the current lease's export lines
 1>   devlab exec -- <cmd...>         run cmd in the current lease (fails fast if a device was unplugged)
-1>   devlab release [--stop-stack]   give everything back (also automatic when the agent exits)
+1>   devlab release [--stop-stack]   give back this worktree's lease and list your others still held
+1>   devlab release --lease <id>     give back that lease of yours from any folder (also: DEVLAB_LEASE)
+1>   devlab release --all-mine       give back every lease of yours (leases also end when the agent exits)
 1>   devlab status [--json]          devices, holders, stack slots, queue, memory
+1>   devlab check [serial...]        can each phone run unattended, and what to do if not (exit 10)
 1>
 1> Options for run/acquire:
 1>   --devices N    devices to hold (default 1); --pair is 2; --no-device holds only a stack slot
@@ -52,12 +67,15 @@ $ a@plain-a devlab help
 1>   --stack        start the slot's local stack too (quiet; log path on failure)
 1>   --wait SEC     how long to queue for a free device or slot (default 480); 0 = do not wait;
 1>                  seconds, or 90s, 9m or 1h
+1>   --keep         run only: keep the lease the run made once cmd ends (devlab release ends it)
 1>
 1> A lease belongs to the calling agent (or your terminal) and this worktree; every command from the
 1> same agent in the same worktree finds it again. Subagents count as their lead: one owner may hold at
 1> most maxSlotsPerOwner stack slots of a project (default: all but one), even when no one else waits.
 1> Over the cap it queues, naming the cap, and steps aside for other owners until one of its own
-1> leases ends. Leased devices: ANDROID_SERIAL is set, so plain adb,
+1> leases ends. Devices count alike: at most maxDevicesPerOwner phones and emulators (default: all
+1> phones but one); a request for more is refused (exit 75). A request waiting for a phone lets requests
+1> that need none go first. Leased devices: ANDROID_SERIAL is set, so plain adb,
 1> maestro and expo commands reach only them. Phone builds' fixed ports reach your slot through adb reverse.
 1>
 1> Exit codes: 2 usage, 3 config, 4 no lease, 75 nothing free in time, 76 a leased device went away,
@@ -65,7 +83,7 @@ $ a@plain-a devlab help
 1>
 1> Also: devlab stack up|down|status, devlab prep [serial...], devlab watch (the daemon is the watcher), devlab gc.
 1> Config: ~/.config/devlab/config.json (machine), devlab.json at a repo root (ports, stack, reverse,
-1> maxSlotsPerOwner, which wins over the machine's).
+1> maxSlotsPerOwner and maxDevicesPerOwner, which win over the machine's).
 ? 0
 $ a@plain-a devlab frobnicate
 2> devlab: unknown command frobnicate; devlab help

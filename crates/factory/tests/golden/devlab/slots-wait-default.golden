@@ -35,7 +35,7 @@ $ b@demo-b devlab acquire --no-device --quiet
 & q c@demo-c devlab acquire --no-device --quiet --wait -1
 until q devlab: waiting:
 $ a@demo-a devlab release
-2> devlab: released lease 1
+2> devlab: released lease 1 (<sandbox>/wt/demo-a)
 ? 0
 wait q
 1> export DEVLAB_PROJECT=demo

@@ -1,6 +1,6 @@
 # Free phones go out in serial order: owner a gets the first and runs commands on it (run passes the
-# command's exit code through); owner b gets the next authorized one, whose lock screen stays up.
-# With the last phone unauthorized, owner c gives up at once.
+# command's exit code through). Only a ready phone is granted: owner b waits for the locked one, and
+# gets it once it is unlocked. With the last phone unauthorized, owner c gives up at once.
 plug FAKEPHONE01 device usb:1-1 product:shiba model:Pixel_8 device:shiba transport_id:1
 plug FAKEPHONE02 unauthorized usb:1-2 transport_id:2
 plug FAKEPHONE03 device usb:1-3 product:panther model:Pixel_7 device:panther transport_id:3
@@ -23,13 +23,16 @@ $ a@plain-a devlab exec -- sh -c 'echo "lease $DEVLAB_LEASE: $DEVLAB_SERIALS"'
 $ a@plain-a devlab stack status
 2> devlab: this lease has no stack slot (devlab.json has no supabase)
 ? 3
+$ b@plain-b devlab acquire --phone --wait 0
+2> devlab: gave up after 0 s: no free phone: 1 phone(s) busy, 1 locked (unlock it once), 1 unauthorized (tap Allow on the phone)
+? 75
+unlock FAKEPHONE03
 $ b@plain-b devlab acquire --phone
 1> export DEVLAB_LEASE=2
 1> export ANDROID_SERIAL=FAKEPHONE03
 1> export DEVLAB_SERIALS=FAKEPHONE03
 1> export DEVLAB_KINDS=phone
 1> export DEVLAB_ABIS=arm64-v8a
-2> devlab: FAKEPHONE03: lock screen still showing: set the phone's screen lock to None or Swipe
 2> devlab: lease 2, phone FAKEPHONE03 (Pixel 7)
 ? 0
 $ c@plain-c devlab acquire --phone --wait 0
@@ -40,6 +43,9 @@ $ a@plain-a devlab status
 1>   FAKEPHONE01        phone    Pixel 8        ready        lease 1 plain-a (claude:<a>)
 1>   FAKEPHONE02        phone    -              unauthorized free
 1>   FAKEPHONE03        phone    Pixel 7        ready        lease 2 plain-b (claude:<b>)
+1> leases
+1>   lease 1 plain-a (claude:<a>): age 0m, idle 0m
+1>   lease 2 plain-b (claude:<b>): age 0m, idle 0m
 1> memory <mem> GB free; watcher active
 ? 0
 $ a@plain-a devlab status --json
@@ -50,21 +56,42 @@ $ a@plain-a devlab status --json
 1>       "kind": "phone",
 1>       "model": "Pixel 8",
 1>       "state": "ready",
-1>       "holder": "lease 1 plain-a (claude:<a>)"
+1>       "holder": "lease 1 plain-a (claude:<a>)",
+1>       "readiness": "ready"
 1>     },
 1>     {
 1>       "serial": "FAKEPHONE02",
 1>       "kind": "phone",
 1>       "model": "",
 1>       "state": "unauthorized",
-1>       "holder": "free"
+1>       "holder": "free",
+1>       "readiness": "unauthorized"
 1>     },
 1>     {
 1>       "serial": "FAKEPHONE03",
 1>       "kind": "phone",
 1>       "model": "Pixel 7",
 1>       "state": "ready",
-1>       "holder": "lease 2 plain-b (claude:<b>)"
+1>       "holder": "lease 2 plain-b (claude:<b>)",
+1>       "readiness": "ready"
+1>     }
+1>   ],
+1>   "leases": [
+1>     {
+1>       "id": 1,
+1>       "worktree": "plain-a",
+1>       "owner": "claude:<a>",
+1>       "ageMin": 0,
+1>       "idleMin": 0,
+1>       "running": null
+1>     },
+1>     {
+1>       "id": 2,
+1>       "worktree": "plain-b",
+1>       "owner": "claude:<b>",
+1>       "ageMin": 0,
+1>       "idleMin": 0,
+1>       "running": null
 1>     }
 1>   ],
 1>   "slots": [],
@@ -74,7 +101,8 @@ $ a@plain-a devlab status --json
 1>   "memAvailableMB": <mem>
 1> }
 ? 0
+lock FAKEPHONE03
 $ a@plain-a devlab prep
 1> FAKEPHONE01: ready
-1> FAKEPHONE03: lock screen still showing: set the phone's screen lock to None or Swipe
+1> FAKEPHONE03: lock screen still showing: unlock the phone once
 ? 0

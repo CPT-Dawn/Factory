@@ -1,7 +1,7 @@
 //! The lab's daemon methods and what they carry. The CLI reads configs, finds the owner and runs
 //! stacks; the daemon keeps the lease store and decides grants.
 
-use factory_core::lab::devices::{Held, lost};
+use factory_core::lab::devices::{Held, Reclaimed, lost, reclaimed_lost};
 use factory_core::lab::queue::{Holding, QueueEntry};
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,11 @@ pub const RUN_START: &str = "lab.run.start";
 /// of the queue, and the acquire is answered with an error. Sent as [`RUN_END_ID`] once the run
 /// has its grant, it is answered `true` once recorded; sent as a notification, it is not.
 pub const RUN_END: &str = "lab.run.end";
+/// A notification on a run's connection, unanswered: a signal stopped devlab while its command
+/// runs, [`RunEnd`] saying how. The command, still running, keeps the run's lease until
+/// [`RUN_END`] says it is gone; a connection that closes before then is recorded with this end,
+/// not `lost`.
+pub const RUN_STOPPING: &str = "lab.run.stopping";
 /// Picks up the run of a devlab process whose daemon went away: [`RunResume`] in, `true` out
 /// once the daemon follows it on this connection, as it did on the acquire's. A run the daemon
 /// doesn't keep, or that another connection follows, is refused.
@@ -34,11 +39,19 @@ pub const RUN_RESUME: &str = "lab.run.resume";
 pub const RUN_END_ID: u64 = u64::MAX;
 /// The caller's lease, touched: [`FindParams`] in, `Option<Lease>` out.
 pub const LEASE: &str = "lab.lease";
-/// Drops the caller's lease: [`ReleaseParams`] in, the lease it dropped (`Option<Lease>`) out.
-pub const RELEASE: &str = "lab.release";
+/// The caller's lease for `devlab exec`, touched: [`ExecParams`] in, `Option<Lease>` out. A lease
+/// none of whose devices is lost counts the exec as its running command until [`EXEC_END`], or
+/// until the exec's process exits, so no waiter takes its devices meanwhile.
+pub const EXEC: &str = "lab.exec";
+/// The exec [`EXEC`] counted has ended: [`ExecEnd`] in, null out. Its lease is touched.
+pub const EXEC_END: &str = "lab.exec-end";
+/// Drops the caller's lease, or all of them: [`ReleaseParams`] in, what it dropped and what the
+/// caller still holds ([`Released`]) out. A lease named by id that another owner holds is refused.
+pub const RELEASE: &str = "lab.release-leases";
 /// Marks the caller's slot as having its stack stopped, so it stays held whatever happens to
-/// the lease until the stopper's release: [`StopParams`] in, the caller's lease out.
-pub const STOPPING: &str = "lab.stopping";
+/// the lease until the stopper's release: [`StopParams`] in, the caller's lease out. Named
+/// with [`RELEASE`], so a daemon that lacks that release refuses this before a stack stops.
+pub const STOPPING: &str = "lab.stopping-lease";
 /// Drops the leases of owners that exited: no params, out a line per lease and reservation
 /// this call freed (the daemon frees them as their owners exit, and says nothing of those).
 pub const GC: &str = "lab.gc";
@@ -148,6 +161,9 @@ pub struct Reservation {
     pub owner_label: String,
     /// Seconds since the epoch.
     pub created: i64,
+    /// When a run last gave its slot back, in seconds since the epoch; none before that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<i64>,
 }
 
 impl Reservation {
@@ -162,6 +178,7 @@ impl Reservation {
             id: 0,
             project: Some(self.project.clone()),
             slot: Some(self.slot),
+            devices: 0,
             worktree: String::new(),
             owner: self.owner_key(),
             owner_label: self.owner_label.clone(),
@@ -194,6 +211,9 @@ pub struct DeviceAsk {
     pub gpu: String,
     pub stay_awake: bool,
     pub animations_off: bool,
+    /// `maxDevicesPerOwner` as the configs set it; none: all phones but one.
+    #[serde(default)]
+    pub max_per_owner: Option<u32>,
 }
 
 /// A device a lease holds.
@@ -216,6 +236,9 @@ pub struct RunAsk {
     pub command: String,
     /// The Claude Code session it runs in, `CLAUDE_CODE_SESSION_ID`.
     pub session: Option<String>,
+    /// `--keep`: a lease the run makes outlives it. Without it, that lease ends with the run.
+    #[serde(default)]
+    pub keep: bool,
 }
 
 /// How a run ended, in the ledger's words: [`factory_core::lab::run::End::outcome`] and
@@ -231,6 +254,21 @@ pub struct FindParams {
     pub worktree: String,
     pub owner: Owner,
     pub lease: Option<i64>,
+}
+
+/// `devlab exec`'s lease, and the command it runs on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecParams {
+    #[serde(flatten)]
+    pub find: FindParams,
+    /// The devlab exec process.
+    pub client: Process,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecEnd {
+    pub client: Process,
 }
 
 /// The devlab process whose run to pick up.
@@ -261,6 +299,16 @@ pub struct ReleaseParams {
     /// The stopper whose marks [`STOPPING`] set: they go with the lease.
     #[serde(default)]
     pub stopper: Option<Process>,
+    /// Every lease of the caller's owner goes, not one.
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// What a release did: the leases it dropped, and the caller's leases still held after it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Released {
+    pub dropped: Vec<Lease>,
+    pub still_held: Vec<Lease>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,12 +326,38 @@ pub struct Lease {
     /// In the order they were granted.
     #[serde(default)]
     pub devices: Vec<LeaseDevice>,
+    /// The devices a waiter took from it while it ran nothing (#57).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reclaimed: Vec<ReclaimedDevice>,
+}
+
+/// A device taken from a lease for a waiter, after the lease ran nothing for `idle_min` minutes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReclaimedDevice {
+    pub serial: String,
+    pub kind: String,
+    pub model: String,
+    pub idle_min: i64,
 }
 
 impl Lease {
-    /// Why the lease can't be used because a device it holds is gone or not usable, by the
-    /// states its devices were filled with; none when each is attached as `device`.
+    /// Why the lease can't be used because a waiter took one of its devices, or a device it
+    /// holds is gone or not usable, by the states its devices were filled with; none when
+    /// nothing was taken and each is attached as `device`.
     pub fn lost(&self) -> Option<String> {
+        let taken: Vec<Reclaimed> = self
+            .reclaimed
+            .iter()
+            .map(|d| Reclaimed {
+                serial: d.serial.clone(),
+                kind: d.kind.clone(),
+                model: d.model.clone(),
+                idle_min: d.idle_min,
+            })
+            .collect();
+        if let Some(why) = reclaimed_lost(&taken) {
+            return Some(why);
+        }
         let held: Vec<Held> = self
             .devices
             .iter()
@@ -307,6 +381,7 @@ impl Lease {
             id: self.id,
             project: self.project.clone(),
             slot: self.slot,
+            devices: u32::try_from(self.devices.len()).unwrap_or(u32::MAX),
             worktree: self.worktree.clone(),
             owner: self.owner_key(),
             owner_label: self.owner_label.clone(),
@@ -319,6 +394,18 @@ pub struct Granted {
     pub lease: Lease,
     /// The worktree the slot ran before this grant, if it ran one.
     pub previous: Option<String>,
+    /// The schema the slot's stack last ran, when the daemon has a record of it.
+    #[serde(default)]
+    pub schema: Option<SlotSchema>,
+}
+
+/// The schema a slot's stack last ran, whether or not it runs now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotSchema {
+    /// The worktree whose lease last started the slot's stack.
+    pub worktree: String,
+    /// That worktree's newest migration when the record was made, if it had one.
+    pub head: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,6 +457,8 @@ impl Waiter {
             project: self.project.clone(),
             cap: self.slot_cap,
             max_slots: self.max_slots,
+            // What it asks of devices is kept apart, in `activity`.
+            devices: None,
         }
     }
 }
@@ -390,6 +479,17 @@ pub struct Board {
     /// Every device adb lists, a lease holds or devlab runs.
     #[serde(default)]
     pub devices: Vec<DeviceLine>,
+    /// The command each lease runs, from `devlab run` or `devlab exec`; a lease that runs
+    /// nothing has none.
+    #[serde(default)]
+    pub running: Vec<LeaseRunning>,
+}
+
+/// What lease `lease` runs now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseRunning {
+    pub lease: i64,
+    pub command: String,
 }
 
 /// One device as status shows it.
@@ -402,6 +502,10 @@ pub struct DeviceLine {
     pub state: String,
     /// `lease N <worktree> (<owner>)`, `idle 3m` or `free`.
     pub holder: String,
+    /// A phone's readiness as the daemon last probed it (#55): `ready`, `locked`, `asleep`,
+    /// …; none for an emulator or a phone not yet probed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

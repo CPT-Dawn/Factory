@@ -6,7 +6,7 @@ use factory_adapters::adb::{Adb, AdbCli};
 use factory_core::exit::Exit;
 use factory_core::lab::args::{Opts, wait_span};
 use factory_core::lab::base_name;
-use factory_core::lab::config::{MachineConfig, ProjectConfig, owner_cap};
+use factory_core::lab::config::{MachineConfig, ProjectConfig, devices_per_owner, owner_cap};
 use factory_core::lab::devices::Mode;
 use factory_core::lab::emulator::BOOT_TIMEOUT_SEC;
 use factory_core::lab::slots::{Env, slot_env};
@@ -15,8 +15,9 @@ use super::context::Ctx;
 use super::host::proc;
 use super::stack;
 use super::wire::{
-    ACQUIRE, AcquireParams, DeviceAsk, GC, Granted, LEASE, Lease, Process, ProjectAsk, RECEIVED,
-    RELEASE, ReleaseParams, RunAsk, SLOT, STOPPING, SlotParams, StackAsk, StopParams,
+    ACQUIRE, AcquireParams, DeviceAsk, EXEC, EXEC_END, ExecEnd, ExecParams, GC, Granted, LEASE,
+    Lease, Process, ProjectAsk, RECEIVED, RELEASE, ReleaseParams, Released, RunAsk, SLOT, STOPPING,
+    SlotParams, SlotSchema, StackAsk, StopParams,
 };
 use crate::client;
 use crate::output::Failure;
@@ -84,7 +85,7 @@ pub fn ask(
         lease: super::context::forced_lease(),
         project: project.clone(),
         wait_sec,
-        devices: (opts.want > 0).then(|| device_ask(&ctx.cfg, opts)),
+        devices: (opts.want > 0).then(|| device_ask(&ctx.cfg, ctx.project.as_ref(), opts)),
         resume: None,
         client: Some(me()),
         run,
@@ -114,13 +115,26 @@ pub fn take(
     if let (Some(p), Some(slot)) = (&ctx.project, lease.slot) {
         stack::prepare_workdir(p, &ctx.worktree, slot)?;
         let info = stack::info(p, &ctx.worktree, slot)?;
-        if let (Some(previous), Some(info)) = (&granted.previous, &info)
-            && *previous != ctx.worktree
-            && stack::running(&info.project_id)
-        {
+        // A slot with no record of its schema (a stack devlab never ran, or one an earlier
+        // daemon left) is taken to run its last worktree's while its stack runs.
+        let schema = match (granted.schema, &info) {
+            (Some(schema), Some(_)) => Some(schema),
+            (None, Some(info)) => granted
+                .previous
+                .filter(|previous| *previous != ctx.worktree && stack::running(&info.project_id))
+                .map(|worktree| SlotSchema {
+                    worktree,
+                    head: None,
+                }),
+            (_, None) => None,
+        };
+        if let Some(schema) = schema.filter(|s| s.worktree != ctx.worktree) {
+            let head = schema
+                .head
+                .map_or_else(String::new, |head| format!(", up to {head}"));
             warn(&format!(
-                "slot {slot}'s stack last ran {}'s schema: reset it if your migrations differ",
-                base_name(previous)
+                "slot {slot}'s stack last ran {}'s schema{head}: reset it if your migrations differ",
+                base_name(&schema.worktree)
             ));
         }
         if opts.stack && info.is_some() {
@@ -134,7 +148,7 @@ pub fn take(
     Ok(lease)
 }
 
-fn device_ask(cfg: &MachineConfig, opts: &Opts) -> DeviceAsk {
+fn device_ask(cfg: &MachineConfig, project: Option<&ProjectConfig>, opts: &Opts) -> DeviceAsk {
     DeviceAsk {
         want: opts.want,
         mode: opts.mode.as_str().to_owned(),
@@ -147,6 +161,7 @@ fn device_ask(cfg: &MachineConfig, opts: &Opts) -> DeviceAsk {
         gpu: cfg.emulator_gpu.clone(),
         stay_awake: cfg.prep_stay_awake,
         animations_off: cfg.prep_animations_off,
+        max_per_owner: devices_per_owner(cfg, project),
     }
 }
 
@@ -205,7 +220,32 @@ pub fn find(ctx: &Ctx) -> Result<Option<Lease>, Failure> {
 /// The caller's lease with every device it holds attached; else exit 4, or 76 naming the
 /// devices that are gone.
 pub fn live(ctx: &Ctx) -> Result<Lease, Failure> {
-    let lease = find(ctx)?.ok_or_else(|| {
+    usable(ctx, find(ctx)?)
+}
+
+/// The caller's lease for `devlab exec` of `argv`, as [`live`] finds it. The daemon counts
+/// the exec as running on it, so no waiter takes its devices, until [`exec_ended`].
+pub fn exec_lease(ctx: &Ctx, argv: &[String]) -> Result<Lease, Failure> {
+    let params = ExecParams {
+        find: ctx.find(),
+        client: me(),
+        command: argv.join(" "),
+    };
+    usable(ctx, client::call(&paths()?, EXEC, &params)?)
+}
+
+/// The exec [`exec_lease`] counted ended; its lease is touched. A daemon that went away
+/// forgets the exec once this process exits.
+pub fn exec_ended() {
+    if let Ok(paths) = paths() {
+        let _: Result<(), Failure> = client::call(&paths, EXEC_END, &ExecEnd { client: me() });
+    }
+}
+
+/// `lease`, when it is there and every device it holds is attached; else exit 4, or 76
+/// naming the devices that are gone.
+fn usable(ctx: &Ctx, lease: Option<Lease>) -> Result<Lease, Failure> {
+    let lease = lease.ok_or_else(|| {
         Failure::new(
             Exit::NoLease,
             format!(
@@ -220,14 +260,32 @@ pub fn live(ctx: &Ctx) -> Result<Lease, Failure> {
     }
 }
 
-/// Drops the caller's lease, and lets go of any slot this call held while stopping its stack.
-pub fn release(ctx: &Ctx) -> Result<Option<Lease>, Failure> {
+/// Which leases a release ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// This worktree's lease, or the one `DEVLAB_LEASE` names.
+    Here,
+    /// The lease with this id, from any folder.
+    Lease(i64),
+    /// Every lease of the calling owner.
+    AllMine,
+}
+
+/// Drops the leases `target` names, and lets go of any slot this call held while stopping its
+/// stack; what it dropped and the caller's leases still held. A lease named by id that another
+/// owner holds is refused, exit 4.
+pub fn release(ctx: &Ctx, target: Target) -> Result<Released, Failure> {
+    let mut find = ctx.find();
+    if let Target::Lease(id) = target {
+        find.lease = Some(id);
+    }
     client::call(
         &paths()?,
         RELEASE,
         &ReleaseParams {
-            find: ctx.find(),
+            find,
             stopper: Some(me()),
+            all: target == Target::AllMine,
         },
     )
 }

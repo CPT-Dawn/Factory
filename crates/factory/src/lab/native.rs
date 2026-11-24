@@ -7,17 +7,19 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use factory_core::lab::args::parse_opts;
+use factory_core::lab::args::{Opts, parse_opts};
 use factory_core::lab::slots::export_lines;
 use serde_json::{Map, Value, json};
 
 use super::cli::{self, HELP, Stack};
-use super::context::{Ctx, context};
-use super::wire::{Board, Lease};
-use super::{lease, reserve, run, status};
+use super::context::{Ctx, context, release_context};
+use super::lease::Target;
+use super::wire::{Board, Lease, Released};
+use super::{check, lease, reserve, run, status};
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 
@@ -67,7 +69,7 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
             let file = save("help.txt", HELP)?;
             Done::new(
                 format!(
-                    "factory lab: acquire, run, exec, env, release, stack, status, gc, reserve, prep, watch; usage in {}",
+                    "factory lab: acquire, run, exec, env, release, stack, status, check, gc, reserve, prep, watch; usage in {}",
                     file.display()
                 ),
                 json!({ "help": HELP, "helpFile": file }),
@@ -75,21 +77,22 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
         }
         "status" => status_done(&status::board()?)?,
         "acquire" | "run" => {
+            let (mut opts, rest, flags) = parse_opts(args).map_err(Failure::usage)?;
+            let keep = cli::keep_flag(cmd, &flags)?;
             let ctx = context()?;
-            let (mut opts, rest, _flags) = parse_opts(args).map_err(Failure::usage)?;
             if opts.wait_sec.is_none() {
                 opts.wait_sec = Some(ctx.cfg.wait_sec);
             }
-            if cmd == "run" && rest.is_empty() {
-                return Err(Failure::usage("factory lab run [opts] -- <cmd...>"));
+            if cmd == "run" {
+                if rest.is_empty() {
+                    return Err(Failure::usage("factory lab run [opts] -- <cmd...>"));
+                }
+                return run_done(&ctx, &opts, keep, rest);
             }
             let mut warnings = Vec::new();
             let granted = lease::acquire(&ctx, &opts, &mut |_| {}, &mut |warning| {
                 warnings.push(warning.to_owned());
             })?;
-            if cmd == "run" {
-                return ran(&ctx, &granted, rest);
-            }
             lease_done(&ctx, &granted, &warnings)?
         }
         "exec" => {
@@ -101,19 +104,26 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
             if rest.is_empty() {
                 return Err(Failure::usage("factory lab exec -- <cmd...>"));
             }
-            return ran(&ctx, &lease::live(&ctx)?, rest);
+            let held = lease::exec_lease(&ctx, rest)?;
+            let done = ran(&ctx, &held, rest);
+            lease::exec_ended();
+            return done;
         }
         "env" => {
             let ctx = context()?;
             lease_done(&ctx, &lease::live(&ctx)?, &[])?
         }
         "release" => {
-            let dropped = cli::release(&context()?, args.iter().any(|a| a == "--stop-stack"))?;
-            let line = dropped.as_ref().map_or_else(
-                || "nothing held here".to_owned(),
-                |lease| format!("released lease {}", lease.id),
-            );
-            Done::new(line, json!({ "released": dropped }))
+            let (target, stop_stack) = cli::release_args(args)?;
+            let (released, stop_failed) = cli::release(&release_context()?, stop_stack, target)?;
+            if let Some(failed) = stop_failed {
+                let said = cli::release_lines(&released, target)?.join("; ");
+                return Err(Failure::new(
+                    failed.exit,
+                    format!("{}; the lease was still released: {said}", failed.message),
+                ));
+            }
+            release_done(&released, target)?
         }
         "stack" => stack_done(&cli::stack(
             &context()?,
@@ -146,6 +156,10 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
                 }
             }
         }
+        "check" => {
+            let phones = check::phones(args)?;
+            return Ok(Verb::Ran(check_done(&phones)?, check::code(&phones)));
+        }
         "prep" => prep_done(&cli::prep(&context()?, args)?)?,
         "watch" => Done::new(cli::WATCH, json!({ "watcher": "daemon" })),
         other => {
@@ -155,6 +169,26 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
         }
     };
     Ok(Verb::Done(done))
+}
+
+/// devlab's line for one phone; for more, how many are ready, the file holding the line of each;
+/// every phone as JSON. The exit says whether all are ready.
+fn check_done(phones: &[check::PhoneCheck]) -> Result<Done, Failure> {
+    let mut json = check::to_json(phones);
+    let line = match check::lines(phones).as_slice() {
+        [one] => one.clone(),
+        many => {
+            let file = save("check.txt", &(many.join("\n") + "\n"))?;
+            json["checkFile"] = json!(file);
+            let ready = phones.iter().filter(|p| p.ready()).count();
+            format!(
+                "{ready} of {} phones ready; each in {}",
+                phones.len(),
+                file.display()
+            )
+        }
+    };
+    Ok(Done::new(line, json))
 }
 
 /// `FAKEPHONE01: ready` for one device; for more, how many and how many warned, the file
@@ -238,16 +272,35 @@ fn lease_done(ctx: &Ctx, lease: &Lease, warnings: &[String]) -> Result<Done, Fai
 /// Runs `argv` in the lease, its output in `<runtime>/lab/lease-N.out`: the line
 /// `sh exited 3 in lease 1; output in <file>`, and the command's code to exit with.
 fn ran(ctx: &Ctx, lease: &Lease, argv: &[String]) -> Result<Verb, Failure> {
-    let file = save(&format!("lease-{}.out", lease.id), "")?;
+    let file = output_file(lease)?;
     let code = run::exec_in(ctx, lease, argv, Some(&file))?;
+    Ok(ran_done(argv, code, Some(lease.id), Some(&file)))
+}
+
+/// `factory lab run`: devlab's run, followed by the daemon as one, its output in a file.
+fn run_done(ctx: &Ctx, opts: &Opts, keep: bool, argv: &[String]) -> Result<Verb, Failure> {
+    let ran = run::run_to(ctx, opts, keep, argv, &run::Out::File(&output_file))?;
+    Ok(ran_done(argv, ran.code, ran.lease, ran.output.as_deref()))
+}
+
+/// The file a lease's command's output goes to.
+fn output_file(lease: &Lease) -> Result<PathBuf, Failure> {
+    save(&format!("lease-{}.out", lease.id), "")
+}
+
+/// What a run or exec shows: its command's code, and the lease and output file it had; a run
+/// stopped before it was granted one had neither.
+fn ran_done(argv: &[String], code: u8, lease: Option<i64>, file: Option<&Path>) -> Verb {
     let program = argv.first().map_or("", String::as_str);
-    let line = format!(
-        "{program} exited {code} in lease {}; output in {}",
-        lease.id,
-        file.display()
-    );
-    let json = json!({ "lease": lease.id, "exit": code, "outputFile": file });
-    Ok(Verb::Ran(Done::new(line, json), code))
+    let line = match (lease, file) {
+        (Some(id), Some(file)) => format!(
+            "{program} exited {code} in lease {id}; output in {}",
+            file.display()
+        ),
+        _ => format!("{program} exited {code} before it had a lease"),
+    };
+    let json = json!({ "lease": lease, "exit": code, "outputFile": file });
+    Verb::Ran(Done::new(line, json), code)
 }
 
 fn stack_done(done: &Stack) -> Done {
@@ -264,19 +317,92 @@ fn stack_done(done: &Stack) -> Done {
     Done::new(line, json!({ "stack": id, "slot": slot, "state": state }))
 }
 
-/// Writes `text` to `name` in the lab's runtime directory; its path.
+/// What a release says in one line: what it ended and what the caller still holds, or when that
+/// would run long a count and a file with a line for each lease.
+fn release_done(released: &Released, target: Target) -> Result<Done, Failure> {
+    let lines = cli::release_lines(released, target)?;
+    let json = json!({ "released": released.dropped, "stillHeld": released.still_held });
+    let ended = lines.len() - released.still_held.len();
+    let mut line = lines[..ended].join("; ");
+    if !released.still_held.is_empty() {
+        let ids: Vec<String> = released
+            .still_held
+            .iter()
+            .map(|l| format!("lease {}", l.id))
+            .collect();
+        line = format!("{line}; still held: {}", ids.join(", "));
+    }
+    if line.chars().count() > 150 {
+        let dropped = released.dropped.len();
+        let said = if dropped == 0 {
+            lines[0].clone()
+        } else {
+            format!(
+                "released {dropped} lease{}",
+                if dropped == 1 { "" } else { "s" }
+            )
+        };
+        let held = released.still_held.len();
+        let mut short = said;
+        if held > 0 {
+            short.push_str(&format!("; {held} still held"));
+        }
+        let file = save_new("release", &(lines.join("\n") + "\n"))?;
+        line = format!("{short}, list in {}", file.display());
+        let mut json = json;
+        // Lossy, never a panic: serde refuses a path that isn't UTF-8.
+        json["releasedFile"] = json!(file.to_string_lossy());
+        let mut done = Done::new(line, json);
+        // The path is the point of the line: never cut it.
+        done.whole = true;
+        return Ok(done);
+    }
+    Ok(Done::new(line, json))
+}
+
+/// Writes `text` to a file of its own, `<stem>-<pid>-<n>.txt` in the lab's runtime directory, made
+/// with exclusive creation so no other report is ever overwritten; its path.
+fn save_new(stem: &str, text: &str) -> Result<PathBuf, Failure> {
+    let dir = lab_dir()?;
+    for n in 0u32.. {
+        let path = dir.join(format!("{stem}-{}-{n}.txt", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                return file
+                    .write_all(text.as_bytes())
+                    .map(|()| path.clone())
+                    .map_err(|e| unwritable(&path, &e));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(unwritable(&path, &e)),
+        }
+    }
+    unreachable!("a free report name below u32::MAX")
+}
+
+/// Writes `text` to `name` in the lab's runtime directory, over what was there; its path.
 fn save(name: &str, text: &str) -> Result<PathBuf, Failure> {
+    let path = lab_dir()?.join(name);
+    fs::write(&path, text).map_err(|e| unwritable(&path, &e))?;
+    Ok(path)
+}
+
+/// The lab's runtime directory, made if missing.
+fn lab_dir() -> Result<PathBuf, Failure> {
     let paths = Paths::from_env()?;
     paths.create_runtime()?;
     let dir = paths.runtime.join("lab");
-    let path = dir.join(name);
-    fs::create_dir_all(&dir)
-        .and_then(|()| fs::write(&path, text))
-        .map_err(|e| {
-            Failure::precondition(format!(
-                "cannot write {}: {e}; check XDG_RUNTIME_DIR",
-                path.display()
-            ))
-        })?;
-    Ok(path)
+    fs::create_dir_all(&dir).map_err(|e| unwritable(&dir, &e))?;
+    Ok(dir)
+}
+
+fn unwritable(path: &Path, e: &std::io::Error) -> Failure {
+    Failure::precondition(format!(
+        "cannot write {}: {e}; check XDG_RUNTIME_DIR",
+        path.display()
+    ))
 }
