@@ -301,12 +301,23 @@ fn release_done(released: &Released, target: Target) -> Result<Done, Failure> {
             short.push_str(&format!("; {held} still held"));
         }
         let file = save(
-            &format!("release-{}.txt", std::process::id()),
+            &format!("release-{}-{}.txt", std::process::id(), nanos()),
             &(lines.join("\n") + "\n"),
         )?;
         line = format!("{short}, list in {}", file.display());
+        let mut done = Done::new(line, json);
+        // The path is the point of the line: never cut it.
+        done.whole = true;
+        return Ok(done);
     }
     Ok(Done::new(line, json))
+}
+
+/// The clock's nanoseconds, to tell reports of one pid apart.
+fn nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
 }
 
 /// Writes `text` to `name` in the lab's runtime directory; its path.

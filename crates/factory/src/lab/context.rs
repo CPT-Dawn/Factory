@@ -33,9 +33,9 @@ pub fn context() -> Result<Ctx, Failure> {
     context_with(true)
 }
 
-/// The context of a release: its worktree's `devlab.json` is read only when `project_needed`
-/// (to stop a stack), so one that is broken in another folder can't keep a release by id from
-/// ending its lease.
+/// The context of a release: a worktree's `devlab.json` that can't be read counts as none unless
+/// `project_needed` (to stop a stack), so one that is broken in another folder can't keep a
+/// release by id from ending its lease.
 pub fn release_context(project_needed: bool) -> Result<Ctx, Failure> {
     context_with(project_needed)
 }
