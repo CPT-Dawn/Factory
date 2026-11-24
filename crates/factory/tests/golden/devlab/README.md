@@ -21,8 +21,13 @@ help says so. `devices-settle-lost` (#59): a fresh lease whose phone is unplugge
 grant and its prep (exit 76) is given back, where today's devlab kept it: `devlab env` then exits 4.
 `devices-lease-status` (#57): `devlab status` and its `--json` show each lease's age, idle time
 and running command, and each phone's readiness (#55) where today's devlab showed `ready`; every
-golden with a status step changed with it. `slots-wait-default` is parity regained: `--wait -1`
-is the configured default wait, as in today's devlab, so the call queues.
+golden with a status step changed with it. `slots-release` (#54): a release names the worktree
+of each lease it ends (`released lease 1 (<sandbox>/wt/demo-a)`), where today's devlab named only
+its id; every golden with a release step changed with it. `devices-phone-grant` (#56): only a
+ready phone is granted, so the request for the locked one waits, says how many phones are locked
+or unauthorized, and gets it once it is unlocked, where today's devlab granted it at once with a
+lock-screen warning. `slots-wait-default` is parity regained: `--wait -1` is the configured
+default wait, as in today's devlab, so the call queues.
 
 ## Replaying
 
@@ -68,10 +73,11 @@ One step per line:
   sends its process (the shell, or the devlab it `exec`s) `TERM`, `INT`, `HUP` or `KILL`.
 - `kill <owner>` ends the owner's process.
 - World steps: `plug <serial> <state> [<prop>...]` (adb lists it; plugging again replaces it),
-  `unplug <serial>`, `lock <serial>` (its lock screen stays up), `stall <serial>` (the emulator
+  `unplug <serial>`, `lock <serial>` (its lock screen stays up), `unlock <serial>` (it is unlocked
+  again), `stall <serial>` (the emulator
   never finishes booting; for the tests beside the transcripts), `yank <serial>` (the phone is
   unplugged when it is next asked its ABI, as its grant settles), `break <op>` and `mend <op>`
-  where `<op>` is `supabase start` or `systemd-run`.
+  where `<op>` is `supabase start`, `supabase stop` or `systemd-run`.
 
 After a `$` or `wait` step come the lines it showed: `1> ` per stdout line, `2> ` per stderr
 line, `1~ ` or `2~ ` for a last line without a newline, and `? <exit code>`.

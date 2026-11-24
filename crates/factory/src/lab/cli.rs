@@ -54,13 +54,13 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
         }
         "acquire" | "run" => {
             let (mut opts, rest, flags) = parse_opts(args).map_err(Failure::usage)?;
+            let keep = keep_flag(cmd, &flags)?;
             let ctx = context()?;
             if opts.wait_sec.is_none() {
                 opts.wait_sec = Some(ctx.cfg.wait_sec);
             }
             let quiet = flags.iter().any(|f| f == "--quiet");
             if cmd == "run" {
-                let keep = flags.iter().any(|f| f == "--keep");
                 return run::run(&ctx, &opts, quiet, keep, rest);
             }
             let granted = lease::acquire(&ctx, &opts, &mut |why| note(why), &mut |w| note(w))?;
@@ -147,6 +147,18 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
     }
 }
 
+/// Whether `cmd`'s `flags` hold `--keep`, which only `run` takes: an acquired lease is kept
+/// until it is released anyway.
+pub(super) fn keep_flag(cmd: &str, flags: &[String]) -> Result<bool, Failure> {
+    let keep = flags.iter().any(|f| f == "--keep");
+    if keep && cmd != "run" {
+        return Err(Failure::usage(
+            "--keep is run's only: an acquired lease stays until devlab release",
+        ));
+    }
+    Ok(keep)
+}
+
 /// What `watch` says: there is nothing left for it to start.
 pub(super) const WATCH: &str =
     "the factory daemon frees leases and stops idle emulators and stacks now; nothing to start";
@@ -194,7 +206,17 @@ pub(super) fn release_args(args: &[String]) -> Result<(Target, bool), Failure> {
                 at += 1;
                 Some(lease_id(args.get(at).map_or("", String::as_str))?)
             }
-            _ => arg.strip_prefix("--lease=").map(lease_id).transpose()?,
+            _ => match arg.strip_prefix("--lease=") {
+                Some(id) => Some(lease_id(id)?),
+                None if arg.starts_with('-') => {
+                    return Err(Failure::usage(format!("unknown option {arg}; devlab help")));
+                }
+                None => {
+                    return Err(Failure::usage(format!(
+                        "unknown argument {arg}; devlab help"
+                    )));
+                }
+            },
         };
         if let Some(named) = named {
             if target != Target::Here {

@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use factory_core::lab::args::parse_opts;
+use factory_core::lab::args::{Opts, parse_opts};
 use factory_core::lab::slots::export_lines;
 use serde_json::{Map, Value, json};
 
@@ -77,21 +77,22 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
         }
         "status" => status_done(&status::board()?)?,
         "acquire" | "run" => {
+            let (mut opts, rest, flags) = parse_opts(args).map_err(Failure::usage)?;
+            let keep = cli::keep_flag(cmd, &flags)?;
             let ctx = context()?;
-            let (mut opts, rest, _flags) = parse_opts(args).map_err(Failure::usage)?;
             if opts.wait_sec.is_none() {
                 opts.wait_sec = Some(ctx.cfg.wait_sec);
             }
-            if cmd == "run" && rest.is_empty() {
-                return Err(Failure::usage("factory lab run [opts] -- <cmd...>"));
+            if cmd == "run" {
+                if rest.is_empty() {
+                    return Err(Failure::usage("factory lab run [opts] -- <cmd...>"));
+                }
+                return run_done(&ctx, &opts, keep, rest);
             }
             let mut warnings = Vec::new();
             let granted = lease::acquire(&ctx, &opts, &mut |_| {}, &mut |warning| {
                 warnings.push(warning.to_owned());
             })?;
-            if cmd == "run" {
-                return ran(&ctx, &granted, rest);
-            }
             lease_done(&ctx, &granted, &warnings)?
         }
         "exec" => {
@@ -271,16 +272,35 @@ fn lease_done(ctx: &Ctx, lease: &Lease, warnings: &[String]) -> Result<Done, Fai
 /// Runs `argv` in the lease, its output in `<runtime>/lab/lease-N.out`: the line
 /// `sh exited 3 in lease 1; output in <file>`, and the command's code to exit with.
 fn ran(ctx: &Ctx, lease: &Lease, argv: &[String]) -> Result<Verb, Failure> {
-    let file = save(&format!("lease-{}.out", lease.id), "")?;
+    let file = output_file(lease)?;
     let code = run::exec_in(ctx, lease, argv, Some(&file))?;
+    Ok(ran_done(argv, code, Some(lease.id), Some(&file)))
+}
+
+/// `factory lab run`: devlab's run, followed by the daemon as one, its output in a file.
+fn run_done(ctx: &Ctx, opts: &Opts, keep: bool, argv: &[String]) -> Result<Verb, Failure> {
+    let ran = run::run_to(ctx, opts, keep, argv, &run::Out::File(&output_file))?;
+    Ok(ran_done(argv, ran.code, ran.lease, ran.output.as_deref()))
+}
+
+/// The file a lease's command's output goes to.
+fn output_file(lease: &Lease) -> Result<PathBuf, Failure> {
+    save(&format!("lease-{}.out", lease.id), "")
+}
+
+/// What a run or exec shows: its command's code, and the lease and output file it had; a run
+/// stopped before it was granted one had neither.
+fn ran_done(argv: &[String], code: u8, lease: Option<i64>, file: Option<&Path>) -> Verb {
     let program = argv.first().map_or("", String::as_str);
-    let line = format!(
-        "{program} exited {code} in lease {}; output in {}",
-        lease.id,
-        file.display()
-    );
-    let json = json!({ "lease": lease.id, "exit": code, "outputFile": file });
-    Ok(Verb::Ran(Done::new(line, json), code))
+    let line = match (lease, file) {
+        (Some(id), Some(file)) => format!(
+            "{program} exited {code} in lease {id}; output in {}",
+            file.display()
+        ),
+        _ => format!("{program} exited {code} before it had a lease"),
+    };
+    let json = json!({ "lease": lease, "exit": code, "outputFile": file });
+    Verb::Ran(Done::new(line, json), code)
 }
 
 fn stack_done(done: &Stack) -> Done {

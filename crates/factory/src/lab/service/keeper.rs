@@ -15,13 +15,14 @@ use factory_core::lab::devices::{Attached, Mode};
 use factory_core::lab::emulator::{State, unit_name};
 use factory_core::lab::idle::{self, IdleDevice, IdleEmulator, IdleSlot, Need, Timers};
 use factory_core::lab::js_number;
+use factory_core::lab::ready::EpochMs;
 use factory_core::lab::slots::slot_project_id;
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags, pidfd_open};
 
 use super::super::{activity, context, host, lease, stack};
-use super::{Lab, Lease, lock_ignoring_poison, reservations, store};
+use super::{Lab, Lease, grantable, lock_ignoring_poison, now_ms, readiness, reservations, store};
 use crate::lab::wire::SlotRow;
 
 /// The longest the keeper goes without a look: a changed config is read by then.
@@ -78,7 +79,15 @@ impl Lab {
             .write(|c, _| {
                 // The list adb shows as this transaction runs, as a grant plans from: none while
                 // its stream restarts, when nothing is taken from anyone.
-                let attached = self.attached.borrow().live();
+                let (attached, since) = {
+                    let list = self.attached.borrow();
+                    (list.live(), list.since.clone())
+                };
+                // Only a phone a grant could take is of use to a waiter: one locked, asleep or
+                // otherwise not ready is neither free for it nor worth taking from a lease.
+                let rows = readiness::all(c)?;
+                let probed_by = EpochMs(now_ms());
+                let grantable = |a: &Attached| grantable(&rows, &since, a, probed_by);
                 let taken = store::taken(c)?;
                 // A slot a lease or a reservation holds, or a release is stopping, isn't idle.
                 let leases = store::leases(c)?;
@@ -117,7 +126,7 @@ impl Lab {
                         idle_since: s.idle_since,
                     })
                     .collect();
-                let device_views = device_views(c, &leases, attached.as_deref())?;
+                let device_views = device_views(c, &leases, attached.as_deref(), &grantable)?;
                 let needs: Vec<Need> = activity::needs(c)?
                     .into_iter()
                     .map(|(mode, want)| Need {
@@ -131,9 +140,7 @@ impl Lab {
                     attached
                         .iter()
                         .flatten()
-                        .filter(|a| {
-                            a.kind == "phone" && a.state == "device" && !taken.contains(&a.serial)
-                        })
+                        .filter(|a| grantable(a) && !taken.contains(&a.serial))
                         .count(),
                 );
                 let online = |serial: &str| {
@@ -246,17 +253,19 @@ impl Lab {
 
 /// Each device a lease holds that adb lists as usable, as the sweep sees it: busy while its
 /// lease runs a command or waits in the queue. One unplugged or offline is no use to a waiter,
-/// and its lease is told so, not that it was reclaimed; none is, before adb's first list.
+/// and its lease is told so, not that it was reclaimed; nor is a phone a grant could not take
+/// (`grantable`: locked, asleep, ...), which stays with its lease. None is, before adb's first
+/// list.
 fn device_views(
     c: &rusqlite::Connection,
     leases: &[Lease],
     attached: Option<&[Attached]>,
+    grantable: &dyn Fn(&Attached) -> bool,
 ) -> rusqlite::Result<Vec<IdleDevice>> {
     let usable = |serial: &str| {
-        attached
-            .into_iter()
-            .flatten()
-            .any(|a| a.serial == serial && a.state == "device")
+        attached.into_iter().flatten().any(|a| {
+            a.serial == serial && a.state == "device" && (a.kind != "phone" || grantable(a))
+        })
     };
     let running = activity::running(c, &host::alive)?;
     let waiters = store::waiters(c)?;

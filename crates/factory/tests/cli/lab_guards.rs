@@ -6,16 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::adb_stream::{PHONE_A, adb_playing};
-use super::lab::{devlab, lab};
+use super::lab::{lab, owned};
+use crate::support::Sandbox;
 use crate::support::world::{World, poll_until};
-use crate::support::{Run, Sandbox, run};
-
-/// `devlab <args>` in `dir`, the test process its owner.
-fn owned(sandbox: &Sandbox, dir: &Path, args: &[&str]) -> Run {
-    let mut cmd = devlab(sandbox, dir, args);
-    cmd.env("DEVLAB_OWNER_PID", std::process::id().to_string());
-    run(cmd)
-}
 
 fn daemon_log(sandbox: &Sandbox) -> String {
     fs::read_to_string(sandbox.path("run/factory/daemon.log")).unwrap_or_default()
@@ -123,6 +116,36 @@ fn an_unknown_flag_is_refused_with_exit_2_and_never_run_as_the_command() {
         acquire.stderr.contains("unknown option --stak"),
         "{acquire:?}"
     );
+}
+
+#[test]
+fn release_refuses_what_it_does_not_know_with_exit_2_and_keeps_the_lease() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-a");
+    assert_eq!(owned(&sandbox, &wt, &["acquire", "--no-device"]).code, 0);
+
+    let flag = owned(&sandbox, &wt, &["release", "--allmine"]);
+    let word = owned(&sandbox, &wt, &["release", "lease"]);
+    let status = owned(&sandbox, &wt, &["status"]);
+
+    assert_eq!(flag.code, 2, "{flag:?}");
+    assert!(flag.stderr.contains("unknown option --allmine"), "{flag:?}");
+    assert_eq!(word.code, 2, "{word:?}");
+    assert!(word.stderr.contains("unknown argument lease"), "{word:?}");
+    assert!(status.stdout.contains("lease 1 demo-a"), "{status:?}");
+}
+
+#[test]
+fn acquire_refuses_keep_which_only_a_run_takes() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-a");
+
+    let out = owned(&sandbox, &wt, &["acquire", "--no-device", "--keep"]);
+    let status = owned(&sandbox, &wt, &["status"]);
+
+    assert_eq!(out.code, 2, "{out:?}");
+    assert!(out.stderr.contains("--keep is run's only"), "{out:?}");
+    assert!(!status.stdout.contains("lease 1"), "{status:?}");
 }
 
 #[test]

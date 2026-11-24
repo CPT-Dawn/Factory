@@ -2,9 +2,17 @@
 //! notification each change of that earns.
 
 use factory_core::lab::ready::{
-    Probe, Readiness, Urgency, after, auth_timeout_warning, check_line, for_grant, judge, notice,
-    probe_again, refresh_again, unplugged,
+    EpochMs, Probe, Readiness, Urgency, after, auth_timeout_warning, check_line, for_grant, judge,
+    notice, probe_again, refresh_again, unplugged,
 };
+
+/// An instant a probe could be made at: 2026-11-24, in ms since the epoch.
+const AT: EpochMs = EpochMs(1_764_000_000_000);
+
+/// `ms` after [AT].
+fn later(ms: i64) -> EpochMs {
+    EpochMs(AT.0 + ms)
+}
 
 /// A phone on USB power with stay-awake set, awake and unlocked.
 fn ready_phone() -> Probe {
@@ -272,32 +280,46 @@ fn a_grant_probes_a_ready_phone_again_after_10_s_and_one_that_is_not_ready_every
 #[test]
 fn a_grant_takes_a_phone_adb_cannot_use_as_adb_shows_it_whatever_its_last_probe_found() {
     assert_eq!(
-        for_grant("unauthorized", Some((Readiness::Locked, 0))),
+        for_grant("unauthorized", Some((Readiness::Locked, AT)), AT),
         Some(Readiness::Unauthorized)
     );
     assert_eq!(
-        for_grant("unauthorized", None),
+        for_grant("unauthorized", None, AT),
         Some(Readiness::Unauthorized)
     );
     assert_eq!(
-        for_grant("offline", Some((Readiness::Ready, 0))),
+        for_grant("offline", Some((Readiness::Ready, AT)), AT),
         Some(Readiness::Offline)
     );
 }
 
 #[test]
 fn a_grant_believes_a_usable_phone_s_probe_and_a_ready_one_for_10_s() {
-    assert_eq!(for_grant("device", None), Some(Readiness::Offline));
+    assert_eq!(for_grant("device", None, AT), Some(Readiness::Offline));
     assert_eq!(
-        for_grant("device", Some((Readiness::Locked, 60_000))),
+        for_grant("device", Some((Readiness::Locked, AT)), later(60_000)),
         Some(Readiness::Locked)
     );
     assert_eq!(
-        for_grant("device", Some((Readiness::Ready, 10_000))),
+        for_grant("device", Some((Readiness::Ready, AT)), later(10_000)),
         Some(Readiness::Ready)
     );
     // Too old to grant on: the grant has it probed again.
-    assert_eq!(for_grant("device", Some((Readiness::Ready, 10_001))), None);
+    assert_eq!(
+        for_grant("device", Some((Readiness::Ready, AT)), later(10_001)),
+        None
+    );
+    // Minutes old, as a probe of a phone locked since is.
+    assert_eq!(
+        for_grant("device", Some((Readiness::Ready, AT)), later(300_000)),
+        None
+    );
+}
+
+#[test]
+fn an_instant_says_how_many_ms_after_an_earlier_one_it_is() {
+    assert_eq!(later(2_500).since(AT), 2_500);
+    assert_eq!(AT.since(later(2_500)), -2_500);
 }
 
 #[test]

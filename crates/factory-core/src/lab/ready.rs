@@ -12,6 +12,18 @@ pub const POWER_PROBE: &str = "dumpsys power | grep -E 'mWakefulness=' | head -1
 /// The shell line that prints adb's authorization timeout; `0` when it is off.
 pub const AUTH_TIMEOUT_PROBE: &str = "settings get global adb_allowed_connection_time";
 
+/// An instant, in milliseconds since the epoch: what a probe's time is kept in. Its own type so
+/// that seconds can't stand in for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EpochMs(pub i64);
+
+impl EpochMs {
+    /// How many ms after `earlier` this is; negative when it is before.
+    pub fn since(self, earlier: EpochMs) -> i64 {
+        self.0.saturating_sub(earlier.0)
+    }
+}
+
 /// How old, in ms, a probe of a ready phone may be for a grant to rest on it.
 pub const GRANT_FRESH_MS: i64 = 10_000;
 
@@ -32,12 +44,16 @@ pub fn refresh_again(was: Readiness, age_ms: i64) -> bool {
     probe_again(was, age_ms.saturating_add(GRANT_MARGIN_MS))
 }
 
-/// What a grant takes a phone to be: `state` is how adb shows it now, `probed` what the last
-/// probe of it found and that probe's age in ms, when one was made since adb has shown it so.
+/// What a grant takes a phone to be at `now`: `state` is how adb shows it now, `probed` what
+/// the last probe of it found and when, if one was made since adb has shown it so.
 /// A phone adb can't use is what adb says, whatever was probed before; one it can use is what
 /// its probe found, or offline before any. None: a ready probe more than [GRANT_FRESH_MS] old,
 /// which the grant has made again before it believes the phone ready.
-pub fn for_grant(state: &str, probed: Option<(Readiness, i64)>) -> Option<Readiness> {
+pub fn for_grant(
+    state: &str,
+    probed: Option<(Readiness, EpochMs)>,
+    now: EpochMs,
+) -> Option<Readiness> {
     if state != "device" {
         return Some(judge(&Probe {
             state: state.to_owned(),
@@ -49,7 +65,7 @@ pub fn for_grant(state: &str, probed: Option<(Readiness, i64)>) -> Option<Readin
     }
     match probed {
         None => Some(Readiness::Offline),
-        Some((Readiness::Ready, age_ms)) if probe_again(Readiness::Ready, age_ms) => None,
+        Some((Readiness::Ready, at)) if probe_again(Readiness::Ready, now.since(at)) => None,
         Some((readiness, _)) => Some(readiness),
     }
 }

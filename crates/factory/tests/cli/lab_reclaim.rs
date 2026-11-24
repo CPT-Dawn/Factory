@@ -132,6 +132,95 @@ fn a_phone_whose_lease_runs_a_devlab_run_is_not_taken_and_status_shows_the_run()
 }
 
 #[test]
+fn a_phone_whose_lease_runs_a_factory_lab_run_is_not_taken() {
+    let (sandbox, world) = one_phone();
+    let (a, b) = (Owner::new(), Owner::new());
+    let (wt_a, wt_b) = (world.worktree("plain-a"), world.worktree("plain-b"));
+    let run = spawned_by(
+        &wt_a,
+        &a,
+        sandbox.factory_command(&["lab", "run", "--phone", "--", "sleep", "6"]),
+    );
+    until_running(&sandbox, &wt_a, &a, "sleep 6");
+
+    let refused = owned_by(&sandbox, &wt_b, &b, &["acquire", "--phone", "--wait", "2"]);
+    let ran = finish(run);
+
+    assert_eq!(refused.code, 75, "{refused:?}");
+    assert_eq!(ran.code, 0, "{ran:?}");
+}
+
+/// The lab with a device timer of 0 and phones probed ten times a second, so a phone locked
+/// while a lease holds it is known locked at once; FAKEPHONE01 plugged in.
+fn watched_phones() -> (Sandbox, World) {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""deviceIdleMin": 0, "readinessCheckSec": 0.1"#);
+    world
+        .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
+        .unwrap();
+    (sandbox, world)
+}
+
+/// Waits until `devlab check` says `serial` is locked.
+fn until_locked(sandbox: &Sandbox, dir: &Path, owner: &Owner, serial: &str) {
+    let locked = poll_until(|| {
+        owned_by(sandbox, dir, owner, &["check", serial])
+            .stdout
+            .contains(": locked:")
+    });
+    assert!(locked, "{serial} was never seen locked");
+}
+
+#[test]
+fn a_free_locked_phone_does_not_keep_an_idle_leases_ready_phone_from_a_waiter() {
+    let (sandbox, world) = watched_phones();
+    let (a, b) = (Owner::new(), Owner::new());
+    let (wt_a, wt_b) = (world.worktree("plain-a"), world.worktree("plain-b"));
+    let held = owned_by(&sandbox, &wt_a, &a, &["acquire", "--phone", "--quiet"]);
+    assert!(held.stdout.contains("FAKEPHONE01"), "{held:?}");
+    world.apply("lock FAKEPHONE03").unwrap();
+    world
+        .apply("plug FAKEPHONE03 device usb:1-3 model:Pixel_7")
+        .unwrap();
+    until_locked(&sandbox, &wt_b, &b, "FAKEPHONE03");
+
+    let taken = owned_by(&sandbox, &wt_b, &b, &["acquire", "--phone", "--wait", "10"]);
+
+    assert_eq!(taken.code, 0, "{taken:?}");
+    assert!(
+        taken.stdout.contains("ANDROID_SERIAL=FAKEPHONE01"),
+        "{taken:?}"
+    );
+}
+
+#[test]
+fn an_idle_leases_locked_phone_stays_with_it_while_another_idle_lease_has_a_ready_one() {
+    let (sandbox, world) = watched_phones();
+    world
+        .apply("plug FAKEPHONE03 device usb:1-3 model:Pixel_7")
+        .unwrap();
+    let (a, b, c) = (Owner::new(), Owner::new(), Owner::new());
+    let wt = |name| world.worktree(name);
+    let (wt_a, wt_b, wt_c) = (wt("plain-a"), wt("plain-b"), wt("plain-c"));
+    let first = owned_by(&sandbox, &wt_a, &a, &["acquire", "--phone", "--quiet"]);
+    assert!(first.stdout.contains("FAKEPHONE01"), "{first:?}");
+    let second = owned_by(&sandbox, &wt_b, &b, &["acquire", "--phone", "--quiet"]);
+    assert!(second.stdout.contains("FAKEPHONE03"), "{second:?}");
+    world.apply("lock FAKEPHONE01").unwrap();
+    until_locked(&sandbox, &wt_a, &a, "FAKEPHONE01");
+
+    let taken = owned_by(&sandbox, &wt_c, &c, &["acquire", "--phone", "--wait", "10"]);
+    let kept = owned_by(&sandbox, &wt_a, &a, &["exec", "--", "true"]);
+
+    assert_eq!(taken.code, 0, "{taken:?}");
+    assert!(
+        taken.stdout.contains("ANDROID_SERIAL=FAKEPHONE03"),
+        "{taken:?}"
+    );
+    assert_eq!(kept.code, 0, "{kept:?}");
+}
+
+#[test]
 fn factory_lab_exec_counts_as_running_too() {
     let (sandbox, world) = one_phone();
     let (a, b) = (Owner::new(), Owner::new());
