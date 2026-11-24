@@ -53,9 +53,12 @@ pub enum ReviewerError {
     Files(io::Error),
     /// The backend ran out of quota; it gets it back at this reset.
     OutOfQuota(Reset),
-    /// The backend can't take a review now, for this reason (its usage query failed, say);
-    /// the review goes on to the next one.
+    /// The backend can't take a review now, for this reason (its quota is kept for hard
+    /// reviews, say); the review goes on to the next one.
     Unready(String),
+    /// The backend's usage answer, which says whether it has quota, could not be had or read,
+    /// for this reason; the review goes on to the next one, and says so.
+    NoUsage(String),
     /// The backend's sandbox would not be active, or was not, for this reason, so it must
     /// not review, or its review is not kept.
     NoSandbox(String),
@@ -76,8 +79,9 @@ pub trait Reviewer {
     /// The extension of its event stream's file, after the review's label.
     fn stream_extension(&self) -> &str;
     /// Checks, before a review is prepared for it, that the backend can take one: quota left,
-    /// its sandbox active. [`ReviewerError::OutOfQuota`], [`ReviewerError::Unready`] and
-    /// [`ReviewerError::NoSandbox`] send the review on to the next backend.
+    /// its sandbox active. [`ReviewerError::OutOfQuota`], [`ReviewerError::Unready`],
+    /// [`ReviewerError::NoUsage`] and [`ReviewerError::NoSandbox`] send the review on to the
+    /// next backend.
     fn preflight(&self) -> Result<(), ReviewerError> {
         Ok(())
     }
@@ -346,14 +350,14 @@ impl Agy {
         cmd.args(["-p", "/usage", "--output-format", "json"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let unready = |why: String| ReviewerError::Unready(format!("its usage query {why}"));
-        let output = process::run(cmd, AGY_CHECK_TIMEOUT).map_err(|e| unready(e.to_string()))?;
+        let no_usage = |why: String| ReviewerError::NoUsage(format!("its usage query {why}"));
+        let output = process::run(cmd, AGY_CHECK_TIMEOUT).map_err(|e| no_usage(e.to_string()))?;
         if !output.status.success() {
             let code = output
                 .status
                 .code()
                 .map_or("by a signal".to_owned(), |code| code.to_string());
-            return Err(unready(format!("exited {code}")));
+            return Err(no_usage(format!("exited {code}")));
         }
         let usage = String::from_utf8_lossy(&output.stdout).into_owned();
         // A cache that can't be written only costs the next review another query. It is
@@ -370,17 +374,18 @@ impl Agy {
     /// than the reserve this review must leave.
     fn quota_left(&self) -> Result<(), ReviewerError> {
         let model = self.quota_model();
-        let group = quota::agy_group(&model);
         let (mut usage, cached) = self.usage(false)?;
-        let mut said = quota::agy_usage(&usage, group);
+        let mut group = quota::agy_group(&usage, &model);
+        let mut said = quota::agy_usage(&usage, &group);
         // A cached answer may name an empty bucket whose reset has come since: ask again.
         if cached && matches!(said, quota::AgyUsage::Empty { until } if until <= now()) {
             usage = self.usage(true)?.0;
-            said = quota::agy_usage(&usage, group);
+            group = quota::agy_group(&usage, &model);
+            said = quota::agy_usage(&usage, &group);
         }
         if let Some(reserve) = self.reserve
             && matches!(said, quota::AgyUsage::Left)
-            && quota::agy_below(&usage, group, "5h", reserve)
+            && quota::agy_below(&usage, &group, "5h", reserve)
         {
             return Err(ReviewerError::Unready(format!(
                 "its {group} 5-hour bucket is under {:.0}%, kept for hard reviews",
@@ -395,7 +400,7 @@ impl Agy {
             }
             // An empty bucket whose reset has passed has its quota back.
             quota::AgyUsage::Left | quota::AgyUsage::Empty { .. } => Ok(()),
-            quota::AgyUsage::Unreadable(why) => Err(ReviewerError::Unready(format!(
+            quota::AgyUsage::Unreadable(why) => Err(ReviewerError::NoUsage(format!(
                 "its usage query is unreadable: {why}"
             ))),
         }
@@ -833,7 +838,9 @@ impl fmt::Display for ReviewerError {
             ReviewerError::TimedOut(timeout) => write!(f, "timed out after {}s", timeout.as_secs()),
             ReviewerError::Files(e) => write!(f, "cannot open its files: {e}"),
             ReviewerError::OutOfQuota(_) => write!(f, "is out of quota"),
-            ReviewerError::Unready(why) | ReviewerError::NoSandbox(why) => {
+            ReviewerError::Unready(why)
+            | ReviewerError::NoUsage(why)
+            | ReviewerError::NoSandbox(why) => {
                 write!(f, "skipped: {why}")
             }
             ReviewerError::Checkout(why) => write!(f, "has no checkout to review in: {why}"),

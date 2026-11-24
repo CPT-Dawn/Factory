@@ -804,3 +804,99 @@ fn a_restarted_daemon_still_writes_the_end_of_a_lead_it_spawned_and_only_once() 
         .collect();
     assert_eq!(ends, ["cart", "pay"]);
 }
+
+#[test]
+fn a_lead_end_logged_for_a_spawned_lead_keeps_the_daemon_from_writing_a_second() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    for (slug, spec) in [("cart", "#12"), ("pay", "#13")] {
+        let out = sandbox.factory_in(&repo, &["lead", "spawn", slug, spec]);
+        assert_eq!(out.code, 0, "{out:?}");
+    }
+    herdr.await_watch("w1:p1");
+    herdr.await_watch("w2:p1");
+    let logged = sandbox.factory(&[
+        "log",
+        "lead-end",
+        "repo=repo",
+        "slug=cart",
+        "outcome=parked",
+    ]);
+    assert_eq!(logged.code, 0, "{logged:?}");
+    for (slug, pane) in [("cart", "w1:p1"), ("pay", "w2:p1")] {
+        fs::write(
+            sandbox.path(format!("state/factory/leads/repo/{slug}.md")),
+            "done\n",
+        )
+        .expect("write the report");
+        herdr.status(pane, "idle");
+    }
+
+    // The daemon settles every lead it knew of in one pass, so pay's end shows cart's is skipped.
+    assert!(
+        poll_until(|| events(&sandbox, "lead-end")
+            .iter()
+            .any(|end| end["slug"] == "pay")),
+        "no lead-end for pay in {:?}",
+        sandbox.ledger_lines()
+    );
+    let ends: Vec<(String, String)> = events(&sandbox, "lead-end")
+        .iter()
+        .map(|end| {
+            (
+                end["slug"].as_str().unwrap_or_default().to_owned(),
+                end["outcome"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            ("cart".to_owned(), "parked".to_owned()),
+            ("pay".to_owned(), "finished".to_owned())
+        ]
+    );
+}
+
+#[test]
+fn a_lead_respawned_after_its_logged_end_still_gets_its_own_end() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    herdr.await_watch("w1:p1");
+    let logged = sandbox.factory(&[
+        "log",
+        "lead-end",
+        "repo=repo",
+        "slug=cart",
+        "outcome=parked",
+    ]);
+    assert_eq!(logged.code, 0, "{logged:?}");
+    herdr.close("w1:p1");
+    // A barrier: pay's end lands after the daemon has settled cart, whose own end it skips.
+    spawn_and_finish(&sandbox, &herdr, &repo, "pay", "w2:p1");
+
+    let again = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+    assert_eq!(again.code, 0, "{again:?}");
+    herdr.await_watch("w3:p1");
+    fs::write(sandbox.path("state/factory/leads/repo/cart.md"), "done\n")
+        .expect("write the report");
+    herdr.status("w3:p1", "idle");
+
+    assert!(
+        poll_until(|| events(&sandbox, "lead-end")
+            .iter()
+            .any(|end| end["slug"] == "cart" && end["outcome"] == "finished")),
+        "no finished lead-end for cart in {:?}",
+        sandbox.ledger_lines()
+    );
+    let outcomes: Vec<String> = events(&sandbox, "lead-end")
+        .iter()
+        .filter(|end| end["slug"] == "cart")
+        .map(|end| end["outcome"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(outcomes, ["parked", "finished"]);
+}

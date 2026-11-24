@@ -125,10 +125,13 @@ impl Store {
         Ok(())
     }
 
-    /// Records that the end of the lead `name` is in the ledger.
-    pub fn lead_ended(&self, name: &str) -> rusqlite::Result<()> {
-        self.db
-            .execute("UPDATE lead SET ended = 1 WHERE name = ?1", params![name])?;
+    /// Records that the end of the lead `name` of `repo` is in the ledger; a lead of that name
+    /// spawned since in another repo keeps its record.
+    pub fn lead_ended(&self, name: &str, repo: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE lead SET ended = 1 WHERE name = ?1 AND repo = ?2",
+            params![name, repo],
+        )?;
         Ok(())
     }
 

@@ -8,7 +8,8 @@
 //! add to a live subscription. Nothing polls.
 //!
 //! Each lead the daemon spawns gets one `lead-end` in the ledger: `finished` once it has written
-//! its report, `dead` when its agent is gone without one.
+//! its report, `dead` when its agent is gone without one. A lead whose latest start already has an
+//! end in the ledger, whoever logged it, is not given a second.
 //!
 //! A wait on a lead registers itself in the wait registry, so the lead it runs in shows as
 //! waiting, and is answered when an event settles the lead it waits on.
@@ -91,6 +92,9 @@ struct Inner {
 struct Unfinished {
     repo: String,
     report: PathBuf,
+    /// Which run of its slug this is, by the count of `lead-start` events in the ledger when it
+    /// began: an end is written only for the run it belongs to.
+    run: usize,
 }
 
 struct Lead {
@@ -136,14 +140,14 @@ impl<H: HerdrApi> Leads<H> {
         // lead and writing its start, or between writing its end and keeping that, owes none.
         let mut unfinished = BTreeMap::new();
         for (name, repo, report) in running {
-            let owes = ledger.owes_end(&repo, lead::slug(&name)).map_err(|e| {
+            let standing = ledger.standing(&repo, lead::slug(&name)).map_err(|e| {
                 Failure::precondition(format!(
                     "cannot read {}: {e}; check FACTORY_STATE",
                     ledger.path.display()
                 ))
             })?;
-            if !owes {
-                if let Err(e) = store.lead_ended(&name) {
+            if !standing.owes {
+                if let Err(e) = store.lead_ended(&name, &repo) {
                     eprintln!("factory: cannot mark {name} ended in the database: {e}");
                 }
                 continue;
@@ -153,6 +157,7 @@ impl<H: HerdrApi> Leads<H> {
                 Unfinished {
                     repo,
                     report: PathBuf::from(report),
+                    run: standing.starts,
                 },
             );
         }
@@ -338,19 +343,24 @@ impl<H: HerdrApi> Leads<H> {
             ("effort", params.effort.as_str()),
         ]
         .map(|(key, value)| format!("{key}={value}"));
-        // Kept before the event is written: a daemon that stops after it still owes the end,
-        // and one that stops before it owes none, which the ledger shows on restart.
-        if started.is_ok() {
-            self.keep(&name, &params.repo_name, &report);
-        }
         let event = event::Event::from_args("lead-start", &pairs, params.session.as_deref())
             .map_err(|e| Failure::usage(e.to_string()))?;
-        self.ledger.append(&event).map_err(|e| {
-            Failure::precondition(format!(
-                "cannot append to {}: {e}; check the disk and FACTORY_STATE",
-                self.ledger.path.display()
-            ))
-        })?;
+        // Kept before the event is written: a daemon that stops after it still owes the end,
+        // and one that stops before it owes none, which the ledger shows on restart. Kept under
+        // the ledger's lock, so an earlier run's settlement cannot mark this one's row ended.
+        let run = self
+            .ledger
+            .append_start(&params.repo_name, slug, &event, || {
+                if started.is_ok() {
+                    self.keep(&name, &params.repo_name, &report);
+                }
+            })
+            .map_err(|e| {
+                Failure::precondition(format!(
+                    "cannot append to {}: {e}; check the disk and FACTORY_STATE",
+                    self.ledger.path.display()
+                ))
+            })?;
         let started = started.map_err(|failed| Failure::precondition(failed.message))?;
         {
             // The workspace is new: list herdr again so its pane is watched.
@@ -365,6 +375,7 @@ impl<H: HerdrApi> Leads<H> {
             Unfinished {
                 repo: params.repo_name.clone(),
                 report: report.clone(),
+                run,
             },
         );
         self.bump();
@@ -429,29 +440,30 @@ impl<H: HerdrApi> Leads<H> {
                 format!("slug={}", lead::slug(&name)),
                 format!("outcome={how}"),
             ];
+            // A lead-end the ledger already holds, whoever logged it, is not written again. The row
+            // is marked under the ledger's lock: a respawn keeps its own row under it too.
+            let mark = || {
+                let kept = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .lead_ended(&name, &lead.repo);
+                if let Err(e) = kept {
+                    eprintln!("factory: cannot mark {name} ended in the database: {e}");
+                }
+            };
             let landed = event::Event::from_args("lead-end", &pairs, None)
                 .map_err(|e| e.to_string())
                 .and_then(|event| {
                     self.ledger
-                        .append(&event)
-                        .map(|_| ())
+                        .append_end(&lead.repo, lead::slug(&name), lead.run, &event, mark)
                         .map_err(|e| e.to_string())
                 });
-            match landed {
-                Ok(_) => {
-                    let kept = self
-                        .store
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .lead_ended(&name);
-                    if let Err(e) = kept {
-                        eprintln!("factory: cannot mark {name} ended in the database: {e}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("factory: cannot write the lead-end of {name}: {e}");
-                    self.lock().unfinished.insert(name, lead);
-                }
+            // A newer run of this name has its own record to close: nothing is written for this one.
+            if let Err(e) = landed {
+                eprintln!("factory: cannot write the lead-end of {name}: {e}");
+                // Tried again later, unless a respawn of this name has taken its place since.
+                self.lock().unfinished.entry(name).or_insert(lead);
             }
         }
     }
