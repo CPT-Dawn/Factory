@@ -178,6 +178,7 @@ impl Reservation {
             id: 0,
             project: Some(self.project.clone()),
             slot: Some(self.slot),
+            devices: 0,
             worktree: String::new(),
             owner: self.owner_key(),
             owner_label: self.owner_label.clone(),
@@ -210,6 +211,9 @@ pub struct DeviceAsk {
     pub gpu: String,
     pub stay_awake: bool,
     pub animations_off: bool,
+    /// `maxDevicesPerOwner` as the configs set it; none: all phones but one.
+    #[serde(default)]
+    pub max_per_owner: Option<u32>,
 }
 
 /// A device a lease holds.
@@ -377,6 +381,7 @@ impl Lease {
             id: self.id,
             project: self.project.clone(),
             slot: self.slot,
+            devices: u32::try_from(self.devices.len()).unwrap_or(u32::MAX),
             worktree: self.worktree.clone(),
             owner: self.owner_key(),
             owner_label: self.owner_label.clone(),
@@ -452,6 +457,8 @@ impl Waiter {
             project: self.project.clone(),
             cap: self.slot_cap,
             max_slots: self.max_slots,
+            // What it asks of devices is kept apart, in `activity`.
+            devices: None,
         }
     }
 }

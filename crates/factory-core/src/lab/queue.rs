@@ -1,7 +1,26 @@
 //! The FIFO queue acquire waits in. An owner at its per-owner cap steps aside: it can't be served
-//! until one of its own leases ends, so it must not hold up the owners behind it.
+//! until one of its own leases ends, so it must not hold up the owners behind it. So does a waiter
+//! short of devices, for the waiters that ask for none of the kind it waits for (#58): FIFO holds
+//! only among waiters for the same devices.
 
+use super::devices::Mode;
 use super::js_round;
+
+/// The devices a waiter asks for, as its last look found them: the waiters behind it read this
+/// to see whether it stands in their way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceNeed {
+    /// The kind of device it asks for.
+    pub mode: Mode,
+    /// The devices it asks for in all.
+    pub want: u32,
+    /// The devices it still has to take: `want` less those its lease holds already.
+    pub lacks: u32,
+    /// The devices, phones and emulators together, one owner may hold at once.
+    pub cap: u32,
+    /// No free device of its kind was there for it.
+    pub short: bool,
+}
 
 /// A waiter in the queue. `cap` is none when it asks for no new stack slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +40,8 @@ pub struct QueueEntry {
     pub project: Option<String>,
     pub cap: Option<u32>,
     pub max_slots: u32,
+    /// None when it asks for no device.
+    pub devices: Option<DeviceNeed>,
 }
 
 /// Whether `e` is served by a lease that exists, so it asks for no new slot: the one it names,
@@ -64,22 +85,58 @@ pub fn waiter_capped(e: &QueueEntry, held: &dyn Fn(&str, &str) -> u32) -> Option
     cap_wait(e, held(&e.owner, project))
 }
 
+/// Why a waiter's owner may not take the devices it lacks yet, given how many it holds; none
+/// when it may.
+pub fn device_cap_wait(e: &QueueEntry, held: u32) -> Option<String> {
+    let d = e.devices?;
+    over_device_cap(&d, held).then(|| {
+        format!(
+            "owner {} already holds {held} device(s); {} more would pass its cap of {} (maxDevicesPerOwner; waits for one of its own leases to end)",
+            e.owner_label, d.lacks, d.cap
+        )
+    })
+}
+
+/// Whether taking the devices `d` lacks would put an owner holding `held` over its cap.
+pub fn over_device_cap(d: &DeviceNeed, held: u32) -> bool {
+    d.lacks > 0 && held.saturating_add(d.lacks) > d.cap
+}
+
+/// Whether a request for `mine` (none: no device) competes with a waiter short of `theirs`:
+/// a phone and an emulator are not the same device, but `any` takes either.
+pub fn competes(mine: Option<Mode>, theirs: Mode) -> bool {
+    mine.is_some_and(|mine| mine == theirs || mine == Mode::Any || theirs == Mode::Any)
+}
+
+/// Whether waiter `e` lets a request for `mine` go ahead of it: its owner is at a cap, so only
+/// one of its own leases ending serves it, or it is short of devices `mine` doesn't compete for.
+fn steps_aside(e: &QueueEntry, mine: Option<Mode>, counts: &Counts<'_>) -> bool {
+    waiter_capped(e, counts.slots).is_some()
+        || device_cap_wait(e, (counts.devices)(&e.owner)).is_some()
+        || e.devices
+            .is_some_and(|d| d.short && !competes(mine, d.mode))
+}
+
+/// What each owner holds: `slots(owner, project)` stack slots, `devices(owner)` devices.
+pub struct Counts<'a> {
+    pub slots: &'a dyn Fn(&str, &str) -> u32,
+    pub devices: &'a dyn Fn(&str) -> u32,
+}
+
 /// Whose turn it is: none when it is waiter `me`'s (devices and slots are checked next), else
 /// why it waits. `now` is seconds since the epoch.
-pub fn queue_turn(
-    queue: &[QueueEntry],
-    me: i64,
-    held: &dyn Fn(&str, &str) -> u32,
-    now: i64,
-) -> Option<String> {
-    if let Some(why) = queue
-        .iter()
-        .find(|e| e.id == me)
-        .and_then(|e| waiter_capped(e, held))
+pub fn queue_turn(queue: &[QueueEntry], me: i64, counts: &Counts<'_>, now: i64) -> Option<String> {
+    let mine = queue.iter().find(|e| e.id == me);
+    if let Some(e) = mine
+        && let Some(why) = waiter_capped(e, counts.slots)
+            .or_else(|| device_cap_wait(e, (counts.devices)(&e.owner)))
     {
         return Some(why);
     }
-    let head = queue.iter().find(|e| waiter_capped(e, held).is_none())?;
+    let wants = mine.and_then(|e| e.devices).map(|d| d.mode);
+    let head = queue
+        .iter()
+        .find(|e| e.id == me || !steps_aside(e, wants, counts))?;
     (head.id != me).then(|| {
         format!(
             "queued behind {} (waiting since {} min)",
@@ -89,12 +146,14 @@ pub fn queue_turn(
     })
 }
 
-/// A lease as the queue counts it: which slot it holds, and for whom.
+/// A lease as the queue counts it: which slot and how many devices it holds, and for whom.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Holding {
     pub id: i64,
     pub project: Option<String>,
     pub slot: Option<u32>,
+    /// Phones and emulators.
+    pub devices: u32,
     pub worktree: String,
     /// The owner's key, `<pid>:<start>`.
     pub owner: String,
@@ -144,6 +203,21 @@ pub fn held_by(leases: &[Holding]) -> impl Fn(&str, &str) -> u32 + use<> {
     }
 }
 
+/// Devices held per owner, phones and emulators together, as a lookup `held(owner)`.
+pub fn devices_held_by(leases: &[Holding]) -> impl Fn(&str) -> u32 + use<> {
+    let counts: Vec<(String, u32)> = leases
+        .iter()
+        .map(|l| (l.owner.clone(), l.devices))
+        .collect();
+    move |owner| {
+        counts
+            .iter()
+            .filter(|(o, _)| o == owner)
+            .map(|(_, n)| *n)
+            .sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +235,7 @@ mod tests {
             project: Some("peekabus".to_owned()),
             cap: Some(2),
             max_slots: 3,
+            devices: None,
         }
     }
 
@@ -176,6 +251,7 @@ mod tests {
             project: Some("peekabus".to_owned()),
             cap: Some(2),
             max_slots: 3,
+            devices: None,
         }
     }
 
@@ -189,10 +265,21 @@ mod tests {
         }
     }
 
+    fn no_devices(_: &str) -> u32 {
+        0
+    }
+
+    fn counts(slots: &dyn Fn(&str, &str) -> u32) -> Counts<'_> {
+        Counts {
+            slots,
+            devices: &no_devices,
+        }
+    }
+
     #[test]
     fn an_owner_at_its_cap_waits_and_the_wait_names_the_cap() {
         assert_eq!(
-            queue_turn(&[lead(1), other(2)], 1, &held(2), 0).as_deref(),
+            queue_turn(&[lead(1), other(2)], 1, &counts(&held(2)), 0).as_deref(),
             Some(
                 "owner claude:100 already holds 2 of 3 peekabus stack slots; cap 2 (waits for one of its own leases to end)"
             )
@@ -201,23 +288,32 @@ mod tests {
 
     #[test]
     fn another_owner_queued_behind_it_is_served_meanwhile() {
-        assert_eq!(queue_turn(&[lead(1), other(2)], 2, &held(2), 0), None);
+        assert_eq!(
+            queue_turn(&[lead(1), other(2)], 2, &counts(&held(2)), 0),
+            None
+        );
     }
 
     #[test]
     fn an_owner_under_its_cap_is_served_in_its_turn() {
-        assert_eq!(queue_turn(&[lead(1), other(2)], 1, &held(1), 0), None);
         assert_eq!(
-            queue_turn(&[lead(1), other(2)], 2, &held(1), 0).as_deref(),
+            queue_turn(&[lead(1), other(2)], 1, &counts(&held(1)), 0),
+            None
+        );
+        assert_eq!(
+            queue_turn(&[lead(1), other(2)], 2, &counts(&held(1)), 0).as_deref(),
             Some("queued behind claude:100 @ s5-t1 (waiting since 0 min)")
         );
     }
 
     #[test]
     fn once_one_of_its_own_leases_ends_the_capped_owner_is_first_again() {
-        assert_eq!(queue_turn(&[lead(1), other(3)], 1, &held(1), 0), None);
+        assert_eq!(
+            queue_turn(&[lead(1), other(3)], 1, &counts(&held(1)), 0),
+            None
+        );
         assert!(
-            queue_turn(&[lead(1), other(3)], 3, &held(1), 0)
+            queue_turn(&[lead(1), other(3)], 3, &counts(&held(1)), 0)
                 .is_some_and(|why| why.starts_with("queued behind"))
         );
     }
@@ -228,22 +324,25 @@ mod tests {
             cap: None,
             ..lead(1)
         };
-        assert_eq!(queue_turn(&[top_up, other(2)], 1, &held(2), 0), None);
+        assert_eq!(
+            queue_turn(&[top_up, other(2)], 1, &counts(&held(2)), 0),
+            None
+        );
         let elsewhere = QueueEntry {
             project: Some("fleet".to_owned()),
             ..lead(1)
         };
-        assert_eq!(queue_turn(&[elsewhere], 1, &held(2), 0), None);
+        assert_eq!(queue_turn(&[elsewhere], 1, &counts(&held(2)), 0), None);
     }
 
     #[test]
     fn the_wait_behind_another_says_how_long_it_has_waited_in_rounded_minutes() {
         assert_eq!(
-            queue_turn(&[other(1), lead(2)], 2, &held(0), 89).as_deref(),
+            queue_turn(&[other(1), lead(2)], 2, &counts(&held(0)), 89).as_deref(),
             Some("queued behind codex:200 @ main (waiting since 1 min)")
         );
         assert_eq!(
-            queue_turn(&[other(1), lead(2)], 2, &held(0), 29).as_deref(),
+            queue_turn(&[other(1), lead(2)], 2, &counts(&held(0)), 29).as_deref(),
             Some("queued behind codex:200 @ main (waiting since 0 min)")
         );
     }
@@ -254,6 +353,7 @@ mod tests {
             id: 0,
             project: project.map(str::to_owned),
             slot,
+            devices: 0,
             worktree: "wt".to_owned(),
             owner: owner.to_owned(),
             owner_label: label.to_owned(),

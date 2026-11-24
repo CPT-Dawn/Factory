@@ -6,7 +6,7 @@ use factory_adapters::adb::{Adb, AdbCli};
 use factory_core::exit::Exit;
 use factory_core::lab::args::{Opts, wait_span};
 use factory_core::lab::base_name;
-use factory_core::lab::config::{MachineConfig, ProjectConfig, owner_cap};
+use factory_core::lab::config::{MachineConfig, ProjectConfig, devices_per_owner, owner_cap};
 use factory_core::lab::devices::Mode;
 use factory_core::lab::emulator::BOOT_TIMEOUT_SEC;
 use factory_core::lab::slots::{Env, slot_env};
@@ -85,7 +85,7 @@ pub fn ask(
         lease: super::context::forced_lease(),
         project: project.clone(),
         wait_sec,
-        devices: (opts.want > 0).then(|| device_ask(&ctx.cfg, opts)),
+        devices: (opts.want > 0).then(|| device_ask(&ctx.cfg, ctx.project.as_ref(), opts)),
         resume: None,
         client: Some(me()),
         run,
@@ -148,7 +148,7 @@ pub fn take(
     Ok(lease)
 }
 
-fn device_ask(cfg: &MachineConfig, opts: &Opts) -> DeviceAsk {
+fn device_ask(cfg: &MachineConfig, project: Option<&ProjectConfig>, opts: &Opts) -> DeviceAsk {
     DeviceAsk {
         want: opts.want,
         mode: opts.mode.as_str().to_owned(),
@@ -161,6 +161,7 @@ fn device_ask(cfg: &MachineConfig, opts: &Opts) -> DeviceAsk {
         gpu: cfg.emulator_gpu.clone(),
         stay_awake: cfg.prep_stay_awake,
         animations_off: cfg.prep_animations_off,
+        max_per_owner: devices_per_owner(cfg, project),
     }
 }
 

@@ -1,5 +1,5 @@
 //! The machine config (`~/.config/devlab/config.json`, optional) and a project's `devlab.json`,
-//! read from their text, and the per-owner slot cap they set.
+//! read from their text, and the per-owner slot and device caps they set.
 
 use serde_json::{Map, Value};
 
@@ -24,6 +24,8 @@ pub struct MachineConfig {
     pub wait_sec: f64,
     /// Stack slots of a project one owner may hold, for projects whose devlab.json sets none.
     pub max_slots_per_owner: Option<u32>,
+    /// Devices one owner may hold, for projects whose devlab.json sets none.
+    pub max_devices_per_owner: Option<u32>,
     /// RAM a stack is expected to take, and what the host must keep free after it.
     pub stack_ram_mb: i64,
     pub host_floor_mb: i64,
@@ -60,6 +62,7 @@ impl Default for MachineConfig {
             owner_names: vec!["claude".to_owned(), "codex".to_owned()],
             wait_sec: 480.0,
             max_slots_per_owner: None,
+            max_devices_per_owner: None,
             stack_ram_mb: 2048,
             host_floor_mb: 5120,
             max_emulators: 2,
@@ -95,6 +98,8 @@ pub struct ProjectConfig {
     pub max_slots: u32,
     /// Overrides the machine config's cap.
     pub max_slots_per_owner: Option<u32>,
+    /// Overrides the machine config's device cap.
+    pub max_devices_per_owner: Option<u32>,
     /// Slot n adds n * slot_stride to every port.
     pub slot_stride: u32,
     /// Host ports the project's own servers use in slot 0, exported under these names.
@@ -201,7 +206,8 @@ pub fn machine_config(file: &str, text: &str) -> Result<MachineConfig, ConfigErr
             ))
         })?;
     }
-    cfg.max_slots_per_owner = cap(&raw, file)?;
+    cfg.max_slots_per_owner = cap(&raw, file, "maxSlotsPerOwner")?;
+    cfg.max_devices_per_owner = cap(&raw, file, "maxDevicesPerOwner")?;
     Ok(cfg)
 }
 
@@ -214,7 +220,8 @@ pub fn project_config(file: &str, text: &str) -> Result<ProjectConfig, ConfigErr
             "{file}: \"name\" must be lowercase letters, digits and -"
         )));
     }
-    let max_slots_per_owner = cap(&raw, file)?;
+    let max_slots_per_owner = cap(&raw, file, "maxSlotsPerOwner")?;
+    let max_devices_per_owner = cap(&raw, file, "maxDevicesPerOwner")?;
     let whole = |key: &str, default: u32, least: u64| -> Result<u32, ConfigError> {
         match raw.get(key) {
             None => Ok(default),
@@ -276,6 +283,7 @@ pub fn project_config(file: &str, text: &str) -> Result<ProjectConfig, ConfigErr
         name: name.to_owned(),
         max_slots,
         max_slots_per_owner,
+        max_devices_per_owner,
         slot_stride,
         ports,
         reverse,
@@ -305,6 +313,22 @@ pub fn owner_cap(machine: &MachineConfig, project: &ProjectConfig) -> u32 {
     )
 }
 
+/// How many devices, phones and emulators together, one owner may hold at once, on a machine
+/// with `phones` phones attached: `configured` when set, else all phones but one; at least 1.
+pub fn device_cap(phones: u32, configured: Option<u32>) -> u32 {
+    configured
+        .unwrap_or_else(|| phones.saturating_sub(1))
+        .max(1)
+}
+
+/// The device cap the configs set, devlab.json's winning over the machine's; none leaves it to
+/// [`device_cap`]'s default.
+pub fn devices_per_owner(machine: &MachineConfig, project: Option<&ProjectConfig>) -> Option<u32> {
+    project
+        .and_then(|p| p.max_devices_per_owner)
+        .or(machine.max_devices_per_owner)
+}
+
 fn object(file: &str, text: &str) -> Result<Map<String, Value>, ConfigError> {
     match serde_json::from_str::<Value>(text) {
         Ok(Value::Object(map)) => Ok(map),
@@ -319,8 +343,8 @@ fn valid_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-fn cap(raw: &Map<String, Value>, file: &str) -> Result<Option<u32>, ConfigError> {
-    match raw.get("maxSlotsPerOwner") {
+fn cap(raw: &Map<String, Value>, file: &str, key: &str) -> Result<Option<u32>, ConfigError> {
+    match raw.get(key) {
         None => Ok(None),
         Some(v) => v
             .as_u64()
@@ -333,7 +357,7 @@ fn cap(raw: &Map<String, Value>, file: &str) -> Result<Option<u32>, ConfigError>
             .map(|n| Some(u32::try_from(n).unwrap_or(u32::MAX)))
             .ok_or_else(|| {
                 ConfigError(format!(
-                    "{file}: \"maxSlotsPerOwner\" must be a whole number, 1 or more"
+                    "{file}: \"{key}\" must be a whole number, 1 or more"
                 ))
             }),
     }
@@ -373,6 +397,42 @@ mod tests {
         assert_eq!(slot_cap(3, None, Some(1)), 1);
         assert_eq!(slot_cap(3, Some(9), None), 3);
         assert_eq!(slot_cap(4, Some(0), None), 1);
+    }
+
+    #[test]
+    fn the_default_device_cap_is_every_phone_but_one_and_at_least_one() {
+        assert_eq!(device_cap(3, None), 2);
+        assert_eq!(device_cap(2, None), 1);
+        assert_eq!(device_cap(1, None), 1);
+        assert_eq!(device_cap(0, None), 1);
+    }
+
+    #[test]
+    fn a_set_device_cap_holds_however_many_phones_there_are() {
+        assert_eq!(device_cap(3, Some(3)), 3);
+        assert_eq!(device_cap(0, Some(2)), 2);
+        assert_eq!(device_cap(5, Some(0)), 1);
+    }
+
+    #[test]
+    fn devlab_json_sets_the_device_cap_over_the_machine() {
+        let machine = machine_config("m", r#"{"maxDevicesPerOwner":1}"#).unwrap();
+        let project = project_config("f", r#"{"name":"demo","maxDevicesPerOwner":3}"#).unwrap();
+        let unset = project_config("f", r#"{"name":"demo"}"#).unwrap();
+        assert_eq!(machine.max_devices_per_owner, Some(1));
+        assert_eq!(devices_per_owner(&machine, Some(&project)), Some(3));
+        assert_eq!(devices_per_owner(&machine, Some(&unset)), Some(1));
+        assert_eq!(devices_per_owner(&machine, None), Some(1));
+        assert_eq!(
+            devices_per_owner(&MachineConfig::default(), Some(&unset)),
+            None
+        );
+        assert_eq!(
+            machine_config("m", r#"{"maxDevicesPerOwner":0}"#),
+            Err(ConfigError(
+                "m: \"maxDevicesPerOwner\" must be a whole number, 1 or more".to_owned()
+            ))
+        );
     }
 
     #[test]
