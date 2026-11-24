@@ -313,12 +313,16 @@ impl Lab {
     }
 
     /// Gives lease `lease` back whole, its devices as they are now, and ends request `waiter`:
-    /// a request that failed for good. The reverses its devices were given are taken back.
-    fn give_back(&self, waiter: i64, lease: i64) -> Answer<()> {
+    /// a request that failed for good. The reverses its devices were given are taken back, and
+    /// `from`, the reservation the lease was made from, is put back.
+    fn give_back(&self, waiter: i64, lease: i64, from: Option<&Reservation>) -> Answer<()> {
         let dropped = self.write(|c, now| {
             let held = store::lease(c, lease)?;
             if let Some(held) = &held {
                 store::drop_lease(c, held, now)?;
+                if let Some(from) = from {
+                    reservations::restore(c, from, now)?;
+                }
             }
             store::delete_waiter(c, waiter)?;
             Ok(held)
@@ -758,6 +762,8 @@ struct Taken {
     phones: Vec<String>,
     /// The idle emulators just granted.
     reused: Vec<String>,
+    /// The reservation a fresh lease was made from, put back if the lease is given back.
+    from: Option<Reservation>,
 }
 
 /// What the request's device ask plans, or why it waits: the held devices adb no longer lists
@@ -1031,7 +1037,10 @@ fn try_grant(
         let mut lease = store::find_lease(c, &p.worktree, &p.owner, p.lease)?;
         // A reservation of the caller's project is used once: it becomes the caller's lease,
         // without a turn in the queue. One that is gone (used, released or its lead exited)
-        // asks for a slot the normal way.
+        // asks for a slot the normal way. The claim is undone when the request then waits: its
+        // lease is made for good only in a grant, so a request that waits, or gives up, leaves
+        // the reservation as it was.
+        c.execute_batch("SAVEPOINT claim")?;
         let mut claimed = None;
         if lease.is_none()
             && let (Some(id), Some(project)) = (p.reservation, &p.project)
@@ -1045,6 +1054,7 @@ fn try_grant(
             && p.devices.is_none()
             && let (Some(lease), Some(project)) = (&lease, &p.project)
         {
+            c.execute_batch("RELEASE claim")?;
             let previous = match lease.slot {
                 Some(slot) => store::claim_slot(c, &project.name, slot, &p.worktree)?,
                 None => None,
@@ -1066,6 +1076,7 @@ fn try_grant(
                 boots: Vec::new(),
                 phones: Vec::new(),
                 reused: Vec::new(),
+                from: claimed,
             }));
         }
         let stopping = lock_ignoring_poison(&lab.stopping).clone();
@@ -1126,9 +1137,16 @@ fn try_grant(
             devices_wait,
         };
         let (slot, new) = match grant::decide(&ask, &board, now) {
-            Decision::Wait(why) => return Ok(Err(why)),
+            Decision::Wait(why) => {
+                if claimed.is_some() {
+                    c.execute_batch("ROLLBACK TO claim")?;
+                }
+                c.execute_batch("RELEASE claim")?;
+                return Ok(Err(why));
+            }
             Decision::Grant { slot, new } => (slot, new),
         };
+        c.execute_batch("RELEASE claim")?;
         let fresh = new || lease.is_none() || claimed.is_some();
         // The slot goes back to the reservation only from the lease it was made into.
         let from = claimed.filter(|_| !new);
@@ -1205,6 +1223,7 @@ fn try_grant(
             boots,
             phones,
             reused,
+            from,
         }))
     })
 }
@@ -1618,6 +1637,7 @@ pub async fn acquire<W, R, S>(
                     taken.granted.schema.clone(),
                 );
                 let lease = taken.granted.lease.clone();
+                let from = taken.from.clone();
                 match settle(&lab, &p, taken, writer, id).await {
                     Ok(lease) => {
                         let granted = Granted {
@@ -1629,15 +1649,18 @@ pub async fn acquire<W, R, S>(
                         deliver(&lab, writer, lines, id, place, run, stopping.as_mut()).await;
                     }
                     Err(mut body) => {
-                        // An emulator that would not boot (exit 77) gives the lease back, before
-                        // its caller hears so: it can ask `devlab env` at once and find none.
-                        // Any other failure keeps the lease, and only a caller that never hears
-                        // of a fresh one loses it.
+                        // An emulator that would not boot (exit 77), or a device of a fresh lease
+                        // gone before its prep (exit 76), gives the lease back before its caller
+                        // hears so: it can ask `devlab env` at once and find none. Any other
+                        // failure keeps the lease, and only a caller that never hears of a fresh
+                        // one loses it.
                         let mut given_back = false;
-                        if body.code == Exit::Emulator.code() {
-                            match lab.give_back(waiter, lease.id) {
+                        if body.code == Exit::Emulator.code()
+                            || (fresh && body.code == Exit::DeviceLost.code())
+                        {
+                            match lab.give_back(waiter, lease.id, from.as_ref()) {
                                 Ok(()) => given_back = true,
-                                // Not exit 77: the lease is still held.
+                                // Not the exit it failed with: the lease is still held.
                                 Err(why) => {
                                     body = ErrorBody {
                                         code: why.code,

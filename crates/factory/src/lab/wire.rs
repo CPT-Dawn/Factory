@@ -161,6 +161,9 @@ pub struct Reservation {
     pub owner_label: String,
     /// Seconds since the epoch.
     pub created: i64,
+    /// When a run last gave its slot back, in seconds since the epoch; none before that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<i64>,
 }
 
 impl Reservation {

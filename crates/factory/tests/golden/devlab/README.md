@@ -17,9 +17,11 @@ daemon as the watcher, not a systemd unit), `devices-emulator-failure` (an emula
 gives its lease back: `devlab env` then exits 4) and `slots-release` (`devlab gc` reports only the leases it freed
 itself, not those the daemon freed first). `devices-run-lease-end` (#53): a run gives back the
 lease it made when its command ends, unless `--keep`, where today's devlab kept it; `cli-usage`'s
-help says so. `devices-lease-status` (#57): `devlab status` and its `--json` show each lease's
-age, idle time and running command, and each phone's readiness (#55) where today's devlab showed
-`ready`; every golden with a status step changed with it. `slots-wait-default` is parity regained: `--wait -1`
+help says so. `devices-settle-lost` (#59): a fresh lease whose phone is unplugged between its
+grant and its prep (exit 76) is given back, where today's devlab kept it: `devlab env` then exits 4.
+`devices-lease-status` (#57): `devlab status` and its `--json` show each lease's age, idle time
+and running command, and each phone's readiness (#55) where today's devlab showed `ready`; every
+golden with a status step changed with it. `slots-wait-default` is parity regained: `--wait -1`
 is the configured default wait, as in today's devlab, so the call queues.
 
 ## Replaying
@@ -67,7 +69,8 @@ One step per line:
 - `kill <owner>` ends the owner's process.
 - World steps: `plug <serial> <state> [<prop>...]` (adb lists it; plugging again replaces it),
   `unplug <serial>`, `lock <serial>` (its lock screen stays up), `stall <serial>` (the emulator
-  never finishes booting; for the tests beside the transcripts), `break <op>` and `mend <op>`
+  never finishes booting; for the tests beside the transcripts), `yank <serial>` (the phone is
+  unplugged when it is next asked its ABI, as its grant settles), `break <op>` and `mend <op>`
   where `<op>` is `supabase start` or `systemd-run`.
 
 After a `$` or `wait` step come the lines it showed: `1> ` per stdout line, `2> ` per stderr

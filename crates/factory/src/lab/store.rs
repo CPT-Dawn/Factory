@@ -501,7 +501,7 @@ pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<(
     c.execute("DELETE FROM run_leases WHERE lease = ?1", [lease.id])?;
     activity::forget_lease(c, lease.id)?;
     if let Some(from) = &from {
-        reservations::restore(c, from)?;
+        reservations::restore(c, from, now)?;
     }
     reservations::record_lease_end(c, lease, now)
 }
