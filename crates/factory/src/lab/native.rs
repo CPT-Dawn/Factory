@@ -103,7 +103,10 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
             if rest.is_empty() {
                 return Err(Failure::usage("factory lab exec -- <cmd...>"));
             }
-            return ran(&ctx, &lease::live(&ctx)?, rest);
+            let held = lease::exec_lease(&ctx, rest)?;
+            let done = ran(&ctx, &held, rest);
+            lease::exec_ended();
+            return done;
         }
         "env" => {
             let ctx = context()?;

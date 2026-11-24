@@ -74,6 +74,7 @@ impl Lab {
             cfg.device_idle_min,
         );
         let now = now_f64();
+        let attached = self.attached.borrow().shown.clone();
         let claimed = self
             .write(|c, _| {
                 let taken = store::taken(c)?;
@@ -114,7 +115,7 @@ impl Lab {
                         idle_since: s.idle_since,
                     })
                     .collect();
-                let device_views = device_views(c, &leases)?;
+                let device_views = device_views(c, &leases, attached.as_deref())?;
                 let needs: Vec<Need> = activity::needs(c)?
                     .into_iter()
                     .map(|(mode, want)| Need {
@@ -122,6 +123,20 @@ impl Lab {
                         want,
                     })
                     .collect();
+                // What nobody holds goes to the waiters before anything is taken from a lease.
+                let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+                let free_phones = count(
+                    attached
+                        .iter()
+                        .flatten()
+                        .filter(|a| {
+                            a.kind == "phone" && a.state == "device" && !taken.contains(&a.serial)
+                        })
+                        .count(),
+                );
+                let free_emulators =
+                    count(emulator_views.iter().filter(|e| e.ready && !e.held).count());
+                let needs = idle::unmet(&needs, free_phones, free_emulators);
                 let due = idle::sweep(
                     &emulator_views,
                     &slot_views,
@@ -213,9 +228,20 @@ impl Lab {
     }
 }
 
-/// Each device a lease holds, as the sweep sees it: busy while its lease runs a command or
-/// waits in the queue.
-fn device_views(c: &rusqlite::Connection, leases: &[Lease]) -> rusqlite::Result<Vec<IdleDevice>> {
+/// Each device a lease holds that adb lists as usable, as the sweep sees it: busy while its
+/// lease runs a command or waits in the queue. One unplugged or offline is no use to a waiter,
+/// and its lease is told so, not that it was reclaimed; none is, before adb's first list.
+fn device_views(
+    c: &rusqlite::Connection,
+    leases: &[Lease],
+    attached: Option<&[Attached]>,
+) -> rusqlite::Result<Vec<IdleDevice>> {
+    let usable = |serial: &str| {
+        attached
+            .into_iter()
+            .flatten()
+            .any(|a| a.serial == serial && a.state == "device")
+    };
     let running = activity::running(c, &host::alive)?;
     let waiters = store::waiters(c)?;
     Ok(leases
@@ -225,13 +251,16 @@ fn device_views(c: &rusqlite::Connection, leases: &[Lease]) -> rusqlite::Result<
                 || waiters.iter().any(|w| {
                     w.lease == Some(l.id) || (w.owner == l.owner_key() && w.worktree == l.worktree)
                 });
-            l.devices.iter().map(move |d| IdleDevice {
-                lease: l.id,
-                serial: d.serial.clone(),
-                phone: d.kind == "phone",
-                busy,
-                touched: l.touched,
-            })
+            l.devices
+                .iter()
+                .filter(|d| usable(&d.serial))
+                .map(move |d| IdleDevice {
+                    lease: l.id,
+                    serial: d.serial.clone(),
+                    phone: d.kind == "phone",
+                    busy,
+                    touched: l.touched,
+                })
         })
         .collect())
 }

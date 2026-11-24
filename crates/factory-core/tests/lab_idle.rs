@@ -3,7 +3,9 @@
 //! stack timer; never a stack started outside devlab.
 
 use factory_core::lab::devices::Mode;
-use factory_core::lab::idle::{IdleDevice, IdleEmulator, IdleSlot, Need, Sweep, Timers, sweep};
+use factory_core::lab::idle::{
+    IdleDevice, IdleEmulator, IdleSlot, Need, Sweep, Timers, sweep, unmet,
+};
 
 const NOW: f64 = 10_000.0;
 
@@ -234,5 +236,33 @@ fn a_phone_idle_for_less_than_its_timer_is_due_when_it_reaches_it() {
             next: Some(10_000.0 - 60.0 + 600.0),
             ..Sweep::default()
         }
+    );
+}
+
+#[test]
+fn a_free_device_meets_a_need_before_any_is_taken_from_a_lease() {
+    // A phone just taken back for a waiter is free until the waiter's grant takes it: that
+    // need is met, and the next look takes nothing more for it.
+    assert_eq!(unmet(&[needs(Mode::Phone, 1)], 1, 0), Vec::<Need>::new());
+    assert_eq!(
+        unmet(&[needs(Mode::Phone, 2)], 1, 3),
+        vec![needs(Mode::Phone, 1)]
+    );
+    // A need of either kind takes what the kind-bound needs leave over.
+    assert_eq!(
+        unmet(
+            &[
+                needs(Mode::Any, 2),
+                needs(Mode::Emulator, 1),
+                needs(Mode::Phone, 1)
+            ],
+            1,
+            2
+        ),
+        vec![needs(Mode::Any, 1)]
+    );
+    assert_eq!(
+        unmet(&[needs(Mode::Emulator, 1)], 4, 0),
+        vec![needs(Mode::Emulator, 1)]
     );
 }

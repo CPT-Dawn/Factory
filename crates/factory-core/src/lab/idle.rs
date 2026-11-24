@@ -73,6 +73,36 @@ pub struct Need {
     pub want: u32,
 }
 
+/// What `needs` still lacks once the free devices go to it: `free_phones` and `free_emulators`
+/// nobody holds go to the needs of their kind first, then to those that take either. A device
+/// just taken back for a waiter is free until the waiter's grant holds it, so its need asks for
+/// no other.
+pub fn unmet(needs: &[Need], free_phones: u32, free_emulators: u32) -> Vec<Need> {
+    let (mut phones, mut emulators) = (free_phones, free_emulators);
+    let take = |want: u32, free: &mut u32| {
+        let met = want.min(*free);
+        *free -= met;
+        want - met
+    };
+    let mut left: Vec<Need> = needs
+        .iter()
+        .map(|n| Need {
+            mode: n.mode,
+            want: match n.mode {
+                Mode::Phone => take(n.want, &mut phones),
+                Mode::Emulator => take(n.want, &mut emulators),
+                Mode::Any => n.want,
+            },
+        })
+        .collect();
+    for n in left.iter_mut().filter(|n| n.mode == Mode::Any) {
+        let want = take(n.want, &mut phones);
+        n.want = take(want, &mut emulators);
+    }
+    left.retain(|n| n.want > 0);
+    left
+}
+
 /// What to stop now, and when the next thing falls due.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Sweep {

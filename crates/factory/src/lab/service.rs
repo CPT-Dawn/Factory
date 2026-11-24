@@ -497,14 +497,20 @@ fn lab_exec(lab: &Lab, p: ExecParams, seen: &[Attached]) -> Answer<Option<Lease>
     })
 }
 
-/// The exec of `client` ended: its lease is touched, and runs it no longer.
+/// The exec of `client` ended: its lease is touched, and runs it no longer. The keeper looks
+/// again, for a waiter may now take the lease's devices once they idle.
 fn exec_end(lab: &Lab, client: &Process) -> Answer<()> {
-    lab.write(|c, now| {
-        if let Some(lease) = activity::end_exec(c, client)? {
+    let ended = lab.write(|c, now| {
+        let lease = activity::end_exec(c, client)?;
+        if let Some(lease) = lease {
             store::touch(c, lease, now)?;
         }
-        Ok(())
-    })
+        Ok(lease)
+    })?;
+    if ended.is_some() {
+        lab.notify();
+    }
+    Ok(())
 }
 
 /// The lease with what adb says of each of its devices.
@@ -1088,10 +1094,11 @@ fn try_grant(
             Ok(planned) => (planned, None),
             Err(why) => (None, Some(why)),
         };
-        // A request short of devices says which it needs, so the keeper may take them from a
-        // lease that runs nothing (#57); it looks as soon as the request first says so.
+        // A request short of devices that waits says which it needs, so the keeper may take
+        // them from a lease that runs nothing (#57); it looks as soon as the request first says
+        // so. One that won't wait takes nothing from anyone.
         let need = match (&p.devices, &devices_wait) {
-            (Some(ask), Some(why)) if why != ADB_RESTARTING => {
+            (Some(ask), Some(why)) if why != ADB_RESTARTING && p.wait_sec > 0.0 => {
                 let usable = |serial: &str| {
                     attached
                         .iter()
@@ -1147,8 +1154,9 @@ fn try_grant(
             ends_with_run(c, p, waiter, &lease, from.as_ref())?;
         }
         let (mut boots, mut phones, mut reused) = (Vec::new(), Vec::new(), Vec::new());
+        // A grant is the answer to a reclaim: the lease holds what this request asked for.
+        activity::clear_reclaimed(c, lease.id)?;
         if let (Some(Planned { plan, used }), Some(ask)) = (planned, &p.devices) {
-            activity::clear_reclaimed(c, lease.id)?;
             for serial in &plan.phones {
                 let model = attached
                     .iter()
@@ -1997,14 +2005,18 @@ impl Run {
             .await;
             match taken {
                 Ok(None) => return,
-                Ok(Some((_, Some(ended)))) => {
+                // A run's end frees its lease's devices for the keeper's next look, or ends the
+                // lease it made.
+                Ok(Some((_, ended))) => {
                     self.lab.notify();
-                    keeper::take_back_reverses_on_thread(
-                        self.lab.attached.borrow().shown.clone(),
-                        vec![ended],
-                    );
+                    if let Some(ended) = ended {
+                        keeper::take_back_reverses_on_thread(
+                            self.lab.attached.borrow().shown.clone(),
+                            vec![ended],
+                        );
+                    }
                 }
-                _ => {}
+                Err(_) => {}
             }
         }
         let (ledger, row, phase) = (
