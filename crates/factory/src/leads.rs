@@ -345,23 +345,29 @@ impl<H: HerdrApi> Leads<H> {
         .map(|(key, value)| format!("{key}={value}"));
         let event = event::Event::from_args("lead-start", &pairs, params.session.as_deref())
             .map_err(|e| Failure::usage(e.to_string()))?;
+        let unwritten = |e: std::io::Error| {
+            Failure::precondition(format!(
+                "cannot append to {}: {e}; check the disk and FACTORY_STATE",
+                self.ledger.path.display()
+            ))
+        };
+        let started = match started {
+            Ok(started) => started,
+            Err(failed) => {
+                // A failed start began no lead: it is logged, but no run owes an end for it.
+                self.ledger.append(&event).map_err(unwritten)?;
+                return Err(Failure::precondition(failed.message));
+            }
+        };
         // Kept before the event is written: a daemon that stops after it still owes the end,
         // and one that stops before it owes none, which the ledger shows on restart. Kept under
         // the ledger's lock, so an earlier run's settlement cannot mark this one's row ended.
         let run = self
             .ledger
             .append_start(&params.repo_name, slug, &event, || {
-                if started.is_ok() {
-                    self.keep(&name, &params.repo_name, &report);
-                }
+                self.keep(&name, &params.repo_name, &report);
             })
-            .map_err(|e| {
-                Failure::precondition(format!(
-                    "cannot append to {}: {e}; check the disk and FACTORY_STATE",
-                    self.ledger.path.display()
-                ))
-            })?;
-        let started = started.map_err(|failed| Failure::precondition(failed.message))?;
+            .map_err(unwritten)?;
         {
             // The workspace is new: list herdr again so its pane is watched.
             let _turn = self.turn.lock().await;

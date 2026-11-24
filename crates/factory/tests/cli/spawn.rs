@@ -900,3 +900,68 @@ fn a_lead_respawned_after_its_logged_end_still_gets_its_own_end() {
         .collect();
     assert_eq!(outcomes, ["parked", "finished"]);
 }
+
+#[test]
+fn a_failed_start_of_a_running_lead_leaves_it_its_own_end() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    herdr.await_watch("w1:p1");
+    herdr.refuse("worktree.create", "internal", "the disk is full");
+    let failed = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+    assert_eq!(failed.code, 3, "{failed:?}");
+    let outcomes: Vec<Value> = events(&sandbox, "lead-start")
+        .iter()
+        .map(|start| start["outcome"].clone())
+        .collect();
+    assert_eq!(outcomes, ["ok", "error"]);
+
+    fs::write(sandbox.path("state/factory/leads/repo/cart.md"), "done\n")
+        .expect("write the report");
+    herdr.status("w1:p1", "idle");
+
+    assert!(
+        poll_until(|| !events(&sandbox, "lead-end").is_empty()),
+        "no lead-end for cart in {:?}",
+        sandbox.ledger_lines()
+    );
+    let ends = events(&sandbox, "lead-end");
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert_eq!(ends[0]["outcome"], "finished");
+}
+
+#[test]
+fn a_failed_start_after_a_logged_park_gets_no_second_end_on_a_restart() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    herdr.await_watch("w1:p1");
+    let logged = sandbox.factory(&[
+        "log",
+        "lead-end",
+        "repo=repo",
+        "slug=cart",
+        "outcome=parked",
+    ]);
+    assert_eq!(logged.code, 0, "{logged:?}");
+    herdr.refuse("worktree.create", "internal", "the disk is full");
+    let failed = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+    assert_eq!(failed.code, 3, "{failed:?}");
+    // The daemon dies before it settles cart, whose database row is still open.
+    crash_daemon(&sandbox);
+    herdr.close("w1:p1");
+
+    // A barrier: pay's end lands after the restarted daemon has settled what it inherited.
+    spawn_and_finish(&sandbox, &herdr, &repo, "pay", "w2:p1");
+
+    let outcomes: Vec<String> = events(&sandbox, "lead-end")
+        .iter()
+        .filter(|end| end["slug"] == "cart")
+        .map(|end| end["outcome"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(outcomes, ["parked"]);
+}
