@@ -15,7 +15,7 @@ use factory_core::lab::slots::{
     Env, StackInfo, patch_supabase_config, project_id_of, read_supabase_ports, slot_project_id,
 };
 
-use super::context::devlab_state;
+use super::context::{devlab_state, project_config};
 use super::host::mem_available_mb;
 use crate::output::Failure;
 
@@ -108,6 +108,34 @@ pub fn prepare_workdir(p: &ProjectConfig, worktree: &str, slot: u32) -> Result<(
         fs::write(&out, patched).map_err(|e| io_failure(&out, &e))?;
     }
     Ok(())
+}
+
+/// The newest migration of the worktree's supabase project: of the files named as the supabase
+/// CLI names one, `<version>_<name>.sql` with an all-digit version, the one with the greatest
+/// version. None when it has none, or when its devlab.json is gone or names no supabase dir.
+/// It reads files and runs no command, so the daemon's store reads it inside a transaction.
+pub fn migration_head(worktree: &str) -> Option<String> {
+    let p = project_config(worktree).ok()??;
+    let dir = Path::new(worktree)
+        .join(&p.supabase?.dir)
+        .join("migrations");
+    fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().into_string().ok()?;
+            let (version, rest) = name.split_once('_')?;
+            let migration = !version.is_empty()
+                && version.bytes().all(|b| b.is_ascii_digit())
+                && rest.ends_with(".sql")
+                && entry.file_type().ok()?.is_file();
+            // Versions compare as numbers: past its leading zeros, a longer one is greater.
+            let digits = version.trim_start_matches('0');
+            let key = (digits.len(), digits.to_owned());
+            migration.then_some((key, name))
+        })
+        .max()
+        .map(|(_, name)| name)
 }
 
 pub fn running(project_id: &str) -> bool {

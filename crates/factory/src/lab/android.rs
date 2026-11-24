@@ -15,7 +15,8 @@ use factory_core::lab::emulator::{Look, avd_name, port_of, serial_of, unit_name}
 use super::wire::DeviceAsk;
 
 /// Follows adb's device list for as long as the process runs: `frame` gets each list a stream
-/// shows, and `quiet` is told when a stream ended without showing one (adb missing or
+/// shows; `lost` is told each time a stream ends, since the list it showed last is then no
+/// longer followed; and `quiet` is told when it ended without showing one (adb missing or
 /// failing), so that no one waits on it. A stream that ends is replaced after a wait that
 /// doubles with each stream in a row that did not get going, from `pace.restart_base` to
 /// `pace.restart_cap`; `log` is told one line before each wait.
@@ -23,6 +24,7 @@ pub fn track_forever(
     source: &dyn TrackDevices,
     pace: Pace,
     frame: &dyn Fn(Vec<Attached>),
+    lost: &dyn Fn(),
     quiet: &dyn Fn(),
     log: &dyn Fn(&str),
 ) -> ! {
@@ -50,6 +52,7 @@ pub fn track_forever(
             }
             Err(e) => format!("cannot start: {e}"),
         };
+        lost();
         if !shown {
             quiet();
         }
