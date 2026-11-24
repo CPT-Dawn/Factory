@@ -2,13 +2,17 @@
 //! readiness change as it happens, one line each, and a ledger it can't write changes nothing
 //! any lab command does.
 
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use serde_json::Value;
 
-use super::lab::{devlab, lab, owned, write_machine_config};
+use super::lab::{Agent, ask, devlab, lab, owned, received, write_machine_config};
+use crate::support::herdr::FakeHerdr;
 use crate::support::world::{World, poll_until};
-use crate::support::{Run, Sandbox, run};
+use crate::support::{Run, Sandbox, run, stop_daemon};
 
 const PIXEL: &str = "plug FAKEPHONE01 device usb:1-1 model:Pixel_8";
 
@@ -184,9 +188,11 @@ fn a_reclaim_writes_the_reclaim_and_the_waiters_grant() {
     assert!(reclaim["idle_minutes"].is_u64(), "{reclaim}");
     let granted = await_events(&sandbox, "lab-wait", 2, |e| e["action"] == "granted");
     assert_eq!(granted.len(), 2, "{granted:?}");
-    // The reclaim names the waiter whose grant took the phone.
-    assert!(reclaim["waiter"].is_i64(), "{reclaim}");
-    assert_eq!(granted[1]["waiter"], reclaim["waiter"], "{granted:?}");
+    // The grant that took the phone names the lease it was reclaimed from; the reclaim, made
+    // before any grant, names no waiter it could only guess at.
+    assert_eq!(granted[0].get("reclaimed"), None, "{granted:?}");
+    assert_eq!(granted[1]["reclaimed"], reclaim["lease"], "{granted:?}");
+    assert_eq!(reclaim.get("waiter"), None, "{reclaim}");
     let _ = holder.kill();
     let _ = holder.wait();
     nothing_private(&sandbox);
@@ -282,4 +288,89 @@ fn a_ledger_that_cannot_be_written_leaves_every_lab_commands_exit_code_and_outpu
         "{:?}",
         writable.ledger_lines()
     );
+}
+
+/// The next line on `stream` that holds `key`, or an error.
+fn next_with(stream: &UnixStream, key: &str) -> Value {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone the stream"));
+    loop {
+        let mut line = String::new();
+        assert!(
+            reader.read_line(&mut line).expect("read the daemon") > 0,
+            "the daemon hung up"
+        );
+        let answer: Value = serde_json::from_str(&line).expect("a JSON line");
+        if answer.get(key).is_some() || answer.get("error").is_some() {
+            return answer;
+        }
+    }
+}
+
+#[test]
+fn a_grant_handed_over_after_a_restart_says_the_last_reason_its_wait_had() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-a");
+    let (mut a, b, caller) = (Agent::start(), Agent::start(), Agent::start());
+    assert_eq!(run(devlab(&sandbox, &wt, &["status"])).code, 0);
+    let (mut first, held) = ask(&sandbox, &wt, a.pid(), caller.pid(), "result");
+    assert!(held["result"]["lease"]["id"].is_i64(), "{held}");
+    assert_eq!(received(&mut first)["result"], true);
+    let (second, queued) = ask(&sandbox, &wt, b.pid(), caller.pid(), "queued");
+    assert!(queued["queued"].is_i64(), "{queued}");
+
+    // The holder leaves, the place goes to b, and the daemon stops before b says it has it.
+    a.exit();
+    let granted = next_with(&second, "result");
+    assert!(granted["result"]["lease"]["id"].is_i64(), "{granted}");
+    stop_daemon(&sandbox);
+    drop((first, second));
+    assert_eq!(run(devlab(&sandbox, &wt, &["status"])).code, 0);
+    let (mut again, regranted) = ask(&sandbox, &wt, b.pid(), caller.pid(), "result");
+    assert_eq!(regranted["result"]["lease"], granted["result"]["lease"]);
+    assert_eq!(received(&mut again)["result"], true);
+
+    let grants = await_events(&sandbox, "lab-wait", 2, |e| e["action"] == "granted");
+    assert_eq!(grants.len(), 2, "{grants:?}");
+    let resumed = &grants[1];
+    assert_eq!(resumed["wait"], "slot-cap", "{resumed}");
+    assert_eq!(resumed["cap"], 1, "{resumed}");
+    assert!(resumed["seconds"].is_u64(), "{resumed}");
+}
+
+#[test]
+fn an_unreadable_ledger_with_a_lead_to_settle_still_starts_the_daemon_and_settles_it_later() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    let spawned = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+    assert_eq!(spawned.code, 0, "{spawned:?}");
+    stop_daemon(&sandbox);
+    // The lab's world goes in once the repo is made: it fakes git.
+    let world = World::install(&sandbox);
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_factory"), sandbox.path("bin/devlab"))
+        .expect("link devlab");
+    // The ledger can't be read, as a dir in its place: the lead's standing can't be known.
+    let ledger = sandbox.ledger();
+    let kept = fs::read_to_string(&ledger).expect("read the ledger");
+    fs::remove_file(&ledger).expect("remove the ledger");
+    fs::create_dir(&ledger).expect("make the ledger a dir");
+
+    let wt = world.worktree("demo-unread");
+    let status = run(devlab(&sandbox, &wt, &["status"]));
+    assert_eq!(status.code, 0, "{status:?}");
+    let acquired = owned(&sandbox, &wt, &["acquire", "--no-device"]);
+    assert_eq!(acquired.code, 0, "{acquired:?}");
+    let released = owned(&sandbox, &wt, &["release"]);
+    assert_eq!(released.code, 0, "{released:?}");
+
+    // Readable again, the lead finishes: the daemon settles it then.
+    fs::remove_dir(&ledger).expect("remove the dir");
+    fs::write(&ledger, kept).expect("put the ledger back");
+    fs::write(sandbox.path("state/factory/leads/repo/cart.md"), "done\n").expect("report");
+    herdr.status("w1:p1", "idle");
+    let listed = sandbox.factory(&["lead", "list"]);
+    assert_eq!(listed.code, 0, "{listed:?}");
+    let ends = await_events(&sandbox, "lead-end", 1, |e| e["slug"] == "cart");
+    assert_eq!(ends.len(), 1, "{:?}", sandbox.ledger_lines());
+    assert_eq!(ends[0]["outcome"], "finished");
 }

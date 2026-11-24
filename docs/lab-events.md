@@ -14,8 +14,9 @@ the same ledger and line format as `factory log`.
   lab call waits on the ledger, and a backlog a stopped daemon left goes out from the next one
   (a line appended just before a stop may go out twice). `lab-run` takes the same path.
 - A ledger that can't be written, or opened for writing, costs one daemon log line per event
-  and changes no lab command's exit code or output. (A ledger that can't even be read still
-  stops a daemon that has a lead to settle: the leads read their standing from it.)
+  and changes no lab command's exit code or output. One that can't even be read doesn't stop
+  the daemon either: the leads a stopped daemon left, which read their standing from it, cost
+  one log line and are settled once it can be read.
 
 Values are flat. Numbers are only in fields on the numeric list (`NUMERIC_FIELDS` in
 `crates/factory-core/src/event.rs`). No value names a device serial, a home path or a user: a

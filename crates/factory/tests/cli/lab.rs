@@ -650,7 +650,7 @@ impl Agent {
         self.0.id()
     }
 
-    fn exit(&mut self) {
+    pub(crate) fn exit(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -1409,7 +1409,7 @@ fn started(pid: u32) -> String {
 /// Sends the daemon a `lab.acquire` for a one-slot project straight over its socket, by
 /// `owner` from the devlab call `client`; the connection, and the first line that holds `until`
 /// (`queued` or `result`) or an error.
-fn ask(
+pub(super) fn ask(
     sandbox: &Sandbox,
     worktree: &Path,
     owner: u32,
@@ -1568,7 +1568,7 @@ fn devlab_gc_says_a_freed_reservation_once() {
 }
 
 /// Tells the daemon the grant on `stream` reached its caller; its confirmation.
-fn received(stream: &mut UnixStream) -> serde_json::Value {
+pub(super) fn received(stream: &mut UnixStream) -> serde_json::Value {
     let said = serde_json::json!({"id": 2, "method": "lab.received"});
     writeln!(stream, "{said}").expect("say the grant arrived");
     let mut line = String::new();
