@@ -74,9 +74,11 @@ impl Lab {
             cfg.device_idle_min,
         );
         let now = now_f64();
-        let attached = self.attached.borrow().shown.clone();
         let claimed = self
             .write(|c, _| {
+                // The list adb shows as this transaction runs, as a grant plans from: none while
+                // its stream restarts, when nothing is taken from anyone.
+                let attached = self.attached.borrow().live();
                 let taken = store::taken(c)?;
                 // A slot a lease or a reservation holds, or a release is stopping, isn't idle.
                 let leases = store::leases(c)?;
@@ -134,8 +136,22 @@ impl Lab {
                         })
                         .count(),
                 );
-                let free_emulators =
-                    count(emulator_views.iter().filter(|e| e.ready && !e.held).count());
+                let online = |serial: &str| {
+                    attached
+                        .iter()
+                        .flatten()
+                        .any(|a| a.serial == serial && a.state == "device")
+                };
+                let free_emulators = count(
+                    emulators
+                        .iter()
+                        .filter(|e| {
+                            State::from_word(&e.state) == State::Ready
+                                && !taken.contains(&e.serial)
+                                && online(&e.serial)
+                        })
+                        .count(),
+                );
                 let needs = idle::unmet(&needs, free_phones, free_emulators);
                 let due = idle::sweep(
                     &emulator_views,
