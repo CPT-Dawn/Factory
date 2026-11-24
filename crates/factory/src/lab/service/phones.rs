@@ -4,7 +4,7 @@
 //! saying what to do. One thread does it all, so the probes, the store's rows and the
 //! notifications follow the stream's order; `devlab check` is answered on it too.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -15,7 +15,7 @@ use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{Attached, LOCK_PROBE, prep_command};
 use factory_core::lab::ready::{
     AUTH_TIMEOUT_PROBE, BATTERY_PROBE, Notice, POWER_PROBE, Probe, Readiness, STAY_ON_PROBE, after,
-    auth_timeout_warning, judge, notice, unplugged,
+    auth_timeout_warning, judge, notice, probe_again, unplugged,
 };
 
 use super::super::check::PhoneCheck;
@@ -34,6 +34,8 @@ pub enum Job {
     Frame(Vec<Attached>),
     /// `devlab check`: the phones named (every phone when none), answered on the sender.
     Check(Vec<String>, mpsc::Sender<Vec<PhoneCheck>>),
+    /// A grant: how ready each of these phones is now, answered on the sender.
+    Ready(Vec<String>, mpsc::Sender<HashMap<String, Readiness>>),
 }
 
 impl Lab {
@@ -81,6 +83,20 @@ impl Lab {
             .recv_timeout(CHECK_TIMEOUT)
             .map_err(|e| failed(&format!("the phone watcher did not answer: {e}")))
     }
+
+    /// How ready each of the phones `serials` is for a grant: from a probe at most 10 s old
+    /// when it was ready, else probed again (one that was not ready always is). A phone the
+    /// watcher can't say is left out, which a grant takes for not ready.
+    pub(super) fn ready_phones(&self, serials: Vec<String>) -> HashMap<String, Readiness> {
+        let (reply, answer) = mpsc::channel();
+        let Some(tx) = self.phones.get() else {
+            return HashMap::new();
+        };
+        if tx.send(Job::Ready(serials, reply)).is_err() {
+            return HashMap::new();
+        }
+        answer.recv_timeout(CHECK_TIMEOUT).unwrap_or_default()
+    }
 }
 
 struct Watcher {
@@ -121,6 +137,9 @@ impl Watcher {
                 Ok(Job::Frame(list)) => self.frame(list),
                 Ok(Job::Check(serials, reply)) => {
                     let _ = reply.send(self.check(&serials));
+                }
+                Ok(Job::Ready(serials, reply)) => {
+                    let _ = reply.send(self.ready(&serials));
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     for phone in self.shown.clone() {
@@ -233,11 +252,16 @@ impl Watcher {
             Ok((
                 row,
                 notice(&name(&phone.model, &phone.serial), before, readiness),
+                before.is_none_or(|k| k.readiness != readiness),
             ))
         });
-        let (row, said) = written.ok()?;
+        let (row, said, changed) = written.ok()?;
         if let Some(said) = said {
             self.post(&said);
+        }
+        if changed {
+            // A request waiting for a phone looks again.
+            self.lab.notify();
         }
         Some(row)
     }
@@ -270,6 +294,36 @@ impl Watcher {
         }
     }
 
+    /// `phone`'s row: the kept one unless `stale` says, of its readiness and its age in ms, that
+    /// it is, else what a new probe finds. None: a phone that did not answer.
+    fn current(&mut self, phone: &Attached, stale: fn(Readiness, i64) -> bool) -> Option<ReadyRow> {
+        let kept = self
+            .lab
+            .write(|c, _| readiness::get(c, &phone.serial))
+            .ok()
+            .flatten()
+            .filter(|r| !stale(r.known.readiness, now_ms() - r.probed_ms));
+        match kept {
+            Some(row) => Some(row),
+            None if phone.state == "device" => self.probe(phone),
+            None => self.record(phone, judge(&unprobed(phone)), None),
+        }
+    }
+
+    /// How ready each of `serials` is for a grant.
+    fn ready(&mut self, serials: &[String]) -> HashMap<String, Readiness> {
+        let mut ready = HashMap::new();
+        for serial in serials {
+            let Some(phone) = self.shown.iter().find(|p| &p.serial == serial).cloned() else {
+                continue;
+            };
+            if let Some(row) = self.current(&phone, probe_again) {
+                ready.insert(serial.clone(), row.known.readiness);
+            }
+        }
+        ready
+    }
+
     /// `devlab check`: each phone from a probe at most [`FRESH_MS`] old, probed again when
     /// it is older.
     fn check(&mut self, serials: &[String]) -> Vec<PhoneCheck> {
@@ -290,18 +344,7 @@ impl Watcher {
                         probed_ms: None,
                     };
                 };
-                let kept = self
-                    .lab
-                    .write(|c, _| readiness::get(c, &serial))
-                    .ok()
-                    .flatten()
-                    .filter(|r| now_ms() - r.probed_ms <= FRESH_MS);
-                let row = match kept {
-                    Some(row) => Some(row),
-                    None if phone.state == "device" => self.probe(&phone),
-                    None => self.record(&phone, judge(&unprobed(&phone)), None),
-                };
-                match row {
+                match self.current(&phone, |_, age| age > FRESH_MS) {
                     Some(row) => PhoneCheck {
                         serial,
                         model: row.model,

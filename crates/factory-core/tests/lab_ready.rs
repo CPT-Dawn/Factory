@@ -2,7 +2,8 @@
 //! notification each change of that earns.
 
 use factory_core::lab::ready::{
-    Probe, Readiness, Urgency, after, auth_timeout_warning, check_line, judge, notice, unplugged,
+    Probe, Readiness, Urgency, after, auth_timeout_warning, check_line, judge, notice, probe_again,
+    unplugged,
 };
 
 /// A phone on USB power with stay-awake set, awake and unlocked.
@@ -257,4 +258,13 @@ fn an_authorization_timeout_left_on_is_a_warning_on_a_ready_phone() {
         warning.contains("Disable adb authorization timeout"),
         "{warning}"
     );
+}
+
+#[test]
+fn a_grant_probes_a_ready_phone_again_after_10_s_and_one_that_is_not_ready_every_time() {
+    assert!(!probe_again(Readiness::Ready, 0));
+    assert!(!probe_again(Readiness::Ready, 10_000));
+    assert!(probe_again(Readiness::Ready, 10_001));
+    assert!(probe_again(Readiness::Locked, 0));
+    assert!(probe_again(Readiness::Offline, 5_000));
 }

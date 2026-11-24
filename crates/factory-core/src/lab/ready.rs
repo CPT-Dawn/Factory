@@ -12,6 +12,16 @@ pub const POWER_PROBE: &str = "dumpsys power | grep -E 'mWakefulness=' | head -1
 /// The shell line that prints adb's authorization timeout; `0` when it is off.
 pub const AUTH_TIMEOUT_PROBE: &str = "settings get global adb_allowed_connection_time";
 
+/// How old, in ms, a probe of a ready phone may be for a grant to rest on it.
+pub const GRANT_FRESH_MS: i64 = 10_000;
+
+/// Whether a grant probes a phone again: its last probe, which found it `was`, is `age_ms` old.
+/// One that is ready is believed for [GRANT_FRESH_MS]; one that is not is always probed, so a
+/// request sees the phone its owner has just unlocked.
+pub fn probe_again(was: Readiness, age_ms: i64) -> bool {
+    was != Readiness::Ready || age_ms > GRANT_FRESH_MS
+}
+
 /// What a phone is, as far as running unattended goes. Serialized as its [`Readiness::word`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]

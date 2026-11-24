@@ -17,13 +17,22 @@ use crate::support::{Sandbox, kill_group, run};
 /// the daemon probes with, lists what `adb/devices` holds; it hangs while `adb/probe-hangs`
 /// exists (its pid is then in `adb/probe.pid`, and that of a child it left running in
 /// `adb/probe-child.pid`), and notes each call's pid in `adb/probes`. While `adb/chatty` exists,
-/// it says far more than a pipe holds before its list.
+/// it says far more than a pipe holds before its list. A phone it lists is ready: its shell
+/// answers the readiness probes as a phone kept awake on USB power would.
 pub(super) fn adb_playing(sandbox: &Sandbox, script: &str) -> PathBuf {
     let dir = sandbox.path("adb");
     fs::create_dir_all(&dir).expect("create the adb dir");
     let body = format!(
         r#"w='{dir}'
 frame() {{ printf '%s\n' "$1" > "$w/devices"; printf '%04x' "$(printf '%s\n' "$1" | wc -c)"; printf '%s\n' "$1"; }}
+if [ "$1" = -s ]; then
+  case "$4" in
+  *stay_on_while_plugged_in*) echo 7 ;;
+  *'dumpsys battery'*) echo '  USB powered: true' ;;
+  *'dumpsys power'*) echo '  mWakefulness=Awake' ;;
+  esac
+  exit 0
+fi
 case "$1" in
 devices)
   echo "$$" >> "$w/probes"

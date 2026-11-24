@@ -10,7 +10,7 @@
 
 mod keeper;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -24,13 +24,14 @@ use factory_core::event::{Event, Fields};
 use factory_core::exit::Exit;
 use factory_core::lab::args::{LONGEST_WAIT, wait_span};
 use factory_core::lab::devices::{
-    Attached, EmulatorView, HeldBy, Mode, Plan, PlanInput, device_rows, plan_devices,
+    Attached, EmulatorView, HeldBy, Mode, Plan, PlanInput, Unready, device_rows, plan_devices,
 };
 use factory_core::lab::emulator::{
     Boot, Settle, State, after_restart, boot_step, booting_note, free_indexes, serial_of, unit_name,
 };
 use factory_core::lab::grant::{self, Ask, Decision};
 use factory_core::lab::js_number;
+use factory_core::lab::ready::Readiness;
 use factory_core::lab::run::{End, Phase};
 use factory_core::lab::slots::{SlotView, slot_host_ports, slot_project_id};
 use rusqlite::Connection;
@@ -628,6 +629,9 @@ struct Facts {
     /// Whether each slot's stack runs, by slot.
     running: Vec<bool>,
     mem_available_mb: i64,
+    /// How ready each free phone adb shows as `device` is, by serial; a phone not in it is
+    /// not ready.
+    phones: HashMap<String, Readiness>,
 }
 
 fn gather(lab: &Lab, p: &AcquireParams, attached: Vec<Attached>) -> Facts {
@@ -639,6 +643,12 @@ fn gather(lab: &Lab, p: &AcquireParams, attached: Vec<Attached>) -> Facts {
     };
     Facts {
         mem_available_mb,
+        phones: match &p.devices {
+            Some(ask) if Mode::from_word(&ask.mode) != Mode::Emulator => {
+                ready_phones(lab, &attached)
+            }
+            _ => HashMap::new(),
+        },
         ..gather_stack(p.project.as_ref())
     }
 }
@@ -663,7 +673,24 @@ fn gather_stack(project: Option<&ProjectAsk>) -> Facts {
         listening: host::listening_ports(),
         running,
         mem_available_mb: 0,
+        phones: HashMap::new(),
     }
+}
+
+/// How ready each phone adb shows as `device` and no lease holds is now: asked of the phone
+/// watcher, which probes again one it has not looked at lately. Not in a transaction: the
+/// watcher writes the store.
+fn ready_phones(lab: &Lab, attached: &[Attached]) -> HashMap<String, Readiness> {
+    let held = lab.write(|c, _| store::taken(c)).unwrap_or_default();
+    let free: Vec<String> = attached
+        .iter()
+        .filter(|a| a.kind == "phone" && a.state == "device" && !held.contains(&a.serial))
+        .map(|a| a.serial.clone())
+        .collect();
+    if free.is_empty() {
+        return HashMap::new();
+    }
+    lab.ready_phones(free)
 }
 
 /// Forgets the ready emulators whose unit ended: adb no longer lists them, and they hold a
@@ -703,6 +730,7 @@ fn plan(
     lease: Option<&Lease>,
     seen: &[Attached],
     mem_available_mb: i64,
+    ready: &HashMap<String, Readiness>,
     stopping: &keeper::Stopping,
 ) -> rusqlite::Result<Result<Option<Planned>, String>> {
     let mut have = 0u32;
@@ -724,12 +752,35 @@ fn plan(
         seen.iter()
             .filter(move |a| a.kind == "phone" && a.state == state)
     };
+    let readiness = |serial: &str| ready.get(serial).copied().unwrap_or(Readiness::Offline);
     let mut free_phones: Vec<String> = phones("device")
-        .filter(|a| !is_taken(&a.serial))
+        .filter(|a| !is_taken(&a.serial) && readiness(&a.serial) == Readiness::Ready)
         .map(|a| a.serial.clone())
         .collect();
     free_phones.sort();
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    // The free phones that can't be granted, by what is wrong with each: adb's own word first.
+    let mut unready = Unready::default();
+    for a in seen
+        .iter()
+        .filter(|a| a.kind == "phone" && !is_taken(&a.serial))
+    {
+        let what = if a.state == "device" {
+            readiness(&a.serial)
+        } else if a.state == "unauthorized" {
+            Readiness::Unauthorized
+        } else {
+            Readiness::Offline
+        };
+        match what {
+            Readiness::Ready => {}
+            Readiness::Locked => unready.locked += 1,
+            Readiness::Asleep => unready.asleep += 1,
+            Readiness::StayAwakeOff => unready.stay_awake_off += 1,
+            Readiness::Unauthorized => unready.unauthorized += 1,
+            Readiness::Offline => unready.offline += 1,
+        }
+    }
     let input = PlanInput {
         want,
         mode: Mode::from_word(&ask.mode),
@@ -754,7 +805,7 @@ fn plan(
         mem_available_mb,
         host_floor_mb: ask.host_floor_mb,
         emulator_ram_mb: ask.emulator_ram_mb,
-        unauthorized: count(phones("unauthorized").count()),
+        unready,
         busy_phones: count(phones("device").filter(|a| is_taken(&a.serial)).count()),
     };
     Ok(plan_devices(&input).map(|plan| {
@@ -1021,6 +1072,7 @@ fn try_grant(
                 lease.as_ref(),
                 attached,
                 facts.mem_available_mb,
+                &facts.phones,
                 &stopping,
             )?,
             (None, _) => Ok(None),

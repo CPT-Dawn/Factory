@@ -25,6 +25,9 @@ mod lab;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
 mod lab_guards;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
+mod lab_phones;
 mod lab_ready;
 mod lead;
 mod log;
