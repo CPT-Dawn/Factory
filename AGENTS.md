@@ -9,7 +9,7 @@ One Rust binary, `factory`, and the daemon it runs, for an agent software factor
 ## Done
 
 - The gate is `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`, as CI runs it.
-- The pre-push hook in `.githooks` runs the gate before every push; enable it with `git config core.hooksPath .githooks`.
+- The pre-push hook in `.githooks` runs the gate before every push of the checked-out branch (a push that only deletes branches skips it); enable it with `git config core.hooksPath .githooks`.
 - Tests drive the built binary with a temp state and runtime directory, and with scripted fakes of adb, docker, systemctl, gh, herdr, agy, codex and claude on PATH. They need no devlab lease, phone or stack. Only #19 and #20 work on the real machine.
 
 ## Public repo

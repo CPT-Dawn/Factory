@@ -3,24 +3,39 @@
 # Enable with: git config core.hooksPath .githooks
 set -euo pipefail
 
-# A push that only deletes branches carries nothing to check.
+# A push that only deletes branches sends no code, so there is nothing to check.
 zero=0000000000000000000000000000000000000000
+head=$(git rev-parse HEAD)
 deleting=1
-while read -r _ local_sha _ _; do
-  [[ "$local_sha" == "$zero" ]] || deleting=0
+while read -r local_ref local_sha _ _; do
+  [[ "$local_sha" == "$zero" ]] && continue
+  deleting=0
+  # The gate builds this checkout, so it can only vouch for the branch checked out here.
+  if [[ "$local_ref" == refs/heads/* && "$local_sha" != "$head" ]]; then
+    echo "pre-push: $local_ref is not the checked-out HEAD, so the gate cannot vouch for it; check it out, or push with --no-verify" >&2
+    exit 1
+  fi
 done
 ((deleting)) && exit 0
 
 cd "$(git rev-parse --show-toplevel)"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
+limit=${PRE_PUSH_STEP_TIMEOUT:-1800}
 
+# One step of the gate: a process group of its own, killed at the limit. A failure prints one
+# line, with the last line of the step's output; the whole output stays in a file it names.
 step() {
-  local name=$1
+  local name=$1 code=0
   shift
-  if ! "$@" >"$scratch/out" 2>&1; then
-    tail -n 25 "$scratch/out" >&2
-    echo "pre-push: $name failed, push stopped" >&2
+  timeout -k 10 "$limit" "$@" >"$scratch/out" 2>&1 || code=$?
+  if ((code != 0)); then
+    local log
+    log=$(mktemp "${TMPDIR:-/tmp}/pre-push-XXXXXX.log")
+    cp "$scratch/out" "$log"
+    local last
+    last=$(grep -v '^[[:space:]]*$' "$scratch/out" | tail -n 1 || true)
+    echo "pre-push: $name failed (exit $code, last line: ${last:-none}); full output in $log" >&2
     exit 1
   fi
 }
