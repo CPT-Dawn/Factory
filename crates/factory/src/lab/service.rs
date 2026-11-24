@@ -52,7 +52,8 @@ use super::wire::{
     AcquireParams, Board, DeviceAsk, DeviceLine, EXEC, EXEC_END, ExecEnd, ExecParams, FindParams,
     GC, Granted, LEASE, Lease, LeaseDevice, LeaseRunning, Owner, Process, ProjectAsk, RECEIVED,
     RELEASE, RUN_END, RUN_END_ID, RUN_START, RUN_STOPPING, ReleaseParams, Released, Reservation,
-    RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING, SlotParams, StopParams, UNRESERVE, Waiter,
+    RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING, SlotParams, StopParams, Stopping, UNRESERVE,
+    Waiter,
 };
 use super::{activity, events, readiness, reservations};
 use super::{android, host};
@@ -695,23 +696,22 @@ fn not_yours(lease: &Lease) -> ErrorBody {
     }
 }
 
-/// The caller's lease, its slot marked as stopping for `p.stopper`.
-fn stopping(lab: &Lab, p: StopParams) -> Answer<Option<Lease>> {
+/// The caller's lease, its slot marked as stopping for `p.stopper`, and the stack it was granted.
+fn stopping(lab: &Lab, p: StopParams) -> Answer<Option<Stopping>> {
     lab.write(|c, _| {
         let f = &p.find;
         let lease = match own_lease(c, f)? {
             Ok(lease) => lease,
             Err(refused) => return Ok(Err(refused)),
         };
-        if let Some(Lease {
-            project: Some(project),
-            slot: Some(slot),
-            ..
-        }) = &lease
-        {
-            store::mark_stopping(c, project, *slot, &p.stopper)?;
+        let Some(lease) = lease else {
+            return Ok(Ok(None));
+        };
+        if let (Some(project), Some(slot)) = (&lease.project, lease.slot) {
+            store::mark_stopping(c, project, slot, &p.stopper)?;
         }
-        Ok(Ok(lease))
+        let stack = store::lease_stack(c, lease.id)?;
+        Ok(Ok(Some(Stopping { lease, stack })))
     })?
 }
 
@@ -1318,6 +1318,20 @@ fn ends_with_run(
     }
 }
 
+/// Keeps the stack lease `lease` is granted for its slot, by the project id request `p` named it
+/// with: the one its `--stop-stack` stops (#63).
+fn granted_stack(c: &Connection, p: &AcquireParams, lease: &Lease) -> rusqlite::Result<()> {
+    match (&p.project, lease.slot) {
+        (
+            Some(ProjectAsk {
+                stack: Some(stack), ..
+            }),
+            Some(slot),
+        ) => store::set_lease_stack(c, lease.id, &slot_project_id(&stack.project_id, slot)),
+        _ => Ok(()),
+    }
+}
+
 /// The lease granted, or why the request waits.
 /// `reprobe`: whether a phone's ready probe found too old asks for a [`Refused::Reprobe`];
 /// else the phone is taken for offline. `by`: when the request's wait ends, if it had not when
@@ -1395,6 +1409,7 @@ fn try_grant(
                 None => None,
             };
             store::touch(c, lease.id, now)?;
+            granted_stack(c, p, lease)?;
             let reservation = claimed.as_ref().map(|r| r.id);
             events::lease_began(c, lease.id, reservation, 0)?;
             let waited = events::wait_event(c, waiter, &asked(p), true, None, now)?;
@@ -1530,6 +1545,7 @@ fn try_grant(
         if fresh {
             ends_with_run(c, p, waiter, &lease, from.as_ref())?;
         }
+        granted_stack(c, p, &lease)?;
         let (mut boots, mut phones, mut reused) = (Vec::new(), Vec::new(), Vec::new());
         // A grant is the answer to a reclaim: the lease holds what this request asked for.
         activity::clear_reclaimed(c, lease.id)?;
