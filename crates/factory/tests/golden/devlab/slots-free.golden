@@ -59,6 +59,9 @@ $ b@demo-b devlab stack status
 ? 0
 $ a@demo-a devlab status
 1> devices: none attached
+1> leases
+1>   lease 1 demo-a (claude:<a>): age 0m, idle 0m
+1>   lease 2 demo-b (claude:<b>): age 0m, idle 0m
 1> stack slots
 1>   demo 0   down                         lease 1 demo-a
 1>   demo 1   down                         lease 2 demo-b
@@ -68,6 +71,24 @@ $ a@demo-a devlab status
 $ a@demo-a devlab status --json
 1> {
 1>   "devices": [],
+1>   "leases": [
+1>     {
+1>       "id": 1,
+1>       "worktree": "demo-a",
+1>       "owner": "claude:<a>",
+1>       "ageMin": 0,
+1>       "idleMin": 0,
+1>       "running": null
+1>     },
+1>     {
+1>       "id": 2,
+1>       "worktree": "demo-b",
+1>       "owner": "claude:<b>",
+1>       "ageMin": 0,
+1>       "idleMin": 0,
+1>       "running": null
+1>     }
+1>   ],
 1>   "slots": [
 1>     {
 1>       "project": "demo",

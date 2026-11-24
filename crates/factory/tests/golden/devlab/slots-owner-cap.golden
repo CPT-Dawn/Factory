@@ -39,6 +39,9 @@ $ b@demo-c devlab acquire --no-device --quiet
 until later devlab: waiting:
 $ b@demo-c devlab status
 1> devices: none attached
+1> leases
+1>   lease 1 demo-a (claude:<a>): age 0m, idle 0m
+1>   lease 2 demo-c (claude:<b>): age 0m, idle 0m
 1> stack slots
 1>   demo 0   down                         lease 1 demo-a
 1>   demo 1   down                         lease 2 demo-c
@@ -68,6 +71,9 @@ wait later
 ? 0
 $ b@demo-c devlab status
 1> devices: none attached
+1> leases
+1>   lease 2 demo-c (claude:<b>): age 0m, idle 0m
+1>   lease 3 demo-d (claude:<a>): age 0m, idle 0m
 1> stack slots
 1>   demo 0   down                         lease 3 demo-d
 1>   demo 1   down                         lease 2 demo-c

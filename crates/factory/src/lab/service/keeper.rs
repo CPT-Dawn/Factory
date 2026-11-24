@@ -1,8 +1,9 @@
 //! What devlab's watcher did, inside the daemon (#18): an owner's leases are freed the moment
 //! the owner exits, watched through a pidfd rather than polled; a ready emulator no lease holds
 //! is stopped after `emulatorIdleMin`, and a stack devlab started on a slot no lease holds after
-//! `stackIdleMin`. A stack started outside devlab is never stopped. The machine config is read
-//! again on each look, so a changed timer counts from the next one.
+//! `stackIdleMin`. A stack started outside devlab is never stopped. A device whose lease ran
+//! nothing for `deviceIdleMin` is taken from it while a waiter needs that kind of device (#57).
+//! The machine config is read again on each look, so a changed timer counts from the next one.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -10,16 +11,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use factory_adapters::adb::{Adb, AdbCli};
 use factory_adapters::emulator::{Emulators, SystemdEmulators};
-use factory_core::lab::devices::Attached;
+use factory_core::lab::devices::{Attached, Mode};
 use factory_core::lab::emulator::{State, unit_name};
-use factory_core::lab::idle::{self, IdleEmulator, IdleSlot, Timers};
+use factory_core::lab::idle::{self, IdleDevice, IdleEmulator, IdleSlot, Need, Timers};
 use factory_core::lab::js_number;
 use factory_core::lab::slots::slot_project_id;
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags, pidfd_open};
 
-use super::super::{context, host, lease, stack};
+use super::super::{activity, context, host, lease, stack};
 use super::{Lab, Lease, lock_ignoring_poison, reservations, store};
 use crate::lab::wire::SlotRow;
 
@@ -67,13 +68,18 @@ impl Lab {
     /// falls due.
     fn look(self: &Arc<Self>) -> Result<Option<f64>, String> {
         let cfg = context::machine_config().map_err(|f| f.message)?;
-        let timers = Timers::from_minutes(cfg.emulator_idle_min, cfg.stack_idle_min);
+        let timers = Timers::from_minutes(
+            cfg.emulator_idle_min,
+            cfg.stack_idle_min,
+            cfg.device_idle_min,
+        );
         let now = now_f64();
         let claimed = self
             .write(|c, _| {
                 let taken = store::taken(c)?;
                 // A slot a lease or a reservation holds, or a release is stopping, isn't idle.
-                let mut holdings: Vec<_> = store::leases(c)?.iter().map(Lease::holding).collect();
+                let leases = store::leases(c)?;
+                let mut holdings: Vec<_> = leases.iter().map(Lease::holding).collect();
                 holdings.extend(reservations::all(c)?.iter().map(|r| r.holding()));
                 let mut stopping = lock_ignoring_poison(&self.stopping);
                 let emulators: Vec<store::EmulatorRow> = store::emulators(c)?
@@ -108,7 +114,23 @@ impl Lab {
                         idle_since: s.idle_since,
                     })
                     .collect();
-                let due = idle::sweep(&emulator_views, &slot_views, timers, now);
+                let device_views = device_views(c, &leases)?;
+                let needs: Vec<Need> = activity::needs(c)?
+                    .into_iter()
+                    .map(|(mode, want)| Need {
+                        mode: Mode::from_word(&mode),
+                        want,
+                    })
+                    .collect();
+                let due = idle::sweep(
+                    &emulator_views,
+                    &slot_views,
+                    &device_views,
+                    &needs,
+                    timers,
+                    now,
+                );
+                let reclaimed = reclaim(c, &leases, &due.devices, now)?;
                 let emulators: Vec<store::EmulatorRow> = emulators
                     .into_iter()
                     .filter(|e| due.emulators.contains(&e.idx))
@@ -121,10 +143,14 @@ impl Lab {
                 stopping
                     .slots
                     .extend(slots.iter().map(|s| (s.project.clone(), s.slot)));
-                Ok((emulators, slots, due.next))
+                Ok((emulators, slots, reclaimed, due.next))
             })
             .map_err(|e| e.message)?;
-        let (emulators, slots, next) = claimed;
+        let (emulators, slots, reclaimed, next) = claimed;
+        if !reclaimed.is_empty() {
+            self.notify();
+            take_back_reverses_on_thread(self.attached.borrow().shown.clone(), reclaimed);
+        }
         for row in emulators {
             let lab = Arc::clone(self);
             let minutes = js_number(cfg.emulator_idle_min);
@@ -185,6 +211,70 @@ impl Lab {
             ),
         }
     }
+}
+
+/// Each device a lease holds, as the sweep sees it: busy while its lease runs a command or
+/// waits in the queue.
+fn device_views(c: &rusqlite::Connection, leases: &[Lease]) -> rusqlite::Result<Vec<IdleDevice>> {
+    let running = activity::running(c, &host::alive)?;
+    let waiters = store::waiters(c)?;
+    Ok(leases
+        .iter()
+        .flat_map(|l| {
+            let busy = running.iter().any(|(lease, _)| *lease == l.id)
+                || waiters.iter().any(|w| {
+                    w.lease == Some(l.id) || (w.owner == l.owner_key() && w.worktree == l.worktree)
+                });
+            l.devices.iter().map(move |d| IdleDevice {
+                lease: l.id,
+                serial: d.serial.clone(),
+                phone: d.kind == "phone",
+                busy,
+                touched: l.touched,
+            })
+        })
+        .collect())
+}
+
+/// Takes each `(lease, serial)` from its lease for the waiters; the leases with just the devices
+/// taken from them, whose reverses go back.
+fn reclaim(
+    c: &rusqlite::Connection,
+    leases: &[Lease],
+    due: &[(i64, String)],
+    now: f64,
+) -> rusqlite::Result<Vec<Lease>> {
+    #[allow(clippy::cast_possible_truncation)]
+    let now = now as i64;
+    let mut taken: Vec<Lease> = Vec::new();
+    for (id, serial) in due {
+        let Some(lease) = leases.iter().find(|l| l.id == *id) else {
+            continue;
+        };
+        let idle_min = (now - lease.touched).max(0) / 60;
+        let Some(kind) = activity::reclaim(c, *id, serial, idle_min)? else {
+            continue;
+        };
+        if kind == "emulator" {
+            store::emulator_idle(c, serial, now)?;
+        }
+        eprintln!(
+            "factory: lab: took {kind} {serial} from lease {id}, idle for {idle_min} min, for a waiter"
+        );
+        let devices = lease
+            .devices
+            .iter()
+            .filter(|d| d.serial == *serial)
+            .cloned();
+        match taken.iter_mut().find(|l| l.id == *id) {
+            Some(l) => l.devices.extend(devices),
+            None => taken.push(Lease {
+                devices: devices.collect(),
+                ..lease.clone()
+            }),
+        }
+    }
+    Ok(taken)
 }
 
 /// Looks, then waits for the next thing to fall due, a change to the board, or [`LOOK`].

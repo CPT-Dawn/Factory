@@ -17,7 +17,9 @@ daemon as the watcher, not a systemd unit), `devices-emulator-failure` (an emula
 gives its lease back: `devlab env` then exits 4) and `slots-release` (`devlab gc` reports only the leases it freed
 itself, not those the daemon freed first). `devices-run-lease-end` (#53): a run gives back the
 lease it made when its command ends, unless `--keep`, where today's devlab kept it; `cli-usage`'s
-help says so. `slots-wait-default` is parity regained: `--wait -1`
+help says so. `devices-lease-status` (#57): `devlab status` and its `--json` show each lease's
+age, idle time and running command, and each phone's readiness (#55) where today's devlab showed
+`ready`; every golden with a status step changed with it. `slots-wait-default` is parity regained: `--wait -1`
 is the configured default wait, as in today's devlab, so the call queues.
 
 ## Replaying

@@ -15,9 +15,9 @@ use super::context::Ctx;
 use super::host::proc;
 use super::stack;
 use super::wire::{
-    ACQUIRE, AcquireParams, DeviceAsk, GC, Granted, LEASE, Lease, Process, ProjectAsk, RECEIVED,
-    RELEASE, ReleaseParams, Released, RunAsk, SLOT, STOPPING, SlotParams, SlotSchema, StackAsk,
-    StopParams,
+    ACQUIRE, AcquireParams, DeviceAsk, EXEC, EXEC_END, ExecEnd, ExecParams, GC, Granted, LEASE,
+    Lease, Process, ProjectAsk, RECEIVED, RELEASE, ReleaseParams, Released, RunAsk, SLOT, STOPPING,
+    SlotParams, SlotSchema, StackAsk, StopParams,
 };
 use crate::client;
 use crate::output::Failure;
@@ -219,7 +219,32 @@ pub fn find(ctx: &Ctx) -> Result<Option<Lease>, Failure> {
 /// The caller's lease with every device it holds attached; else exit 4, or 76 naming the
 /// devices that are gone.
 pub fn live(ctx: &Ctx) -> Result<Lease, Failure> {
-    let lease = find(ctx)?.ok_or_else(|| {
+    usable(ctx, find(ctx)?)
+}
+
+/// The caller's lease for `devlab exec` of `argv`, as [`live`] finds it. The daemon counts
+/// the exec as running on it, so no waiter takes its devices, until [`exec_ended`].
+pub fn exec_lease(ctx: &Ctx, argv: &[String]) -> Result<Lease, Failure> {
+    let params = ExecParams {
+        find: ctx.find(),
+        client: me(),
+        command: argv.join(" "),
+    };
+    usable(ctx, client::call(&paths()?, EXEC, &params)?)
+}
+
+/// The exec [`exec_lease`] counted ended; its lease is touched. A daemon that went away
+/// forgets the exec once this process exits.
+pub fn exec_ended() {
+    if let Ok(paths) = paths() {
+        let _: Result<(), Failure> = client::call(&paths, EXEC_END, &ExecEnd { client: me() });
+    }
+}
+
+/// `lease`, when it is there and every device it holds is attached; else exit 4, or 76
+/// naming the devices that are gone.
+fn usable(ctx: &Ctx, lease: Option<Lease>) -> Result<Lease, Failure> {
+    let lease = lease.ok_or_else(|| {
         Failure::new(
             Exit::NoLease,
             format!(

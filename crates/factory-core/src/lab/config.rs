@@ -45,6 +45,9 @@ pub struct MachineConfig {
     pub emulator_idle_min: f64,
     /// Minutes a stack devlab started runs with no lease on its slot before it is stopped.
     pub stack_idle_min: f64,
+    /// Minutes a leased device's lease may run nothing before a waiter for that kind of device
+    /// may take it.
+    pub device_idle_min: f64,
     /// Post a desktop notification when a phone's readiness changes.
     pub notify: bool,
     /// Seconds between two probes of every attached phone's readiness.
@@ -69,6 +72,7 @@ impl Default for MachineConfig {
             prep_animations_off: true,
             emulator_idle_min: 10.0,
             stack_idle_min: 45.0,
+            device_idle_min: 10.0,
             notify: true,
             readiness_check_sec: 60.0,
         }
@@ -127,6 +131,7 @@ pub fn machine_config(file: &str, text: &str) -> Result<MachineConfig, ConfigErr
     for (key, at) in [
         ("emulatorIdleMin", &mut cfg.emulator_idle_min),
         ("stackIdleMin", &mut cfg.stack_idle_min),
+        ("deviceIdleMin", &mut cfg.device_idle_min),
     ] {
         if let Some(v) = raw.get(key) {
             *at = v.as_f64().filter(|n| *n >= 0.0).ok_or_else(|| {
@@ -498,6 +503,19 @@ mod tests {
             machine_config("m", r#"{"stackIdleMin":-1}"#),
             Err(ConfigError(
                 "m: \"stackIdleMin\" must be a number of minutes".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_leased_device_idles_ten_minutes_before_a_waiter_may_take_it_unless_the_config_says() {
+        assert_eq!(machine_config("m", "{}").unwrap().device_idle_min, 10.0);
+        let cfg = machine_config("m", r#"{"deviceIdleMin":0.05}"#).unwrap();
+        assert_eq!(cfg.device_idle_min, 0.05);
+        assert_eq!(
+            machine_config("m", r#"{"deviceIdleMin":"soon"}"#),
+            Err(ConfigError(
+                "m: \"deviceIdleMin\" must be a number of minutes".to_owned()
             ))
         );
     }

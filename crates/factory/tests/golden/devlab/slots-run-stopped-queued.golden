@@ -41,6 +41,9 @@ wait q
 ? 143
 $ c@demo-c devlab status
 1> devices: none attached
+1> leases
+1>   lease 1 demo-a (claude:<a>): age 0m, idle 0m
+1>   lease 2 demo-b (claude:<b>): age 0m, idle 0m
 1> stack slots
 1>   demo 0   down                         lease 1 demo-a
 1>   demo 1   down                         lease 2 demo-b
@@ -56,6 +59,9 @@ wait r
 ? 129
 $ d@demo-d devlab status
 1> devices: none attached
+1> leases
+1>   lease 1 demo-a (claude:<a>): age 0m, idle 0m
+1>   lease 2 demo-b (claude:<b>): age 0m, idle 0m
 1> stack slots
 1>   demo 0   down                         lease 1 demo-a
 1>   demo 1   down                         lease 2 demo-b
