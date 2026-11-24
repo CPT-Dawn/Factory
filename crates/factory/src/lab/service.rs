@@ -635,20 +635,22 @@ struct Facts {
 fn gather(lab: &Lab, p: &AcquireParams, attached: Vec<Attached>) -> Facts {
     let mem_available_mb = if p.devices.is_some() {
         forget_dead_emulators(lab, &attached);
-        if p.devices
-            .as_ref()
-            .is_some_and(|ask| Mode::from_word(&ask.mode) != Mode::Emulator)
-        {
-            refresh_phones(lab, &attached);
-        }
         host::mem_available_mb()
     } else {
         0
     };
-    Facts {
+    let facts = Facts {
         mem_available_mb,
         ..gather_stack(p.project.as_ref())
+    };
+    // Last, so the probes are as young as can be when the grant reads them.
+    if p.devices
+        .as_ref()
+        .is_some_and(|ask| Mode::from_word(&ask.mode) != Mode::Emulator)
+    {
+        refresh_phones(lab, &attached);
     }
+    facts
 }
 
 /// The facts about a project's stacks and the host's ports, for a request that asks for no device.
