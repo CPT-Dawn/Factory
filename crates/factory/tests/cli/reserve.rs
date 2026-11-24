@@ -404,6 +404,45 @@ fn a_reservation_goes_when_its_owner_exits() {
 }
 
 #[test]
+fn a_reservation_nobody_used_for_two_hours_goes_and_gc_says_so() {
+    let (sandbox, world) = lab();
+    let skew = sandbox.path("clock-skew");
+    let sandbox = sandbox.env("FACTORY_CLOCK_SKEW_FILE", &skew);
+    let (lead, _other, wt) = lead_and_a_full_board(&sandbox, &world);
+    let id = reservation(&as_agent(&sandbox, &wt, &lead, &["reserve"]));
+
+    // Not yet: a minute short of two hours.
+    std::fs::write(&skew, "7140").expect("move the clock on");
+    let early = as_agent(&sandbox, &wt, &lead, &["gc"]);
+    assert_eq!((early.code, early.stdout.as_str()), (0, ""), "{early:?}");
+
+    std::fs::write(&skew, "7201").expect("move the clock on");
+    let gc = as_agent(&sandbox, &wt, &lead, &["gc"]);
+    assert_eq!(
+        (gc.code, gc.stdout.as_str()),
+        (
+            0,
+            format!(
+                "released reservation {id} ({}, unused for 2 h)\n",
+                lead.label()
+            )
+            .as_str()
+        ),
+        "{gc:?}"
+    );
+    // The slot it held is free again: a child of the lead's that carries it asks the normal way.
+    let (child, dir) = (Agent::new(), world.worktree("demo-child"));
+    let out = run(call(
+        &sandbox,
+        &dir,
+        &child,
+        &[("DEVLAB_RESERVATION", &id)],
+        &["acquire", "--no-device", "--quiet", "--wait", "0"],
+    ));
+    assert_eq!(slot_of(&out), "1");
+}
+
+#[test]
 fn reserve_release_gives_the_owners_reservations_back() {
     let (sandbox, world) = lab();
     let (lead, _other, wt) = lead_and_a_full_board(&sandbox, &world);

@@ -1509,7 +1509,7 @@ fn gc_has_nothing_to_say_of_leases_the_daemon_already_freed() {
 }
 
 /// A lead that reserved a slot and exited: the keeper watches leases' owners, not reservations',
-/// so only a write that finds the reservation frees it, and a `gc` that is the next call does.
+/// so only a write that finds the reservation frees it; whichever does, the next `gc` says so.
 fn orphaned_reservations(sandbox: &Sandbox, world: &World) -> (PathBuf, Vec<u32>) {
     let (mut a, mut b) = (Agent::start(), Agent::start());
     let [wa, wb] = ["demo-a", "demo-b"].map(|n| world.worktree(n));
@@ -1521,6 +1521,46 @@ fn orphaned_reservations(sandbox: &Sandbox, world: &World) -> (PathBuf, Vec<u32>
     a.exit();
     b.exit();
     (wa, pids)
+}
+
+#[test]
+fn gc_names_its_file_on_one_line_and_in_json_whatever_the_runtime_dir_holds() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let odd: [(&[u8], &str); 2] = [(b"run\nx", "run\\nx"), (b"run\xffx", "run\\xffx")];
+    for (dir, said) in odd {
+        for json in [false, true] {
+            let (sandbox, world) = lab();
+            let runtime = sandbox.path(OsStr::from_bytes(dir));
+            let sandbox = sandbox.env("XDG_RUNTIME_DIR", &runtime);
+            let (wa, _) = orphaned_reservations(&sandbox, &world);
+            let report = runtime.join("factory/lab/gc.txt");
+            let args: &[&str] = if json {
+                &["lab", "gc", "--json"]
+            } else {
+                &["lab", "gc"]
+            };
+
+            let gc = native(&sandbox, &wa, std::process::id(), args);
+
+            let line = one_line(&gc);
+            if json {
+                let body: serde_json::Value = serde_json::from_str(line).expect("gc's JSON");
+                assert_eq!(
+                    body["releasedFile"].as_str(),
+                    Some(report.to_string_lossy().as_ref()),
+                    "{line}"
+                );
+            } else {
+                assert!(
+                    line.starts_with("released 2 leases of exited owners; list in $'")
+                        && line.ends_with(&format!("/{said}/factory/lab/gc.txt'")),
+                    "{line}"
+                );
+            }
+            assert!(report.exists(), "{line}");
+        }
+    }
 }
 
 #[test]
@@ -1544,6 +1584,27 @@ fn gc_names_a_file_with_the_reservations_it_freed_itself() {
     }
     // Said once: the next gc finds nothing.
     let again = run(devlab(&sandbox, &wa, &["gc"]));
+    assert_eq!((again.code, again.stdout.as_str()), (0, ""), "{again:?}");
+}
+
+#[test]
+fn gc_says_a_reservation_another_call_freed_first_once() {
+    let (sandbox, world) = lab();
+    let (wa, pids) = orphaned_reservations(&sandbox, &world);
+    // Any call finds the leads gone and frees their reservations, as the daemon's own looks do.
+    assert_eq!(run(devlab(&sandbox, &wa, &["status"])).code, 0);
+
+    let gc = run(devlab(&sandbox, &wa, &["gc"]));
+    let again = run(devlab(&sandbox, &wa, &["gc"]));
+
+    assert_eq!(gc.code, 0, "{gc:?}");
+    assert_eq!(gc.stdout.lines().count(), 2, "{gc:?}");
+    for (line, pid) in gc.stdout.lines().zip(&pids) {
+        assert!(
+            line.ends_with(&format!("(sleep:{pid}, owner exited)")),
+            "{line}"
+        );
+    }
     assert_eq!((again.code, again.stdout.as_str()), (0, ""), "{again:?}");
 }
 
@@ -2911,6 +2972,31 @@ fn a_devlab_lease_release_with_stop_stack_from_a_broken_folder_still_ends_or_ref
             .starts_with(&format!("devlab: released lease 1 ({})", one.display())),
         "{ended:?}"
     );
+}
+
+#[test]
+fn stop_stack_stops_the_stack_the_lease_was_granted_though_its_project_id_changed_since() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-renamed");
+    let held = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--quiet"],
+    );
+    assert_eq!(held.code, 0, "{held:?}");
+    // The same project now names its Supabase project other, whose stack runs on slot 0 too.
+    fs::write(wt.join("supabase/config.toml"), "project_id = \"other\"\n")
+        .expect("rename the stack");
+    let containers = sandbox.path("world/containers");
+    let mut listed = fs::read_to_string(&containers).unwrap_or_default();
+    listed.push_str("supabase_db_other\n");
+    fs::write(&containers, listed).expect("run other's stack");
+
+    let out = owned(&sandbox, &wt, &["release", "--stop-stack"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(stack_stops(&sandbox, "other"), 0, "{out:?}");
+    assert_eq!(stack_stops(&sandbox, "demo"), 1, "{out:?}");
 }
 
 #[test]

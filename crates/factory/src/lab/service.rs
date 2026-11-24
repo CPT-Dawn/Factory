@@ -10,12 +10,12 @@
 
 mod keeper;
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock, mpsc};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use factory_adapters::adb::{Adb, AdbCli, AdbTrack};
 use factory_adapters::docker::{Containers, Docker};
@@ -35,7 +35,7 @@ use factory_core::lab::events::{Asked, LeaseEnd};
 use factory_core::lab::grant::{self, Ask, Decision};
 use factory_core::lab::js_number;
 use factory_core::lab::queue::{DeviceNeed, QueueEntry, devices_held_by, over_device_cap};
-use factory_core::lab::ready::{EpochMs, Readiness, for_grant};
+use factory_core::lab::ready::{Readiness, for_grant};
 use factory_core::lab::run::{End, Phase};
 use factory_core::lab::slots::{SlotView, slot_host_ports, slot_project_id};
 use rusqlite::Connection;
@@ -52,7 +52,8 @@ use super::wire::{
     AcquireParams, Board, DeviceAsk, DeviceLine, EXEC, EXEC_END, ExecEnd, ExecParams, FindParams,
     GC, Granted, LEASE, Lease, LeaseDevice, LeaseRunning, Owner, Process, ProjectAsk, RECEIVED,
     RELEASE, RUN_END, RUN_END_ID, RUN_START, RUN_STOPPING, ReleaseParams, Released, Reservation,
-    RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING, SlotParams, StopParams, UNRESERVE, Waiter,
+    RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING, SlotParams, StopParams, Stopping, UNRESERVE,
+    Waiter,
 };
 use super::{activity, events, readiness, reservations};
 use super::{android, host};
@@ -94,6 +95,16 @@ pub struct Lab {
     tracking: Once,
     /// The phone watcher's queue, once it runs ([`Lab::watch_phones`]).
     phones: OnceLock<mpsc::Sender<phones::Job>>,
+    /// Of each phone's last probe, by serial: when it began on this daemon's monotonic clock,
+    /// and of which attachment of the phone. What a grant judges the probe's age by, so a wall
+    /// clock that steps can't make an old ready probe count (#63). Written with the phone's
+    /// readiness row and read beside it, under the store's lock.
+    marks: Mutex<HashMap<String, Mark>>,
+    /// The lines of the reservations writes dropped since the last `gc` was told them.
+    untold: Mutex<Vec<String>>,
+    /// Taken to mark adb's list stale, and by a device grant from its last look at the list
+    /// until it has committed: no grant commits from a list whose stream ended before (#63).
+    list_gate: Mutex<()>,
     /// The waiters whose callers are connected to this daemon; the rest are kept for callers
     /// that come back after a restart, until they can't.
     callers: Mutex<HashSet<i64>>,
@@ -114,9 +125,36 @@ struct DeviceList {
     shown: Option<Vec<Attached>>,
     /// The stream that showed it ended and no list has followed yet.
     stale: bool,
-    /// Since when (ms since the epoch) adb has shown each device as it shows it now, by serial:
-    /// a probe of the phone made before is of an earlier attachment, or state, of it.
+    /// Which attachment of each device adb shows now, by serial: the number of the list that
+    /// first showed it as it shows it now. A probe of another is of an earlier attachment, or
+    /// state, of it.
     since: BTreeMap<String, i64>,
+    /// How many lists the streams have shown.
+    lists: i64,
+    /// How many streams have ended: a grant that read the list checks, as it commits, that
+    /// none ended meanwhile (#63).
+    ends: u64,
+}
+
+/// Of a phone's last probe: when it began, on the daemon's monotonic clock, and of which
+/// attachment of the phone ([`DeviceList::since`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Mark {
+    pub attachment: i64,
+    pub at: std::time::Instant,
+}
+
+impl Mark {
+    /// How many ms before `now` the probe began.
+    pub fn age_ms(self, now: std::time::Instant) -> i64 {
+        i64::try_from(now.saturating_duration_since(self.at).as_millis()).unwrap_or(i64::MAX)
+    }
+}
+
+/// The watcher's probes as a look reads them: each phone's readiness row, and its [`Mark`].
+pub(super) struct Probes {
+    rows: Vec<readiness::ReadyRow>,
+    marks: HashMap<String, Mark>,
 }
 
 impl DeviceList {
@@ -174,6 +212,9 @@ impl Lab {
             attached: watch::Sender::new(DeviceList::default()),
             tracking: Once::new(),
             phones: OnceLock::new(),
+            marks: Mutex::new(HashMap::new()),
+            untold: Mutex::new(Vec::new()),
+            list_gate: Mutex::new(()),
             watched: Mutex::new(HashSet::new()),
             stopping: Mutex::new(keeper::Stopping::default()),
             callers: Mutex::new(HashSet::new()),
@@ -226,7 +267,7 @@ impl Lab {
                         &tracker,
                         tracker.pace,
                         &|list| {
-                            let since = {
+                            let (since, lists, ends) = {
                                 let last = lab.attached.borrow();
                                 // After a gap in the stream, each device may have been
                                 // plugged in again: all are new.
@@ -234,22 +275,36 @@ impl Lab {
                                     Some(shown) if !last.stale => shown.as_slice(),
                                     _ => &[],
                                 };
-                                shown_since(before, &last.since, &list, now_ms())
+                                let lists = last.lists + 1;
+                                (
+                                    shown_since(before, &last.since, &list, lists),
+                                    lists,
+                                    last.ends,
+                                )
                             };
-                            lab.saw_phones(&list);
+                            lab.saw_phones(&list, &since);
                             lab.attached.send_replace(DeviceList {
                                 shown: Some(list),
                                 stale: false,
                                 since,
+                                lists,
+                                ends,
                             });
                             lab.notify();
                         },
                         &|| {
-                            // Under the store's lock: a grant reads the list and commits under
-                            // it, so none commits from a list whose stream ended after it read it.
-                            let store = lock_ignoring_poison(&lab.store);
-                            lab.attached.send_modify(|d| d.stale = true);
-                            drop(store);
+                            // Marked under the list gate, not the store's lock: a grant deciding
+                            // from the list sees it at its last check and gives nothing from it,
+                            // and one past that check has committed by the time the gate is ours.
+                            // Once the store's lock is ours too, none that read it still decides.
+                            {
+                                let _gate = lock_ignoring_poison(&lab.list_gate);
+                                lab.attached.send_modify(|d| {
+                                    d.stale = true;
+                                    d.ends += 1;
+                                });
+                            }
+                            drop(lock_ignoring_poison(&lab.store));
                             lab.phone_stream_ended();
                             lab.notify();
                         },
@@ -276,14 +331,24 @@ impl Lab {
     /// followed them are recorded as `daemon-stopped`. The reverses the dropped leases' devices
     /// were given are taken back beside it, after the transaction.
     fn write<T>(&self, work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>) -> Answer<T> {
-        self.write_telling(work).map(|(out, _)| out)
+        self.write_inner(false, work).map(|(out, _)| out)
     }
 
-    /// [`Lab::write`], and a line for each lease and reservation this very write dropped
-    /// because its owner exited: what `devlab gc` reports. One the keeper dropped earlier is
-    /// not told again.
+    /// [`Lab::write`], and a line for each lease this very write dropped because its owner
+    /// exited, and for each reservation dropped since the last such call: what `devlab gc`
+    /// reports. A lease the keeper dropped earlier is not told again. A reservation is freed by
+    /// whichever write finds its lead gone or its time up, most often one the daemon makes on its
+    /// own: the next `gc` tells it, once (#63).
     fn write_telling<T>(
         &self,
+        work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>,
+    ) -> Answer<(T, Vec<String>)> {
+        self.write_inner(true, work)
+    }
+
+    fn write_inner<T>(
+        &self,
+        tell: bool,
         work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>,
     ) -> Answer<(T, Vec<String>)> {
         let mut store = self
@@ -322,6 +387,17 @@ impl Lab {
                 code: Exit::Precondition.code(),
                 message: format!("lab store {}: {e}; retry", self.path.display()),
             })?;
+        let notify = !freed.is_empty() || !unreserved.is_empty();
+        // Under the store's lock, so no gc misses a reservation another write just dropped.
+        let unreserved = {
+            let mut untold = lock_ignoring_poison(&self.untold);
+            untold.extend(unreserved.iter().cloned());
+            if tell {
+                std::mem::take(&mut *untold)
+            } else {
+                Vec::new()
+            }
+        };
         drop(store);
         let _ = self.wake.send(());
         let lines: Vec<String> = freed
@@ -329,7 +405,7 @@ impl Lab {
             .map(|l| format!("lease {} ({}, owner exited)", l.id, l.owner_label))
             .chain(unreserved)
             .collect();
-        if !lines.is_empty() || unstopped > 0 || !ended.is_empty() {
+        if notify || unstopped > 0 || !ended.is_empty() {
             self.notify();
         }
         let freed: Vec<Lease> = freed.into_iter().chain(ended).collect();
@@ -652,23 +728,22 @@ fn not_yours(lease: &Lease) -> ErrorBody {
     }
 }
 
-/// The caller's lease, its slot marked as stopping for `p.stopper`.
-fn stopping(lab: &Lab, p: StopParams) -> Answer<Option<Lease>> {
+/// The caller's lease, its slot marked as stopping for `p.stopper`, and the stack it was granted.
+fn stopping(lab: &Lab, p: StopParams) -> Answer<Option<Stopping>> {
     lab.write(|c, _| {
         let f = &p.find;
         let lease = match own_lease(c, f)? {
             Ok(lease) => lease,
             Err(refused) => return Ok(Err(refused)),
         };
-        if let Some(Lease {
-            project: Some(project),
-            slot: Some(slot),
-            ..
-        }) = &lease
-        {
-            store::mark_stopping(c, project, *slot, &p.stopper)?;
+        let Some(lease) = lease else {
+            return Ok(Ok(None));
+        };
+        if let (Some(project), Some(slot)) = (&lease.project, lease.slot) {
+            store::mark_stopping(c, project, slot, &p.stopper)?;
         }
-        Ok(Ok(lease))
+        let stack = store::lease_stack(c, lease.id)?;
+        Ok(Ok(Some(Stopping { lease, stack })))
     })?
 }
 
@@ -863,10 +938,14 @@ fn plan(
     lease: Option<&Lease>,
     sight: Sight<'_>,
     mem_available_mb: i64,
-    now: EpochMs,
+    now: std::time::Instant,
     stopping: &keeper::Stopping,
 ) -> rusqlite::Result<Result<Option<Planned>, String>> {
-    let Sight { seen, since } = sight;
+    let Sight {
+        seen,
+        since,
+        probes,
+    } = sight;
     let mut have = 0u32;
     for held in lease.map_or(&[][..], |l| l.devices.as_slice()) {
         if state_of(seen, &held.serial) == Some("device") {
@@ -886,8 +965,7 @@ fn plan(
         seen.iter()
             .filter(move |a| a.kind == "phone" && a.state == state)
     };
-    let rows = readiness::all(c)?;
-    let ready_of = |a: &Attached| grant_readiness(&rows, since, a, now);
+    let ready_of = |a: &Attached| grant_readiness(probes, since, a, now);
     let mode = Mode::from_word(&ask.mode);
     let mut free_phones: Vec<String> = phones("device")
         .filter(|a| !is_taken(&a.serial) && ready_of(a) == Some(Readiness::Ready))
@@ -951,36 +1029,43 @@ fn plan(
     }))
 }
 
-/// What phone `a` is to a grant at `now` ([`for_grant`]), from the watcher's `rows` as the
-/// store has them now: a row from a probe made before adb showed the phone as it does now
-/// (`since`, in ms since the epoch) is of an earlier attachment, or state, of it, and not about it.
+/// What phone `a` is to a grant at `now` ([`for_grant`]), from the watcher's `probes` as the
+/// store has them now: a probe of another attachment of the phone than the one adb shows now
+/// (`since`) is of an earlier attachment, or state, of it, and not about it. Its age is
+/// told on the monotonic clock.
 pub(super) fn grant_readiness(
-    rows: &[readiness::ReadyRow],
+    probes: &Probes,
     since: &BTreeMap<String, i64>,
     a: &Attached,
-    now: EpochMs,
+    now: std::time::Instant,
 ) -> Option<Readiness> {
-    let row = rows.iter().find(|r| {
-        r.serial == a.serial
-            && since
+    let attachment = since.get(&a.serial);
+    let probed = probes
+        .rows
+        .iter()
+        .find(|r| r.serial == a.serial)
+        .and_then(|r| {
+            let mark = probes
+                .marks
                 .get(&a.serial)
-                .is_some_and(|&from| r.probed_ms >= EpochMs(from))
-    });
-    for_grant(&a.state, row.map(|r| (r.known.readiness, r.probed_ms)), now)
+                .filter(|m| Some(&m.attachment) == attachment)?;
+            Some((r.known.readiness, mark.age_ms(now)))
+        });
+    for_grant(&a.state, probed)
 }
 
 /// Whether phone `a` is one a grant could take ([`grant_readiness`]): ready, or ready when last
 /// probed too long ago, which the grant probes again before it believes.
 pub(super) fn grantable(
-    rows: &[readiness::ReadyRow],
+    probes: &Probes,
     since: &BTreeMap<String, i64>,
     a: &Attached,
-    now: EpochMs,
+    now: std::time::Instant,
 ) -> bool {
     a.kind == "phone"
         && a.state == "device"
         && matches!(
-            grant_readiness(rows, since, a, now),
+            grant_readiness(probes, since, a, now),
             None | Some(Readiness::Ready)
         )
 }
@@ -991,19 +1076,28 @@ fn ready_lapsed(
     c: &Connection,
     ask: &DeviceAsk,
     sight: &Sight<'_>,
-    now: EpochMs,
+    now: std::time::Instant,
 ) -> rusqlite::Result<bool> {
     if Mode::from_word(&ask.mode) == Mode::Emulator {
         return Ok(false);
     }
     let taken = store::taken(c)?;
-    let rows = readiness::all(c)?;
     Ok(sight.seen.iter().any(|a| {
         a.kind == "phone"
             && a.state == "device"
             && !taken.contains(&a.serial)
-            && grant_readiness(&rows, sight.since, a, now).is_none()
+            && grant_readiness(sight.probes, sight.since, a, now).is_none()
     }))
+}
+
+impl Lab {
+    /// The watcher's probes as the store has them now; called in a transaction.
+    pub(super) fn probes(&self, c: &Connection) -> rusqlite::Result<Probes> {
+        Ok(Probes {
+            rows: readiness::all(c)?,
+            marks: lock_ignoring_poison(&self.marks).clone(),
+        })
+    }
 }
 
 /// What a look at a request sees of the devices: adb's list now, and since when it has shown
@@ -1011,6 +1105,7 @@ fn ready_lapsed(
 struct Sight<'a> {
     seen: &'a [Attached],
     since: &'a BTreeMap<String, i64>,
+    probes: &'a Probes,
 }
 
 /// A device plan, and the emulator indexes in use when it was made.
@@ -1028,6 +1123,9 @@ enum Refused {
     Reprobe,
     /// It is never served, for this: it gives up at once (exit 75).
     Never(String),
+    /// Its wait was over by the time its look would have granted: the deadline wins over a
+    /// probe that ended after it (#63). Nothing the look did is kept.
+    Late,
 }
 
 impl Refused {
@@ -1036,6 +1134,7 @@ impl Refused {
         match self {
             Refused::Wait(why) | Refused::Never(why) => why,
             Refused::Reprobe => "a phone is being probed again".to_owned(),
+            Refused::Late => "the wait ended before the phones' probes did".to_owned(),
         }
     }
 }
@@ -1251,31 +1350,52 @@ fn ends_with_run(
     }
 }
 
+/// Keeps the stack lease `lease` is granted for its slot, by the project id request `p` named it
+/// with: the one its `--stop-stack` stops (#63).
+fn granted_stack(c: &Connection, p: &AcquireParams, lease: &Lease) -> rusqlite::Result<()> {
+    match (&p.project, lease.slot) {
+        (
+            Some(ProjectAsk {
+                stack: Some(stack), ..
+            }),
+            Some(slot),
+        ) => store::set_lease_stack(c, lease.id, &slot_project_id(&stack.project_id, slot)),
+        _ => Ok(()),
+    }
+}
+
 /// The lease granted, or why the request waits.
 /// `reprobe`: whether a phone's ready probe found too old asks for a [`Refused::Reprobe`];
-/// else the phone is taken for offline.
+/// else the phone is taken for offline. `by`: when the request's wait ends, if it had not when
+/// the look began; a device grant decided after it is [`Refused::Late`].
 fn try_grant(
     lab: &Lab,
     p: &AcquireParams,
     waiter: i64,
     facts: &Facts,
     reprobe: bool,
+    by: Option<std::time::Instant>,
 ) -> Answer<Result<Taken, Refused>> {
+    // Held from a device grant's last check until its transaction has committed: a stream that
+    // ends meanwhile waits for the commit to mark its list stale.
+    let mut gate = None;
     let looked = lab.write(|c, now| {
-        // Probes are timed in ms, a lease in seconds.
-        let probed_by = EpochMs(now_ms());
+        // A probe's age is told on the monotonic clock, a lease's in seconds.
+        let probed_by = std::time::Instant::now();
         // Devices are planned from the list adb shows as this transaction runs, never from
-        // one read before the probes. A stream that ends marks its list stale under the
-        // store's lock, so not while this runs: none is granted from a list its stream stopped
-        // following, and the request waits for the stream to show one again. A request for
-        // no device goes on.
-        let (attached, since) = match &p.devices {
+        // one read before the probes. A stream that ends marks its list stale, counting the
+        // end, under the list gate: a device grant checks under that gate, held until it has
+        // committed, that no stream ended since this read, so none is granted from a list its
+        // stream stopped following, and the request waits for the stream to show one again. A
+        // request for no device goes on.
+        let (attached, since, ends) = match &p.devices {
             Some(_) => {
                 let list = lab.attached.borrow();
-                (list.live(), list.since.clone())
+                (list.live(), list.since.clone(), list.ends)
             }
-            None => (Some(Vec::new()), BTreeMap::new()),
+            None => (Some(Vec::new()), BTreeMap::new(), 0),
         };
+        let probes = lab.probes(c)?;
         // Before anything is written: a look that has a phone probed again keeps nothing.
         if reprobe
             && let (Some(ask), Some(seen)) = (&p.devices, &attached)
@@ -1285,12 +1405,16 @@ fn try_grant(
                 &Sight {
                     seen,
                     since: &since,
+                    probes: &probes,
                 },
                 probed_by,
             )?
         {
             return Ok(Err(Refused::Reprobe));
         }
+        // What a device grant writes from here is undone when it turns out to come too late, or
+        // from a list whose stream ended meanwhile.
+        c.execute_batch("SAVEPOINT look")?;
         let mut lease = store::find_lease(c, &p.worktree, &p.owner, p.lease)?;
         // A reservation of the caller's project is used once: it becomes the caller's lease,
         // without a turn in the queue. One that is gone (used, released or its lead exited)
@@ -1321,6 +1445,7 @@ fn try_grant(
                 None => None,
             };
             store::touch(c, lease.id, now)?;
+            granted_stack(c, p, lease)?;
             let reservation = claimed.as_ref().map(|r| r.id);
             events::lease_began(c, lease.id, reservation, 0)?;
             let waited = events::wait_event(c, waiter, &asked(p), true, None, now)?;
@@ -1350,6 +1475,7 @@ fn try_grant(
                 Sight {
                     seen: attached,
                     since: &since,
+                    probes: &probes,
                 },
                 facts.mem_available_mb,
                 probed_by,
@@ -1361,11 +1487,28 @@ fn try_grant(
             Ok(planned) => (planned, None),
             Err(why) => (None, Some(why)),
         };
+        // All phones but one may go to one owner, of those ready or leased: an offline,
+        // unauthorized or locked one is no phone to share, nor one whose ready probe is too old
+        // to grant on (#63).
+        let taken = store::taken(c)?;
+        let sharable = attached.as_deref().map(|seen| {
+            let n = seen
+                .iter()
+                .filter(|a| {
+                    a.kind == "phone"
+                        && (taken.contains(&a.serial)
+                            || grant_readiness(&probes, &since, a, probed_by)
+                                == Some(Readiness::Ready))
+                })
+                .count();
+            u32::try_from(n).unwrap_or(u32::MAX)
+        });
         let devices = p.devices.as_ref().map(|ask| {
             device_need(
                 ask,
                 lease.as_ref(),
                 attached.as_deref(),
+                sharable,
                 devices_wait.is_some(),
             )
         });
@@ -1441,6 +1584,7 @@ fn try_grant(
         if fresh {
             ends_with_run(c, p, waiter, &lease, from.as_ref())?;
         }
+        granted_stack(c, p, &lease)?;
         let (mut boots, mut phones, mut reused) = (Vec::new(), Vec::new(), Vec::new());
         // A grant is the answer to a reclaim: the lease holds what this request asked for.
         activity::clear_reclaimed(c, lease.id)?;
@@ -1489,6 +1633,27 @@ fn try_grant(
             store::delete_waiter(c, waiter)?;
         }
         let lease = store::lease(c, lease.id)?.unwrap_or(lease);
+        if p.devices.is_some() {
+            // The deadline wins over a probe that ended after it, and a stream that ended as
+            // this look decided leaves nothing granted from its list: the request waits for the
+            // next one (#63).
+            let held = lock_ignoring_poison(&lab.list_gate);
+            let late = by.is_some_and(|by| std::time::Instant::now() >= by);
+            let lost = {
+                let list = lab.attached.borrow();
+                list.stale || list.ends != ends
+            };
+            if late || lost {
+                c.execute_batch("ROLLBACK TO look; RELEASE look")?;
+                return Ok(Err(if late {
+                    Refused::Late
+                } else {
+                    Refused::Wait(ADB_RESTARTING.to_owned())
+                }));
+            }
+            gate = Some(held);
+        }
+        c.execute_batch("RELEASE look")?;
         Ok(Ok(Taken {
             granted: Granted {
                 lease,
@@ -1502,8 +1667,9 @@ fn try_grant(
             from,
             waited,
         }))
-    })?;
-    match looked {
+    });
+    drop(gate);
+    match looked? {
         Err(Refused::Never(message)) => Err(ErrorBody {
             code: Exit::Busy.code(),
             message,
@@ -1513,11 +1679,13 @@ fn try_grant(
 }
 
 /// What request `ask` asks of devices, as a look sees it: with lease `lease` (when it has one)
-/// and adb's list `seen` (none: stale); `short`: no free device of its kind was there.
+/// and adb's list `seen` (none: stale); `sharable`: how many phones on it are ready or leased
+/// (none: stale); `short`: no free device of its kind was there.
 fn device_need(
     ask: &DeviceAsk,
     lease: Option<&Lease>,
     seen: Option<&[Attached]>,
+    sharable: Option<u32>,
     short: bool,
 ) -> DeviceNeed {
     let usable = |serial: &str| {
@@ -1531,13 +1699,10 @@ fn device_need(
         .filter(|d| usable(&d.serial))
         .count();
     let have = u32::try_from(have).unwrap_or(u32::MAX);
-    // All phones but one, of those adb lists in any state; while its list is stale, only a cap
-    // the configs set holds.
-    let cap = match seen {
-        Some(seen) => {
-            let phones = seen.iter().filter(|a| a.kind == "phone").count();
-            device_cap(u32::try_from(phones).unwrap_or(u32::MAX), ask.max_per_owner)
-        }
+    // All phones but one, of those ready or leased, and at least one; while adb's list is
+    // stale, only a cap the configs set holds.
+    let cap = match sharable {
+        Some(phones) => device_cap(phones, ask.max_per_owner),
         None => ask.max_per_owner.map_or(u32::MAX, |cap| cap.max(1)),
     };
     DeviceNeed {
@@ -1961,6 +2126,9 @@ pub async fn acquire<W, R, S>(
         let tried = if !first && Instant::now() >= deadline {
             Ok(None)
         } else {
+            // A look begun before the wait's end grants nothing once it is over, however long
+            // its probes took (#63); one begun after it (a wait of 0) has its one look.
+            let by = (Instant::now() < deadline).then(|| deadline.into_std());
             let seen = if p.devices.is_some() {
                 lab.attached().await
             } else {
@@ -1977,7 +2145,7 @@ pub async fn acquire<W, R, S>(
                     // A ready probe found too old is made again while the wait lasts, a few
                     // times at most; past that, the phone is not known to be ready.
                     let reprobe = reprobes < REPROBES && Instant::now() < deadline;
-                    match try_grant(&lab, &p, waiter, &facts, reprobe)? {
+                    match try_grant(&lab, &p, waiter, &facts, reprobe, by)? {
                         Err(Refused::Reprobe) => {
                             reprobes += 1;
                             refresh_phones(&lab, &p, deadline);
@@ -2064,6 +2232,8 @@ pub async fn acquire<W, R, S>(
                 }
                 return;
             }
+            // A look past the wait says what the last one found, if one did.
+            Ok(Some(Err(Refused::Late))) if !said.is_empty() => said.clone(),
             Ok(Some(Err(refused))) => refused.why(),
             Err(body) => {
                 lab.remove_waiter(waiter);
@@ -2532,16 +2702,12 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, response: Response) -> bool
     writer.write_all(line.as_bytes()).await.is_ok()
 }
 
-/// Milliseconds since the epoch.
+/// Milliseconds since the epoch, on the lab's wall clock ([`crate::clock::lab_now_ms`]).
 pub(super) fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+    crate::clock::lab_now_ms()
 }
 
-/// Seconds since the epoch.
+/// Seconds since the epoch, on the lab's wall clock.
 pub fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+    now_ms().div_euclid(1000)
 }

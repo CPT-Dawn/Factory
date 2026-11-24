@@ -70,9 +70,9 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
             Done::new(
                 format!(
                     "factory lab: acquire, run, exec, env, release, stack, status, check, gc, reserve, prep, watch; usage in {}",
-                    file.display()
+                    shown(&file)
                 ),
-                json!({ "help": HELP, "helpFile": file }),
+                json!({ "help": HELP, "helpFile": path_json(&file) }),
             )
         }
         "status" => status_done(&status::board()?)?,
@@ -132,8 +132,8 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
         "reserve" if args.iter().any(|a| a == "-h" || a == "--help") => {
             let file = save("reserve-help.txt", reserve::USAGE)?;
             Done::new(
-                format!("factory lab reserve: usage in {}", file.display()),
-                json!({ "help": reserve::USAGE, "helpFile": file }),
+                format!("factory lab reserve: usage in {}", shown(&file)),
+                json!({ "help": reserve::USAGE, "helpFile": path_json(&file) }),
             )
         }
         "reserve" => reserve::done(args)?,
@@ -145,14 +145,17 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
                 many => {
                     let lines: String = many.iter().map(|f| format!("released {f}\n")).collect();
                     let file = save("gc.txt", &lines)?;
-                    Done::new(
+                    let mut done = Done::new(
                         format!(
                             "released {} leases of exited owners; list in {}",
                             many.len(),
-                            file.display()
+                            shown(&file)
                         ),
-                        json!({ "released": freed, "releasedFile": file }),
-                    )
+                        json!({ "released": freed, "releasedFile": path_json(&file) }),
+                    );
+                    // The path is the point of the line: never cut it.
+                    done.whole = true;
+                    done
                 }
             }
         }
@@ -179,12 +182,12 @@ fn check_done(phones: &[check::PhoneCheck]) -> Result<Done, Failure> {
         [one] => one.clone(),
         many => {
             let file = save("check.txt", &(many.join("\n") + "\n"))?;
-            json["checkFile"] = json!(file);
+            json["checkFile"] = path_json(&file);
             let ready = phones.iter().filter(|p| p.ready()).count();
             format!(
                 "{ready} of {} phones ready; each in {}",
                 phones.len(),
-                file.display()
+                shown(&file)
             )
         }
     };
@@ -210,11 +213,11 @@ fn prep_done(prepped: &[(String, Option<&str>)]) -> Result<Done, Failure> {
         many => {
             let file = save("prep.txt", &(many.join("\n") + "\n"))?;
             let warned = prepped.iter().filter(|(_, w)| w.is_some()).count();
-            json["prepFile"] = json!(file);
+            json["prepFile"] = path_json(&file);
             format!(
                 "prepped {} devices, {warned} with a warning; list in {}",
                 many.len(),
-                file.display()
+                shown(&file)
             )
         }
     };
@@ -230,11 +233,11 @@ fn status_done(board: &Board) -> Result<Done, Failure> {
         "{leases} lease{}, {} waiting; status in {}",
         if leases == 1 { "" } else { "s" },
         board.waiters.len(),
-        file.display()
+        shown(&file)
     );
     let mut json = serde_json::to_value(board).unwrap_or(Value::Null);
     if let Value::Object(fields) = &mut json {
-        fields.insert("statusFile".to_owned(), json!(file));
+        fields.insert("statusFile".to_owned(), path_json(&file));
     }
     Ok(Done::new(line, json))
 }
@@ -260,12 +263,12 @@ fn lease_done(ctx: &Ctx, lease: &Lease, warnings: &[String]) -> Result<Done, Fai
     let line = format!(
         "{}{warned}; env in {}",
         lease::summary(lease, project)?,
-        file.display()
+        shown(&file)
     );
     let vars: Map<String, Value> = env.into_iter().map(|(k, v)| (k, json!(v))).collect();
     Ok(Done::new(
         line,
-        json!({ "lease": lease, "env": vars, "envFile": file, "warnings": warnings }),
+        json!({ "lease": lease, "env": vars, "envFile": path_json(&file), "warnings": warnings }),
     ))
 }
 
@@ -295,11 +298,11 @@ fn ran_done(argv: &[String], code: u8, lease: Option<i64>, file: Option<&Path>) 
     let line = match (lease, file) {
         (Some(id), Some(file)) => format!(
             "{program} exited {code} in lease {id}; output in {}",
-            file.display()
+            shown(file)
         ),
         _ => format!("{program} exited {code} before it had a lease"),
     };
-    let json = json!({ "lease": lease, "exit": code, "outputFile": file });
+    let json = json!({ "lease": lease, "exit": code, "outputFile": file.map(path_json) });
     Verb::Ran(Done::new(line, json), code)
 }
 
@@ -348,10 +351,9 @@ fn release_done(released: &Released, target: Target) -> Result<Done, Failure> {
             short.push_str(&format!("; {held} still held"));
         }
         let file = save_new("release", &(lines.join("\n") + "\n"))?;
-        line = format!("{short}, list in {}", file.display());
+        line = format!("{short}, list in {}", shown(&file));
         let mut json = json;
-        // Lossy, never a panic: serde refuses a path that isn't UTF-8.
-        json["releasedFile"] = json!(file.to_string_lossy());
+        json["releasedFile"] = path_json(&file);
         let mut done = Done::new(line, json);
         // The path is the point of the line: never cut it.
         done.whole = true;
@@ -400,9 +402,52 @@ fn lab_dir() -> Result<PathBuf, Failure> {
     Ok(dir)
 }
 
+/// A report's path as a line says it: as it is, unless it holds a control character (a newline
+/// in `XDG_RUNTIME_DIR`, say) or a byte that isn't UTF-8, when it is quoted as bash's `$'...'`
+/// so that the line stays one line and still names the file (#63).
+fn shown(path: &Path) -> String {
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    if let Ok(plain) = std::str::from_utf8(bytes)
+        && !plain.chars().any(char::is_control)
+    {
+        return plain.to_owned();
+    }
+    let mut out = String::from("$'");
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            match c {
+                '\'' => out.push_str("\\'"),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                c if c.is_ascii_control() => {
+                    let _ = write!(out, "\\x{:02x}", u32::from(c));
+                }
+                c if c.is_control() => {
+                    let _ = write!(out, "\\u{:04x}", u32::from(c));
+                }
+                c => out.push(c),
+            }
+        }
+        for b in chunk.invalid() {
+            let _ = write!(out, "\\x{b:02x}");
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// A report's path as `--json` gives it: lossy where it isn't UTF-8, never a panic (serde
+/// refuses such a path).
+fn path_json(path: &Path) -> serde_json::Value {
+    serde_json::Value::String(path.to_string_lossy().into_owned())
+}
+
 fn unwritable(path: &Path, e: &std::io::Error) -> Failure {
     Failure::precondition(format!(
         "cannot write {}: {e}; check XDG_RUNTIME_DIR",
-        path.display()
+        shown(path)
     ))
 }

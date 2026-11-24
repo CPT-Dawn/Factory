@@ -44,16 +44,13 @@ pub fn refresh_again(was: Readiness, age_ms: i64) -> bool {
     probe_again(was, age_ms.saturating_add(GRANT_MARGIN_MS))
 }
 
-/// What a grant takes a phone to be at `now`: `state` is how adb shows it now, `probed` what
-/// the last probe of it found and when, if one was made since adb has shown it so.
+/// What a grant takes a phone to be: `state` is how adb shows it now, `probed` what the last
+/// probe of it found and how many ms ago it began, on a clock that never steps back, if one
+/// was made since adb has shown it so.
 /// A phone adb can't use is what adb says, whatever was probed before; one it can use is what
 /// its probe found, or offline before any. None: a ready probe more than [GRANT_FRESH_MS] old,
 /// which the grant has made again before it believes the phone ready.
-pub fn for_grant(
-    state: &str,
-    probed: Option<(Readiness, EpochMs)>,
-    now: EpochMs,
-) -> Option<Readiness> {
+pub fn for_grant(state: &str, probed: Option<(Readiness, i64)>) -> Option<Readiness> {
     if state != "device" {
         return Some(judge(&Probe {
             state: state.to_owned(),
@@ -65,7 +62,7 @@ pub fn for_grant(
     }
     match probed {
         None => Some(Readiness::Offline),
-        Some((Readiness::Ready, at)) if probe_again(Readiness::Ready, now.since(at)) => None,
+        Some((Readiness::Ready, age_ms)) if probe_again(Readiness::Ready, age_ms) => None,
         Some((readiness, _)) => Some(readiness),
     }
 }

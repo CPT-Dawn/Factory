@@ -304,6 +304,17 @@ pub struct ReleaseParams {
     pub all: bool,
 }
 
+/// The lease a `release --stop-stack` gives back, its slot held for the stop meanwhile, and the
+/// stack it was granted (its Supabase project id): the one stopped, whatever the worktree's
+/// config names now (#63). None from a daemon that kept none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stopping {
+    #[serde(flatten)]
+    pub lease: Lease,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<String>,
+}
+
 /// What a release did: the leases it dropped, and the caller's leases still held after it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Released {

@@ -31,7 +31,7 @@ $ a@plain-a devlab
 1> most maxSlotsPerOwner stack slots of a project (default: all but one), even when no one else waits.
 1> Over the cap it queues, naming the cap, and steps aside for other owners until one of its own
 1> leases ends. Devices count alike: at most maxDevicesPerOwner phones and emulators (default: all
-1> phones but one); a request for more is refused (exit 75). A request waiting for a phone lets requests
+1> ready or leased phones but one); a request for more is refused (exit 75). A request waiting for a phone lets requests
 1> that need none go first. Leased devices: ANDROID_SERIAL is set, so plain adb,
 1> maestro and expo commands reach only them. Phone builds' fixed ports reach your slot through adb reverse.
 1>
@@ -74,7 +74,7 @@ $ a@plain-a devlab help
 1> most maxSlotsPerOwner stack slots of a project (default: all but one), even when no one else waits.
 1> Over the cap it queues, naming the cap, and steps aside for other owners until one of its own
 1> leases ends. Devices count alike: at most maxDevicesPerOwner phones and emulators (default: all
-1> phones but one); a request for more is refused (exit 75). A request waiting for a phone lets requests
+1> ready or leased phones but one); a request for more is refused (exit 75). A request waiting for a phone lets requests
 1> that need none go first. Leased devices: ANDROID_SERIAL is set, so plain adb,
 1> maestro and expo commands reach only them. Phone builds' fixed ports reach your slot through adb reverse.
 1>

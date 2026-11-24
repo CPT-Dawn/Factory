@@ -1,10 +1,12 @@
 //! The daemon's watch over phones (#55): a phone is prepped when adb's stream first shows it as
 //! `device` and after every replug, every attached phone is probed every `readinessCheckSec`,
 //! and its readiness is kept in the store. Each change of it posts one desktop notification
-//! saying what to do. One thread does it all, so the probes, the store's rows and the
-//! notifications follow the stream's order; `devlab check` is answered on it too.
+//! saying what to do: one per change of a phone, told by its serial and named the same way each
+//! time, and an offline that its unplug soon follows is said as the unplug alone (#63). One
+//! thread does it all, so the probes, the store's rows and the notifications follow the stream's
+//! order; `devlab check` is answered on it too.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -15,14 +17,14 @@ use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{Attached, LOCK_PROBE, prep_command};
 use factory_core::lab::events as event;
 use factory_core::lab::ready::{
-    AUTH_TIMEOUT_PROBE, BATTERY_PROBE, EpochMs, Notice, POWER_PROBE, Probe, Readiness,
+    AUTH_TIMEOUT_PROBE, BATTERY_PROBE, EpochMs, Known, Notice, POWER_PROBE, Probe, Readiness,
     STAY_ON_PROBE, after, auth_timeout_warning, judge, notice, refresh_again, unplugged,
 };
 
 use super::super::check::PhoneCheck;
 use super::super::readiness::{self, ReadyRow};
 use super::super::{context, events};
-use super::{Answer, Lab, failed, now_ms};
+use super::{Answer, Lab, Mark, failed, lock_ignoring_poison, now_ms};
 
 /// How old a probe `devlab check` answers from may be.
 const FRESH_MS: i64 = 10_000;
@@ -30,11 +32,15 @@ const FRESH_MS: i64 = 10_000;
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long `devlab check` waits for the watcher's answer.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long an offline is held back: a phone being unplugged goes offline first, and its unplug
+/// within this is said alone.
+const FOLD: Duration = Duration::from_secs(3);
 
 /// What the watcher thread is asked to do.
 pub enum Job {
-    /// adb's stream showed this list.
-    Frame(Vec<Attached>),
+    /// adb's stream showed this list, and which attachment of each device it shows
+    /// ([`super::DeviceList::since`]).
+    Frame(Vec<Attached>, BTreeMap<String, i64>),
     /// adb's stream ended: whatever it shows next, the phones on it may have been plugged in
     /// again meanwhile.
     StreamEnded,
@@ -60,8 +66,12 @@ impl Lab {
                     adb: Box::new(AdbCli),
                     desktop: Box::new(NotifySend),
                     shown: Vec::new(),
+                    since: BTreeMap::new(),
                     said_missing: false,
                     doubted: HashSet::new(),
+                    said: HashMap::new(),
+                    models: HashMap::new(),
+                    held: HashMap::new(),
                 }
                 .run(&rx);
             });
@@ -72,9 +82,9 @@ impl Lab {
 
     /// Tells the watcher what adb's stream showed; called before the list is told to anyone
     /// else, so anything that saw the list is answered after the watcher has it.
-    pub(super) fn saw_phones(&self, list: &[Attached]) {
+    pub(super) fn saw_phones(&self, list: &[Attached], since: &BTreeMap<String, i64>) {
         if let Some(tx) = self.phones.get() {
-            let _ = tx.send(Job::Frame(list.to_vec()));
+            let _ = tx.send(Job::Frame(list.to_vec(), since.clone()));
         }
     }
 
@@ -131,10 +141,25 @@ struct Watcher {
     desktop: Box<dyn Desktop>,
     /// The phones the last list showed.
     shown: Vec<Attached>,
+    /// Which attachment of each device the last list shows.
+    since: BTreeMap<String, i64>,
     /// Whether the log already said notify-send is missing.
     said_missing: bool,
     /// The phones whose last probe got no answer.
     doubted: HashSet<String>,
+    /// What was last said of each phone, by serial: no change is said twice.
+    said: HashMap<String, Said>,
+    /// Each phone's model, by serial, as adb last named it: an offline phone's line names none.
+    models: HashMap<String, String>,
+    /// The offlines held back, by serial: each notice and when it is said.
+    held: HashMap<String, (Notice, Instant)>,
+}
+
+/// What a notification said of a phone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Said {
+    Is(Readiness),
+    Unplugged,
 }
 
 /// The machine config now; its defaults when it can't be read (the CLI says why).
@@ -146,27 +171,41 @@ fn every(cfg: &MachineConfig) -> Duration {
     Duration::try_from_secs_f64(cfg.readiness_check_sec).unwrap_or(Duration::from_secs(60))
 }
 
-/// The name a notification gives a phone: its model, else its serial.
-fn name(model: &str, serial: &str) -> String {
+/// The name a notification gives phone `serial`: its `model`, else its serial; with the last 4
+/// of its serial when `shared`, another attached phone being of its model.
+fn name(model: &str, serial: &str, shared: bool) -> String {
     if model.is_empty() {
-        serial.to_owned()
-    } else {
-        model.to_owned()
+        return serial.to_owned();
     }
+    if !shared {
+        return model.to_owned();
+    }
+    let chars: Vec<char> = serial.chars().collect();
+    let last: String = chars[chars.len().saturating_sub(4)..].iter().collect();
+    format!("{model} ({last})")
 }
 
 impl Watcher {
     fn run(&mut self, jobs: &mpsc::Receiver<Job>) {
         let mut next = Instant::now() + every(&config());
         loop {
-            match jobs.recv_timeout(next.saturating_duration_since(Instant::now())) {
-                Ok(Job::Frame(list)) => {
+            let until = self
+                .held
+                .values()
+                .map(|(_, at)| *at)
+                .fold(next, Instant::min);
+            match jobs.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(Job::Frame(list, since)) => {
+                    self.since = since;
                     self.frame(list);
                     // Its probes are written: a request waiting for a phone looks again.
                     self.lab.notify();
                 }
                 // The next list's phones are all new to it: each is prepped and probed again.
-                Ok(Job::StreamEnded) => self.shown.clear(),
+                Ok(Job::StreamEnded) => {
+                    self.shown.clear();
+                    self.since.clear();
+                }
                 Ok(Job::Check(serials, fresh, reply)) => {
                     let _ = reply.send(self.check(&serials, fresh));
                 }
@@ -174,7 +213,9 @@ impl Watcher {
                     self.refresh(&serials, by);
                     let _ = reply.send(());
                 }
+                Err(RecvTimeoutError::Timeout) if Instant::now() < next => self.say_held(),
                 Err(RecvTimeoutError::Timeout) => {
+                    self.say_held();
                     for phone in self.shown.clone() {
                         if phone.state == "device" {
                             self.probe(&phone);
@@ -192,6 +233,12 @@ impl Watcher {
     fn frame(&mut self, list: Vec<Attached>) {
         let phones: Vec<Attached> = list.into_iter().filter(|a| a.kind == "phone").collect();
         let rows = self.lab.write(|c, _| readiness::all(c)).unwrap_or_default();
+        // An offline phone's line names no model: the one adb, or its row, named before stays.
+        for r in rows.iter().filter(|r| !r.model.is_empty()) {
+            self.models
+                .entry(r.serial.clone())
+                .or_insert_with(|| r.model.clone());
+        }
         for gone in rows
             .iter()
             .filter(|r| !phones.iter().any(|p| p.serial == r.serial))
@@ -199,10 +246,16 @@ impl Watcher {
             let holder = self.lab.write(|c, _| {
                 let holder = readiness::holder(c, &gone.serial)?;
                 readiness::drop_row(c, &gone.serial)?;
+                lock_ignoring_poison(&self.lab.marks).remove(&gone.serial);
                 Ok(holder)
             });
-            let name = name(&gone.model, &gone.serial);
-            self.post(&unplugged(&name, holder.ok().flatten().as_deref()));
+            // Named as it was while attached: the list it was on is still the one shown.
+            let name = self.name_of(&gone.serial);
+            let said = unplugged(&name, holder.ok().flatten().as_deref());
+            self.say(&gone.serial, Said::Unplugged, said);
+        }
+        for p in phones.iter().filter(|p| !p.model.is_empty()) {
+            self.models.insert(p.serial.clone(), p.model.clone());
         }
         let before = std::mem::replace(&mut self.shown, phones.clone());
         self.doubted.clear();
@@ -219,7 +272,72 @@ impl Watcher {
                 );
                 self.probe(phone);
             } else {
-                self.record(phone, judge(&unprobed(phone)), None, now_ms());
+                let mark = self.mark(&phone.serial);
+                self.record(phone, judge(&unprobed(phone)), None, now_ms(), mark);
+            }
+        }
+    }
+
+    /// Of a probe of phone `serial` that begins now: its [`Mark`], of the attachment the last
+    /// list shows.
+    fn mark(&self, serial: &str) -> Option<Mark> {
+        self.since.get(serial).map(|&attachment| Mark {
+            attachment,
+            at: Instant::now(),
+        })
+    }
+
+    /// The name notifications give phone `serial`: its model, with the last 4 of its serial once
+    /// another phone of the same model has been plugged in while this daemon runs, so that a
+    /// phone keeps its name as its twin comes and goes; its serial while no model is known.
+    fn name_of(&self, serial: &str) -> String {
+        let model = self.models.get(serial).map_or("", String::as_str);
+        let shared = !model.is_empty()
+            && self
+                .models
+                .iter()
+                .any(|(other, m)| other != serial && m == model);
+        name(model, serial, shared)
+    }
+
+    /// Says `n`: phone `serial` is now `what`, unless that was the last thing said of it. An
+    /// offline is held back for [`FOLD`]: an unplug that follows is said in its place, and any
+    /// other change has the offline said first.
+    fn say(&mut self, serial: &str, what: Said, n: Notice) {
+        if what == Said::Is(Readiness::Offline) {
+            if self.said.get(serial) != Some(&what) && !self.held.contains_key(serial) {
+                self.held
+                    .insert(serial.to_owned(), (n, Instant::now() + FOLD));
+            }
+            return;
+        }
+        if let Some((offline, _)) = self.held.remove(serial)
+            && what != Said::Unplugged
+        {
+            self.said
+                .insert(serial.to_owned(), Said::Is(Readiness::Offline));
+            self.post(&offline);
+        }
+        if self.said.get(serial) == Some(&what) {
+            return;
+        }
+        self.said.insert(serial.to_owned(), what);
+        self.post(&n);
+    }
+
+    /// Says each offline held back for [`FOLD`] that nothing followed.
+    fn say_held(&mut self) {
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .held
+            .iter()
+            .filter(|(_, (_, at))| *at <= now)
+            .map(|(serial, _)| serial.clone())
+            .collect();
+        for serial in due {
+            if let Some((n, _)) = self.held.remove(&serial) {
+                self.said.insert(serial, Said::Is(Readiness::Offline));
+                self.post(&n);
             }
         }
     }
@@ -229,6 +347,7 @@ impl Watcher {
         // A probe is as old as its start: one begun before the phone was plugged in again is
         // not about it.
         let at = now_ms();
+        let mark = self.mark(&phone.serial);
         let shell = |cmd: &str| self.adb.shell(&phone.serial, cmd);
         let probe = Probe {
             state: phone.state.clone(),
@@ -252,7 +371,7 @@ impl Watcher {
         } else {
             None
         };
-        self.record(phone, readiness, warning, at)
+        self.record(phone, readiness, warning, at, mark)
     }
 
     /// Whether adb's latest list still shows `serial` as `device`.
@@ -268,40 +387,53 @@ impl Watcher {
             })
     }
 
-    /// Keeps `phone`'s readiness, found at `at` (ms since the epoch), and posts the
-    /// notification a change of it earns.
+    /// Keeps `phone`'s readiness, found by a probe begun at `at` (ms since the epoch, as
+    /// shown) and `mark`, and says the notification a change of it earns.
     fn record(
         &mut self,
         phone: &Attached,
         readiness: Readiness,
         warning: Option<&str>,
         at: i64,
+        mark: Option<Mark>,
     ) -> Option<ReadyRow> {
+        let name = self.name_of(&phone.serial);
         let written = self.lab.write(|c, _| {
-            let before = readiness::get(c, &phone.serial)?.map(|r| r.known);
+            let kept = readiness::get(c, &phone.serial)?;
+            let before: Option<Known> = kept.as_ref().map(|r| r.known);
+            // An offline phone's line names no model: its row keeps the one it had.
+            let model = match kept {
+                Some(r) if phone.model.is_empty() => r.model,
+                _ => phone.model.clone(),
+            };
             let row = ReadyRow {
                 serial: phone.serial.clone(),
-                model: phone.model.clone(),
+                model,
                 known: after(before, readiness),
                 warning: warning.map(str::to_owned),
                 probed_ms: EpochMs(at),
             };
             readiness::put(c, &row)?;
-            let said = notice(&name(&phone.model, &phone.serial), before, readiness);
+            let mut marks = lock_ignoring_poison(&self.lab.marks);
+            match mark {
+                Some(mark) => marks.insert(phone.serial.clone(), mark),
+                None => marks.remove(&phone.serial),
+            };
+            drop(marks);
+            let said = notice(&name, before, readiness);
             let was = before.map(|k| k.readiness);
             let changed = was != Some(readiness);
             if changed {
                 // Notified: the change earns a notification and notifications are on.
                 let notified = said.is_some() && config().notify;
-                let fields =
-                    event::readiness(&phone.model, &phone.serial, was, readiness, notified);
+                let fields = event::readiness(&row.model, &phone.serial, was, readiness, notified);
                 events::queue(c, "lab-readiness", &fields)?;
             }
             Ok((row, said, changed))
         });
         let (row, said, changed) = written.ok()?;
         if let Some(said) = said {
-            self.post(&said);
+            self.say(&phone.serial, Said::Is(readiness), said);
         }
         if changed {
             // A request waiting for a phone looks again.
@@ -342,16 +474,35 @@ impl Watcher {
     /// it is, else what a new probe finds. None: a phone that did not answer.
     fn current(&mut self, phone: &Attached, stale: fn(Readiness, i64) -> bool) -> Option<ReadyRow> {
         let kept = self
-            .lab
-            .write(|c, _| readiness::get(c, &phone.serial))
-            .ok()
-            .flatten()
-            .filter(|r| !stale(r.known.readiness, EpochMs(now_ms()).since(r.probed_ms)));
+            .kept(&phone.serial)
+            .filter(|(r, age)| !stale(r.known.readiness, *age))
+            .map(|(r, _)| r);
         match kept {
             Some(row) => Some(row),
             None if phone.state == "device" => self.probe(phone),
-            None => self.record(phone, judge(&unprobed(phone)), None, now_ms()),
+            None => {
+                let mark = self.mark(&phone.serial);
+                self.record(phone, judge(&unprobed(phone)), None, now_ms(), mark)
+            }
         }
+    }
+
+    /// Phone `serial`'s row, and how many ms ago its probe began on the monotonic clock; as old
+    /// as can be when that probe was of an earlier attachment of it, or of none known.
+    fn kept(&self, serial: &str) -> Option<(ReadyRow, i64)> {
+        let attachment = self.since.get(serial).copied();
+        let (row, mark) = self
+            .lab
+            .write(|c, _| {
+                let mark = lock_ignoring_poison(&self.lab.marks).get(serial).copied();
+                Ok(readiness::get(c, serial)?.map(|row| (row, mark)))
+            })
+            .ok()
+            .flatten()?;
+        let age = mark
+            .filter(|m| Some(m.attachment) == attachment)
+            .map_or(i64::MAX, |m| m.age_ms(Instant::now()));
+        Some((row, age))
     }
 
     /// Brings the rows of `serials` up to date for a grant that reads them right after, by
@@ -390,15 +541,9 @@ impl Watcher {
     /// Whether `phone`, as adb can use it, has a ready probe a grant will soon find too old.
     fn lapsing(&self, phone: &Attached) -> bool {
         phone.state == "device"
-            && self
-                .lab
-                .write(|c, _| readiness::get(c, &phone.serial))
-                .ok()
-                .flatten()
-                .is_some_and(|r| {
-                    r.known.readiness == Readiness::Ready
-                        && refresh_again(r.known.readiness, EpochMs(now_ms()).since(r.probed_ms))
-                })
+            && self.kept(&phone.serial).is_some_and(|(r, age)| {
+                r.known.readiness == Readiness::Ready && refresh_again(r.known.readiness, age)
+            })
     }
 
     /// `devlab check`: each phone from a probe at most [`FRESH_MS`] old, probed again when

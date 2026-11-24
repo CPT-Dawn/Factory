@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use rustix::process::Signal;
 
-use super::lab::devlab;
+use super::lab::{Agent, devlab, for_owner, waiting};
 use crate::support::world::{World, poll_until};
-use crate::support::{Sandbox, kill_group, run};
+use crate::support::{Sandbox, finish, kill_group, run, spawn};
 
 /// The sandbox's adb: each `track-devices` run is numbered, writes its pid to `adb/pid.<run>`, and
 /// then plays the part `script` gives it for that run (shell, with `$n` the run and `frame
@@ -443,4 +443,58 @@ fn a_quiet_stream_whose_adb_answers_at_length_is_left_alone() {
 
     assert!(runs(&pid_of(&adb, 1)), "{}", daemon_log(&sandbox));
     assert!(!adb.join("pid.2").exists(), "{}", daemon_log(&sandbox));
+}
+
+#[test]
+fn no_phone_is_reclaimed_while_adbs_stream_is_down() {
+    let sandbox = Sandbox::new().env("FACTORY_ADB_BACKOFF_MS", "50");
+    let (sandbox, wt_a) = setup(sandbox);
+    super::lab::write_machine_config(&sandbox, r#""deviceIdleMin": 0"#);
+    let adb = adb_playing(
+        &sandbox,
+        &format!(
+            r#"if [ "$n" = 1 ]; then frame '{PHONE_A}'; while [ ! -e "$w/end" ]; do sleep 0.05; done; exit 0; fi
+  while [ ! -e "$w/back" ]; do sleep 0.05; done
+  frame '{PHONE_A}'; exec sleep 1000"#
+        ),
+    );
+    let (a, b) = (Agent::start(), Agent::start());
+    let wt_b = sandbox.path("wt/plain-b");
+    fs::create_dir_all(&wt_b).expect("make plain-b");
+    let held = run(for_owner(
+        &sandbox,
+        &wt_a,
+        a.pid(),
+        &["acquire", "--phone", "--quiet"],
+    ));
+    assert_eq!(held.code, 0, "{held:?}");
+    // The lease runs a command, so its phone stays while b waits for one.
+    let done = adb.join("done");
+    let until_done = format!("while [ ! -e '{}' ]; do sleep 0.05; done", done.display());
+    let exec = spawn(for_owner(
+        &sandbox,
+        &wt_a,
+        a.pid(),
+        &["exec", "--", "sh", "-c", &until_done],
+    ));
+    assert!(poll_until(|| status(&sandbox, &wt_a).contains("running sh")));
+    let waiter = spawn(for_owner(
+        &sandbox,
+        &wt_b,
+        b.pid(),
+        &["acquire", "--phone", "--wait", "4"],
+    ));
+    assert!(poll_until(|| waiting(&sandbox, &wt_a) == ["plain-b"]));
+
+    // The stream ends and stays down while the command ends and b's wait runs out.
+    fs::write(adb.join("end"), "").expect("end the stream");
+    assert!(poll_until(|| pid_of(&adb, 2).trim().parse::<u32>().is_ok()));
+    fs::write(&done, "").expect("end the command");
+    assert_eq!(finish(exec).code, 0);
+    assert_eq!(finish(waiter).code, 75);
+    fs::write(adb.join("back"), "").expect("bring the stream back");
+
+    // Nothing was taken from the lease meanwhile: its next command runs on its phone.
+    let again = run(for_owner(&sandbox, &wt_a, a.pid(), &["exec", "--", "true"]));
+    assert_eq!(again.code, 0, "{again:?}");
 }

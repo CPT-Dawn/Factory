@@ -10,7 +10,7 @@ use super::context::{Ctx, context, project_config, release_context};
 use factory_core::lab::args::parse_opts;
 
 use super::lease::{self, Target};
-use super::wire::{Lease, Released};
+use super::wire::{Lease, Released, Stopping};
 use super::{android, check, reserve, run, stack, status};
 use crate::output::Failure;
 use factory_adapters::adb::AdbCli;
@@ -312,12 +312,16 @@ pub(super) fn release(
         None
     };
     let stopped = match &held {
-        Some(Lease {
-            project: Some(project),
-            slot: Some(slot),
-            worktree,
-            ..
-        }) => Some(stop(project, worktree, *slot)),
+        Some(Stopping {
+            lease:
+                Lease {
+                    project: Some(project),
+                    slot: Some(slot),
+                    worktree,
+                    ..
+                },
+            stack,
+        }) => Some(stop(project, worktree, *slot, stack.as_deref())),
         _ => None,
     };
     let released = lease::release(ctx, target)?;
@@ -329,8 +333,11 @@ pub(super) fn release(
 
 /// Stops the slot's stack of `held`, the lease's project, at `worktree` if it runs, and marks it
 /// no longer devlab's to stop. A `devlab.json` there that now names another project is refused:
-/// its stack on that slot is not the lease's to stop.
-fn stop(held: &str, worktree: &str, slot: u32) -> Result<(), Failure> {
+/// its stack on that slot is not the lease's to stop. The stack is `granted`, the one the lease
+/// was granted: a Supabase project id changed under the same project name since names another
+/// stack (#63). A lease the daemon kept none for (granted before it kept them, or with no
+/// stack then) has none of its own: nothing is stopped, and the caller is told so.
+fn stop(held: &str, worktree: &str, slot: u32, granted: Option<&str>) -> Result<(), Failure> {
     let Some(project) = project_config(worktree)? else {
         return Ok(());
     };
@@ -341,10 +348,19 @@ fn stop(held: &str, worktree: &str, slot: u32) -> Result<(), Failure> {
             project.name
         )));
     }
-    if let Some(info) = stack::info(&project, worktree, slot)?
-        && stack::running(&info.project_id)
-    {
-        stack::down(&project, &info.project_id, worktree)?;
+    let Some(id) = granted else {
+        let now = stack::info(&project, worktree, slot)?.map(|info| info.project_id);
+        return match now {
+            // No stack in the config either: there is none to stop.
+            None => Ok(()),
+            Some(id) => Err(Failure::precondition(format!(
+                "lease held slot {slot} of {held} with no stack of its own: stack {id} left running; \
+                 if it is yours, stop it from a lease of this worktree: devlab acquire --no-device, then devlab stack down"
+            ))),
+        };
+    };
+    if stack::running(id) {
+        stack::down(&project, id, worktree)?;
     }
     lease::stack_ours(&project.name, slot, false)
 }

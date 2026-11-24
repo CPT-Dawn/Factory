@@ -17,7 +17,7 @@ use super::stack;
 use super::wire::{
     ACQUIRE, AcquireParams, DeviceAsk, EXEC, EXEC_END, ExecEnd, ExecParams, GC, Granted, LEASE,
     Lease, Process, ProjectAsk, RECEIVED, RELEASE, ReleaseParams, Released, RunAsk, SLOT, STOPPING,
-    SlotParams, SlotSchema, StackAsk, StopParams,
+    SlotParams, SlotSchema, StackAsk, StopParams, Stopping,
 };
 use crate::client;
 use crate::output::Failure;
@@ -291,8 +291,8 @@ pub fn release(ctx: &Ctx, target: Target) -> Result<Released, Failure> {
 }
 
 /// The caller's lease, its slot held for this call until its [`release`] while it stops
-/// the slot's stack.
-pub fn stopping(ctx: &Ctx) -> Result<Option<Lease>, Failure> {
+/// the slot's stack, and the stack it was granted.
+pub fn stopping(ctx: &Ctx) -> Result<Option<Stopping>, Failure> {
     client::call(
         &paths()?,
         STOPPING,

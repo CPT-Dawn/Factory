@@ -106,6 +106,10 @@ CREATE TABLE IF NOT EXISTS emulator_boots (
   idx INTEGER PRIMARY KEY,
   lease INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS lease_stacks (
+  lease INTEGER PRIMARY KEY,
+  stack TEXT NOT NULL
+);
 ";
 
 /// An emulator devlab runs: `booting` from its start until adb says it finished booting, then
@@ -120,7 +124,8 @@ pub struct EmulatorRow {
 }
 /// The schema's version, in `PRAGMA user_version`. Version 0 kept waiters only while the
 /// daemon that queued them ran, so their table is rebuilt; `stoppers` is new. Version 2 adds
-/// `runs`. `run_leases` (#53) needs no new version: `SCHEMA` makes it on every open.
+/// `runs`. `run_leases` (#53) and `lease_stacks` (#63) need no new version: `SCHEMA` makes them
+/// on every open.
 const VERSION: i64 = 2;
 
 pub struct Store {
@@ -537,11 +542,33 @@ pub fn drop_lease(
     }
     c.execute("DELETE FROM leases WHERE id = ?1", [lease.id])?;
     c.execute("DELETE FROM run_leases WHERE lease = ?1", [lease.id])?;
+    c.execute("DELETE FROM lease_stacks WHERE lease = ?1", [lease.id])?;
     activity::forget_lease(c, lease.id)?;
     if let Some(from) = &from {
         reservations::restore(c, from, now)?;
     }
     reservations::record_lease_end(c, lease, now)
+}
+
+/// Lease `lease` was granted its slot's stack `stack` (the stack's Supabase project id): the one
+/// `--stop-stack` stops, whatever the worktree's config names later (#63). The first grant's
+/// stays.
+pub fn set_lease_stack(c: &Connection, lease: i64, stack: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT OR IGNORE INTO lease_stacks (lease, stack) VALUES (?1, ?2)",
+        params![lease, stack],
+    )?;
+    Ok(())
+}
+
+/// The stack lease `lease` was granted, if it was granted one.
+pub fn lease_stack(c: &Connection, lease: i64) -> rusqlite::Result<Option<String>> {
+    c.query_row(
+        "SELECT stack FROM lease_stacks WHERE lease = ?1",
+        [lease],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 /// Lease `lease` ends with run `run`: the run made it and didn't ask to keep it. `from` is the

@@ -94,6 +94,44 @@ fn a_request_for_more_devices_than_the_cap_exits_75_at_once() {
 }
 
 #[test]
+fn the_default_cap_counts_only_phones_that_are_ready_or_leased() {
+    let (sandbox, world) = lab();
+    world.apply("lock FAKEPHONE03").unwrap();
+    world
+        .apply("plug FAKEPHONE04 unauthorized usb:1-4")
+        .unwrap();
+    for i in 1..=3 {
+        world
+            .apply(&format!(
+                "plug FAKEPHONE0{i} device usb:1-{i} model:Pixel_8"
+            ))
+            .unwrap();
+    }
+    let lead = Agent::start();
+    let wt = world.worktree("plain-cap");
+    let ask = ["acquire", "--devices", "2", "--phone", "--wait", "0"];
+
+    // Two phones are ready: one owner may hold one of them, as if the locked one and the
+    // unauthorized one were not there.
+    let refused = run(for_owner(&sandbox, &wt, lead.pid(), &ask));
+    assert_eq!(refused.code, 75, "{refused:?}");
+    assert!(
+        refused
+            .stderr
+            .contains("asks for 2 devices; one owner may hold at most 1 (maxDevicesPerOwner)"),
+        "{refused:?}"
+    );
+
+    // Unlocked, it counts: all three phones but one.
+    world.apply("unlock FAKEPHONE03").unwrap();
+    assert!(
+        poll_until(|| run(for_owner(&sandbox, &wt, lead.pid(), &ask)).code == 0),
+        "{:?}",
+        run(for_owner(&sandbox, &wt, lead.pid(), &ask))
+    );
+}
+
+#[test]
 fn devlab_json_sets_the_device_cap_over_the_machine_config() {
     let (sandbox, world) = phones(3);
     write_machine_config(&sandbox, r#""maxDevicesPerOwner": 1"#);

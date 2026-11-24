@@ -29,7 +29,7 @@ same agent in the same worktree finds it again. Subagents count as their lead: o
 most maxSlotsPerOwner stack slots of a project (default: all but one), even when no one else waits.
 Over the cap it queues, naming the cap, and steps aside for other owners until one of its own
 leases ends. Devices count alike: at most maxDevicesPerOwner phones and emulators (default: all
-phones but one); a request for more is refused (exit 75). A request waiting for a phone lets requests
+ready or leased phones but one); a request for more is refused (exit 75). A request waiting for a phone lets requests
 that need none go first. Leased devices: ANDROID_SERIAL is set, so plain adb,
 maestro and expo commands reach only them. Phone builds' fixed ports reach your slot through adb reverse.
 
