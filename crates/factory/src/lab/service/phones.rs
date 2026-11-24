@@ -287,21 +287,22 @@ impl Watcher {
         })
     }
 
-    /// The name notifications give phone `serial`: its model, with the last 4 of its serial
-    /// while another phone on the list shown is of the same model; its serial while no model is
-    /// known.
+    /// The name notifications give phone `serial`: its model, with the last 4 of its serial once
+    /// another phone of the same model has been plugged in while this daemon runs, so that a
+    /// phone keeps its name as its twin comes and goes; its serial while no model is known.
     fn name_of(&self, serial: &str) -> String {
         let model = self.models.get(serial).map_or("", String::as_str);
         let shared = !model.is_empty()
-            && self.shown.iter().any(|p| {
-                p.serial != serial && self.models.get(&p.serial).is_some_and(|m| m == model)
-            });
+            && self
+                .models
+                .iter()
+                .any(|(other, m)| other != serial && m == model);
         name(model, serial, shared)
     }
 
     /// Says `n`: phone `serial` is now `what`, unless that was the last thing said of it. An
-    /// offline is held back for [`FOLD`], and what the phone is next, its unplug most often,
-    /// is said in its place.
+    /// offline is held back for [`FOLD`]: an unplug that follows is said in its place, and any
+    /// other change has the offline said first.
     fn say(&mut self, serial: &str, what: Said, n: Notice) {
         if what == Said::Is(Readiness::Offline) {
             if self.said.get(serial) != Some(&what) && !self.held.contains_key(serial) {
@@ -310,7 +311,13 @@ impl Watcher {
             }
             return;
         }
-        self.held.remove(serial);
+        if let Some((offline, _)) = self.held.remove(serial)
+            && what != Said::Unplugged
+        {
+            self.said
+                .insert(serial.to_owned(), Said::Is(Readiness::Offline));
+            self.post(&offline);
+        }
         if self.said.get(serial) == Some(&what) {
             return;
         }

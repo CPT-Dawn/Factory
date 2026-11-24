@@ -314,8 +314,8 @@ fn connections_taken(pid: u32, socket: &Path) -> usize {
         })
         .unwrap_or_default();
     let path = socket.to_string_lossy();
-    fs::read_to_string("/proc/net/unix")
-        .unwrap_or_default()
+    // Lossy: another test's daemon may listen on a path that isn't UTF-8.
+    String::from_utf8_lossy(&fs::read("/proc/net/unix").unwrap_or_default())
         .lines()
         .map(|line| line.split_whitespace().collect::<Vec<_>>())
         // Num RefCount Protocol Flags Type St Inode Path; St 03 is connected.

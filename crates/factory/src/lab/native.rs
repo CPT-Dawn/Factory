@@ -145,14 +145,17 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
                 many => {
                     let lines: String = many.iter().map(|f| format!("released {f}\n")).collect();
                     let file = save("gc.txt", &lines)?;
-                    Done::new(
+                    let mut done = Done::new(
                         format!(
                             "released {} leases of exited owners; list in {}",
                             many.len(),
                             shown(&file)
                         ),
                         json!({ "released": freed, "releasedFile": path_json(&file) }),
-                    )
+                    );
+                    // The path is the point of the line: never cut it.
+                    done.whole = true;
+                    done
                 }
             }
         }

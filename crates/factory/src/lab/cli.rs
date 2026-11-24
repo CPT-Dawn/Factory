@@ -334,8 +334,9 @@ pub(super) fn release(
 /// Stops the slot's stack of `held`, the lease's project, at `worktree` if it runs, and marks it
 /// no longer devlab's to stop. A `devlab.json` there that now names another project is refused:
 /// its stack on that slot is not the lease's to stop. The stack is `granted`, the one the lease
-/// was granted, when the daemon kept it: a Supabase project id changed under the same project
-/// name since names another stack (#63).
+/// was granted: a Supabase project id changed under the same project name since names another
+/// stack (#63). A lease the daemon kept none for (granted before it kept them, or with no
+/// stack then) has none of its own: nothing is stopped, and the caller is told so.
 fn stop(held: &str, worktree: &str, slot: u32, granted: Option<&str>) -> Result<(), Failure> {
     let Some(project) = project_config(worktree)? else {
         return Ok(());
@@ -347,14 +348,19 @@ fn stop(held: &str, worktree: &str, slot: u32, granted: Option<&str>) -> Result<
             project.name
         )));
     }
-    let id = match granted {
-        Some(id) => Some(id.to_owned()),
-        None => stack::info(&project, worktree, slot)?.map(|info| info.project_id),
+    let Some(id) = granted else {
+        let now = stack::info(&project, worktree, slot)?.map(|info| info.project_id);
+        return match now {
+            // No stack in the config either: there is none to stop.
+            None => Ok(()),
+            Some(id) => Err(Failure::precondition(format!(
+                "lease held slot {slot} of {held} with no stack of its own: stack {id} left running; \
+                 stop it with devlab stack down if it is yours"
+            ))),
+        };
     };
-    if let Some(id) = id
-        && stack::running(&id)
-    {
-        stack::down(&project, &id, worktree)?;
+    if stack::running(id) {
+        stack::down(&project, id, worktree)?;
     }
     lease::stack_ours(&project.name, slot, false)
 }

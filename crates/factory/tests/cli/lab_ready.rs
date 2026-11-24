@@ -292,6 +292,24 @@ fn a_phone_that_stays_offline_is_said_offline_once_by_its_model() {
 }
 
 #[test]
+fn a_phone_offline_for_a_moment_is_said_offline_and_ready_again() {
+    let (sandbox, world, _wt) = watching();
+    world.apply(PIXEL).unwrap();
+    assert!(poll_until(|| summaries(&sandbox).len() == 1));
+    world.apply("plug FAKEPHONE01 offline usb:1-1").unwrap();
+    world.apply(PIXEL).unwrap();
+    assert!(
+        poll_until(|| summaries(&sandbox).len() == 3),
+        "{:?}",
+        summaries(&sandbox)
+    );
+    assert_eq!(
+        summaries(&sandbox),
+        ["Pixel 8 ready", "Pixel 8 offline", "Pixel 8 ready again"]
+    );
+}
+
+#[test]
 fn two_phones_of_one_model_are_told_apart_by_the_end_of_their_serials() {
     let (sandbox, world, _wt) = watching();
     world.apply("lock FAKEPHONE01").unwrap();
@@ -320,6 +338,18 @@ fn two_phones_of_one_model_are_told_apart_by_the_end_of_their_serials() {
     assert_eq!(
         summaries(&sandbox)[2..],
         ["Pixel 8 (NE01) ready", "Pixel 8 (NE02) ready"]
+    );
+    // Its twin gone, a phone keeps the name it had.
+    world.apply("unplug FAKEPHONE02").unwrap();
+    world.apply("lock FAKEPHONE01").unwrap();
+    assert!(
+        poll_until(|| summaries(&sandbox).len() == 6),
+        "{:?}",
+        summaries(&sandbox)
+    );
+    assert_eq!(
+        summaries(&sandbox)[4..],
+        ["Pixel 8 (NE02) unplugged", "Pixel 8 (NE01) locked again"]
     );
 }
 
