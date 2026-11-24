@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Runs the gate from CLAUDE.md before a push, so a red first CI run is caught here.
+# Enable with: git config core.hooksPath .githooks
+set -euo pipefail
+
+# A push that only deletes branches carries nothing to check.
+zero=0000000000000000000000000000000000000000
+deleting=1
+while read -r _ local_sha _ _; do
+  [[ "$local_sha" == "$zero" ]] || deleting=0
+done
+((deleting)) && exit 0
+
+cd "$(git rev-parse --show-toplevel)"
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+
+step() {
+  local name=$1
+  shift
+  if ! "$@" >"$scratch/out" 2>&1; then
+    tail -n 25 "$scratch/out" >&2
+    echo "pre-push: $name failed, push stopped" >&2
+    exit 1
+  fi
+}
+
+step "cargo fmt --check" cargo fmt --check
+step "cargo clippy" cargo clippy --all-targets -- -D warnings
+step "cargo test" cargo test
