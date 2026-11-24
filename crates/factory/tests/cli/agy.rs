@@ -2,13 +2,14 @@
 //! read-only and offline invocation, its sandbox check, its quota error and its auth modes.
 
 use std::fs;
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
 
-use crate::support::{BWRAP_PASSES, Sandbox, finish, spawn};
+use crate::support::{BWRAP_PASSES, PROXY_LISTENS, Sandbox, finish, spawn};
 
 const CLEAN_REPORT: &str = r#"## Standards
 
@@ -123,10 +124,14 @@ fn codex_writes(report: &str) -> String {
 
 /// A sandbox whose user namespaces work and whose write guard starts, so agy's sandbox is
 /// active.
+/// A sandbox in which agy's sandbox and its write guard start, on a session bus.
 fn sandboxed() -> Sandbox {
     let sandbox = Sandbox::new();
+    let bus = format!("unix:path={},guid=0", sandbox.path("run/bus").display());
+    let sandbox = sandbox.env("DBUS_SESSION_BUS_ADDRESS", bus);
     sandbox.fake("unshare", "exit 0");
     sandbox.fake("bwrap", BWRAP_PASSES);
+    sandbox.fake("xdg-dbus-proxy", PROXY_LISTENS);
     sandbox
 }
 
@@ -644,14 +649,112 @@ fn agy_reviews_inside_a_write_guard_that_leaves_only_its_checkout_its_log_and_it
         tmpfs.contains(&&path("run")),
         "the runtime dir and its sockets are hidden: {guard:?}"
     );
-    let rebound = mounts(guard, "--ro-bind-try");
     assert!(
-        rebound.contains(&(path("run/bus"), path("run/bus"))),
-        "but the session bus, for agy's login: {guard:?}"
+        mounts(guard, "--ro-bind-try")
+            .contains(&("/dev/null".to_owned(), "/run/docker.sock".to_owned())),
+        "Docker's socket is masked: {guard:?}"
     );
     assert!(
-        rebound.contains(&("/dev/null".to_owned(), "/run/docker.sock".to_owned())),
-        "Docker's socket is masked: {guard:?}"
+        guard.windows(2).any(|pair| pair == ["--dev", "/dev"]),
+        "a private /dev, not the host's: {guard:?}"
+    );
+    assert!(!guard.contains(&"--dev-bind".to_owned()), "{guard:?}");
+
+    // The session bus comes back through a proxy that lets it reach the keyring alone.
+    let proxies = sandbox.calls("xdg-dbus-proxy");
+    assert_eq!(
+        proxies.len(),
+        2,
+        "one for the probe, one for the review: {proxies:?}"
+    );
+    let proxy = &proxies[1];
+    assert_eq!(proxy[0], format!("unix:path={},guid=0", path("run/bus")));
+    assert_eq!(
+        proxy[2..],
+        ["--filter", "--talk=org.freedesktop.secrets", "--fd=1"],
+        "{proxy:?}"
+    );
+    assert!(
+        mounts(guard, "--ro-bind").contains(&(proxy[1].clone(), path("run/bus"))),
+        "the proxy's socket stands in for the bus: {guard:?}"
+    );
+    assert!(
+        guard.windows(3).any(|three| three
+            == [
+                "--setenv".to_owned(),
+                "DBUS_SESSION_BUS_ADDRESS".to_owned(),
+                format!("unix:path={}", path("run/bus")),
+            ]),
+        "{guard:?}"
+    );
+    let pids = fs::read_to_string(sandbox.path("bin/proxy.pids")).unwrap();
+    for pid in pids.lines() {
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "a proxy is stopped with its guard: {pid}"
+        );
+    }
+}
+
+#[test]
+fn an_api_key_review_reaches_no_session_bus() {
+    let sandbox = sandboxed().env("GEMINI_API_KEY", "test-key");
+    let repo = sandbox.repo();
+    configure(
+        &sandbox,
+        "[[review.backend]]\ncli = \"agy\"\nauth = \"api-key\"\n",
+    );
+    sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(
+        sandbox.calls("xdg-dbus-proxy").is_empty(),
+        "no keyring to reach: {:?}",
+        sandbox.calls("xdg-dbus-proxy")
+    );
+    let runs = guards_of(&sandbox, "agy");
+    let (guard, _) = guarded(&runs[0]);
+    assert!(
+        guard
+            .windows(2)
+            .any(|pair| pair == ["--unsetenv", "DBUS_SESSION_BUS_ADDRESS"]),
+        "{guard:?}"
+    );
+}
+
+#[test]
+fn a_bus_proxy_that_cannot_start_skips_agy_in_its_words() {
+    let sandbox = sandboxed();
+    agy_then_codex(&sandbox);
+    let repo = sandbox.repo();
+    sandbox.fake(
+        "xdg-dbus-proxy",
+        "echo 'Failed to connect to bus: No such file or directory' >&2\nexit 1",
+    );
+    sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+
+    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(
+        reviews_run(&sandbox).is_empty(),
+        "agy never reviews on an open bus"
+    );
+    let shown = shown(&out.stdout);
+    assert_eq!(shown["backend"], "codex", "{shown}");
+    assert_eq!(
+        shown["skipped"][0]["reason"],
+        "its sandbox is not active (its write guard can't start: \
+         xdg-dbus-proxy: Failed to connect to bus: No such file or directory)",
+        "{shown}"
+    );
+    assert!(
+        sandbox.calls("bwrap").is_empty(),
+        "{:?}",
+        sandbox.calls("bwrap")
     );
 }
 

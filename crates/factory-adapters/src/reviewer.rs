@@ -323,6 +323,15 @@ impl Agy {
         self.as_its_auth(Command::new("agy"))
     }
 
+    /// How a review on its auth reaches the session bus: the subscription login reads its
+    /// token from the keyring over it; an API key needs none of it.
+    fn bus(&self) -> guard::Bus {
+        match self.auth {
+            AgyAuth::Subscription => guard::Bus::Keyring,
+            AgyAuth::ApiKey => guard::Bus::Closed,
+        }
+    }
+
     /// `cmd`, which runs agy, as its auth runs it.
     fn as_its_auth(&self, mut cmd: Command) -> Command {
         if self.auth == AgyAuth::Subscription {
@@ -447,7 +456,7 @@ impl Reviewer for Agy {
                 }
             }
         }
-        sandbox_active(self.namespaces.as_ref())
+        sandbox_active(self.namespaces.as_ref(), self.bus())
     }
 
     fn review(&self, job: &Job) -> Result<(), ReviewerError> {
@@ -466,8 +475,11 @@ impl Reviewer for Agy {
         File::create(&own_log).map_err(ReviewerError::Files)?;
         // Dropped, so removed, however the review ends.
         let (checkout, within) = self.checkout(job)?;
-        // Under the write guard, which leaves it its checkout, its own log and agy's state.
-        let mut cmd = self.as_its_auth(guard::command("agy", &[checkout.dir(), own_log.as_path()]));
+        // Under the write guard, which leaves it its checkout, its own log and agy's state, and
+        // which stays up until the review is done.
+        let guard = guard::Guard::start(&[checkout.dir(), own_log.as_path()], self.bus())
+            .map_err(guard_down)?;
+        let mut cmd = self.as_its_auth(guard.command("agy"));
         cmd.arg("-p")
             .arg(prompt)
             .args(["--mode", "plan", "--sandbox", "--add-dir"])
@@ -559,8 +571,9 @@ fn sweep_checkouts(dir: &Path, repo: &dyn Repo) {
 pub trait Namespaces: fmt::Debug + Send + Sync {
     /// `Ok`, or why they are unavailable, in the probe's own words.
     fn user_namespaces(&self) -> Result<(), String>;
-    /// `Ok`, or why the guard can't start, in the probe's own words.
-    fn guard(&self) -> Result<(), String>;
+    /// `Ok`, or why the guard, reaching the bus as `bus` says, can't start, in the probe's
+    /// own words.
+    fn guard(&self, bus: guard::Bus) -> Result<(), String>;
 }
 
 /// The probes through `unshare --user --map-root-user true`, bare and under the guard.
@@ -599,8 +612,9 @@ impl Namespaces for Unshare {
         Unshare::probe(cmd, "unshare")
     }
 
-    fn guard(&self) -> Result<(), String> {
-        let mut cmd = guard::command("unshare", &[]);
+    fn guard(&self, bus: guard::Bus) -> Result<(), String> {
+        let guard = guard::Guard::start(&[], bus)?;
+        let mut cmd = guard.command("unshare");
         cmd.args(UNSHARE_PROBE);
         Unshare::probe(cmd, guard::BWRAP)
     }
@@ -619,23 +633,26 @@ impl Namespaces for FakeNamespaces {
         self.namespaces.clone().map_or(Ok(()), Err)
     }
 
-    fn guard(&self) -> Result<(), String> {
+    fn guard(&self, _bus: guard::Bus) -> Result<(), String> {
         self.guard.clone().map_or(Ok(()), Err)
     }
 }
 
 /// Whether agy's sandbox would be active, and its write guard start, as `namespaces` says.
-fn sandbox_active(namespaces: &dyn Namespaces) -> Result<(), ReviewerError> {
+fn sandbox_active(namespaces: &dyn Namespaces, bus: guard::Bus) -> Result<(), ReviewerError> {
     namespaces.user_namespaces().map_err(|why| {
         ReviewerError::NoSandbox(format!(
             "its sandbox is not active (unprivileged user namespaces are unavailable: {why})"
         ))
     })?;
-    namespaces.guard().map_err(|why| {
-        ReviewerError::NoSandbox(format!(
-            "its sandbox is not active (its write guard can't start: {why})"
-        ))
-    })
+    namespaces.guard(bus).map_err(guard_down)
+}
+
+/// A review's sandbox, when its write guard can't start, for `why`.
+fn guard_down(why: String) -> ReviewerError {
+    ReviewerError::NoSandbox(format!(
+        "its sandbox is not active (its write guard can't start: {why})"
+    ))
 }
 
 /// The tools a headless Claude reviewer may not use: it reads and reports, and runs no skill
@@ -920,7 +937,7 @@ mod seams {
             namespaces: Some("unshare: Operation not permitted".to_owned()),
             guard: None,
         };
-        match sandbox_active(&off) {
+        match sandbox_active(&off, guard::Bus::Keyring) {
             Err(ReviewerError::NoSandbox(why)) => assert_eq!(
                 why,
                 "its sandbox is not active (unprivileged user namespaces are unavailable: \
@@ -928,7 +945,7 @@ mod seams {
             ),
             other => panic!("expected NoSandbox, got {other:?}"),
         }
-        assert!(sandbox_active(&FakeNamespaces::default()).is_ok());
+        assert!(sandbox_active(&FakeNamespaces::default(), guard::Bus::Keyring).is_ok());
     }
 
     #[test]
@@ -937,7 +954,7 @@ mod seams {
             namespaces: None,
             guard: Some("bwrap: No such file or directory".to_owned()),
         };
-        match sandbox_active(&off) {
+        match sandbox_active(&off, guard::Bus::Keyring) {
             Err(ReviewerError::NoSandbox(why)) => assert_eq!(
                 why,
                 "its sandbox is not active (its write guard can't start: \
