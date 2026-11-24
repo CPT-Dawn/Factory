@@ -24,7 +24,9 @@ fn named(event: &Fields, field: &str, want: &str) -> bool {
 
 /// Where a lead stands in the ledger: how many starts it has, and whether the latest of its
 /// starts and ends is a start. A lead with no events owes nothing, since an end without a start
-/// reads as a lead that never began.
+/// reads as a lead that never began. A start with `outcome=error` began no lead, so it is no
+/// start here: counting it would leave the lead it shares a slug with owing an end it already
+/// has, or a run its settlement no longer matches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Standing {
     pub starts: usize,
@@ -57,7 +59,7 @@ fn standing_in(path: &std::path::Path, repo: &str, slug: &str) -> io::Result<Sta
             continue;
         }
         match event["type"].as_str() {
-            Some("lead-start") => {
+            Some("lead-start") if !named(event, "outcome", "error") => {
                 standing.starts += 1;
                 standing.owes = true;
             }
