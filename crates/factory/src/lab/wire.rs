@@ -1,7 +1,7 @@
 //! The lab's daemon methods and what they carry. The CLI reads configs, finds the owner and runs
 //! stacks; the daemon keeps the lease store and decides grants.
 
-use factory_core::lab::devices::{Held, lost};
+use factory_core::lab::devices::{Held, Reclaimed, lost, reclaimed_lost};
 use factory_core::lab::queue::{Holding, QueueEntry};
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +39,12 @@ pub const RUN_RESUME: &str = "lab.run.resume";
 pub const RUN_END_ID: u64 = u64::MAX;
 /// The caller's lease, touched: [`FindParams`] in, `Option<Lease>` out.
 pub const LEASE: &str = "lab.lease";
+/// The caller's lease for `devlab exec`, touched: [`ExecParams`] in, `Option<Lease>` out. A lease
+/// none of whose devices is lost counts the exec as its running command until [`EXEC_END`], or
+/// until the exec's process exits, so no waiter takes its devices meanwhile.
+pub const EXEC: &str = "lab.exec";
+/// The exec [`EXEC`] counted has ended: [`ExecEnd`] in, null out. Its lease is touched.
+pub const EXEC_END: &str = "lab.exec-end";
 /// Drops the caller's lease, or all of them: [`ReleaseParams`] in, what it dropped and what the
 /// caller still holds ([`Released`]) out. A lease named by id that another owner holds is refused.
 pub const RELEASE: &str = "lab.release-leases";
@@ -246,6 +252,21 @@ pub struct FindParams {
     pub lease: Option<i64>,
 }
 
+/// `devlab exec`'s lease, and the command it runs on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecParams {
+    #[serde(flatten)]
+    pub find: FindParams,
+    /// The devlab exec process.
+    pub client: Process,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecEnd {
+    pub client: Process,
+}
+
 /// The devlab process whose run to pick up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunResume {
@@ -301,12 +322,38 @@ pub struct Lease {
     /// In the order they were granted.
     #[serde(default)]
     pub devices: Vec<LeaseDevice>,
+    /// The devices a waiter took from it while it ran nothing (#57).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reclaimed: Vec<ReclaimedDevice>,
+}
+
+/// A device taken from a lease for a waiter, after the lease ran nothing for `idle_min` minutes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReclaimedDevice {
+    pub serial: String,
+    pub kind: String,
+    pub model: String,
+    pub idle_min: i64,
 }
 
 impl Lease {
-    /// Why the lease can't be used because a device it holds is gone or not usable, by the
-    /// states its devices were filled with; none when each is attached as `device`.
+    /// Why the lease can't be used because a waiter took one of its devices, or a device it
+    /// holds is gone or not usable, by the states its devices were filled with; none when
+    /// nothing was taken and each is attached as `device`.
     pub fn lost(&self) -> Option<String> {
+        let taken: Vec<Reclaimed> = self
+            .reclaimed
+            .iter()
+            .map(|d| Reclaimed {
+                serial: d.serial.clone(),
+                kind: d.kind.clone(),
+                model: d.model.clone(),
+                idle_min: d.idle_min,
+            })
+            .collect();
+        if let Some(why) = reclaimed_lost(&taken) {
+            return Some(why);
+        }
         let held: Vec<Held> = self
             .devices
             .iter()
@@ -425,6 +472,17 @@ pub struct Board {
     /// Every device adb lists, a lease holds or devlab runs.
     #[serde(default)]
     pub devices: Vec<DeviceLine>,
+    /// The command each lease runs, from `devlab run` or `devlab exec`; a lease that runs
+    /// nothing has none.
+    #[serde(default)]
+    pub running: Vec<LeaseRunning>,
+}
+
+/// What lease `lease` runs now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseRunning {
+    pub lease: i64,
+    pub command: String,
 }
 
 /// One device as status shows it.
@@ -437,6 +495,10 @@ pub struct DeviceLine {
     pub state: String,
     /// `lease N <worktree> (<owner>)`, `idle 3m` or `free`.
     pub holder: String,
+    /// A phone's readiness as the daemon last probed it (#55): `ready`, `locked`, `asleep`,
+    /// …; none for an emulator or a phone not yet probed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -83,8 +83,10 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
             if rest.is_empty() {
                 return Err(Failure::usage("devlab exec -- <cmd...>"));
             }
-            let held = lease::live(&ctx)?;
-            run::exec_in(&ctx, &held, rest, None)
+            let held = lease::exec_lease(&ctx, rest)?;
+            let ran = run::exec_in(&ctx, &held, rest, None);
+            lease::exec_ended();
+            ran
         }
         "env" => {
             let ctx = context()?;

@@ -42,14 +42,14 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::check::{CHECK, CheckParams};
-use super::reservations;
 use super::store::{self, RunRow, Store};
 use super::wire::{
-    AcquireParams, Board, DeviceAsk, DeviceLine, FindParams, GC, Granted, LEASE, Lease,
-    LeaseDevice, Owner, Process, ProjectAsk, RECEIVED, RELEASE, RUN_END, RUN_END_ID, RUN_START,
-    RUN_STOPPING, ReleaseParams, Released, Reservation, RunAsk, RunEnd, RunResume, SLOT, STATUS,
-    STOPPING, SlotParams, StopParams, UNRESERVE, Waiter,
+    AcquireParams, Board, DeviceAsk, DeviceLine, EXEC, EXEC_END, ExecEnd, ExecParams, FindParams,
+    GC, Granted, LEASE, Lease, LeaseDevice, LeaseRunning, Owner, Process, ProjectAsk, RECEIVED,
+    RELEASE, RUN_END, RUN_END_ID, RUN_START, RUN_STOPPING, ReleaseParams, Released, Reservation,
+    RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING, SlotParams, StopParams, UNRESERVE, Waiter,
 };
+use super::{activity, readiness, reservations};
 use super::{android, host};
 use crate::ledger::Ledger;
 use crate::output::Failure;
@@ -419,6 +419,8 @@ pub async fn wait_lease(
 pub async fn respond(lab: &Arc<Lab>, method: &str, params: Value) -> Option<Outcome> {
     let work: fn(&Lab, Value, &[Attached]) -> Answer<Value> = match method {
         LEASE => |lab, p, seen| reply(lab_lease(lab, parse(p)?, seen)),
+        EXEC => |lab, p, seen| reply(lab_exec(lab, parse(p)?, seen)),
+        EXEC_END => |lab, p, _| reply(exec_end(lab, &parse::<ExecEnd>(p)?.client)),
         RELEASE => |lab, p, _| reply(release(lab, parse(p)?)),
         STOPPING => |lab, p, _| reply(stopping(lab, parse(p)?)),
         GC => |lab, _, _| reply(lab.write_telling(|_, _| Ok(())).map(|((), freed)| freed)),
@@ -430,7 +432,7 @@ pub async fn respond(lab: &Arc<Lab>, method: &str, params: Value) -> Option<Outc
     };
     // A lease's devices and the status table are told as adb lists them now; a check waits
     // for adb's first list, which reaches the phone watcher before it.
-    let seen = if method == LEASE || method == STATUS || method == CHECK {
+    let seen = if [LEASE, EXEC, STATUS, CHECK].contains(&method) {
         lab.attached().await
     } else {
         Vec::new()
@@ -474,6 +476,45 @@ fn lab_lease(lab: &Lab, p: FindParams, seen: &[Attached]) -> Answer<Option<Lease
         Ok(lease)
     })?;
     Ok(lease.map(|lease| with_states(lease, seen)))
+}
+
+/// The caller's lease for `devlab exec`, touched; a usable one counts the exec as running on it.
+fn lab_exec(lab: &Lab, p: ExecParams, seen: &[Attached]) -> Answer<Option<Lease>> {
+    lab.write(|c, now| {
+        let Some(lease) = store::find_lease(c, &p.find.worktree, &p.find.owner, p.find.lease)?
+        else {
+            return Ok(None);
+        };
+        store::touch(c, lease.id, now)?;
+        let lease = with_states(lease, seen);
+        if lease.lost().is_none() {
+            activity::begin_exec(
+                c,
+                &activity::Exec {
+                    client: p.client.clone(),
+                    lease: lease.id,
+                    command: p.command.clone(),
+                },
+            )?;
+        }
+        Ok(Some(lease))
+    })
+}
+
+/// The exec of `client` ended: its lease is touched, and runs it no longer. The keeper looks
+/// again, for a waiter may now take the lease's devices once they idle.
+fn exec_end(lab: &Lab, client: &Process) -> Answer<()> {
+    let ended = lab.write(|c, now| {
+        let lease = activity::end_exec(c, client)?;
+        if let Some(lease) = lease {
+            store::touch(c, lease, now)?;
+        }
+        Ok(lease)
+    })?;
+    if ended.is_some() {
+        lab.notify();
+    }
+    Ok(())
 }
 
 /// The lease with what adb says of each of its devices.
@@ -575,7 +616,22 @@ fn stopping(lab: &Lab, p: StopParams) -> Answer<Option<Lease>> {
 }
 
 fn status(lab: &Lab, seen: &[Attached]) -> Answer<Board> {
+    // Each phone's readiness (#55), probed now; the last probe's, in a daemon that runs no
+    // phone watcher.
+    let checked: Option<Vec<(String, String)>> = lab.probe_phones().ok().map(|phones| {
+        phones
+            .into_iter()
+            .filter_map(|p| Some((p.serial, p.readiness?.word().to_owned())))
+            .collect()
+    });
     lab.write(|c, now| {
+        let ready = match &checked {
+            Some(ready) => ready.clone(),
+            None => readiness::all(c)?
+                .into_iter()
+                .map(|r| (r.serial, r.known.readiness.word().to_owned()))
+                .collect(),
+        };
         let leases = store::leases(c)?;
         let held: Vec<HeldBy> = leases
             .iter()
@@ -604,12 +660,20 @@ fn status(lab: &Lab, seen: &[Attached]) -> Answer<Board> {
         let devices = device_rows(seen, &held, &emulators, now)
             .into_iter()
             .map(|r| DeviceLine {
+                readiness: (r.kind == "phone")
+                    .then(|| ready.iter().find(|(s, _)| *s == r.serial))
+                    .flatten()
+                    .map(|(_, word)| word.clone()),
                 serial: r.serial,
                 kind: r.kind,
                 model: r.model,
                 state: r.state,
                 holder: r.holder,
             })
+            .collect();
+        let running = activity::running(c, &host::alive)?
+            .into_iter()
+            .map(|(lease, command)| LeaseRunning { lease, command })
             .collect();
         Ok(Board {
             now,
@@ -618,6 +682,7 @@ fn status(lab: &Lab, seen: &[Attached]) -> Answer<Board> {
             waiters: store::waiters(c)?,
             reservations: reservations::all(c)?,
             devices,
+            running,
         })
     })
 }
@@ -1040,6 +1105,27 @@ fn try_grant(
             Ok(planned) => (planned, None),
             Err(why) => (None, Some(why)),
         };
+        // A request short of devices that waits says which it needs, so the keeper may take
+        // them from a lease that runs nothing (#57); it looks as soon as the request first says
+        // so. One that won't wait takes nothing from anyone.
+        let need = match (&p.devices, &devices_wait) {
+            (Some(ask), Some(why)) if why != ADB_RESTARTING && p.wait_sec > 0.0 => {
+                let usable = |serial: &str| {
+                    attached
+                        .iter()
+                        .flatten()
+                        .any(|a| a.serial == serial && a.state == "device")
+                };
+                let have = lease
+                    .iter()
+                    .flat_map(|l| &l.devices)
+                    .filter(|d| usable(&d.serial))
+                    .count();
+                let have = u32::try_from(have).unwrap_or(u32::MAX);
+                Some((ask.mode.as_str(), ask.want.saturating_sub(have)))
+            }
+            _ => None,
+        };
         let board = grant_board(c, p.project.as_ref(), &p.worktree, facts, &stopping)?;
         let ask = Ask {
             waiter,
@@ -1053,6 +1139,10 @@ fn try_grant(
                     c.execute_batch("ROLLBACK TO claim")?;
                 }
                 c.execute_batch("RELEASE claim")?;
+                // After the claim is undone, so a waiter with a reservation keeps its need.
+                if activity::set_need(c, waiter, need)? {
+                    lab.notify();
+                }
                 return Ok(Err(why));
             }
             Decision::Grant { slot, new } => (slot, new),
@@ -1083,6 +1173,8 @@ fn try_grant(
             ends_with_run(c, p, waiter, &lease, from.as_ref())?;
         }
         let (mut boots, mut phones, mut reused) = (Vec::new(), Vec::new(), Vec::new());
+        // A grant is the answer to a reclaim: the lease holds what this request asked for.
+        activity::clear_reclaimed(c, lease.id)?;
         if let (Some(Planned { plan, used }), Some(ask)) = (planned, &p.devices) {
             for serial in &plan.phones {
                 let model = attached
@@ -1928,20 +2020,27 @@ impl Run {
                     let Some(run) = store::take_run(c, id)? else {
                         return Ok(None);
                     };
+                    if let Some(lease) = run.lease {
+                        store::touch(c, lease, now)?;
+                    }
                     Ok(Some((run, store::end_run_lease(c, id, now)?)))
                 })
             })
             .await;
             match taken {
                 Ok(None) => return,
-                Ok(Some((_, Some(ended)))) => {
+                // A run's end frees its lease's devices for the keeper's next look, or ends the
+                // lease it made.
+                Ok(Some((_, ended))) => {
                     self.lab.notify();
-                    keeper::take_back_reverses_on_thread(
-                        self.lab.attached.borrow().shown.clone(),
-                        vec![ended],
-                    );
+                    if let Some(ended) = ended {
+                        keeper::take_back_reverses_on_thread(
+                            self.lab.attached.borrow().shown.clone(),
+                            vec![ended],
+                        );
+                    }
                 }
-                _ => {}
+                Err(_) => {}
             }
         }
         let (ledger, row, phase) = (

@@ -9,6 +9,7 @@
 //! devlab's watcher did (#18) is the daemon's keeper now: it frees an exited owner's leases and
 //! stops idle emulators and stacks. Reservations (#17) build on these modules beside them.
 
+mod activity;
 mod android;
 mod check;
 mod cli;

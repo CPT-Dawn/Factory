@@ -18,7 +18,10 @@ gives its lease back: `devlab env` then exits 4) and `slots-release` (`devlab gc
 itself, not those the daemon freed first). `devices-run-lease-end` (#53): a run gives back the
 lease it made when its command ends, unless `--keep`, where today's devlab kept it; `cli-usage`'s
 help says so. `devices-settle-lost` (#59): a fresh lease whose phone is unplugged between its
-grant and its prep (exit 76) is given back, where today's devlab kept it: `devlab env` then exits 4. `slots-wait-default` is parity regained: `--wait -1`
+grant and its prep (exit 76) is given back, where today's devlab kept it: `devlab env` then exits 4.
+`devices-lease-status` (#57): `devlab status` and its `--json` show each lease's age, idle time
+and running command, and each phone's readiness (#55) where today's devlab showed `ready`; every
+golden with a status step changed with it. `slots-wait-default` is parity regained: `--wait -1`
 is the configured default wait, as in today's devlab, so the call queues.
 
 ## Replaying

@@ -32,8 +32,9 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 pub enum Job {
     /// adb's stream showed this list.
     Frame(Vec<Attached>),
-    /// `devlab check`: the phones named (every phone when none), answered on the sender.
-    Check(Vec<String>, mpsc::Sender<Vec<PhoneCheck>>),
+    /// `devlab check`: the phones named (every phone when none), answered on the sender; with
+    /// `fresh`, each phone adb can use is probed now, whatever its last probe found.
+    Check(Vec<String>, bool, mpsc::Sender<Vec<PhoneCheck>>),
 }
 
 impl Lab {
@@ -70,12 +71,21 @@ impl Lab {
 
     /// The phones `serials` names, every attached phone when none, as `devlab check` says them.
     pub(super) fn check_phones(&self, serials: Vec<String>) -> Answer<Vec<PhoneCheck>> {
+        self.ask_watcher(serials, false)
+    }
+
+    /// Every attached phone, each probed now: what `devlab status` shows of them (#57).
+    pub(super) fn probe_phones(&self) -> Answer<Vec<PhoneCheck>> {
+        self.ask_watcher(Vec::new(), true)
+    }
+
+    fn ask_watcher(&self, serials: Vec<String>, fresh: bool) -> Answer<Vec<PhoneCheck>> {
         let (reply, answer) = mpsc::channel();
         let tx = self
             .phones
             .get()
             .ok_or_else(|| failed(&"no phone watcher runs in this daemon"))?;
-        tx.send(Job::Check(serials, reply))
+        tx.send(Job::Check(serials, fresh, reply))
             .map_err(|_| failed(&"the phone watcher stopped"))?;
         answer
             .recv_timeout(CHECK_TIMEOUT)
@@ -119,8 +129,8 @@ impl Watcher {
         loop {
             match jobs.recv_timeout(next.saturating_duration_since(Instant::now())) {
                 Ok(Job::Frame(list)) => self.frame(list),
-                Ok(Job::Check(serials, reply)) => {
-                    let _ = reply.send(self.check(&serials));
+                Ok(Job::Check(serials, fresh, reply)) => {
+                    let _ = reply.send(self.check(&serials, fresh));
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     for phone in self.shown.clone() {
@@ -271,8 +281,8 @@ impl Watcher {
     }
 
     /// `devlab check`: each phone from a probe at most [`FRESH_MS`] old, probed again when
-    /// it is older.
-    fn check(&mut self, serials: &[String]) -> Vec<PhoneCheck> {
+    /// it is older, or with `fresh` always.
+    fn check(&mut self, serials: &[String], fresh: bool) -> Vec<PhoneCheck> {
         let wanted: Vec<String> = if serials.is_empty() {
             self.shown.iter().map(|p| p.serial.clone()).collect()
         } else {
@@ -295,7 +305,7 @@ impl Watcher {
                     .write(|c, _| readiness::get(c, &serial))
                     .ok()
                     .flatten()
-                    .filter(|r| now_ms() - r.probed_ms <= FRESH_MS);
+                    .filter(|r| !fresh && now_ms() - r.probed_ms <= FRESH_MS);
                 let row = match kept {
                     Some(row) => Some(row),
                     None if phone.state == "device" => self.probe(&phone),

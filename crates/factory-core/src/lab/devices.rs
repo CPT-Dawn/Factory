@@ -280,6 +280,42 @@ pub struct Held {
     pub state: Option<String>,
 }
 
+/// A device taken off its lease, which ran nothing for `idle_min` minutes, for a waiter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reclaimed {
+    pub serial: String,
+    pub kind: String,
+    pub model: String,
+    pub idle_min: i64,
+}
+
+/// Why a lease can't be used because a device was taken from it for a waiter; none when none
+/// was. Exit 76 says it.
+pub fn reclaimed_lost(reclaimed: &[Reclaimed]) -> Option<String> {
+    let gone: Vec<String> = reclaimed
+        .iter()
+        .map(|d| {
+            format!(
+                "{} {}{} was reclaimed after {} min idle",
+                d.kind,
+                d.serial,
+                in_parens(&d.model),
+                d.idle_min
+            )
+        })
+        .collect();
+    (!gone.is_empty()).then(|| format!("{}: run devlab acquire to replace it", gone.join("; ")))
+}
+
+/// ` (<model>)`, or nothing for no model.
+fn in_parens(model: &str) -> String {
+    if model.is_empty() {
+        String::new()
+    } else {
+        format!(" ({model})")
+    }
+}
+
 /// Why a lease can't be used because a device it holds is gone or not usable; none when every
 /// device is attached as `device`. Exit 76 says it.
 pub fn lost(held: &[Held]) -> Option<String> {
@@ -287,15 +323,11 @@ pub fn lost(held: &[Held]) -> Option<String> {
         .iter()
         .filter(|d| d.state.as_deref() != Some("device"))
         .map(|d| {
-            let model = if d.model.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", d.model)
-            };
             format!(
-                "{} {}{model} is {}",
+                "{} {}{} is {}",
                 d.kind,
                 d.serial,
+                in_parens(&d.model),
                 d.state.as_deref().unwrap_or("unplugged")
             )
         })
@@ -643,6 +675,21 @@ mod tests {
             lost(&[held(Some("offline"))]).unwrap(),
             "phone FAKEPHONE01 (Pixel 8) is offline: run devlab acquire to replace it"
         );
+    }
+
+    #[test]
+    fn a_device_reclaimed_for_a_waiter_is_lost_saying_how_long_its_lease_idled() {
+        let gone = Reclaimed {
+            serial: "FAKEPHONE01".into(),
+            kind: "phone".into(),
+            model: "Pixel 8".into(),
+            idle_min: 12,
+        };
+        assert_eq!(
+            reclaimed_lost(&[gone]).unwrap(),
+            "phone FAKEPHONE01 (Pixel 8) was reclaimed after 12 min idle: run devlab acquire to replace it"
+        );
+        assert_eq!(reclaimed_lost(&[]), None);
     }
 
     #[test]

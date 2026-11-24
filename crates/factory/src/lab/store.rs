@@ -10,7 +10,7 @@ use super::wire::{
     AcquireParams, Granted, Lease, LeaseDevice, Owner, Process, Reservation, SlotRow, SlotSchema,
     Waiter,
 };
-use super::{readiness, reservations, stack};
+use super::{activity, readiness, reservations, stack};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS leases (
@@ -133,6 +133,7 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(reservations::SCHEMA)?;
         conn.execute_batch(readiness::SCHEMA)?;
+        conn.execute_batch(activity::SCHEMA)?;
         if version < VERSION {
             conn.pragma_update(None, "user_version", VERSION)?;
         }
@@ -165,12 +166,14 @@ fn lease_row(row: &Row<'_>) -> rusqlite::Result<Lease> {
         created: row.get("created")?,
         touched: row.get("touched")?,
         devices: Vec::new(),
+        reclaimed: Vec::new(),
     })
 }
 
 /// The lease with the devices it holds.
 fn with_devices(c: &Connection, mut lease: Lease) -> rusqlite::Result<Lease> {
     lease.devices = lease_devices(c, lease.id)?;
+    lease.reclaimed = activity::reclaimed(c, lease.id)?;
     Ok(lease)
 }
 
@@ -496,6 +499,7 @@ pub fn drop_lease(c: &Connection, lease: &Lease, now: i64) -> rusqlite::Result<(
     }
     c.execute("DELETE FROM leases WHERE id = ?1", [lease.id])?;
     c.execute("DELETE FROM run_leases WHERE lease = ?1", [lease.id])?;
+    activity::forget_lease(c, lease.id)?;
     if let Some(from) = &from {
         reservations::restore(c, from, now)?;
     }
@@ -656,6 +660,7 @@ pub fn insert_lease(
         created: now,
         touched: now,
         devices: Vec::new(),
+        reclaimed: Vec::new(),
     })
 }
 

@@ -77,10 +77,15 @@ track-devices)
           if [ "$p" = "$on" ]; then echo "  $p powered: true"; else echo "  $p powered: false"; fi
         done ;;
       *settings\ put\ global\ *)
+        # The daemon readies a phone as it is plugged in while a grant readies it too: one
+        # put at a time, so neither loses the other's.
         set -- $cmd
-        awk -v s="$serial" -v k="$4" '!($1 == s && $2 == k)' "$w/settings" > "$w/settings.new"
-        echo "$serial $4 $5" >> "$w/settings.new"
-        mv "$w/settings.new" "$w/settings" ;;
+        (
+          flock 9
+          awk -v s="$serial" -v k="$4" '!($1 == s && $2 == k)' "$w/settings" > "$w/settings.new"
+          echo "$serial $4 $5" >> "$w/settings.new"
+          mv "$w/settings.new" "$w/settings"
+        ) 9> "$w/settings.lock" ;;
       *settings\ get\ global\ *)
         set -- $cmd
         awk -v s="$serial" -v k="$4" '$1 == s && $2 == k { v = $3 } END { print (v == "" ? "null" : v) }' "$w/settings" ;;

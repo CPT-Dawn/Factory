@@ -39,7 +39,10 @@ $ a@plain-a devlab status
 1> devices
 1>   FAKEPHONE01        phone    Pixel 8        ready        lease 1 plain-a (claude:<a>)
 1>   FAKEPHONE02        phone    -              unauthorized free
-1>   FAKEPHONE03        phone    Pixel 7        ready        lease 2 plain-b (claude:<b>)
+1>   FAKEPHONE03        phone    Pixel 7        locked       lease 2 plain-b (claude:<b>)
+1> leases
+1>   lease 1 plain-a (claude:<a>): age 0m, idle 0m
+1>   lease 2 plain-b (claude:<b>): age 0m, idle 0m
 1> memory <mem> GB free; watcher active
 ? 0
 $ a@plain-a devlab status --json
@@ -50,21 +53,42 @@ $ a@plain-a devlab status --json
 1>       "kind": "phone",
 1>       "model": "Pixel 8",
 1>       "state": "ready",
-1>       "holder": "lease 1 plain-a (claude:<a>)"
+1>       "holder": "lease 1 plain-a (claude:<a>)",
+1>       "readiness": "ready"
 1>     },
 1>     {
 1>       "serial": "FAKEPHONE02",
 1>       "kind": "phone",
 1>       "model": "",
 1>       "state": "unauthorized",
-1>       "holder": "free"
+1>       "holder": "free",
+1>       "readiness": "unauthorized"
 1>     },
 1>     {
 1>       "serial": "FAKEPHONE03",
 1>       "kind": "phone",
 1>       "model": "Pixel 7",
 1>       "state": "ready",
-1>       "holder": "lease 2 plain-b (claude:<b>)"
+1>       "holder": "lease 2 plain-b (claude:<b>)",
+1>       "readiness": "locked"
+1>     }
+1>   ],
+1>   "leases": [
+1>     {
+1>       "id": 1,
+1>       "worktree": "plain-a",
+1>       "owner": "claude:<a>",
+1>       "ageMin": 0,
+1>       "idleMin": 0,
+1>       "running": null
+1>     },
+1>     {
+1>       "id": 2,
+1>       "worktree": "plain-b",
+1>       "owner": "claude:<b>",
+1>       "ageMin": 0,
+1>       "idleMin": 0,
+1>       "running": null
 1>     }
 1>   ],
 1>   "slots": [],
