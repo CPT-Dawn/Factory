@@ -41,6 +41,7 @@ const STATE_FILES: &[&str] = &[
     "broken",
     "locked",
     "stalled",
+    "yanked",
     "asleep",
     "power",
     "settings",
@@ -91,6 +92,8 @@ impl World {
     ///   `stay_on_while_plugged_in`, is changed on it,
     /// - `power <serial> AC|USB|Wireless`: the power source it is on,
     /// - `stall <serial>`: the emulator never finishes booting,
+    /// - `yank <serial>`: the phone is unplugged when it is next asked its ABI, as a grant of it
+    ///   settles: between the grant and the prep,
     /// - `break <operation>` / `mend <operation>`: `supabase start`, `supabase stop` or `systemd-run` fails,
     ///   or works again.
     pub fn apply(&self, step: &str) -> Result<(), String> {
@@ -117,6 +120,7 @@ impl World {
             }
             ["power", serial, source] => self.append("power", &format!("{serial} {source}")),
             ["stall", serial] => self.append("stalled", serial),
+            ["yank", serial] => self.append("yanked", serial),
             ["break", what @ ..] if !what.is_empty() => self.append("broken", &what.join(" ")),
             ["mend", what @ ..] if !what.is_empty() => {
                 let what = what.join(" ");

@@ -433,3 +433,103 @@ fn reserve_needs_a_project_and_a_readable_count() {
         (2, "devlab: --slots takes a whole number of 1 or more\n")
     );
 }
+
+#[test]
+fn a_reservation_backed_phone_request_that_waits_out_its_time_leaves_the_reservation_and_no_lease()
+{
+    let (sandbox, world) = lab();
+    let (lead, _other, wt) = lead_and_a_full_board(&sandbox, &world);
+    let id = reservation(&as_agent(&sandbox, &wt, &lead, &["reserve"]));
+    let (child, dir) = (Agent::new(), world.worktree("demo-child"));
+
+    // No phone is plugged in: the request waits for one, and gives up.
+    let ask = ["acquire", "--phone", "--quiet", "--wait", "1"];
+    let out = run(call(
+        &sandbox,
+        &dir,
+        &child,
+        &[("DEVLAB_RESERVATION", &id)],
+        &ask,
+    ));
+    assert_eq!((out.code, out.stdout.as_str()), (75, ""), "{out:?}");
+
+    // The reservation is the lead's still, and nobody holds a lease.
+    let status = as_agent(&sandbox, &wt, &lead, &["status"]).stdout;
+    assert!(
+        status.contains(&format!("reserved by {} (reservation {id})", lead.label())),
+        "{status}"
+    );
+    assert!(!status.contains("demo-child"), "{status}");
+    assert_eq!(run(call(&sandbox, &dir, &child, &[], &["env"])).code, 4);
+}
+
+#[test]
+fn a_reservation_backed_lease_whose_phone_goes_before_its_prep_is_given_back_to_the_reservation() {
+    let (sandbox, world) = lab();
+    let (lead, _other, wt) = lead_and_a_full_board(&sandbox, &world);
+    let id = reservation(&as_agent(&sandbox, &wt, &lead, &["reserve"]));
+    let (child, dir) = (Agent::new(), world.worktree("demo-child"));
+    for step in [
+        "plug FAKEPHONE01 device usb:1-1 model:Pixel_8",
+        "yank FAKEPHONE01",
+    ] {
+        world.apply(step).expect("a world step");
+    }
+
+    let ask = ["acquire", "--phone", "--quiet", "--wait", "1"];
+    let out = run(call(
+        &sandbox,
+        &dir,
+        &child,
+        &[("DEVLAB_RESERVATION", &id)],
+        &ask,
+    ));
+    assert_eq!(out.code, 76, "{out:?}");
+
+    let status = as_agent(&sandbox, &wt, &lead, &["status"]).stdout;
+    assert!(
+        status.contains(&format!("reserved by {} (reservation {id})", lead.label())),
+        "{status}"
+    );
+    assert_eq!(run(call(&sandbox, &dir, &child, &[], &["env"])).code, 4);
+}
+
+#[test]
+fn a_run_that_gives_its_slot_back_to_a_reservation_is_its_last_use() {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""maxSlotsPerOwner": 2"#);
+    let (lead, wt) = (Agent::new(), world.worktree("demo-lead"));
+    let reserved = as_agent(&sandbox, &wt, &lead, &["reserve", "--slots", "2"]);
+    assert_eq!(reserved.code, 0, "{reserved:?}");
+    let (child, dir) = (Agent::new(), world.worktree("demo-child"));
+    let suite = ["run", "--no-device", "--stack", "--quiet", "--", "true"];
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    let ran = run(call(
+        &sandbox,
+        &dir,
+        &child,
+        &[("DEVLAB_RESERVATION", "2")],
+        &suite,
+    ));
+    assert_eq!(ran.code, 0, "{ran:?}");
+
+    let mut cmd = sandbox.factory_command(&["lab", "status", "--json"]);
+    cmd.current_dir(&wt).env("DEVLAB_OWNER_PID", lead.pid());
+    let board = run(cmd);
+    let board: serde_json::Value =
+        serde_json::from_str(&board.stdout).unwrap_or_else(|e| panic!("{e}: {board:?}"));
+    let reservations = &board["reservations"];
+    // Reservation 1 was never used; 2 was used when the run ended, so its two hours start again.
+    assert_eq!(reservations[0]["id"], 1, "{board}");
+    assert!(reservations[0].get("used").is_none(), "{board}");
+    assert_eq!(reservations[1]["id"], 2, "{board}");
+    assert!(
+        reservations[1]["used"]
+            .as_u64()
+            .is_some_and(|used| used >= before),
+        "{board}"
+    );
+}
