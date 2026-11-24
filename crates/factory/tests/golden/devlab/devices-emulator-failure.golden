@@ -1,5 +1,5 @@
-# The emulator's unit cannot start: acquire exits 77 naming the unit. The lease it made stays, with
-# no device in it.
+# The emulator's unit cannot start: acquire exits 77 naming the unit, and the lease it made goes
+# back: env finds none.
 break systemd-run
 $ a@plain-a devlab acquire --emulator
 2> devlab: booting 1 emulator(s), about a minute (quick boot) or three (first boot)
@@ -10,5 +10,5 @@ $ a@plain-a devlab status
 1> memory <mem> GB free; watcher active
 ? 0
 $ a@plain-a devlab env
-1> export DEVLAB_LEASE=1
-? 0
+2> devlab: no lease for <sandbox>/wt/plain-a (claude:<a>): run devlab acquire
+? 4

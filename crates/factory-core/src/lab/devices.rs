@@ -80,10 +80,7 @@ pub fn parse_track(buf: &[u8]) -> (Vec<Vec<Attached>>, usize) {
     let mut frames = Vec::new();
     let mut at = 0;
     while let Some(head) = buf.get(at..at + 4) {
-        let Some(len) = std::str::from_utf8(head)
-            .ok()
-            .and_then(|h| usize::from_str_radix(h, 16).ok())
-        else {
+        let Some(len) = list_len(head) else {
             break;
         };
         let Some(body) = buf.get(at + 4..at + 4 + len) else {
@@ -93,6 +90,101 @@ pub fn parse_track(buf: &[u8]) -> (Vec<Vec<Attached>>, usize) {
         at += 4 + len;
     }
     (frames, at)
+}
+
+/// The length a list's four hex digits give.
+fn list_len(head: &[u8]) -> Option<usize> {
+    std::str::from_utf8(head)
+        .ok()
+        .and_then(|h| usize::from_str_radix(h, 16).ok())
+}
+
+/// Whether a list from `adb track-devices -l` names the same devices, in the same states and
+/// of the same models, as `adb devices -l` text; their order and other properties do not count.
+pub fn same_devices(track_list: &[u8], devices_l: &str) -> bool {
+    let key = |text: &str| {
+        let mut devices: Vec<(String, String, String)> = parse_devices_l(text)
+            .into_iter()
+            .map(|a| (a.serial, a.state, a.model))
+            .collect();
+        devices.sort();
+        devices
+    };
+    key(&String::from_utf8_lossy(track_list)) == key(devices_l)
+}
+
+/// How far an `adb track-devices` stream has come through its lists, by their lengths alone
+/// (no device row is read): it tells a stream that stopped partway through a list from one
+/// that is quiet between lists. A length that is not four hex digits leaves it partway for
+/// good, as [`parse_track`] never gets past it either.
+#[derive(Debug, Clone, Default)]
+pub struct ListFraming {
+    /// The digits of the next length read so far.
+    head: Vec<u8>,
+    /// The bytes still to come of the list under way, and those that came.
+    left: usize,
+    body: Vec<u8>,
+    /// The last whole list.
+    last: Option<Vec<u8>>,
+    broken: bool,
+}
+
+impl ListFraming {
+    /// Takes the stream's next bytes; returns how many lists they finished.
+    pub fn feed(&mut self, mut bytes: &[u8]) -> usize {
+        let mut finished = 0;
+        while !bytes.is_empty() && !self.broken {
+            if self.left > 0 {
+                let take = self.left.min(bytes.len());
+                self.left -= take;
+                self.body
+                    .extend_from_slice(bytes.get(..take).unwrap_or_default());
+                bytes = bytes.get(take..).unwrap_or_default();
+                if self.left == 0 {
+                    self.last = Some(std::mem::take(&mut self.body));
+                    finished += 1;
+                }
+                continue;
+            }
+            let take = (4 - self.head.len()).min(bytes.len());
+            self.head
+                .extend_from_slice(bytes.get(..take).unwrap_or_default());
+            bytes = bytes.get(take..).unwrap_or_default();
+            if self.head.len() == 4 {
+                match list_len(&self.head) {
+                    Some(0) => {
+                        self.last = Some(Vec::new());
+                        finished += 1;
+                    }
+                    Some(len) => self.left = len,
+                    None => self.broken = true,
+                }
+                self.head.clear();
+            }
+        }
+        finished
+    }
+
+    /// The device lines of the last whole list, once one came.
+    pub fn last_list(&self) -> Option<&[u8]> {
+        self.last.as_deref()
+    }
+
+    /// Whether the stream stands partway through a list.
+    pub fn mid_list(&self) -> bool {
+        self.broken || self.left > 0 || !self.head.is_empty()
+    }
+}
+
+/// How long to wait before restart number `restarts` (0 for the first) of the adb device
+/// stream: `base` doubled for each restart before it, at most `cap`.
+pub fn restart_delay(
+    restarts: u32,
+    base: std::time::Duration,
+    cap: std::time::Duration,
+) -> std::time::Duration {
+    base.saturating_mul(1u32.checked_shl(restarts).unwrap_or(u32::MAX))
+        .min(cap)
 }
 
 /// What the planner knows of the board for one request.

@@ -5,11 +5,11 @@ use std::process::Child;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustix::process::Signal;
 use serde_json::Value;
 
 use crate::support::herdr::FakeHerdr;
-use crate::support::{DEADLINE, Sandbox, finish, kill_group, spawn};
+use crate::support::world::poll_until;
+use crate::support::{DEADLINE, Sandbox, finish, freeze, spawn, stop_daemon, thaw, waited_on};
 
 #[test]
 fn a_herdr_on_another_protocol_is_reported_and_not_used() {
@@ -211,7 +211,9 @@ fn without_herdr_lead_commands_say_where_they_looked() {
 }
 
 /// Starts `factory wait lead <args>` and returns once the daemon watches `pane` in herdr, so an
-/// event the test sends next reaches it.
+/// event the test sends next reaches it, and holds the wait, so a restart the test makes next
+/// finds it in the database. The daemon a wait starts watches its panes before the wait reaches
+/// it: the watch alone does not say the wait is held.
 // cfg(test), as the harness is, so clippy lets it unwrap.
 #[cfg(test)]
 fn waiting(sandbox: &Sandbox, herdr: &FakeHerdr, args: &[&str], pane: &str) -> Child {
@@ -219,6 +221,11 @@ fn waiting(sandbox: &Sandbox, herdr: &FakeHerdr, args: &[&str], pane: &str) -> C
     all.extend(args);
     let child = spawn(sandbox.factory_command(&all));
     herdr.await_watch(pane);
+    let lead = format!("lead-{}", args[0]);
+    assert!(
+        poll_until(|| waited_on(sandbox, "lead", &lead)),
+        "the daemon never held the wait on {lead}"
+    );
     child
 }
 
@@ -438,19 +445,98 @@ fn a_lead_that_appears_later_is_found() {
 }
 
 #[test]
-fn a_wait_the_daemon_stops_under_says_to_wait_again() {
+fn a_wait_carries_on_across_a_daemon_restart_and_hears_what_happened_meanwhile() {
     let sandbox = Sandbox::new();
     let herdr = shop(&sandbox, &[("lead-cart", "w1:p1", "working")]);
     let child = waiting(&sandbox, &herdr, &["cart"], "w1:p1");
 
-    // As systemd stops it for a restart or an upgrade.
-    let daemon = fs::read_to_string(sandbox.path("run/factory/daemon.pid")).unwrap();
-    kill_group(daemon.trim().parse().unwrap(), Signal::TERM);
+    // The CLI sleeps through the restart; the lead blocks while no daemon runs.
+    freeze(&child);
+    stop_daemon(&sandbox);
+    herdr.status("w1:p1", "blocked");
+    thaw(&child);
     let out = finish(child);
 
-    assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(
-        out.stderr,
-        "factory: the daemon stopped (a restart or an upgrade); run the wait again\n"
+        (
+            out.code,
+            out.stdout_lines().first().copied(),
+            out.stderr.as_str()
+        ),
+        (10, Some("lead-cart blocked"), ""),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_lead_whose_pane_closed_while_no_daemon_ran_is_dead_to_its_resumed_wait() {
+    let sandbox = Sandbox::new();
+    let herdr = shop(&sandbox, &[("lead-cart", "w1:p1", "working")]);
+    let child = waiting(&sandbox, &herdr, &["cart"], "w1:p1");
+
+    freeze(&child);
+    stop_daemon(&sandbox);
+    herdr.close("w1:p1");
+    thaw(&child);
+    let out = finish(child);
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (10, "lead-cart dead\n", ""),
+        "{out:?}"
+    );
+    assert!(
+        !waited_on(&sandbox, "lead", "lead-cart"),
+        "the wait outlived its answer"
+    );
+}
+
+#[test]
+fn a_lead_that_reported_and_left_while_no_daemon_ran_has_finished_for_its_resumed_wait() {
+    let sandbox = Sandbox::new();
+    let herdr = shop(&sandbox, &[("lead-cart", "w1:p1", "working")]);
+    let child = waiting(&sandbox, &herdr, &["cart"], "w1:p1");
+
+    freeze(&child);
+    stop_daemon(&sandbox);
+    let shipped = report(&sandbox, "cart");
+    herdr.close("w1:p1");
+    thaw(&child);
+    let out = finish(child);
+
+    assert_eq!(
+        (out.code, out.stdout, out.stderr.as_str()),
+        (0, format!("lead-cart finished: {shipped}\n"), ""),
+    );
+}
+
+#[test]
+fn a_restarted_wait_keeps_what_is_left_of_its_deadline() {
+    let sandbox = Sandbox::new();
+    let herdr = shop(&sandbox, &[("lead-cart", "w1:p1", "working")]);
+    let began = Instant::now();
+    let child = waiting(&sandbox, &herdr, &["cart", "--timeout", "6"], "w1:p1");
+
+    thread::sleep(Duration::from_secs(3).saturating_sub(began.elapsed()));
+    freeze(&child);
+    stop_daemon(&sandbox);
+    thaw(&child);
+    let out = finish(child);
+    let took = began.elapsed();
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (
+            124,
+            "",
+            "factory: lead-cart is still working after 6s; \
+             wait again, or see factory lead status cart\n"
+        ),
+        "{out:?}"
+    );
+    // 6s from the start, not 6s from the restart.
+    assert!(
+        took >= Duration::from_secs(6) && took < Duration::from_millis(8500),
+        "took {took:?}"
     );
 }

@@ -12,8 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustix::process::Signal;
 
+pub(super) use crate::support::stop_daemon;
 use crate::support::world::{World, fixtures, poll_until};
-use crate::support::{Run, Sandbox, finish, kill_group, run, spawn};
+use crate::support::{Run, Sandbox, finish, freeze, kill_group, run, spawn, thaw};
 
 /// The sandbox with the golden world installed and the built binary on PATH as `devlab`.
 pub(super) fn lab() -> (Sandbox, World) {
@@ -45,29 +46,6 @@ fn lease_id(out: &Run) -> String {
         .unwrap_or_else(|| panic!("no DEVLAB_LEASE in {out:?}"))
         .trim_matches('\'')
         .to_owned()
-}
-
-/// Stops the sandbox's daemon and waits until it is gone.
-pub(super) fn stop_daemon(sandbox: &Sandbox) {
-    let pid: u32 = fs::read_to_string(sandbox.path("run/factory/daemon.pid"))
-        .expect("a daemon runs")
-        .trim()
-        .parse()
-        .expect("a pid");
-    kill_group(pid, Signal::TERM);
-    // A zombie leader can outlast its other threads, which still hold the socket and the lock:
-    // the daemon is gone once the leader is all that is left of it.
-    let gone = poll_until(|| {
-        let threads = fs::read_dir(format!("/proc/{pid}/task")).map_or(0, Iterator::count);
-        fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-            threads <= 1
-                && stat
-                    .rsplit(')')
-                    .next()
-                    .is_some_and(|s| s.trim_start().starts_with('Z'))
-        })
-    });
-    assert!(gone, "daemon {pid} outlived its TERM");
 }
 
 pub(super) fn write_machine_config(sandbox: &Sandbox, extra: &str) {
@@ -171,7 +149,26 @@ fn a_wait_that_is_no_number_of_seconds_is_refused() {
         (
             2,
             "",
-            "devlab: --wait takes a number of seconds (0 = do not wait)\n"
+            "devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)\n"
+        )
+    );
+}
+
+#[test]
+fn a_wait_takes_a_unit_too() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-unit");
+
+    let unit = owned(&sandbox, &wt, &["acquire", "--no-device", "--wait", "1m"]);
+    let bad = owned(&sandbox, &wt, &["acquire", "--no-device", "--wait", "1.5m"]);
+
+    assert_eq!(unit.code, 0, "{unit:?}");
+    assert!(unit.stdout.contains("DEVLAB_SLOT="), "{unit:?}");
+    assert_eq!(
+        (bad.code, bad.stderr.as_str()),
+        (
+            2,
+            "devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)\n"
         )
     );
 }
@@ -201,7 +198,7 @@ fn a_wait_that_is_no_number_of_seconds_stops_run_before_it_runs_anything() {
         (
             2,
             "",
-            "devlab: --wait takes a number of seconds (0 = do not wait)\n"
+            "devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)\n"
         )
     );
     assert!(!marker.exists(), "the command ran");
@@ -268,7 +265,7 @@ fn a_bad_wait_is_refused_even_when_the_machine_config_is_broken() {
         (out.code, out.stderr.as_str()),
         (
             2,
-            "devlab: --wait takes a number of seconds (0 = do not wait)\n"
+            "devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)\n"
         )
     );
 }
@@ -451,12 +448,9 @@ fn an_emulator_whose_unit_ends_while_it_boots_is_never_ready_and_is_forgotten() 
     // Status shows what adb lists, which drops the emulator once its stream says so.
     let gone = poll_until(|| status(&sandbox, &wt).starts_with("devices: none attached\n"));
     assert!(gone, "{}", status(&sandbox, &wt));
-    // The lease stays, with no device in it.
+    // The lease went with it: nothing is held here.
     let env = owned(&sandbox, &wt, &["env"]);
-    assert_eq!(
-        (env.code, env.stdout.as_str()),
-        (0, "export DEVLAB_LEASE=1\n")
-    );
+    assert_eq!(env.code, 4, "{env:?}");
 }
 
 #[test]
@@ -508,9 +502,62 @@ fn a_pair_whose_emulator_fails_to_boot_gives_back_its_phone_too() {
         status(&sandbox, &wt)
     );
     let env = owned(&sandbox, &wt, &["env"]);
-    assert_eq!(
-        (env.code, env.stdout.as_str()),
-        (0, "export DEVLAB_LEASE=1\n")
+    assert_eq!(env.code, 4, "{env:?}");
+}
+
+#[test]
+fn a_failed_emulator_boot_frees_the_slot_for_the_next_owner() {
+    let (sandbox, world) = lab();
+    let (a, b) = (Agent::start(), Agent::start());
+    let [wa, wb] = ["demo-a", "demo-b"].map(|n| world.worktree(n));
+    world.apply("break systemd-run").unwrap();
+
+    let failed = run(for_owner(
+        &sandbox,
+        &wa,
+        a.pid(),
+        &["acquire", "--emulator"],
+    ));
+    assert_eq!(failed.code, 77, "{failed:?}");
+    world.apply("mend systemd-run").unwrap();
+    let again = run(for_owner(
+        &sandbox,
+        &wb,
+        b.pid(),
+        &["acquire", "--no-device"],
+    ));
+
+    // Both slots of demo are free again: the failed lease took neither.
+    assert!(again.stdout.contains("DEVLAB_SLOT=0"), "{again:?}");
+    let env = run(for_owner(&sandbox, &wa, a.pid(), &["env"]));
+    assert_eq!(env.code, 4, "{env:?}");
+}
+
+#[test]
+fn a_top_up_whose_emulator_fails_to_boot_gives_the_whole_lease_back() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("plain-a");
+    world
+        .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
+        .unwrap();
+    let held = owned(&sandbox, &wt, &["acquire", "--phone", "--quiet"]);
+    assert_eq!(held.code, 0, "{held:?}");
+    world.apply("break systemd-run").unwrap();
+
+    let more = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--devices", "2", "--emulator", "--quiet"],
+    );
+
+    assert_eq!(more.code, 77, "{more:?}");
+    // The phone it already held is free again too.
+    let env = owned(&sandbox, &wt, &["env"]);
+    assert_eq!(env.code, 4, "{env:?}");
+    assert!(
+        status(&sandbox, &wt).contains("Pixel 8        ready        free"),
+        "{}",
+        status(&sandbox, &wt)
     );
 }
 
@@ -679,8 +726,13 @@ fn a_plain_release_mid_stop_leaves_the_slot_held_until_the_stack_is_down() {
 fn an_owner_that_exits_mid_stop_leaves_the_slot_held_until_the_stack_is_down() {
     a_slot_stays_held_while_its_stack_stops(|sandbox, wa, a, _| {
         a.exit();
+        // The daemon frees it the moment a exits, or this gc does: either way it is gone.
         let gc = run(devlab(sandbox, wa, &["gc"]));
-        assert!(gc.stdout.starts_with("released lease 1 "), "{gc:?}");
+        assert_eq!(gc.code, 0, "{gc:?}");
+        assert!(
+            gc.stdout.is_empty() || gc.stdout.starts_with("released lease 1 "),
+            "{gc:?}"
+        );
     });
 }
 
@@ -1097,6 +1149,56 @@ fn factory_lab_is_silent_while_it_waits() {
 }
 
 #[test]
+fn a_wait_of_minus_one_queues_for_the_configured_default_and_other_negatives_are_refused() {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""waitSec": 1"#);
+    let (a, b, c) = (Agent::start(), Agent::start(), Agent::start());
+    let [wa, wb, wc] = ["demo-a", "demo-b", "demo-c"].map(|n| world.worktree(n));
+    for (agent, wt) in [(&a, &wa), (&b, &wb)] {
+        let held = run(for_owner(
+            &sandbox,
+            wt,
+            agent.pid(),
+            &["acquire", "--no-device"],
+        ));
+        assert_eq!(held.code, 0, "{held:?}");
+    }
+
+    let queued = run(for_owner(
+        &sandbox,
+        &wc,
+        c.pid(),
+        &["acquire", "--no-device", "--wait", "-1"],
+    ));
+    let ran = run(for_owner(
+        &sandbox,
+        &wc,
+        c.pid(),
+        &["run", "--no-device", "--wait", "-1", "--", "true"],
+    ));
+    let refused = run(for_owner(
+        &sandbox,
+        &wc,
+        c.pid(),
+        &["acquire", "--no-device", "--wait", "-2"],
+    ));
+
+    for out in [&queued, &ran] {
+        assert_eq!(out.code, 75, "{out:?}");
+        assert!(
+            out.stderr
+                .ends_with("devlab: gave up after 1 s: all 2 stack slots of demo are held\n"),
+            "{out:?}"
+        );
+    }
+    assert_eq!(refused.code, 2, "{refused:?}");
+    assert_eq!(
+        refused.stderr,
+        "devlab: --wait takes seconds, or a whole number and s, m or h such as 90s or 9m (0 = do not wait)\n"
+    );
+}
+
+#[test]
 fn a_queued_request_keeps_its_deadline_across_a_daemon_restart() {
     let (sandbox, world) = lab();
     let (a, b, c) = (Agent::start(), Agent::start(), Agent::start());
@@ -1274,7 +1376,7 @@ fn a_request_its_caller_sends_again_keeps_the_place_it_never_heard_of() {
 }
 
 #[test]
-fn factory_lab_gc_names_a_file_with_the_leases_it_released() {
+fn gc_has_nothing_to_say_of_leases_the_daemon_already_freed() {
     let (sandbox, world) = lab();
     let (mut a, mut b) = (Agent::start(), Agent::start());
     let [wa, wb] = ["demo-a", "demo-b"].map(|n| world.worktree(n));
@@ -1287,9 +1389,44 @@ fn factory_lab_gc_names_a_file_with_the_leases_it_released() {
         ));
         assert_eq!(held.code, 0, "{held:?}");
     }
-    let (pa, pb) = (a.pid(), b.pid());
     a.exit();
     b.exit();
+    let gone = poll_until(|| {
+        [(&wa, &a), (&wb, &b)]
+            .iter()
+            .all(|(wt, agent)| run(for_owner(&sandbox, wt, agent.pid(), &["env"])).code == 4)
+    });
+    assert!(
+        gone,
+        "the daemon never freed the leases of the owners that exited"
+    );
+
+    // The daemon freed them: gc has nothing of its own to say.
+    let gc = native(&sandbox, &wa, std::process::id(), &["lab", "gc"]);
+    assert_eq!(one_line(&gc), "no lease of an exited owner");
+    let plain = run(devlab(&sandbox, &wa, &["gc"]));
+    assert_eq!((plain.code, plain.stdout.as_str()), (0, ""), "{plain:?}");
+}
+
+/// A lead that reserved a slot and exited: the keeper watches leases' owners, not reservations',
+/// so only a write that finds the reservation frees it, and a `gc` that is the next call does.
+fn orphaned_reservations(sandbox: &Sandbox, world: &World) -> (PathBuf, Vec<u32>) {
+    let (mut a, mut b) = (Agent::start(), Agent::start());
+    let [wa, wb] = ["demo-a", "demo-b"].map(|n| world.worktree(n));
+    for (agent, wt) in [(&a, &wa), (&b, &wb)] {
+        let reserved = run(for_owner(sandbox, wt, agent.pid(), &["reserve"]));
+        assert_eq!(reserved.code, 0, "{reserved:?}");
+    }
+    let pids = vec![a.pid(), b.pid()];
+    a.exit();
+    b.exit();
+    (wa, pids)
+}
+
+#[test]
+fn gc_names_a_file_with_the_reservations_it_freed_itself() {
+    let (sandbox, world) = lab();
+    let (wa, pids) = orphaned_reservations(&sandbox, &world);
 
     let gc = native(&sandbox, &wa, std::process::id(), &["lab", "gc"]);
 
@@ -1298,12 +1435,36 @@ fn factory_lab_gc_names_a_file_with_the_leases_it_released() {
         line.starts_with("released 2 leases of exited owners; list in "),
         "{line}"
     );
-    assert_eq!(
-        named_file(line),
-        format!(
-            "released lease 1 (sleep:{pa}, owner exited)\nreleased lease 2 (sleep:{pb}, owner exited)\n"
-        )
-    );
+    let freed = named_file(line);
+    for pid in pids {
+        assert!(
+            freed.contains(&format!("(sleep:{pid}, owner exited)")),
+            "{freed}"
+        );
+    }
+    // Said once: the next gc finds nothing.
+    let again = run(devlab(&sandbox, &wa, &["gc"]));
+    assert_eq!((again.code, again.stdout.as_str()), (0, ""), "{again:?}");
+}
+
+#[test]
+fn devlab_gc_says_a_freed_reservation_once() {
+    let (sandbox, world) = lab();
+    let (wa, pids) = orphaned_reservations(&sandbox, &world);
+
+    let gc = run(devlab(&sandbox, &wa, &["gc"]));
+    let again = run(devlab(&sandbox, &wa, &["gc"]));
+
+    assert_eq!(gc.code, 0, "{gc:?}");
+    assert_eq!(gc.stdout.lines().count(), 2, "{gc:?}");
+    for (line, pid) in gc.stdout.lines().zip(&pids) {
+        assert!(
+            line.starts_with("released reservation ")
+                && line.ends_with(&format!("(sleep:{pid}, owner exited)")),
+            "{line}"
+        );
+    }
+    assert_eq!((again.code, again.stdout.as_str()), (0, ""), "{again:?}");
 }
 
 /// Tells the daemon the grant on `stream` reached its caller; its confirmation.
@@ -1476,6 +1637,24 @@ fn a_run_lands_in_the_ledger_with_its_command_slot_and_exit() {
 }
 
 #[test]
+fn a_run_whose_emulator_fails_to_boot_records_no_lease_it_gave_back() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-boot-fail");
+    world.apply("break systemd-run").unwrap();
+
+    let out = owned(
+        &sandbox,
+        &wt,
+        &["run", "--emulator", "--quiet", "--", "true"],
+    );
+
+    assert_eq!(out.code, 77, "{out:?}");
+    let event = the_lab_run(&sandbox);
+    assert!(event.get("lease").is_none(), "{event}");
+    assert!(event.get("slot").is_none(), "{event}");
+}
+
+#[test]
 fn sigterm_while_queued_leaves_the_queue_and_the_ledger_says_so() {
     let (sandbox, world) = lab();
     hold_the_owners_slot(&sandbox, &world);
@@ -1599,30 +1778,222 @@ fn a_client_killed_while_queued_is_recorded_as_lost_and_leaves_the_queue() {
     assert!(!status.stdout.contains("waiting:"), "{status:?}");
 }
 
+/// The lab board, as `factory lab status --json` shows it.
+fn board(sandbox: &Sandbox, dir: &Path) -> serde_json::Value {
+    one_json(&native(
+        sandbox,
+        dir,
+        std::process::id(),
+        &["lab", "status", "--json"],
+    ))
+}
+
+/// Each lease on the board: its id, slot and worktree.
+fn leases_on(board: &serde_json::Value) -> Vec<(i64, i64, String)> {
+    board["leases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|lease| {
+            (
+                lease["id"].as_i64().unwrap_or_default(),
+                lease["slot"].as_i64().unwrap_or(-1),
+                lease["worktree"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The waiters on the board, oldest first: their ids and worktrees.
+fn waiters_on(board: &serde_json::Value) -> Vec<(i64, String)> {
+    board["waiters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|waiter| {
+            (
+                waiter["id"].as_i64().unwrap_or_default(),
+                waiter["worktree"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// A command for `spawn_run` that starts, then ends with `code` once the test writes `go`.
+fn until_go(code: u8) -> String {
+    format!("echo $$ > child.pid; while [ ! -e go ]; do sleep 0.1; done; exit {code}")
+}
+
 #[test]
-fn a_daemon_stopping_under_a_run_records_it_as_lost_without_waiting_for_it() {
+fn a_run_whose_command_runs_across_a_daemon_restart_keeps_its_lease_and_records_its_exit() {
     let (sandbox, world) = lab();
     let wt = world.worktree("demo-restart");
-    let child = spawn_run(&sandbox, &wt, "echo $$ > child.pid; exec sleep 30");
+    let child = spawn_run(&sandbox, &wt, &until_go(3));
     assert!(
         poll_until(|| wt.join("child.pid").exists()),
         "the command never started"
     );
-    let devlab_pid = child.id();
+    let held = leases_on(&board(&sandbox, &wt));
 
     let stopping = std::time::Instant::now();
     stop_daemon(&sandbox);
     let took = stopping.elapsed();
-    let event = the_lab_run(&sandbox);
-    kill_group(devlab_pid, Signal::KILL);
-    let _ = finish(child);
+    let kept = leases_on(&board(&sandbox, &wt));
+    fs::write(wt.join("go"), "").expect("write go");
+    let out = finish(child);
 
     assert!(
         took < std::time::Duration::from_secs(5),
         "the stop took {took:?}"
     );
-    assert_eq!(event["outcome"], "lost", "{event}");
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(kept, held);
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "exit 3", "{event}");
     assert_eq!(event["phase"], "running", "{event}");
+    assert_eq!(event["lease"], held[0].0, "{event}");
+    assert_eq!(event["slot"], 0, "{event}");
+}
+
+#[test]
+fn a_run_whose_command_outlasts_a_daemon_answer_is_still_followed_across_a_restart() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-long");
+    // Longer than devlab waits for any one answer of the daemon's (10 s).
+    let script = "sleep 11; touch slept; while [ ! -e go ]; do sleep 0.1; done; exit 4".to_owned();
+    let child = spawn_run(&sandbox, &wt, &script);
+    assert!(
+        poll_until(|| wt.join("slept").exists()),
+        "the command never slept"
+    );
+
+    stop_daemon(&sandbox);
+    let _ = board(&sandbox, &wt);
+    fs::write(wt.join("go"), "").expect("write go");
+    let out = finish(child);
+
+    assert_eq!(out.code, 4, "{out:?}");
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "exit 4", "{event}");
+    assert_eq!(event["phase"], "running", "{event}");
+}
+
+#[test]
+fn a_signal_while_a_run_waits_for_its_end_to_be_recorded_keeps_the_commands_exit() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-settling");
+    // A daemon a devlab started would be hung up on, frozen, once that devlab exits (its
+    // process group orphaned): this one's starter is gone before the freeze.
+    let _ = board(&sandbox, &wt);
+    let child = spawn_run(&sandbox, &wt, &until_go(3));
+    assert!(
+        poll_until(|| wt.join("child.pid").exists()),
+        "the command never started"
+    );
+    let command: u32 = fs::read_to_string(wt.join("child.pid"))
+        .expect("child.pid")
+        .trim()
+        .parse()
+        .expect("a pid");
+    let daemon: u32 = fs::read_to_string(sandbox.path("run/factory/daemon.pid"))
+        .expect("a daemon runs")
+        .trim()
+        .parse()
+        .expect("a pid");
+
+    // A frozen daemon never answers the run's end, so devlab waits for it.
+    kill_group(daemon, Signal::STOP);
+    fs::write(wt.join("go"), "").expect("write go");
+    let ended = poll_until(|| !Path::new(&format!("/proc/{command}")).exists());
+    signal(child.id(), Signal::TERM);
+    let out = finish(child);
+    kill_group(daemon, Signal::CONT);
+
+    assert!(ended, "the command never ended");
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(out.stderr, "", "{out:?}");
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "exit 3", "{event}");
+}
+
+#[test]
+fn runs_queued_across_a_daemon_restart_keep_their_places_and_are_granted_in_turn() {
+    let (sandbox, world) = lab();
+    hold_the_owners_slot(&sandbox, &world);
+    let (first, second) = (world.worktree("demo-first"), world.worktree("demo-second"));
+    let a = spawn_run(&sandbox, &first, "echo ran > ran");
+    assert!(poll_until(
+        || waiters_on(&board(&sandbox, &first)).len() == 1
+    ));
+    let b = spawn_run(&sandbox, &second, "echo ran > ran");
+    assert!(poll_until(
+        || waiters_on(&board(&sandbox, &first)).len() == 2
+    ));
+    let queued = waiters_on(&board(&sandbox, &first));
+
+    stop_daemon(&sandbox);
+    let requeued = waiters_on(&board(&sandbox, &first));
+    let holder = world.worktree("demo-holder");
+    assert_eq!(owned(&sandbox, &holder, &["release"]).code, 0);
+    let out_a = finish(a);
+    let second_waited = !second.join("ran").exists();
+    assert_eq!(owned(&sandbox, &first, &["release"]).code, 0);
+    let out_b = finish(b);
+
+    assert_eq!(requeued, queued);
+    assert_eq!(out_a.code, 0, "{out_a:?}");
+    assert!(second_waited, "the second run went before the first");
+    assert_eq!(out_b.code, 0, "{out_b:?}");
+    assert!(poll_until(|| lab_runs(&sandbox).len() == 2));
+    for event in lab_runs(&sandbox) {
+        assert_eq!(event["outcome"], "exit 0", "{event}");
+        assert_eq!(event["phase"], "running", "{event}");
+    }
+}
+
+#[test]
+fn a_run_a_daemon_stop_cut_off_for_good_is_recorded_as_daemon_stopped_not_lost() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-cut-off");
+    let child = spawn_run(&sandbox, &wt, "echo $$ > child.pid; exec sleep 30");
+    assert!(
+        poll_until(|| wt.join("child.pid").exists()),
+        "the command never started"
+    );
+
+    // Frozen, the run can't get back to a daemon before it is killed.
+    freeze(&child);
+    stop_daemon(&sandbox);
+    kill_group(child.id(), Signal::KILL);
+    let _ = finish(child);
+    let after = board(&sandbox, &wt);
+
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "daemon-stopped", "{event}");
+    assert_eq!(event["phase"], "running", "{event}");
+    assert_eq!(leases_on(&after).len(), 1, "{after}");
+}
+
+#[test]
+fn a_run_still_queued_when_the_daemon_stops_for_good_is_recorded_as_daemon_stopped() {
+    let (sandbox, world) = lab();
+    hold_the_owners_slot(&sandbox, &world);
+    let wt = world.worktree("demo-queued-gone");
+    let child = spawn_run(&sandbox, &wt, "true");
+    await_waiter(&sandbox, &wt);
+
+    freeze(&child);
+    stop_daemon(&sandbox);
+    kill_group(child.id(), Signal::KILL);
+    let _ = finish(child);
+    let after = board(&sandbox, &wt);
+
+    let event = the_lab_run(&sandbox);
+    assert_eq!(event["outcome"], "daemon-stopped", "{event}");
+    assert_eq!(event["phase"], "queued", "{event}");
+    assert_eq!(event["run_s"], 0, "{event}");
+    assert_eq!(waiters_on(&after), Vec::new());
 }
 
 /// A process that stands in for an agent owning leases, until the test kills it.
@@ -1904,6 +2275,42 @@ fn factory_wait_lease_returns_once_the_lease_is_released() {
     let again = one_json(&sandbox.factory(&["wait", "lease", "1", "--json"]));
     assert_eq!(again, serde_json::json!({"lease": 1, "held": false}));
     assert!(!lease_waited_on(&sandbox, "1"));
+}
+
+#[test]
+fn factory_wait_lease_carries_on_across_a_daemon_restart_and_hears_what_happened_meanwhile() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-wait-restart");
+    let mut owner = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn the owner");
+    let acquired = native(
+        &sandbox,
+        &wt,
+        owner.id(),
+        &["lab", "acquire", "--no-device"],
+    );
+    assert!(one_line(&acquired).starts_with("lease 1,"), "{acquired:?}");
+    let waiter = spawn(sandbox.factory_command(&["wait", "lease", "1"]));
+    assert!(
+        poll_until(|| lease_waited_on(&sandbox, "1")),
+        "the daemon never held the wait"
+    );
+
+    // The CLI sleeps through the restart; the owner exits while no daemon runs.
+    freeze(&waiter);
+    stop_daemon(&sandbox);
+    owner.kill().expect("kill the owner");
+    owner.wait().expect("reap the owner");
+    thaw(&waiter);
+    let out = finish(waiter);
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "lease 1 ended\n", ""),
+        "{out:?}"
+    );
 }
 
 #[test]

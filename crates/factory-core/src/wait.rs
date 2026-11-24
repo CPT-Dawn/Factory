@@ -33,6 +33,31 @@ impl fmt::Display for WaitOn {
     }
 }
 
+impl WaitOn {
+    /// Its kind and what it is on, as a wait is stored and listed: `("ci", "acme/shop#12")`.
+    pub fn parts(&self) -> (&'static str, String) {
+        match self {
+            WaitOn::Lead(name) => ("lead", name.clone()),
+            WaitOn::Ci(pr) => ("ci", pr.clone()),
+            WaitOn::Review(label) => ("review", label.clone()),
+            WaitOn::Lease(id) => ("lease", id.to_string()),
+            WaitOn::Claude => ("claude", "quota".to_owned()),
+        }
+    }
+
+    /// The wait [`WaitOn::parts`] gave `kind` and `target`; none for parts it never gives.
+    pub fn from_parts(kind: &str, target: &str) -> Option<WaitOn> {
+        match kind {
+            "lead" => Some(WaitOn::Lead(target.to_owned())),
+            "ci" => Some(WaitOn::Ci(target.to_owned())),
+            "review" => Some(WaitOn::Review(target.to_owned())),
+            "lease" => target.parse().ok().map(WaitOn::Lease),
+            "claude" => Some(WaitOn::Claude),
+            _ => None,
+        }
+    }
+}
+
 /// One registered wait.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Wait {
@@ -57,6 +82,13 @@ impl Waits {
         self.next += 1;
         self.waits.insert(id, wait);
         id
+    }
+
+    /// Points the wait `id` at `on` instead, as when the pull request a wait named is found.
+    pub fn retarget(&mut self, id: WaitId, on: WaitOn) {
+        if let Some(wait) = self.waits.get_mut(&id) {
+            wait.on = on;
+        }
     }
 
     pub fn clear(&mut self, id: WaitId) {

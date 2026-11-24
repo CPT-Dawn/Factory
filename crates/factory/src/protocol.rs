@@ -93,7 +93,9 @@ pub enum Outcome {
     /// Progress before the result, `{"id", "note"}`: a request that waits may send any number.
     Note(String),
     /// `{"id", "queued": n}`: a request that waits in a queue the daemon keeps across restarts
-    /// (`lab.acquire`) holds place `n`, which it names to keep it when it asks again.
+    /// (`lab.acquire`) holds place `n`, which it names to keep it when it asks again; a
+    /// blocking wait (`wait.lead`, `wait.ci`, `wait.review`, `wait.lease`, `wait.claude`) is
+    /// kept as wait `n`, which it names as `resume` to carry on with it.
     Queued(i64),
 }
 
@@ -168,6 +170,10 @@ pub struct WaitClaudeParams {
     /// The herdr pane the wait comes from, so the lead in it shows as waiting.
     pub waiter: Option<String>,
     pub timeout_secs: u64,
+    /// The wait an earlier daemon held for this CLI, by the id its `queued` line gave: the
+    /// wait carries on with what is left of its time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<i64>,
 }
 
 /// Whether a lead may dispatch: `unknown`, `go` or `hold`, with the window and the hold.
@@ -306,6 +312,10 @@ pub struct WaitLeadParams {
     /// The herdr pane the wait comes from, so the lead in it shows as waiting.
     pub waiter: Option<String>,
     pub timeout_secs: u64,
+    /// The wait an earlier daemon held for this CLI, by the id its `queued` line gave: the
+    /// wait carries on with what is left of its time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -346,6 +356,10 @@ pub struct WaitReviewParams {
     /// The herdr pane the wait comes from, so the lead in it shows as waiting.
     pub waiter: Option<String>,
     pub timeout_secs: u64,
+    /// The wait an earlier daemon held for this CLI, by the id its `queued` line gave: the
+    /// wait carries on with what is left of its time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -354,6 +368,10 @@ pub struct WaitLeaseParams {
     /// The herdr pane the wait comes from, so the lead in it shows as waiting.
     pub waiter: Option<String>,
     pub timeout_secs: u64,
+    /// The wait an earlier daemon held for this CLI, by the id its `queued` line gave: the
+    /// wait carries on with what is left of its time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -375,6 +393,10 @@ pub struct WaitCiParams {
     /// How often to poll GitHub when it can't listen for events; the first wait on a pull
     /// request sets it for all.
     pub poll_secs: u64,
+    /// The wait an earlier daemon held for this CLI, by the id its `queued` line gave: the
+    /// wait carries on with what is left of its time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -61,9 +61,10 @@ pub enum Command {
         spec: Option<String>,
         /// The previous round's report
         previous: Option<PathBuf>,
-        /// Seconds a reviewer may take before its process group is killed (default: the config's)
-        #[arg(long, value_name = "SECONDS")]
-        timeout: Option<u64>,
+        /// How long a reviewer may take before its process group is killed: seconds, or 90s, 9m
+        /// or 1h (default: the config's)
+        #[arg(long, value_parser = duration)]
+        timeout: Option<Duration>,
         /// The ticket's tier, which picks the chain of reviewers: hard, standard or trivial
         /// (a spec review is hard; a small or docs-only diff is trivial unless tagged hard)
         #[arg(long, value_name = "TIER")]
@@ -100,7 +101,7 @@ pub enum Command {
         /// Give the name back to today's devlab and start its watcher again
         #[arg(long)]
         rollback: bool,
-        /// With --rollback: skip the check that factory lab holds nothing, for a lab that no longer answers
+        /// With --rollback: skip the check that factory lab holds nothing, for a lab that no longer answers, and the need for a watcher unit to start again
         #[arg(long, requires = "rollback")]
         force: bool,
     },
@@ -173,8 +174,8 @@ pub enum WaitCommand {
     Lead {
         /// The lead's slug, or lead-<slug>
         lead: String,
-        /// Give up after this long with exit 124, such as 90s, 9m or 2h [default: 9m, or 2h
-        /// with --notify]
+        /// Give up after this long with exit 124: seconds, or 90s, 9m or 1h [default: 9m,
+        /// or 2h with --notify]
         #[arg(long, value_parser = duration)]
         timeout: Option<Duration>,
         /// Return at once; the daemon posts the line into this Claude Code session when the
@@ -186,8 +187,8 @@ pub enum WaitCommand {
     Ci {
         /// The PR: its number (from its repo's checkout), URL or branch
         pr: String,
-        /// Give up after this long with exit 124, such as 90s, 9m or 2h [default: 9m, or 2h
-        /// with --notify]
+        /// Give up after this long with exit 124: seconds, or 90s, 9m or 1h [default: 9m,
+        /// or 2h with --notify]
         #[arg(long, value_parser = duration)]
         timeout: Option<Duration>,
         /// Return at once; the daemon posts the line into this Claude Code session when the
@@ -199,13 +200,13 @@ pub enum WaitCommand {
     Review {
         /// The review's label, as factory review was given it
         label: String,
-        /// Give up after this long with exit 124, such as 90s, 9m or 2h
+        /// Give up after this long with exit 124: seconds, or 90s, 9m or 1h
         #[arg(long, default_value = "9m", value_parser = duration)]
         timeout: Duration,
     },
     /// Until a lead may dispatch on the Claude plan again: its window has room (exit 0)
     Claude {
-        /// Give up after this long with exit 124, such as 90s, 9m or 2h
+        /// Give up after this long with exit 124: seconds, or 90s, 9m or 1h
         #[arg(long, default_value = "9m", value_parser = duration)]
         timeout: Duration,
     },
@@ -213,7 +214,7 @@ pub enum WaitCommand {
     Lease {
         /// The lease's id, as factory lab acquire and status name it
         lease: u32,
-        /// Give up after this long with exit 124, such as 90s, 9m or 2h
+        /// Give up after this long with exit 124: seconds, or 90s, 9m or 1h
         #[arg(long, default_value = "9m", value_parser = duration)]
         timeout: Duration,
     },

@@ -144,9 +144,16 @@ fn a_cooled_backend_shows_when_it_resets_and_the_other_is_available() {
 
     let lines = out.stdout_lines();
     let at = until.to_string();
+    // A reset on another day than the one the title is dated shows its date too.
+    let today = lines[0].strip_prefix("factory status ").unwrap();
+    let day = if today[..10] == at[..10] {
+        String::new()
+    } else {
+        format!("{} ", &at[5..10])
+    };
     let codex = lines.iter().find(|l| l.starts_with("  codex")).unwrap();
     assert!(
-        codex.contains(&format!("cooling, resets {}Z (in 2h)", &at[11..16])),
+        codex.contains(&format!("cooling, resets {day}{}Z (in 2h)", &at[11..16])),
         "{out:?}"
     );
     let claude = lines.iter().find(|l| l.starts_with("  claude")).unwrap();

@@ -30,9 +30,9 @@ const START_LOCK_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a stopping daemon may take to exit: its drain, then its runtime's shutdown.
 const STOPPING_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the daemon may take to answer a request that doesn't wait on an event.
-const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a queued request keeps trying to get back to a daemon it lost.
-const RESUME_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const RESUME_TIMEOUT: Duration = Duration::from_secs(20);
 /// The pause between those tries.
 const RESUME_PAUSE: Duration = Duration::from_millis(100);
 /// The next step when the daemon fails to start for no reason it gave.
@@ -83,6 +83,63 @@ pub fn wait<P: Serialize, R: DeserializeOwned>(
     )
 }
 
+/// [`wait`] for a blocking wait the daemon keeps across its restarts (`wait.lead`, `wait.ci`,
+/// `wait.review`, `wait.lease`, `wait.claude`). The daemon says the wait's id in a `queued`
+/// line; when the daemon goes away, the CLI connects again (starting a daemon if none runs) for
+/// up to [`RESUME_TIMEOUT`] and asks with `params(Some(id), _)`, and the wait carries on with
+/// what is left of its time. Lost before it heard an id, it asks afresh with
+/// `params(None, seconds)`, the seconds left of `limit`; the first ask gives all of `limit`.
+pub fn hold<P: Serialize, R: DeserializeOwned>(
+    paths: &Paths,
+    method: &str,
+    params: impl Fn(Option<i64>, u64) -> P,
+    limit: Duration,
+) -> Result<R, Failure> {
+    let begun = Instant::now();
+    let until = begun + limit + ANSWER_TIMEOUT;
+    let mut kept: Option<i64> = None;
+    let mut give_up: Option<Instant> = None;
+    let mut retry = false;
+    loop {
+        // Afresh, a wait is given what is left of its time; resumed, the daemon keeps it.
+        let left = if retry {
+            limit.saturating_sub(begun.elapsed())
+        } else {
+            limit
+        };
+        let patience = until
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        let mut heard = None;
+        let lost = match Session::open(paths) {
+            Ok(mut session) => match session.exchange_raw(
+                method,
+                &params(kept, left.as_secs()),
+                Some(patience),
+                Exit::Timeout,
+                &mut |_| {},
+                &mut |row| heard = Some(row),
+            ) {
+                Ok(answer) => return Ok(answer),
+                Err(Ended::Refused(failure)) => return Err(failure),
+                Err(Ended::Lost(failure)) => failure,
+            },
+            Err(failure) if !retry => return Err(failure),
+            Err(failure) => failure,
+        };
+        retry = true;
+        if heard.is_some() {
+            kept = heard;
+            give_up = None;
+        }
+        let stop = (*give_up.get_or_insert_with(|| Instant::now() + RESUME_TIMEOUT)).min(until);
+        if Instant::now() >= stop {
+            return Err(lost);
+        }
+        thread::sleep(RESUME_PAUSE);
+    }
+}
+
 /// [`call`] for a request that waits in a queue the daemon keeps (`lab.acquire`): each note
 /// before its answer goes to `on_note`, and each line may take up to `read_timeout` (none waits
 /// as long as it takes).
@@ -99,40 +156,66 @@ pub fn call_queued<P: Serialize, R: DeserializeOwned>(
     read_timeout: Option<Duration>,
     mut on_note: impl FnMut(&str),
 ) -> Result<R, Failure> {
+    call_queued_on(
+        paths,
+        method,
+        received,
+        params,
+        read_timeout,
+        &mut on_note,
+        &mut |_| {},
+    )
+    .map(|(answer, _)| answer)
+}
+
+/// [`call_queued`], handing each connection it asks on to `on_session` before it asks, and
+/// returning the one its answer came on with the answer.
+pub fn call_queued_on<P: Serialize, R: DeserializeOwned>(
+    paths: &Paths,
+    method: &str,
+    received: &str,
+    params: impl Fn(Option<i64>) -> P,
+    read_timeout: Option<Duration>,
+    on_note: &mut dyn FnMut(&str),
+    on_session: &mut dyn FnMut(&Session),
+) -> Result<(R, Session), Failure> {
     let mut place = None;
     let mut give_up = None;
     let mut asked = false;
     loop {
         let mut placed = None;
         let lost = match Session::open(paths) {
-            Ok(mut session) => match session.exchange_raw(
-                method,
-                &params(place),
-                read_timeout,
-                Exit::Precondition,
-                &mut on_note,
-                &mut |n| placed = Some(n),
-            ) {
-                Ok(answer) => match session.exchange_raw::<_, serde_json::Value>(
-                    received,
-                    &(),
-                    Some(ANSWER_TIMEOUT),
+            Ok(mut session) => {
+                on_session(&session);
+                match session.exchange_raw(
+                    method,
+                    &params(place),
+                    read_timeout,
                     Exit::Precondition,
-                    &mut |_| {},
-                    &mut |_| {},
+                    on_note,
+                    &mut |n| placed = Some(n),
                 ) {
-                    Ok(_) => return Ok(answer),
-                    Err(Ended::Refused(failure) | Ended::Lost(failure)) => {
+                    Ok(answer) => match session.exchange_raw::<_, serde_json::Value>(
+                        received,
+                        &(),
+                        Some(ANSWER_TIMEOUT),
+                        Exit::Precondition,
+                        &mut |_| {},
+                        &mut |_| {},
+                    ) {
+                        Ok(_) => return Ok((answer, session)),
+                        Err(Ended::Refused(failure) | Ended::Lost(failure)) => {
+                            asked = true;
+                            failure
+                        }
+                    },
+                    Err(Ended::Refused(failure)) => return Err(failure),
+                    Err(Ended::Lost(failure)) => {
                         asked = true;
                         failure
                     }
-                },
-                Err(Ended::Refused(failure)) => return Err(failure),
-                Err(Ended::Lost(failure)) => {
-                    asked = true;
-                    failure
                 }
-            },
+            }
             Err(failure) => failure,
         };
         if placed.is_some() {
@@ -144,6 +227,35 @@ pub fn call_queued<P: Serialize, R: DeserializeOwned>(
         }
         let until = *give_up.get_or_insert_with(|| Instant::now() + RESUME_TIMEOUT);
         if Instant::now() >= until {
+            return Err(lost);
+        }
+        thread::sleep(RESUME_PAUSE);
+    }
+}
+
+/// Asks a daemon to take up again, on a new connection, what one that went away held on the
+/// last (`lab.run.resume`): connects (starting a daemon if none runs) and asks, again and
+/// again for up to [`RESUME_TIMEOUT`] while the daemon can't be reached. A daemon that says no
+/// is the answer.
+pub fn reattach<P: Serialize>(paths: &Paths, method: &str, params: &P) -> Result<Session, Failure> {
+    let give_up = Instant::now() + RESUME_TIMEOUT;
+    loop {
+        let lost = match Session::open(paths) {
+            Ok(mut session) => match session.exchange_raw::<_, serde_json::Value>(
+                method,
+                params,
+                Some(ANSWER_TIMEOUT),
+                Exit::Precondition,
+                &mut |_| {},
+                &mut |_| {},
+            ) {
+                Ok(_) => return Ok(session),
+                Err(Ended::Refused(failure)) => return Err(failure),
+                Err(Ended::Lost(failure)) => failure,
+            },
+            Err(failure) => failure,
+        };
+        if Instant::now() >= give_up {
             return Err(lost);
         }
         thread::sleep(RESUME_PAUSE);
@@ -199,6 +311,13 @@ impl Session {
         on_note: &mut dyn FnMut(&str),
     ) -> Result<R, Failure> {
         self.exchange(method, params, read_timeout, Exit::Precondition, on_note)
+    }
+
+    /// The connection's reader, to read what the daemon sends unasked.
+    /// It waits as long as it takes: an exchange's patience no longer holds.
+    pub fn into_reader(self) -> BufReader<UnixStream> {
+        let _ = self.reader.get_ref().set_read_timeout(None);
+        self.reader
     }
 
     /// A second handle on the connection, to send notifications on (requests the daemon doesn't

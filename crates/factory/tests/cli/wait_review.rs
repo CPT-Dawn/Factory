@@ -1,13 +1,15 @@
 //! `factory wait review`, against reviews run by the binary and a fake codex.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 
 use serde_json::Value;
 
 use crate::review::{CLEAN_REPORT, FINDINGS_REPORT, codex_writes};
 use crate::support::herdr::FakeHerdr;
 use crate::support::world::poll_until;
-use crate::support::{Sandbox, finish, spawn};
+use crate::support::{Sandbox, finish, freeze, kill_group, spawn, stop_daemon, thaw, waited_on};
 
 /// A herdr with the lead `cart` in pane w1:p1, so a wait that names the pane shows up in `lead
 /// status` once the daemon holds it.
@@ -150,6 +152,122 @@ fn a_rerun_under_the_same_label_is_waited_for_not_answered_from_the_last_run() {
     assert!(
         out.stdout.starts_with("review t1-r1: findings ("),
         "{out:?}"
+    );
+}
+
+#[test]
+fn a_wait_carries_on_across_a_daemon_restart_and_hears_what_happened_meanwhile() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    let mut waiter = sandbox.factory_command(&["wait", "review", "t1-r1"]);
+    waiter.current_dir(&repo);
+    let waiter = spawn(waiter);
+    assert!(
+        poll_until(|| waited_on(&sandbox, "review", "t1-r1")),
+        "the daemon never held the wait"
+    );
+
+    // The CLI sleeps through the restart; the review ends before it wakes.
+    freeze(&waiter);
+    stop_daemon(&sandbox);
+    let logged = sandbox.factory(&[
+        "log",
+        "review",
+        "repo=repo",
+        "label=t1-r1",
+        "outcome=ok",
+        "verdict=clean",
+    ]);
+    assert_eq!(logged.code, 0, "{logged:?}");
+    thaw(&waiter);
+    let out = finish(waiter);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(out.stdout.starts_with("review t1-r1: clean"), "{out:?}");
+    assert_eq!(out.stderr, "");
+}
+
+#[test]
+fn a_wait_whose_cli_went_away_is_not_brought_back_by_a_restart() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    let mut waiter = sandbox.factory_command(&["wait", "review", "t1-r1"]);
+    waiter.current_dir(&repo);
+    let waiter = spawn(waiter);
+    assert!(
+        poll_until(|| waited_on(&sandbox, "review", "t1-r1")),
+        "the daemon never held the wait"
+    );
+
+    kill_group(waiter.id(), rustix::process::Signal::KILL);
+    let _ = finish(waiter);
+    assert!(
+        poll_until(|| !waited_on(&sandbox, "review", "t1-r1")),
+        "the daemon still holds the wait of a CLI that is gone"
+    );
+    stop_daemon(&sandbox);
+
+    assert!(
+        !waited_on(&sandbox, "review", "t1-r1"),
+        "the restart brought it back"
+    );
+}
+
+#[test]
+fn a_wait_no_daemon_holds_any_more_says_to_run_it_again() {
+    let sandbox = Sandbox::new();
+    let started = sandbox.factory(&["status"]);
+    assert_eq!(started.code, 0, "{started:?}");
+    let mut stream = UnixStream::connect(sandbox.path("run/factory/factory.sock")).unwrap();
+    let request = r#"{"id":1,"method":"wait.review","params":{"label":"t1-r1","repo":null,"waiter":null,"timeout_secs":5,"resume":42}}"#;
+
+    writeln!(stream, "{request}").unwrap();
+
+    let mut answer = String::new();
+    BufReader::new(&stream).read_line(&mut answer).unwrap();
+    let answer: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(answer["error"]["code"], 3, "{answer}");
+    assert_eq!(
+        answer["error"]["message"],
+        "the daemon restarted and no longer holds wait 42; run the wait again"
+    );
+}
+
+#[test]
+fn a_restarted_wait_on_a_rerun_still_waits_for_the_rerun_not_the_last_run() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+    let first = sandbox.factory_in(&repo, &["review", "main", "t1-r1"]);
+    assert_eq!(first.code, 0, "{first:?}");
+    let gate = gated_codex(&sandbox, FINDINGS_REPORT);
+    let mut rerun = sandbox.factory_command(&["review", "main", "t1-r1"]);
+    rerun.current_dir(&repo);
+    let rerun = spawn(rerun);
+    assert!(
+        poll_until(|| sandbox.calls("codex").len() == 2),
+        "codex never started"
+    );
+    let mut waiter = sandbox.factory_command(&["wait", "review", "t1-r1", "--timeout", "5"]);
+    waiter.current_dir(&repo);
+    let waiter = spawn(waiter);
+    assert!(
+        poll_until(|| waited_on(&sandbox, "review", "t1-r1")),
+        "the daemon never held the wait"
+    );
+
+    // The restarted daemon never saw the rerun begin; the wait remembers it did.
+    freeze(&waiter);
+    stop_daemon(&sandbox);
+    thaw(&waiter);
+    let out = finish(waiter);
+    fs::write(&gate, "").unwrap();
+    finish(rerun);
+
+    assert_eq!(out.code, 124, "answered from the first run: {out:?}");
+    assert_eq!(
+        out.stderr,
+        "factory: no review t1-r1 ended within 5s; wait again\n"
     );
 }
 

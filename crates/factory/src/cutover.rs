@@ -271,9 +271,11 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
     if !force {
         lab_holds_nothing()?;
     }
-    let unit_gone = fs::symlink_metadata(&place.watcher).is_err();
+    let unit_gone = !unit_present(&place)?;
     let link_unit = match &marker.watcher {
         Unit::Link(text) if unit_gone => Some(text),
+        // --force goes on without a unit it cannot link again, and says so.
+        Unit::Unrecorded | Unit::File if unit_gone && force => None,
         Unit::Unrecorded | Unit::File if unit_gone => {
             return Err(Failure::precondition(format!(
                 "{} is gone and {} names no link to put back; link it again (dots link), then run factory cutover --rollback again",
@@ -294,9 +296,21 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
         }
     }
     if let Some(text) = link_unit {
-        link_watcher(&place, text, "cutover --rollback")?;
+        match link_watcher(&place, text, "cutover --rollback") {
+            Err(_) if force => {}
+            linked => linked?,
+        }
     }
-    let retire = fs::symlink_metadata(&place.watcher).is_ok();
+    // What is said follows what is there now, not what was found first: a unit that came back
+    // meanwhile is enabled, one that went again (or links to nothing) is skipped.
+    let present = unit_present(&place)?;
+    let dangles = present
+        && matches!(fs::metadata(&place.watcher), Err(e) if matches!(
+            e.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+        ));
+    let retire = present && !(force && dangles);
+    let skipped = force && !retire && (marker.watcher != Unit::Absent || !unit_gone || present);
     if retire {
         Systemctl
             .enable_now(WATCHER)
@@ -304,7 +318,13 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
     }
     remove(&place.marker(), "cutover --rollback")?;
     Ok(Done::new(
-        if retire {
+        if skipped {
+            format!(
+                "rolled back: {} runs today's devlab again; skipped {}, which is gone or links to nothing",
+                place.link.display(),
+                place.watcher.display()
+            )
+        } else if retire {
             format!(
                 "rolled back: {} runs today's devlab again and {WATCHER} is enabled; cut over again with factory cutover",
                 place.link.display()
@@ -318,7 +338,8 @@ pub fn rollback(force: bool) -> Result<Done, Failure> {
         json!({
             "devlab": place.link,
             "restored": marker.devlab,
-            "watcher": if retire { "enabled" } else { "not installed" },
+            "watcher": if skipped { "skipped" } else if retire { "enabled" } else { "not installed" },
+            "skipped": skipped.then_some(&place.watcher),
         }),
     ))
 }
@@ -519,6 +540,19 @@ impl Undo<'_> {
             ),
         };
         self.marker(failure)
+    }
+}
+
+/// Whether the watcher's unit file (or link, even a dangling one) is there: only a missing one
+/// counts as gone, so a unit that cannot be looked at stops the rollback.
+fn unit_present(place: &Place) -> Result<bool, Failure> {
+    match fs::symlink_metadata(&place.watcher) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Failure::precondition(format!(
+            "cannot look at {}: {e}; check it, then run factory cutover --rollback again",
+            place.watcher.display()
+        ))),
     }
 }
 

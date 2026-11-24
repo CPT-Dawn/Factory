@@ -12,12 +12,14 @@ use crate::protocol::{WAIT_LEASE, WaitLeaseParams, WaitLeaseResult};
 
 pub fn wait(lease: u32, timeout: Duration) -> Result<Done, Failure> {
     let paths = Paths::from_env()?;
-    let params = WaitLeaseParams {
+    let waiter = client::waiter();
+    let params = |resume, timeout_secs| WaitLeaseParams {
         lease: i64::from(lease),
-        waiter: client::waiter(),
-        timeout_secs: timeout.as_secs(),
+        waiter: waiter.clone(),
+        timeout_secs,
+        resume,
     };
-    let answer: WaitLeaseResult = client::wait(&paths, WAIT_LEASE, &params, timeout)?;
+    let answer: WaitLeaseResult = client::hold(&paths, WAIT_LEASE, params, timeout)?;
     Ok(Done::new(
         format!("lease {} ended", answer.lease),
         serde_json::to_value(&answer).unwrap_or(Value::Null),

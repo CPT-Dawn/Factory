@@ -11,9 +11,7 @@ use crate::quota::Reset;
 use crate::status;
 use crate::timestamp::Timestamp;
 
-const MILLIS_PER_MINUTE: i64 = 60_000;
 const MILLIS_PER_HOUR: i64 = 3_600_000;
-const MILLIS_PER_DAY: i64 = 86_400_000;
 
 /// How much of the window may be spent before a lead holds new dispatches, by default.
 pub const HOLD_AT_PERCENT: f64 = 90.0;
@@ -201,26 +199,114 @@ impl LimitHit {
 /// the reset it names, read in a zone `utc_offset` seconds east of UTC: a time of day that has
 /// passed is the next day's, a weekday the next one's. None when it is no plan limit.
 pub fn limit_reset(text: &str, now: Timestamp, utc_offset: i32) -> Option<LimitHit> {
+    Some(match plan_limit(text)? {
+        Reset::Unknown => LimitHit::Unnamed,
+        reset => LimitHit::Resets(reset.until(now, utc_offset)),
+    })
+}
+
+/// Whether the text of a failed `claude -p` says it ran out of quota: a plan limit
+/// ([`limit_reset`]'s), a rate limit (`rate_limit_error`, HTTP 429), or a reset it names. The
+/// reset is the one it names, else [`Reset::Unknown`]. None when the failure is no quota's.
+pub fn failure_limit(text: &str) -> Option<Reset> {
+    if let Some(reset) = plan_limit(text) {
+        return Some(reset);
+    }
+    let lower = text.to_lowercase();
+    let named = named_reset(&lower);
+    let rate = lower.contains("rate limit")
+        || names_rate_limit(&lower)
+        || lower.contains("too many requests")
+        || is_status(&lower, "429");
+    (rate || named.is_some()).then(|| named.unwrap_or(Reset::Unknown))
+}
+
+/// Whether `lower` carries the API's `rate_limit` or `rate_limit_error` type as a whole word,
+/// not an identifier that only starts with it (`rate_limit_config`).
+fn names_rate_limit(lower: &str) -> bool {
+    lower.match_indices("rate_limit").any(|(at, word)| {
+        let rest = &lower[at + word.len()..];
+        let rest = rest.strip_prefix("_error").unwrap_or(rest);
+        !lower[..at].ends_with(is_word_char) && !rest.starts_with(is_word_char)
+    })
+}
+
+/// Whether `text` has the HTTP status `code`: the number alone, after an HTTP marker
+/// (`API Error: 429`, `HTTP/1.1 429`, `HTTP/2 429`, `"status":429`, `status code 429`), not
+/// a number that only follows other words (`request 429 failed`, `request code 429`).
+fn is_status(text: &str, code: &str) -> bool {
+    text.match_indices(code).any(|(at, _)| {
+        let alone = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric());
+        if !alone(text[..at].chars().next_back()) || !alone(text[at + code.len()..].chars().next())
+        {
+            return false;
+        }
+        let before = text[..at].trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+        let http_version = before
+            .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
+            .strip_suffix('/')
+            .is_some_and(|head| ends_with_word(head, "http"));
+        http_version
+            || [
+                "http",
+                "http error",
+                "status",
+                "status code",
+                "status_code",
+                "statuscode",
+                "api error",
+            ]
+            .iter()
+            .any(|marker| ends_with_word(before, marker))
+    })
+}
+
+/// Whether `text` ends with `word` as a whole word: no letter, digit or `_` just before it.
+fn ends_with_word(text: &str, word: &str) -> bool {
+    text.strip_suffix(word)
+        .is_some_and(|head| !head.ends_with(is_word_char))
+}
+
+/// A letter, digit or `_`: a character that carries a word or identifier on.
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Where `lower` says `resets` as a whole word (not inside `presets` or `resets_hourly`), the
+/// last first.
+fn resets_at(lower: &str) -> impl Iterator<Item = usize> + '_ {
+    lower
+        .rmatch_indices("resets")
+        .map(|(at, _)| at)
+        .filter(|at| {
+            let end = at + "resets".len();
+            ends_with_word(&lower[..end], "resets") && !lower[end..].starts_with(is_word_char)
+        })
+}
+
+/// The reset `lower` names after its last `resets `: a time of day or a weekday and time.
+fn named_reset(lower: &str) -> Option<Reset> {
+    let at = resets_at(lower).find(|at| lower[at + "resets".len()..].starts_with(' '))?;
+    reset_clock(&lower[at + "resets ".len()..])
+}
+
+/// The plan limit `text` says was hit, and the reset it names: [`Reset::Unknown`] when none
+/// can be read.
+fn plan_limit(text: &str) -> Option<Reset> {
     let lower = text.to_lowercase();
     if let Some((_, after)) = lower.split_once("limit reached|") {
         let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
         if let Ok(secs) = digits.parse::<i64>() {
-            return Some(LimitHit::Resets(Timestamp::from_unix_millis(
+            return Some(Reset::On(Timestamp::from_unix_millis(
                 secs.saturating_mul(1000),
             )));
         }
     }
     let plan = lower.contains("limit")
-        && (lower.contains("resets")
+        && (resets_at(&lower).next().is_some()
             || lower.contains("hit your")
             || lower.contains("usage limit"));
-    if !plan {
-        return None;
-    }
-    let reset = lower
-        .rfind("resets ")
-        .and_then(|at| reset_time(&lower[at + "resets ".len()..], now, utc_offset));
-    Some(reset.map_or(LimitHit::Unnamed, LimitHit::Resets))
+    plan.then(|| named_reset(&lower).unwrap_or(Reset::Unknown))
 }
 
 /// A `StopFailure` hook's input: the limit a turn ended on, with the reset its message names.
@@ -244,8 +330,8 @@ pub fn stop_failure(input: &Value, now: Timestamp, utc_offset: i32) -> Option<Li
 
 const WEEKDAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
-/// `3:45pm`, `11am`, `12:15 PM` or `Mon 12:00am` at the start of `text`, as its next moment.
-fn reset_time(text: &str, now: Timestamp, utc_offset: i32) -> Option<Timestamp> {
+/// `3:45pm`, `11am`, `12:15 PM` or `Mon 12:00am` at the start of `text`, as a reset.
+fn reset_clock(text: &str) -> Option<Reset> {
     let (weekday, clock) = match WEEKDAYS.iter().position(|day| text.starts_with(day)) {
         Some(day) => (Some(day), text.get(3..)?.trim_start()),
         None => (None, text),
@@ -267,19 +353,12 @@ fn reset_time(text: &str, now: Timestamp, utc_offset: i32) -> Option<Timestamp> 
         return None;
     }
     let hour = hour % 12 + if pm { 12 } else { 0 };
-    let Some(weekday) = weekday else {
-        return Some(Reset::At { hour, minute }.until(now, utc_offset));
-    };
-    let offset = i64::from(utc_offset) * 1000;
-    let local = now.unix_millis() + offset;
-    let day = local.div_euclid(MILLIS_PER_DAY);
-    // 1970-01-01 was a Thursday.
-    let today = (day + 4).rem_euclid(7);
-    let ahead = (i64::try_from(weekday).ok()? - today).rem_euclid(7);
-    let minutes = i64::from(hour) * 60 + i64::from(minute);
-    let mut until = (day + ahead) * MILLIS_PER_DAY + minutes * MILLIS_PER_MINUTE - offset;
-    if until <= now.unix_millis() {
-        until += 7 * MILLIS_PER_DAY;
-    }
-    Some(Timestamp::from_unix_millis(until))
+    Some(match weekday {
+        None => Reset::At { hour, minute },
+        Some(weekday) => Reset::Weekly {
+            weekday: u32::try_from(weekday).ok()?,
+            hour,
+            minute,
+        },
+    })
 }

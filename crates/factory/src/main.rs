@@ -170,7 +170,7 @@ fn run(command: Command, json: bool) -> ExitCode {
             label,
             spec,
             previous,
-            timeout: timeout.map(std::time::Duration::from_secs),
+            timeout,
             tier,
             skill,
         })
