@@ -799,10 +799,9 @@ pub fn package_manager(command: &str, escape: bool) -> Option<String> {
     if escape {
         return None;
     }
-    let found = all_parts(command).iter().find_map(|part| match part {
-        Part::Command(words) => manager_in(words),
-        _ => None,
-    })?;
+    let found = commands(command)
+        .iter()
+        .find_map(|words| manager_in(words))?;
     let fix = if found == "npx" {
         "bunx".to_owned()
     } else {
@@ -817,29 +816,93 @@ pub fn package_manager(command: &str, escape: bool) -> Option<String> {
 /// every agent's processes on the machine, and the pattern can match the caller's own shell. No
 /// escape: the damage lands on other agents, not on the one that asks.
 pub fn machine_wide_kill(command: &str) -> Option<String> {
-    all_parts(command).iter().any(|part| match part {
-        Part::Command(words) => shell::invocation(words).is_some_and(|call| match call.program {
-            "killall" => true,
-            "pkill" => matches_full_command_line(call.args),
-            _ => false,
-        }),
-        _ => false,
-    })
-    .then(|| {
-        "pkill -f and killall reach every agent's processes on this machine; kill the PID you started (note $! when you start it, or list candidates with pgrep -af <pattern> and kill only yours)."
-            .to_owned()
-    })
+    commands(command)
+        .iter()
+        .any(|words| {
+            shell::invocation(words).is_some_and(|call| match call.program {
+                "killall" => true,
+                "pkill" => matches_full_command_line(call.args),
+                _ => false,
+            })
+        })
+        .then(|| {
+            "pkill -f and killall reach every agent's processes on this machine; kill the PID you started (note $! when you start it, or list candidates with pgrep -af <pattern> and kill only yours)."
+                .to_owned()
+        })
 }
 
-/// Whether pkill's options, up to a bare `--`, include `-f` (alone or inside a group such as
-/// `-9f`) or `--full` (or any prefix of it getopt accepts).
+/// pkill's short options that take a value: the rest of the group, or else the next word.
+const PKILL_VALUE_SHORT: &str = "FGPUgOqrstu";
+
+/// pkill's long options that take a value, which getopt matches by any unambiguous prefix.
+const PKILL_VALUE_LONG: &[&str] = &[
+    "cgroup",
+    "euid",
+    "group",
+    "ns",
+    "nslist",
+    "older",
+    "parent",
+    "pgroup",
+    "pidfile",
+    "queue",
+    "runstates",
+    "session",
+    "signal",
+    "terminal",
+    "uid",
+];
+
+/// Whether pkill's arguments include `-f` (alone or inside a group such as `-9f`) or `--full`
+/// (or a prefix of it), reading the value of each option that takes one (`-u -f` names a user)
+/// and stopping at a `--` that is not such a value.
 fn matches_full_command_line(args: &[String]) -> bool {
-    args.iter()
-        .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| match arg.strip_prefix("--") {
-            Some(long) => !long.is_empty() && "full".starts_with(long),
-            None => is_short_flag(arg, 'f'),
+    let mut words = args.iter();
+    while let Some(arg) = words.next() {
+        if arg == "--" {
+            return false;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, has_value) = match long.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (long, false),
+            };
+            if !name.is_empty() && "full".starts_with(name) {
+                return true;
+            }
+            let takes = !name.is_empty()
+                && PKILL_VALUE_LONG
+                    .iter()
+                    .any(|option| option.starts_with(name));
+            if takes && !has_value {
+                words.next();
+            }
+        } else if let Some(group) = arg.strip_prefix('-') {
+            for (at, flag) in group.char_indices() {
+                if flag == 'f' {
+                    return true;
+                }
+                if PKILL_VALUE_SHORT.contains(flag) {
+                    if at + flag.len_utf8() == group.len() {
+                        words.next();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The words of every simple command in a command line, those inside `bash -c '…'` included.
+fn commands(command: &str) -> Vec<shell::Words> {
+    all_parts(command)
+        .into_iter()
+        .filter_map(|part| match part {
+            Part::Command(words) => Some(words),
+            _ => None,
         })
+        .collect()
 }
 
 fn manager_in(words: &[String]) -> Option<&'static str> {

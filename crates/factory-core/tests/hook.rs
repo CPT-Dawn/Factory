@@ -125,6 +125,10 @@ fn pre_tool_blocks_a_machine_wide_kill_wherever_it_sits() {
         "(pkill -f y)",
         "echo $(pkill -f y)",
         "pkill \\\n  -f y",
+        // A bare `--` that is an option's value ends nothing.
+        "pkill -u -- -f y",
+        "pkill --uid -- -f y",
+        "pkill -nf y",
     ] {
         let reason = blocked(&bash(command), false);
         assert!(reason.is_some(), "{command:?} should be blocked");
@@ -146,6 +150,11 @@ fn pre_tool_lets_a_kill_of_one_pid_through() {
         "pkill -9 factory",
         "pkill -u me factory",
         "pkill -x factory",
+        // `-f` and `f` here are the values of -u, -U and -s.
+        "pkill -u -f factory",
+        "pkill -uf factory",
+        "pkill --uid f factory",
+        "pkill --session -f factory",
         "pgrep -af factory",
         "pkill -- -f",
         "echo pkill -f y",
