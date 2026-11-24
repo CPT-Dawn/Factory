@@ -14,6 +14,7 @@ mod android;
 mod check;
 mod cli;
 mod context;
+mod events;
 pub(crate) mod host;
 mod lease;
 mod native;

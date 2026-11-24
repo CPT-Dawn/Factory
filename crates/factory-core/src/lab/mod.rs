@@ -11,11 +11,13 @@
 //! - [`idle`] says which idle emulators and stacks to stop, and when to look again.
 //! - [`reserve`] sets slots aside for a lead's implementers.
 //! - [`ready`] says whether a phone can run unattended, and what to tell the owner.
+//! - [`events`] builds the lab's events in the stats ledger.
 
 pub mod args;
 pub mod config;
 pub mod devices;
 pub mod emulator;
+pub mod events;
 pub mod grant;
 pub mod idle;
 pub mod queue;

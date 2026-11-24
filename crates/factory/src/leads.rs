@@ -87,6 +87,26 @@ struct Inner {
     /// The leads this daemon spawned that have not finished, by agent name: each gets one
     /// `lead-end` event when it does.
     unfinished: BTreeMap<String, Unfinished>,
+    /// The leads the last daemon left whose standing the ledger could not yet be read for.
+    unread: BTreeMap<String, Inherited>,
+}
+
+/// A lead the last daemon kept as running, before the ledger says whether it still owes its end.
+struct Inherited {
+    repo: String,
+    report: PathBuf,
+}
+
+impl Inherited {
+    /// What lead `name` owes, as the ledger says: its end, or (none) nothing.
+    fn standing(&self, ledger: &Ledger, name: &str) -> std::io::Result<Option<Unfinished>> {
+        let standing = ledger.standing(&self.repo, lead::slug(name))?;
+        Ok(standing.owes.then(|| Unfinished {
+            repo: self.repo.clone(),
+            report: self.report.clone(),
+            run: standing.starts,
+        }))
+    }
 }
 
 struct Unfinished {
@@ -138,28 +158,34 @@ impl<H: HerdrApi> Leads<H> {
         })?;
         // The ledger says which still owe their end: a daemon that stopped between keeping a
         // lead and writing its start, or between writing its end and keeping that, owes none.
+        // A ledger that can't be read leaves them unread, for each settlement to try again: the
+        // daemon starts without it, and the lab never needs it.
         let mut unfinished = BTreeMap::new();
+        let mut unread = BTreeMap::new();
         for (name, repo, report) in running {
-            let standing = ledger.standing(&repo, lead::slug(&name)).map_err(|e| {
-                Failure::precondition(format!(
-                    "cannot read {}: {e}; check FACTORY_STATE",
-                    ledger.path.display()
-                ))
-            })?;
-            if !standing.owes {
-                if let Err(e) = store.lead_ended(&name, &repo) {
-                    eprintln!("factory: cannot mark {name} ended in the database: {e}");
+            let lead = Inherited {
+                repo,
+                report: PathBuf::from(report),
+            };
+            match lead.standing(&ledger, &name) {
+                Ok(Some(owed)) => {
+                    unfinished.insert(name, owed);
                 }
-                continue;
+                Ok(None) => {
+                    if let Err(e) = store.lead_ended(&name, &lead.repo) {
+                        eprintln!("factory: cannot mark {name} ended in the database: {e}");
+                    }
+                }
+                Err(e) => {
+                    if unread.is_empty() {
+                        eprintln!(
+                            "factory: cannot read {}: {e}; the leads the last daemon left are settled once it can be read",
+                            ledger.path.display()
+                        );
+                    }
+                    unread.insert(name, lead);
+                }
             }
-            unfinished.insert(
-                name,
-                Unfinished {
-                    repo,
-                    report: PathBuf::from(report),
-                    run: standing.starts,
-                },
-            );
         }
         // The blocking waits the last daemon held, until their CLIs come back for them.
         let kept = store.waits().map_err(|e| {
@@ -192,6 +218,7 @@ impl<H: HerdrApi> Leads<H> {
                 follower: None,
                 generation: 0,
                 unfinished,
+                unread,
             }),
             turn: tokio::sync::Mutex::new(()),
             changed: watch::channel(0).0,
@@ -420,7 +447,49 @@ impl<H: HerdrApi> Leads<H> {
         }
     }
 
+    /// Reads the ledger again for the leads the last daemon left that it could not be read for.
+    fn reread(&self) {
+        let unread = std::mem::take(&mut self.lock().unread);
+        let mut still = BTreeMap::new();
+        for (name, lead) in unread {
+            // A lead that owes nothing is marked ended under the ledger's lock, as a settlement
+            // is: a respawn of its name keeps its own row under that lock too.
+            let read = self
+                .ledger
+                .with_standing(&lead.repo, lead::slug(&name), |standing| {
+                    if standing.owes {
+                        return Some(Unfinished {
+                            repo: lead.repo.clone(),
+                            report: lead.report.clone(),
+                            run: standing.starts,
+                        });
+                    }
+                    let ended = self
+                        .store
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .lead_ended(&name, &lead.repo);
+                    if let Err(e) = ended {
+                        eprintln!("factory: cannot mark {name} ended in the database: {e}");
+                    }
+                    None
+                });
+            match read {
+                // A respawn of the name since has its own record, and settles this one's row.
+                Ok(Some(owed)) => {
+                    self.lock().unfinished.entry(name).or_insert(owed);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    still.insert(name, lead);
+                }
+            }
+        }
+        self.lock().unread.extend(still);
+    }
+
     fn settle(&self) {
+        self.reread();
         let done: Vec<(String, Unfinished, &'static str)> = {
             let mut inner = self.lock();
             if inner.down.is_some() {

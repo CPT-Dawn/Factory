@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use factory_adapters::adb::{Adb, AdbCli, AdbTrack};
 use factory_adapters::docker::{Containers, Docker};
 use factory_adapters::emulator::{EmulatorSpec, Emulators, SystemdEmulators};
-use factory_core::event::{Event, Fields};
+use factory_core::event::Fields;
 use factory_core::exit::Exit;
 use factory_core::lab::args::{LONGEST_WAIT, wait_span};
 use factory_core::lab::config::device_cap;
@@ -31,6 +31,7 @@ use factory_core::lab::devices::{
 use factory_core::lab::emulator::{
     Boot, Settle, State, after_restart, boot_step, booting_note, free_indexes, serial_of, unit_name,
 };
+use factory_core::lab::events::{Asked, LeaseEnd};
 use factory_core::lab::grant::{self, Ask, Decision};
 use factory_core::lab::js_number;
 use factory_core::lab::queue::{DeviceNeed, QueueEntry, devices_held_by, over_device_cap};
@@ -53,7 +54,7 @@ use super::wire::{
     RELEASE, RUN_END, RUN_END_ID, RUN_START, RUN_STOPPING, ReleaseParams, Released, Reservation,
     RunAsk, RunEnd, RunResume, SLOT, STATUS, STOPPING, SlotParams, StopParams, UNRESERVE, Waiter,
 };
-use super::{activity, readiness, reservations};
+use super::{activity, events, readiness, reservations};
 use super::{android, host};
 use crate::ledger::Ledger;
 use crate::output::Failure;
@@ -100,8 +101,9 @@ pub struct Lab {
     watched: Mutex<HashSet<String>>,
     /// What the keeper is stopping because it idled; no grant hands it out meanwhile.
     stopping: Mutex<keeper::Stopping>,
-    /// Where runs no daemon can follow any more are recorded.
-    ledger: Arc<Ledger>,
+    /// Tells the ledger's thread that events are queued: it alone appends them, so no lab
+    /// call waits on the ledger (#62).
+    wake: mpsc::Sender<()>,
 }
 
 /// What `adb track-devices` showed last, and whether its stream still follows it: one value,
@@ -141,6 +143,30 @@ impl Lab {
     pub fn open(path: &Path, ledger: Arc<Ledger>) -> Result<Lab, String> {
         let store =
             Store::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        // The ledger's thread, on its own connection: it appends what the lab's transactions
+        // queued, when told to and at least every few seconds, so a backlog an earlier daemon
+        // left goes out too.
+        let reader = Connection::open(path)
+            .and_then(|c| c.busy_timeout(Duration::from_secs(15)).map(|()| c))
+            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let (wake, woken) = mpsc::channel::<()>();
+        let spawned = std::thread::Builder::new()
+            .name("lab-ledger".to_owned())
+            .spawn(move || {
+                loop {
+                    if let Err(e) = events::drain(&reader, &ledger) {
+                        eprintln!("factory: lab: cannot read the events to log: {e}");
+                    }
+                    if let Err(mpsc::RecvTimeoutError::Disconnected) =
+                        woken.recv_timeout(Duration::from_secs(5))
+                    {
+                        return;
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            return Err(format!("cannot start the lab's ledger writer: {e}"));
+        }
         Ok(Lab {
             path: path.to_owned(),
             store: Mutex::new(store),
@@ -151,7 +177,7 @@ impl Lab {
             watched: Mutex::new(HashSet::new()),
             stopping: Mutex::new(keeper::Stopping::default()),
             callers: Mutex::new(HashSet::new()),
-            ledger,
+            wake,
         })
     }
 
@@ -265,7 +291,7 @@ impl Lab {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = now();
-        let (freed, unreserved, unstopped, (orphans, ended), out) = store
+        let (freed, unreserved, unstopped, ended, out) = store
             .write(|c| {
                 let (freed, unreserved) = store::gc(c, now, &host::alive)?;
                 let unstopped = store::clear_dead_stoppers(c, &host::alive)?;
@@ -282,33 +308,22 @@ impl Lab {
                 let mut ended = Vec::new();
                 for run in &orphans {
                     ended.extend(store::end_run_lease(c, run.id, now)?);
+                    let phase = if run.started_ms.is_some() {
+                        Phase::Running
+                    } else {
+                        Phase::Queued
+                    };
+                    let fields = run_fields(run, End::DaemonStopped.outcome(), phase.word());
+                    events::queue(c, "lab-run", &fields)?;
                 }
-                Ok((
-                    freed,
-                    unreserved,
-                    unstopped + pruned,
-                    (orphans, ended),
-                    work(c, now)?,
-                ))
+                Ok((freed, unreserved, unstopped + pruned, ended, work(c, now)?))
             })
             .map_err(|e| ErrorBody {
                 code: Exit::Precondition.code(),
                 message: format!("lab store {}: {e}; retry", self.path.display()),
             })?;
         drop(store);
-        for run in &orphans {
-            let phase = if run.started_ms.is_some() {
-                Phase::Running
-            } else {
-                Phase::Queued
-            };
-            append_run(
-                &self.ledger,
-                run,
-                End::DaemonStopped.outcome(),
-                phase.word(),
-            );
-        }
+        let _ = self.wake.send(());
         let lines: Vec<String> = freed
             .iter()
             .map(|l| format!("lease {} ({}, owner exited)", l.id, l.owner_label))
@@ -322,6 +337,26 @@ impl Lab {
             keeper::take_back_reverses_on_thread(self.attached.borrow().shown.clone(), freed);
         }
         Ok((out, lines))
+    }
+
+    /// Queues one lab event for the ledger's thread, outside any other change.
+    fn log(&self, kind: &str, fields: Fields) {
+        if let Err(e) = self.write(|c, _| events::queue(c, kind, &fields)) {
+            eprintln!("factory: lab: cannot queue a {kind} event: {}", e.message);
+        }
+    }
+
+    /// Ends request `waiter`, which gave up waiting for `why` (none: what it waited for last),
+    /// and tells the ledger so.
+    fn give_up(&self, waiter: i64, p: &AcquireParams, why: Option<&str>) {
+        let gone = self.write(|c, now| {
+            let fields = events::wait_event(c, waiter, &asked(p), false, why, now)?;
+            events::queue(c, "lab-wait", &fields)?;
+            store::delete_waiter(c, waiter)
+        });
+        if let Ok(true) = gone {
+            self.notify();
+        }
     }
 
     fn callers(&self) -> std::sync::MutexGuard<'_, HashSet<i64>> {
@@ -341,7 +376,7 @@ impl Lab {
         let dropped = self.write(|c, now| {
             let held = store::lease(c, lease)?;
             if let Some(held) = &held {
-                store::drop_lease(c, held, now)?;
+                store::drop_lease(c, held, now, LeaseEnd::SettleFailed)?;
                 if let Some(from) = from {
                     reservations::restore(c, from, now)?;
                 }
@@ -361,7 +396,7 @@ impl Lab {
     fn settle(&self, waiter: i64, to_drop: Option<&Lease>) -> Answer<()> {
         self.write(|c, now| {
             if let Some(lease) = to_drop {
-                store::drop_lease(c, lease, now)?;
+                store::drop_lease(c, lease, now, LeaseEnd::SettleFailed)?;
             }
             store::delete_waiter(c, waiter)
         })?;
@@ -566,7 +601,7 @@ fn release(lab: &Lab, p: ReleaseParams) -> Answer<Released> {
             }
         };
         for lease in &dropped {
-            store::drop_lease(c, lease, now)?;
+            store::drop_lease(c, lease, now, LeaseEnd::Release)?;
         }
         let unstopped = match &p.stopper {
             Some(stopper) => store::clear_stopping(c, stopper)?,
@@ -815,6 +850,9 @@ struct Taken {
     reused: Vec<String>,
     /// The reservation a fresh lease was made from, put back if the lease is given back.
     from: Option<Reservation>,
+    /// The request's `lab-wait`, written once the grant is handed over: one that fails as it
+    /// is settled was no grant.
+    waited: Fields,
 }
 
 /// What the request's device ask plans, or why it waits: the held devices adb no longer lists
@@ -1114,6 +1152,15 @@ fn insert(c: &Connection, p: &AcquireParams, now: i64) -> rusqlite::Result<(i64,
     Ok((id, deadline_ms))
 }
 
+/// What request `p` asks for, as its `lab-wait` says it.
+fn asked(p: &AcquireParams) -> Asked {
+    Asked {
+        mode: p.devices.as_ref().map(|d| d.mode.clone()),
+        count: p.devices.as_ref().map_or(0, |d| d.want),
+        stack: p.project.is_some(),
+    }
+}
+
 fn project_ask(p: &AcquireParams) -> Option<grant::ProjectAsk> {
     p.project.as_ref().map(grant_project)
 }
@@ -1274,6 +1321,9 @@ fn try_grant(
                 None => None,
             };
             store::touch(c, lease.id, now)?;
+            let reservation = claimed.as_ref().map(|r| r.id);
+            events::lease_began(c, lease.id, reservation, 0)?;
+            let waited = events::wait_event(c, waiter, &asked(p), true, None, now)?;
             store::delete_waiter(c, waiter)?;
             ends_with_run(c, p, waiter, lease, claimed.as_ref())?;
             return Ok(Ok(Taken {
@@ -1287,6 +1337,7 @@ fn try_grant(
                 phones: Vec::new(),
                 reused: Vec::new(),
                 from: claimed,
+                waited,
             }));
         }
         let stopping = lock_ignoring_poison(&lab.stopping).clone();
@@ -1345,6 +1396,7 @@ fn try_grant(
                     c.execute_batch("ROLLBACK TO claim")?;
                 }
                 c.execute_batch("RELEASE claim")?;
+                events::waiting(c, waiter, &why)?;
                 // After the claim is undone, so a waiter with a reservation keeps its need.
                 // What it asks of devices tells the waiters behind it whether it is in their way
                 // (#58): when that changes, they look again.
@@ -1366,6 +1418,7 @@ fn try_grant(
         c.execute_batch("RELEASE claim")?;
         let fresh = new || lease.is_none() || claimed.is_some();
         // The slot goes back to the reservation only from the lease it was made into.
+        let claimed_from = claimed.clone();
         let from = claimed.filter(|_| !new);
         let lease = match lease {
             Some(lease) if !new => lease,
@@ -1422,6 +1475,12 @@ fn try_grant(
             }
         }
         store::touch(c, lease.id, now)?;
+        if fresh {
+            let reservation = claimed_from.as_ref().map(|r| r.id);
+            let booting = u32::try_from(boots.len()).unwrap_or(u32::MAX);
+            events::lease_began(c, lease.id, reservation, booting)?;
+        }
+        let waited = events::wait_event(c, waiter, &asked(p), true, None, now)?;
         // A grant that boots emulators can't be handed to a caller again after a restart: the
         // daemon that comes back stops them, so the place goes now, as it did before.
         if fresh && boots.is_empty() {
@@ -1441,6 +1500,7 @@ fn try_grant(
             phones,
             reused,
             from,
+            waited,
         }))
     })?;
     match looked {
@@ -1807,8 +1867,28 @@ pub async fn acquire<W, R, S>(
             granted,
         }) => {
             let _attached = Present(Arc::clone(&lab), waiter);
+            // Its grant was never handed over: it is told now, waited until now, for the
+            // reason it last waited for. One the store can't say is not told, not told empty.
+            let waited = lab
+                .write(|c, now| events::wait_event(c, waiter, &asked(&p), true, None, now))
+                .map_err(|e| {
+                    eprintln!(
+                        "factory: lab: cannot read the wait of request {waiter}: {}; its lab-wait is not written",
+                        e.message
+                    );
+                })
+                .ok();
             let place = (waiter, *granted, true);
-            deliver(&lab, writer, lines, id, place, run, stopping.as_mut()).await;
+            deliver(
+                &lab,
+                writer,
+                lines,
+                id,
+                (place, waited),
+                run,
+                stopping.as_mut(),
+            )
+            .await;
             return;
         }
         Err(body) => {
@@ -1842,7 +1922,7 @@ pub async fn acquire<W, R, S>(
     }
     // A wait that ran out while the daemon was away takes nothing that came free meanwhile.
     if resumed && deadline_ms.is_some_and(|ms| ms <= now_ms()) {
-        lab.remove_waiter(waiter);
+        lab.give_up(waiter, &p, None);
         let body = ErrorBody {
             code: Exit::Busy.code(),
             message: format!(
@@ -1922,6 +2002,7 @@ pub async fn acquire<W, R, S>(
                 );
                 let lease = taken.granted.lease.clone();
                 let from = taken.from.clone();
+                let waited = Some(taken.waited.clone());
                 match settle(&lab, &p, taken, writer, id).await {
                     Ok(lease) => {
                         let granted = Granted {
@@ -1930,7 +2011,16 @@ pub async fn acquire<W, R, S>(
                             schema,
                         };
                         let place = (waiter, granted, fresh);
-                        deliver(&lab, writer, lines, id, place, run, stopping.as_mut()).await;
+                        deliver(
+                            &lab,
+                            writer,
+                            lines,
+                            id,
+                            (place, waited),
+                            run,
+                            stopping.as_mut(),
+                        )
+                        .await;
                     }
                     Err(mut body) => {
                         // An emulator that would not boot (exit 77), or a device of a fresh lease
@@ -1993,7 +2083,7 @@ pub async fn acquire<W, R, S>(
             }
         };
         if Instant::now() >= deadline {
-            lab.remove_waiter(waiter);
+            lab.give_up(waiter, &p, Some(&why));
             let body = ErrorBody {
                 code: Exit::Busy.code(),
                 message: format!("gave up after {} s: {why}", js_number(p.wait_sec)),
@@ -2081,7 +2171,7 @@ async fn deliver<W, R, S>(
     writer: &mut W,
     lines: &mut Lines<R>,
     id: Option<u64>,
-    (waiter, granted, fresh): (i64, Granted, bool),
+    ((waiter, granted, fresh), waited): ((i64, Granted, bool), Option<Fields>),
     run: Option<Run>,
     mut stopping: Pin<&mut S>,
 ) where
@@ -2099,6 +2189,10 @@ async fn deliver<W, R, S>(
         &mut stopping,
     )
     .await;
+    // The caller has its grant: only now was the request granted.
+    if let (Receipt::Received { .. }, Some(waited)) = (&receipt, waited) {
+        lab.log("lab-wait", waited);
+    }
     let Some(mut run) = run else { return };
     match receipt {
         Receipt::Received { then } => {
@@ -2326,13 +2420,8 @@ impl Run {
                 Err(_) => {}
             }
         }
-        let (ledger, row, phase) = (
-            Arc::clone(&self.lab.ledger),
-            self.row.clone(),
-            phase.to_owned(),
-        );
-        let _ =
-            tokio::task::spawn_blocking(move || append_run(&ledger, &row, outcome, &phase)).await;
+        let (lab, fields) = (Arc::clone(&self.lab), run_fields(&self.row, outcome, phase));
+        let _ = tokio::task::spawn_blocking(move || lab.log("lab-run", fields)).await;
     }
 }
 
@@ -2397,8 +2486,8 @@ pub async fn resume_run<W, R, S>(
     run.follow(writer, lines, None, stopping).await;
 }
 
-/// Appends the `lab-run` event of `run`, ended with `outcome` in `phase`.
-fn append_run(ledger: &Ledger, run: &RunRow, outcome: String, phase: &str) {
+/// The `lab-run` event of `run`, ended with `outcome` in `phase`.
+fn run_fields(run: &RunRow, outcome: String, phase: &str) -> Fields {
     let now = now_ms();
     let secs = |since: i64| u64::try_from(now.saturating_sub(since) / 1000).unwrap_or(0);
     let mut fields = Fields::new();
@@ -2423,14 +2512,7 @@ fn append_run(ledger: &Ledger, run: &RunRow, outcome: String, phase: &str) {
     if let Some(session) = &run.session {
         fields.insert("session".to_owned(), session.clone().into());
     }
-    let landed = Event::new("lab-run", fields).map(|event| ledger.append(&event));
-    if !matches!(landed, Ok(Ok(_))) {
-        let _ = writeln!(
-            std::io::stderr(),
-            "factory: lab: cannot record a run of {} in the ledger",
-            run.worktree
-        );
-    }
+    fields
 }
 
 async fn blocking<T: Send + 'static>(

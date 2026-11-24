@@ -13,6 +13,7 @@ use factory_adapters::adb::{Adb, AdbCli};
 use factory_adapters::emulator::{Emulators, SystemdEmulators};
 use factory_core::lab::devices::{Attached, Mode};
 use factory_core::lab::emulator::{State, unit_name};
+use factory_core::lab::events as event;
 use factory_core::lab::idle::{self, IdleDevice, IdleEmulator, IdleSlot, Need, Timers};
 use factory_core::lab::js_number;
 use factory_core::lab::ready::EpochMs;
@@ -21,7 +22,7 @@ use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags, pidfd_open};
 
-use super::super::{activity, context, host, lease, stack};
+use super::super::{activity, context, events, host, lease, stack};
 use super::{Lab, Lease, grantable, lock_ignoring_poison, now_ms, readiness, reservations, store};
 use crate::lab::wire::SlotRow;
 
@@ -312,6 +313,13 @@ fn reclaim(
         if kind == "emulator" {
             store::emulator_idle(c, serial, now)?;
         }
+        let model = lease
+            .devices
+            .iter()
+            .find(|d| d.serial == *serial)
+            .map_or("", |d| d.model.as_str());
+        let fields = event::reclaim(*id, &kind, model, idle_min);
+        events::queue(c, "lab-reclaim", &fields)?;
         eprintln!(
             "factory: lab: took {kind} {serial} from lease {id}, idle for {idle_min} min, for a waiter"
         );

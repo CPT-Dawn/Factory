@@ -650,7 +650,7 @@ impl Agent {
         self.0.id()
     }
 
-    fn exit(&mut self) {
+    pub(crate) fn exit(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -1383,6 +1383,17 @@ fn a_wait_that_ran_out_while_the_daemon_was_down_takes_no_slot_freed_meanwhile()
         "{gave_up:?}"
     );
     assert!(!gave_up.stdout.contains("DEVLAB_SLOT"), "{gave_up:?}");
+    // Its `lab-wait` keeps what it waited for before the restart (#62).
+    let waits = || -> Vec<serde_json::Value> {
+        sandbox
+            .ledger_lines()
+            .iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|e| e["type"] == "lab-wait" && e["action"] == "gave-up")
+            .collect()
+    };
+    assert!(poll_until(|| !waits().is_empty()), "no lab-wait");
+    assert_eq!(waits()[0]["wait"], "slots", "{:?}", waits());
 }
 
 /// Field 22 of `/proc/<pid>/stat`: when the process started.
@@ -1398,7 +1409,7 @@ fn started(pid: u32) -> String {
 /// Sends the daemon a `lab.acquire` for a one-slot project straight over its socket, by
 /// `owner` from the devlab call `client`; the connection, and the first line that holds `until`
 /// (`queued` or `result`) or an error.
-fn ask(
+pub(super) fn ask(
     sandbox: &Sandbox,
     worktree: &Path,
     owner: u32,
@@ -1557,7 +1568,7 @@ fn devlab_gc_says_a_freed_reservation_once() {
 }
 
 /// Tells the daemon the grant on `stream` reached its caller; its confirmation.
-fn received(stream: &mut UnixStream) -> serde_json::Value {
+pub(super) fn received(stream: &mut UnixStream) -> serde_json::Value {
     let said = serde_json::json!({"id": 2, "method": "lab.received"});
     writeln!(stream, "{said}").expect("say the grant arrived");
     let mut line = String::new();

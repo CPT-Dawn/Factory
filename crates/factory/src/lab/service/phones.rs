@@ -13,14 +13,15 @@ use factory_adapters::adb::{Adb, AdbCli};
 use factory_adapters::desktop::{Desktop, NotifySend, PostError};
 use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{Attached, LOCK_PROBE, prep_command};
+use factory_core::lab::events as event;
 use factory_core::lab::ready::{
     AUTH_TIMEOUT_PROBE, BATTERY_PROBE, EpochMs, Notice, POWER_PROBE, Probe, Readiness,
     STAY_ON_PROBE, after, auth_timeout_warning, judge, notice, refresh_again, unplugged,
 };
 
 use super::super::check::PhoneCheck;
-use super::super::context;
 use super::super::readiness::{self, ReadyRow};
+use super::super::{context, events};
 use super::{Answer, Lab, failed, now_ms};
 
 /// How old a probe `devlab check` answers from may be.
@@ -286,11 +287,17 @@ impl Watcher {
                 probed_ms: EpochMs(at),
             };
             readiness::put(c, &row)?;
-            Ok((
-                row,
-                notice(&name(&phone.model, &phone.serial), before, readiness),
-                before.is_none_or(|k| k.readiness != readiness),
-            ))
+            let said = notice(&name(&phone.model, &phone.serial), before, readiness);
+            let was = before.map(|k| k.readiness);
+            let changed = was != Some(readiness);
+            if changed {
+                // Notified: the change earns a notification and notifications are on.
+                let notified = said.is_some() && config().notify;
+                let fields =
+                    event::readiness(&phone.model, &phone.serial, was, readiness, notified);
+                events::queue(c, "lab-readiness", &fields)?;
+            }
+            Ok((row, said, changed))
         });
         let (row, said, changed) = written.ok()?;
         if let Some(said) = said {

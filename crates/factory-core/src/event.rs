@@ -134,7 +134,7 @@ fn parse_pairs<S: AsRef<str>>(pairs: &[S]) -> Result<Fields, EventError> {
 /// (`round`, `duration_s`, `tokens` and the finding counts) and the other counts its lines
 /// have always held as numbers. Every other field keeps the text it was given, so a sha of
 /// digits like `0475004` stays a sha.
-pub const NUMERIC_FIELDS: [&str; 16] = [
+pub const NUMERIC_FIELDS: [&str; 31] = [
     "round",
     "duration_s",
     "tokens",
@@ -151,6 +151,22 @@ pub const NUMERIC_FIELDS: [&str; 16] = [
     "advisory",
     "question",
     "dropped",
+    // The lab's events (#62): its ids, durations and counts.
+    "lease",
+    "slot",
+    "reservation",
+    "waiter",
+    "seconds",
+    "idle_seconds",
+    "idle_minutes",
+    "count",
+    "cap",
+    "busy",
+    "locked",
+    "asleep",
+    "stay_awake_off",
+    "offline",
+    "unauthorized",
 ];
 
 /// `value` as the ledger keeps field `key`.

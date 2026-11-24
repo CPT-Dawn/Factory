@@ -91,7 +91,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
             paths.state.display()
         ))
     })?;
-    let ledger = Arc::new(Ledger::open(paths.ledger())?);
+    let ledger = Arc::new(Ledger::open(paths.ledger()));
     let _lock = take_daemon_lock(&paths)?;
     let leads = Leads::new(
         paths.clone(),
