@@ -222,7 +222,7 @@ pub struct Unready {
 
 impl Unready {
     /// What a wait says of them, each kind after the busy phones: `, 1 locked (unlock it once)`.
-    fn said(self) -> String {
+    fn wait_details(self) -> String {
         [
             (self.locked, "locked (unlock it once)"),
             (self.asleep, "asleep (wake it)"),
@@ -258,7 +258,13 @@ pub fn plan_devices(p: &PlanInput) -> Result<Plan, String> {
         take(&p.free_phones, p.want)
     };
     let mut need = p.want - u32::try_from(phones.len()).unwrap_or(p.want);
-    let why = || format!("{} phone(s) busy{}", p.busy_phones, p.unready.said());
+    let why = || {
+        format!(
+            "{} phone(s) busy{}",
+            p.busy_phones,
+            p.unready.wait_details()
+        )
+    };
     if need > 0 && p.mode == Mode::Phone {
         return Err(format!("no free phone: {}", why()));
     }

@@ -4,7 +4,7 @@
 //! saying what to do. One thread does it all, so the probes, the store's rows and the
 //! notifications follow the stream's order; `devlab check` is answered on it too.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -25,6 +25,8 @@ use super::{Answer, Lab, failed, now_ms};
 
 /// How old a probe `devlab check` answers from may be.
 const FRESH_MS: i64 = 10_000;
+/// How long a grant waits for the watcher to bring the phones' readiness up to date.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long `devlab check` waits for the watcher's answer.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -34,8 +36,8 @@ pub enum Job {
     Frame(Vec<Attached>),
     /// `devlab check`: the phones named (every phone when none), answered on the sender.
     Check(Vec<String>, mpsc::Sender<Vec<PhoneCheck>>),
-    /// A grant: how ready each of these phones is now, answered on the sender.
-    Ready(Vec<String>, mpsc::Sender<HashMap<String, Readiness>>),
+    /// A grant: bring these phones' readiness up to date, then answer on the sender.
+    Refresh(Vec<String>, mpsc::Sender<()>),
 }
 
 impl Lab {
@@ -84,18 +86,18 @@ impl Lab {
             .map_err(|e| failed(&format!("the phone watcher did not answer: {e}")))
     }
 
-    /// How ready each of the phones `serials` is for a grant: from a probe at most 10 s old
-    /// when it was ready, else probed again (one that was not ready always is). A phone the
-    /// watcher can't say is left out, which a grant takes for not ready.
-    pub(super) fn ready_phones(&self, serials: Vec<String>) -> HashMap<String, Readiness> {
+    /// Has the watcher bring the readiness of the phones `serials` up to date for a grant: a
+    /// probe at most 10 s old is kept when it found the phone ready, any other is made again.
+    /// The grant then reads the store. A watcher that is gone or slow leaves the rows as they
+    /// are, which the grant trusts only while they are fresh.
+    pub(super) fn refresh_phones(&self, serials: Vec<String>) {
         let (reply, answer) = mpsc::channel();
         let Some(tx) = self.phones.get() else {
-            return HashMap::new();
+            return;
         };
-        if tx.send(Job::Ready(serials, reply)).is_err() {
-            return HashMap::new();
+        if tx.send(Job::Refresh(serials, reply)).is_ok() {
+            let _ = answer.recv_timeout(REFRESH_TIMEOUT);
         }
-        answer.recv_timeout(CHECK_TIMEOUT).unwrap_or_default()
     }
 }
 
@@ -138,8 +140,9 @@ impl Watcher {
                 Ok(Job::Check(serials, reply)) => {
                     let _ = reply.send(self.check(&serials));
                 }
-                Ok(Job::Ready(serials, reply)) => {
-                    let _ = reply.send(self.ready(&serials));
+                Ok(Job::Refresh(serials, reply)) => {
+                    self.refresh(&serials);
+                    let _ = reply.send(());
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     for phone in self.shown.clone() {
@@ -310,18 +313,13 @@ impl Watcher {
         }
     }
 
-    /// How ready each of `serials` is for a grant.
-    fn ready(&mut self, serials: &[String]) -> HashMap<String, Readiness> {
-        let mut ready = HashMap::new();
+    /// Brings the rows of `serials` up to date for a grant.
+    fn refresh(&mut self, serials: &[String]) {
         for serial in serials {
-            let Some(phone) = self.shown.iter().find(|p| &p.serial == serial).cloned() else {
-                continue;
-            };
-            if let Some(row) = self.current(&phone, probe_again) {
-                ready.insert(serial.clone(), row.known.readiness);
+            if let Some(phone) = self.shown.iter().find(|p| &p.serial == serial).cloned() {
+                self.current(&phone, probe_again);
             }
         }
-        ready
     }
 
     /// `devlab check`: each phone from a probe at most [`FRESH_MS`] old, probed again when
