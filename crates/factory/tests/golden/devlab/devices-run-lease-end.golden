@@ -15,7 +15,7 @@ $ b@plain-b devlab acquire --phone --wait 0
 2> devlab: lease 2, phone FAKEPHONE01 (Pixel 8)
 ? 0
 $ b@plain-b devlab release
-2> devlab: released lease 2
+2> devlab: released lease 2 (<sandbox>/wt/plain-b)
 ? 0
 $ a@plain-a devlab run --keep --phone -- true
 2> devlab: lease 3, phone FAKEPHONE01 (Pixel 8)
@@ -23,7 +23,7 @@ $ a@plain-a devlab run --keep --phone -- true
 $ a@plain-a devlab exec -- true
 ? 0
 $ a@plain-a devlab release
-2> devlab: released lease 3
+2> devlab: released lease 3 (<sandbox>/wt/plain-a)
 ? 0
 $ a@plain-a devlab acquire --phone --quiet
 1> export DEVLAB_LEASE=4
@@ -38,7 +38,7 @@ $ a@plain-a devlab run -- true
 $ a@plain-a devlab exec -- true
 ? 0
 $ a@plain-a devlab release
-2> devlab: released lease 4
+2> devlab: released lease 4 (<sandbox>/wt/plain-a)
 ? 0
 $ a@plain-a devlab run --phone --quiet -- sh -c 'exit 3'
 ? 3
@@ -50,7 +50,7 @@ $ b@plain-b devlab acquire --phone --wait 0 --quiet
 1> export DEVLAB_ABIS=arm64-v8a
 ? 0
 $ b@plain-b devlab release
-2> devlab: released lease 6
+2> devlab: released lease 6 (<sandbox>/wt/plain-b)
 ? 0
 $ a@plain-a devlab run --phone --quiet -- sh -c 'kill -KILL $$'
 2> devlab: sh killed by SIGKILL after <n> s

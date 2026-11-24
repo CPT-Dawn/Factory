@@ -11,7 +11,9 @@ $ a@plain-a devlab
 1>   devlab acquire [opts]           lease and print the env as export lines: eval "$(devlab acquire)"
 1>   devlab env                      print the current lease's export lines
 1>   devlab exec -- <cmd...>         run cmd in the current lease (fails fast if a device was unplugged)
-1>   devlab release [--stop-stack]   give everything back (also automatic when the agent exits)
+1>   devlab release [--stop-stack]   give back this worktree's lease and list your others still held
+1>   devlab release --lease <id>     give back that lease of yours from any folder (also: DEVLAB_LEASE)
+1>   devlab release --all-mine       give back every lease of yours (leases also end when the agent exits)
 1>   devlab status [--json]          devices, holders, stack slots, queue, memory
 1>
 1> Options for run/acquire:
@@ -49,7 +51,9 @@ $ a@plain-a devlab help
 1>   devlab acquire [opts]           lease and print the env as export lines: eval "$(devlab acquire)"
 1>   devlab env                      print the current lease's export lines
 1>   devlab exec -- <cmd...>         run cmd in the current lease (fails fast if a device was unplugged)
-1>   devlab release [--stop-stack]   give everything back (also automatic when the agent exits)
+1>   devlab release [--stop-stack]   give back this worktree's lease and list your others still held
+1>   devlab release --lease <id>     give back that lease of yours from any folder (also: DEVLAB_LEASE)
+1>   devlab release --all-mine       give back every lease of yours (leases also end when the agent exits)
 1>   devlab status [--json]          devices, holders, stack slots, queue, memory
 1>
 1> Options for run/acquire:
