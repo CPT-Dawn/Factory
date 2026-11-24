@@ -40,13 +40,36 @@ track-devices)
   if [ "$state" != device ]; then echo "adb: device $state" >&2; exit 1; fi
   case "$1" in
   shell)
-    # adb runs its arguments as one command line, whether they come as one or several.
+    # adb runs its arguments as one command line, whether they come as one or several; each
+    # command of a "a; b" line plays on its own. A phone's global settings are world/settings
+    # ("serial key value" lines), its screen sleeps while world/asleep names it and wakes on
+    # KEYCODE_WAKEUP, and it is on the power world/power names (USB when none).
     shift
-    case "$*" in
-    *ro.product.cpu.abi*) case "$serial" in emulator-*) echo x86_64 ;; *) echo arm64-v8a ;; esac ;;
-    *sys.boot_completed*) grep -qxF "$serial" "$w/stalled" || echo 1 ;;
-    *dumpsys\ window*) grep -qxF "$serial" "$w/locked" && echo "  mDreamingLockscreen=true" ;;
-    esac
+    printf '%s\n' "$*" | tr ';' '\n' | while IFS= read -r cmd; do
+      case "$cmd" in
+      *ro.product.cpu.abi*) case "$serial" in emulator-*) echo x86_64 ;; *) echo arm64-v8a ;; esac ;;
+      *sys.boot_completed*) grep -qxF "$serial" "$w/stalled" || echo 1 ;;
+      *dumpsys\ window*) grep -qxF "$serial" "$w/locked" && echo "  mDreamingLockscreen=true" ;;
+      *dumpsys\ power*)
+        if grep -qxF "$serial" "$w/asleep"; then echo "  mWakefulness=Asleep"; else echo "  mWakefulness=Awake"; fi ;;
+      *dumpsys\ battery*)
+        on=$(awk -v s="$serial" '$1 == s { p = $2 } END { print (p == "" ? "USB" : p) }' "$w/power")
+        for p in AC USB Wireless; do
+          if [ "$p" = "$on" ]; then echo "  $p powered: true"; else echo "  $p powered: false"; fi
+        done ;;
+      *settings\ put\ global\ *)
+        set -- $cmd
+        awk -v s="$serial" -v k="$4" '!($1 == s && $2 == k)' "$w/settings" > "$w/settings.new"
+        echo "$serial $4 $5" >> "$w/settings.new"
+        mv "$w/settings.new" "$w/settings" ;;
+      *settings\ get\ global\ *)
+        set -- $cmd
+        awk -v s="$serial" -v k="$4" '$1 == s && $2 == k { v = $3 } END { print (v == "" ? "null" : v) }' "$w/settings" ;;
+      *KEYCODE_WAKEUP*)
+        grep -vxF "$serial" "$w/asleep" > "$w/asleep.new"
+        mv "$w/asleep.new" "$w/asleep" ;;
+      esac
+    done
     exit 0 ;;
   emu)
     # emu kill: the emulator saves its snapshot and exits, and its unit with it.

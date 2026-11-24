@@ -83,10 +83,15 @@ pub fn reserved() -> Option<i64> {
         .filter(|id| *id > 0)
 }
 
-pub fn machine_config() -> Result<MachineConfig, Failure> {
-    let file = var("XDG_CONFIG_HOME")
+/// The machine config: `$XDG_CONFIG_HOME/devlab/config.json`.
+pub fn machine_config_path() -> PathBuf {
+    var("XDG_CONFIG_HOME")
         .map_or_else(|| home().join(".config"), PathBuf::from)
-        .join("devlab/config.json");
+        .join("devlab/config.json")
+}
+
+pub fn machine_config() -> Result<MachineConfig, Failure> {
+    let file = machine_config_path();
     match std::fs::read_to_string(&file) {
         Ok(text) => config::machine_config(&file.to_string_lossy(), &text)
             .map_err(|e| Failure::new(Exit::Precondition, e.0)),

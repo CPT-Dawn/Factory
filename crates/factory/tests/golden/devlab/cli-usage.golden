@@ -10,6 +10,7 @@ $ a@plain-a devlab
 1>   devlab exec -- <cmd...>         run cmd in the current lease (fails fast if a device was unplugged)
 1>   devlab release [--stop-stack]   give everything back (also automatic when the agent exits)
 1>   devlab status [--json]          devices, holders, stack slots, queue, memory
+1>   devlab check [serial...]        can each phone run unattended, and what to do if not (exit 10)
 1>
 1> Options for run/acquire:
 1>   --devices N    devices to hold (default 1); --pair is 2; --no-device holds only a stack slot
@@ -44,6 +45,7 @@ $ a@plain-a devlab help
 1>   devlab exec -- <cmd...>         run cmd in the current lease (fails fast if a device was unplugged)
 1>   devlab release [--stop-stack]   give everything back (also automatic when the agent exits)
 1>   devlab status [--json]          devices, holders, stack slots, queue, memory
+1>   devlab check [serial...]        can each phone run unattended, and what to do if not (exit 10)
 1>
 1> Options for run/acquire:
 1>   --devices N    devices to hold (default 1); --pair is 2; --no-device holds only a stack slot

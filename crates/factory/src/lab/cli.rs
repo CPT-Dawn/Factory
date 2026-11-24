@@ -12,7 +12,7 @@ use factory_core::lab::config::ProjectConfig;
 
 use super::lease;
 use super::wire::Lease;
-use super::{android, reserve, run, stack, status};
+use super::{android, check, reserve, run, stack, status};
 use crate::output::Failure;
 use factory_adapters::adb::AdbCli;
 
@@ -115,6 +115,17 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
                 println!("released {freed}");
             }
             Ok(0)
+        }
+        "check" => {
+            let phones = check::phones(args)?;
+            if args.iter().any(|a| a == "--json") {
+                println!("{}", check::to_json(&phones));
+            } else {
+                for line in check::lines(&phones) {
+                    println!("{line}");
+                }
+            }
+            Ok(check::code(&phones))
         }
         "prep" => {
             for (serial, warning) in prep(&context()?, args)? {

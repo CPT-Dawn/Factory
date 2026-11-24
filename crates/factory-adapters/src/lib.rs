@@ -1,5 +1,5 @@
 //! Each external tool the factory drives (adb, docker, systemd, git, gh, herdr, agy, codex,
-//! claude) sits behind a trait here, and each trait has a fake beside it, such as
+//! claude, notify-send) sits behind a trait here, and each trait has a fake beside it, such as
 //! [`herdr::HerdrApi`] and [`herdr::fake::FakeHerdr`]. So does the Claude Code session inbox
 //! ([`inbox::InboxApi`]) the daemon posts into.
 //!
@@ -10,6 +10,7 @@
 //! too, and those tests run a fake of it (`crates/factory/tests/cli/support/inbox.rs`).
 
 pub mod adb;
+pub mod desktop;
 pub mod devlab;
 pub mod docker;
 pub mod emulator;

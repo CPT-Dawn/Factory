@@ -41,6 +41,9 @@ const STATE_FILES: &[&str] = &[
     "broken",
     "locked",
     "stalled",
+    "asleep",
+    "power",
+    "settings",
 ];
 
 /// How often a wait on a file looks again.
@@ -80,7 +83,11 @@ impl World {
     /// Applies one world step:
     /// - `plug <serial> <state> [<prop>...]`: adb lists the device (replacing its old line),
     /// - `unplug <serial>`: adb no longer lists it,
-    /// - `lock <serial>`: its lock screen stays up,
+    /// - `lock <serial>`: its lock screen stays up; `unlock <serial>`: it is unlocked,
+    /// - `asleep <serial>`: its screen is off until something wakes it,
+    /// - `setting <serial> <key> <value>`: a global setting of the phone, such as
+    ///   `stay_on_while_plugged_in`, is changed on it,
+    /// - `power <serial> AC|USB|Wireless`: the power source it is on,
     /// - `stall <serial>`: the emulator never finishes booting,
     /// - `break <operation>` / `mend <operation>`: `supabase start` or `systemd-run` fails,
     ///   or works again.
@@ -97,6 +104,15 @@ impl World {
                 self.settle_trackers();
             }
             ["lock", serial] => self.append("locked", serial),
+            ["unlock", serial] => self.remove("locked", |line| line == *serial),
+            ["asleep", serial] => self.append("asleep", serial),
+            ["setting", serial, key, value] => {
+                self.remove("settings", |line| {
+                    line.split_whitespace().take(2).eq([*serial, *key])
+                });
+                self.append("settings", &format!("{serial} {key} {value}"));
+            }
+            ["power", serial, source] => self.append("power", &format!("{serial} {source}")),
             ["stall", serial] => self.append("stalled", serial),
             ["break", what @ ..] if !what.is_empty() => self.append("broken", &what.join(" ")),
             ["mend", what @ ..] if !what.is_empty() => {
@@ -155,6 +171,11 @@ impl World {
             }
         }
         dir
+    }
+
+    /// What world file `name` holds now, such as `settings`.
+    pub fn read(&self, name: &str) -> String {
+        fs::read_to_string(self.dir.join(name)).unwrap_or_default()
     }
 
     /// Starts `adb track-devices` on the world, for tests of the stream itself.

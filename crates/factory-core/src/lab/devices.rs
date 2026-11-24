@@ -304,7 +304,8 @@ pub fn lost(held: &[Held]) -> Option<String> {
 }
 
 /// The shell line that readies a device for unattended runs: the screen stays on while it has
-/// power, animations off when asked, then it is woken and a non-secure keyguard lifted.
+/// power, animations off when asked, adb's authorization timeout off where the phone allows
+/// it, then it is woken and a non-secure keyguard lifted. Nothing in it turns a screen off.
 pub fn prep_command(stay_awake: bool, animations_off: bool) -> String {
     let mut cmds: Vec<String> = Vec::new();
     if stay_awake {
@@ -319,6 +320,7 @@ pub fn prep_command(stay_awake: bool, animations_off: bool) -> String {
             cmds.push(format!("settings put global {key} 0"));
         }
     }
+    cmds.push("settings put global adb_allowed_connection_time 0".to_owned());
     cmds.push(WAKE.to_owned());
     cmds.join("; ")
 }
@@ -684,8 +686,14 @@ mod tests {
     fn prep_lifts_the_keyguard_and_reads_the_lock_screen() {
         assert_eq!(
             prep_command(true, false),
-            "settings put global stay_on_while_plugged_in 7; input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard"
+            "settings put global stay_on_while_plugged_in 7; settings put global adb_allowed_connection_time 0; input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard"
         );
+        // adb's authorization timeout goes off whether or not the screen is kept on.
+        assert_eq!(
+            prep_command(false, false),
+            "settings put global adb_allowed_connection_time 0; input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard"
+        );
+        assert!(!prep_command(true, true).contains("KEYCODE_POWER"));
         assert_eq!(lock_warning("\n"), None);
         assert!(lock_warning("  mDreamingLockscreen=true").is_some());
     }
