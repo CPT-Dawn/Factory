@@ -350,22 +350,15 @@ impl<H: HerdrApi> Leads<H> {
         }
         let event = event::Event::from_args("lead-start", &pairs, params.session.as_deref())
             .map_err(|e| Failure::usage(e.to_string()))?;
-        self.ledger.append(&event).map_err(|e| {
-            Failure::precondition(format!(
-                "cannot append to {}: {e}; check the disk and FACTORY_STATE",
-                self.ledger.path.display()
-            ))
-        })?;
         let run = self
             .ledger
-            .standing(&params.repo_name, slug)
+            .append_start(&params.repo_name, slug, &event)
             .map_err(|e| {
                 Failure::precondition(format!(
-                    "cannot read {}: {e}; check FACTORY_STATE",
+                    "cannot append to {}: {e}; check the disk and FACTORY_STATE",
                     self.ledger.path.display()
                 ))
-            })?
-            .starts;
+            })?;
         let started = started.map_err(|failed| Failure::precondition(failed.message))?;
         {
             // The workspace is new: list herdr again so its pane is watched.

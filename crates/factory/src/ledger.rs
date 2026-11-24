@@ -101,6 +101,18 @@ impl Ledger {
         standing_in(&self.path, repo, slug)
     }
 
+    /// Appends the `lead-start` of the lead `slug` of `repo` and says which run of that slug it
+    /// is, counted under the same lock as the write, so a start logged beside it cannot take
+    /// its number.
+    pub fn append_start(&self, repo: &str, slug: &str, event: &Event) -> io::Result<usize> {
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        write_line(&mut file, event)?;
+        Ok(standing_in(&self.path, repo, slug)?.starts)
+    }
+
     /// Appends the `lead-end` of the lead `slug` of `repo`, the run whose start was the
     /// `run`th, unless the ledger already holds an end for it, whoever wrote it, or the lead has
     /// been started again since. The check and the write share the lock every append takes, so
