@@ -39,7 +39,7 @@ use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
-use crate::ledger::Ledger;
+use crate::ledger::{End, Ledger};
 use crate::output::Failure;
 use crate::paths::Paths;
 use crate::protocol::{LeadList, LeadReport, SpawnParams, SpawnResult, WaitLeadResult};
@@ -92,6 +92,9 @@ struct Inner {
 struct Unfinished {
     repo: String,
     report: PathBuf,
+    /// Which run of its slug this is, by the count of `lead-start` events in the ledger when it
+    /// began: an end is written only for the run it belongs to.
+    run: usize,
 }
 
 struct Lead {
@@ -137,13 +140,13 @@ impl<H: HerdrApi> Leads<H> {
         // lead and writing its start, or between writing its end and keeping that, owes none.
         let mut unfinished = BTreeMap::new();
         for (name, repo, report) in running {
-            let owes = ledger.owes_end(&repo, lead::slug(&name)).map_err(|e| {
+            let standing = ledger.standing(&repo, lead::slug(&name)).map_err(|e| {
                 Failure::precondition(format!(
                     "cannot read {}: {e}; check FACTORY_STATE",
                     ledger.path.display()
                 ))
             })?;
-            if !owes {
+            if !standing.owes {
                 if let Err(e) = store.lead_ended(&name) {
                     eprintln!("factory: cannot mark {name} ended in the database: {e}");
                 }
@@ -154,6 +157,7 @@ impl<H: HerdrApi> Leads<H> {
                 Unfinished {
                     repo,
                     report: PathBuf::from(report),
+                    run: standing.starts,
                 },
             );
         }
@@ -352,6 +356,16 @@ impl<H: HerdrApi> Leads<H> {
                 self.ledger.path.display()
             ))
         })?;
+        let run = self
+            .ledger
+            .standing(&params.repo_name, slug)
+            .map_err(|e| {
+                Failure::precondition(format!(
+                    "cannot read {}: {e}; check FACTORY_STATE",
+                    self.ledger.path.display()
+                ))
+            })?
+            .starts;
         let started = started.map_err(|failed| Failure::precondition(failed.message))?;
         {
             // The workspace is new: list herdr again so its pane is watched.
@@ -366,6 +380,7 @@ impl<H: HerdrApi> Leads<H> {
             Unfinished {
                 repo: params.repo_name.clone(),
                 report: report.clone(),
+                run,
             },
         );
         self.bump();
@@ -435,12 +450,13 @@ impl<H: HerdrApi> Leads<H> {
                 .map_err(|e| e.to_string())
                 .and_then(|event| {
                     self.ledger
-                        .append_end(&lead.repo, lead::slug(&name), &event)
-                        .map(|_| ())
+                        .append_end(&lead.repo, lead::slug(&name), lead.run, &event)
                         .map_err(|e| e.to_string())
                 });
             match landed {
-                Ok(_) => {
+                // A newer run of this name has its own record: it is not this one's to close.
+                Ok(End::Superseded) => {}
+                Ok(End::Written | End::Already) => {
                     let kept = self
                         .store
                         .lock()
