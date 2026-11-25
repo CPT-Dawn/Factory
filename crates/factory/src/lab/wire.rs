@@ -299,9 +299,12 @@ pub struct ReleaseParams {
     /// The stopper whose marks [`STOPPING`] set: they go with the lease.
     #[serde(default)]
     pub stopper: Option<Process>,
-    /// Every lease of the caller's owner goes, not one.
+    /// Every lease of the caller's owner held from the caller's worktree goes, not one.
     #[serde(default)]
     pub all: bool,
+    /// With `all`: from every worktree, not only the caller's.
+    #[serde(default)]
+    pub everywhere: bool,
 }
 
 /// The lease a `release --stop-stack` gives back, its slot held for the stop meanwhile, and the

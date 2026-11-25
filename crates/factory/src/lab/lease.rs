@@ -267,8 +267,11 @@ pub enum Target {
     Here,
     /// The lease with this id, from any folder.
     Lease(i64),
-    /// Every lease of the calling owner.
+    /// Every lease of the calling owner held from this worktree: subagents count as their lead,
+    /// so the owner's leases in other worktrees may be a sibling's.
     AllMine,
+    /// Every lease of the calling owner, from any worktree: a lead at the end of its run.
+    AllMineEverywhere,
 }
 
 /// Drops the leases `target` names, and lets go of any slot this call held while stopping its
@@ -285,7 +288,8 @@ pub fn release(ctx: &Ctx, target: Target) -> Result<Released, Failure> {
         &ReleaseParams {
             find,
             stopper: Some(me()),
-            all: target == Target::AllMine,
+            all: matches!(target, Target::AllMine | Target::AllMineEverywhere),
+            everywhere: target == Target::AllMineEverywhere,
         },
     )
 }

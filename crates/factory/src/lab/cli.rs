@@ -188,11 +188,13 @@ pub(super) fn prep(
         .collect())
 }
 
-/// What `release` ends, from its arguments: `--lease <id>`, `--all-mine`, else this worktree's
-/// lease; and whether `--stop-stack` was given, which only goes with the lease here.
+/// What `release` ends, from its arguments: `--lease <id>`, `--all-mine` (with
+/// `--all-worktrees`, every worktree's), else this worktree's lease; and whether `--stop-stack`
+/// was given, which only goes with the lease here.
 pub(super) fn release_args(args: &[String]) -> Result<(Target, bool), Failure> {
     let mut target = Target::Here;
     let mut stop_stack = false;
+    let mut everywhere = false;
     let mut at = 0;
     while at < args.len() {
         let arg = args[at].as_str();
@@ -202,6 +204,10 @@ pub(super) fn release_args(args: &[String]) -> Result<(Target, bool), Failure> {
                 None
             }
             "--all-mine" => Some(Target::AllMine),
+            "--all-worktrees" => {
+                everywhere = true;
+                None
+            }
             "--lease" => {
                 at += 1;
                 Some(lease_id(args.get(at).map_or("", String::as_str))?)
@@ -228,6 +234,14 @@ pub(super) fn release_args(args: &[String]) -> Result<(Target, bool), Failure> {
         }
         at += 1;
     }
+    if everywhere {
+        if target != Target::AllMine {
+            return Err(Failure::usage(
+                "--all-worktrees goes with --all-mine: devlab release --all-mine --all-worktrees",
+            ));
+        }
+        target = Target::AllMineEverywhere;
+    }
     if stop_stack && target != Target::Here {
         return Err(Failure::usage(
             "--stop-stack stops this worktree's stack: run it in the worktree, without --lease or --all-mine",
@@ -247,7 +261,8 @@ fn lease_id(text: &str) -> Result<Target, Failure> {
 
 /// What a release says, a line each: the leases it ended, or that there were none (a lease named
 /// by id that isn't held is exit 4), then each lease of the caller still held with the command
-/// that ends it.
+/// that ends it. After `--all-mine` those are other worktrees' leases, which it would not end:
+/// subagents share their lead's owner, so they may be a sibling's.
 pub(super) fn release_lines(released: &Released, target: Target) -> Result<Vec<String>, Failure> {
     let mut lines: Vec<String> = released
         .dropped
@@ -257,8 +272,8 @@ pub(super) fn release_lines(released: &Released, target: Target) -> Result<Vec<S
     if lines.is_empty() {
         lines.push(
             match target {
-                Target::Here => "nothing held here",
-                Target::AllMine => "nothing held",
+                Target::Here | Target::AllMine => "nothing held here",
+                Target::AllMineEverywhere => "nothing held",
                 Target::Lease(id) => {
                     return Err(Failure::new(
                         Exit::NoLease,
@@ -269,12 +284,33 @@ pub(super) fn release_lines(released: &Released, target: Target) -> Result<Vec<S
             .to_owned(),
         );
     }
-    lines.extend(released.still_held.iter().map(still_held));
+    if target == Target::AllMine {
+        lines.extend(released.still_held.iter().map(not_ending));
+    } else {
+        lines.extend(released.still_held.iter().map(still_held));
+    }
     Ok(lines)
+}
+
+/// `not ending lease 1, /path, slot 0: another worktree's; devlab release --all-mine --all-worktrees ends it too`.
+fn not_ending(lease: &Lease) -> String {
+    format!(
+        "not ending {}: another worktree's; devlab release --all-mine --all-worktrees ends it too",
+        lease_parts(lease)
+    )
 }
 
 /// `still held: lease 1, /path, slot 0, phone SERIAL (Pixel 8): end it with devlab release --lease 1`.
 pub(super) fn still_held(lease: &Lease) -> String {
+    format!(
+        "still held: {}: end it with devlab release --lease {}",
+        lease_parts(lease),
+        lease.id
+    )
+}
+
+/// `lease 1, /path, slot 0, phone SERIAL (Pixel 8)`.
+fn lease_parts(lease: &Lease) -> String {
     let mut parts = vec![format!("lease {}", lease.id), lease.worktree.clone()];
     if let Some(slot) = lease.slot {
         parts.push(format!("slot {slot}"));
@@ -287,11 +323,7 @@ pub(super) fn still_held(lease: &Lease) -> String {
         };
         parts.push(format!("{} {}{model}", d.kind, d.serial));
     }
-    format!(
-        "still held: {}: end it with devlab release --lease {}",
-        parts.join(", "),
-        lease.id
-    )
+    parts.join(", ")
 }
 
 /// Gives the leases `target` names back. With `--stop-stack` the

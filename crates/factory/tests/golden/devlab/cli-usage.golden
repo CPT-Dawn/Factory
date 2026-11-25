@@ -13,7 +13,11 @@ $ a@plain-a devlab
 1>   devlab exec -- <cmd...>         run cmd in the current lease (fails fast if a device was unplugged)
 1>   devlab release [--stop-stack]   give back this worktree's lease and list your others still held
 1>   devlab release --lease <id>     give back that lease of yours from any folder (also: DEVLAB_LEASE)
-1>   devlab release --all-mine       give back every lease of yours (leases also end when the agent exits)
+1>   devlab release --all-mine       give back every lease of yours held from this worktree, and name
+1>                                   the others (subagents count as their lead: they may be a sibling's)
+1>   devlab release --all-mine --all-worktrees
+1>                                   a lead at the end of its run: give back every lease of yours
+1>                                   (leases also end when the agent exits)
 1>   devlab status [--json]          devices, holders, stack slots, queue, memory
 1>   devlab check [serial...]        can each phone run unattended, and what to do if not (exit 10)
 1>
@@ -56,7 +60,11 @@ $ a@plain-a devlab help
 1>   devlab exec -- <cmd...>         run cmd in the current lease (fails fast if a device was unplugged)
 1>   devlab release [--stop-stack]   give back this worktree's lease and list your others still held
 1>   devlab release --lease <id>     give back that lease of yours from any folder (also: DEVLAB_LEASE)
-1>   devlab release --all-mine       give back every lease of yours (leases also end when the agent exits)
+1>   devlab release --all-mine       give back every lease of yours held from this worktree, and name
+1>                                   the others (subagents count as their lead: they may be a sibling's)
+1>   devlab release --all-mine --all-worktrees
+1>                                   a lead at the end of its run: give back every lease of yours
+1>                                   (leases also end when the agent exits)
 1>   devlab status [--json]          devices, holders, stack slots, queue, memory
 1>   devlab check [serial...]        can each phone run unattended, and what to do if not (exit 10)
 1>
