@@ -27,7 +27,10 @@ its id; every golden with a release step changed with it. `devices-phone-grant` 
 ready phone is granted, so the request for the locked one waits, says how many phones are locked
 or unauthorized, and gets it once it is unlocked, where today's devlab granted it at once with a
 lock-screen warning. `slots-wait-default` is parity regained: `--wait -1` is the configured
-default wait, as in today's devlab, so the call queues.
+default wait, as in today's devlab, so the call queues. `cli-usage` (the 2026-11-25 retro):
+`release --all-mine` gives back only the caller's leases held from its worktree, and names the
+others, since subagents share their lead's owner; `--all-mine --all-worktrees` gives back every
+one, as `--all-mine` did; the help says so.
 
 ## Replaying
 

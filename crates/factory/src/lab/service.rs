@@ -669,7 +669,10 @@ fn release(lab: &Lab, p: ReleaseParams) -> Answer<Released> {
         let f = &p.find;
         let mine = |l: &Lease| held_by(l, &f.owner);
         let dropped = if p.all {
-            store::leases(c)?.into_iter().filter(mine).collect()
+            store::leases(c)?
+                .into_iter()
+                .filter(|l| mine(l) && (p.everywhere || l.worktree == f.worktree))
+                .collect()
         } else {
             match own_lease(c, f)? {
                 Ok(found) => found.into_iter().collect(),

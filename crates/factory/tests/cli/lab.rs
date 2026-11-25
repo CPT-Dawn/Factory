@@ -2732,6 +2732,8 @@ fn release_refuses_stop_stack_with_a_lease_or_all_mine_and_two_targets_together(
         &["release", "--stop-stack", "--lease", "1"],
         &["release", "--all-mine", "--lease", "1"],
         &["release", "--lease", "x"],
+        &["release", "--all-worktrees"],
+        &["release", "--lease", "1", "--all-worktrees"],
     ] {
         let out = run(for_owner(&sandbox, &wt, std::process::id(), args));
         assert_eq!(out.code, 2, "{args:?}: {out:?}");
@@ -2759,7 +2761,57 @@ fn release_lease_of_a_lease_that_does_not_exist_exits_4() {
 }
 
 #[test]
-fn release_all_mine_ends_every_lease_of_the_owner_and_no_one_elses() {
+fn release_all_mine_in_a_worktree_ends_its_leases_and_names_the_owners_others() {
+    let (sandbox, world) = lab();
+    let a = Agent::start();
+    let (one, two) = owner_holding_in_two_worktrees(&sandbox, &world, &a);
+
+    // Subagents count as their lead: an implementer in `two` shares an owner with a sibling
+    // in `one`, and its --all-mine must not end the sibling's lease.
+    let released = run(for_owner(
+        &sandbox,
+        &two,
+        a.pid(),
+        &["release", "--all-mine"],
+    ));
+
+    assert_eq!(
+        (released.code, released.stderr.as_str()),
+        (
+            0,
+            format!(
+                "devlab: released lease 2 ({})
+\
+                 devlab: not ending lease 1, {}, phone FAKEPHONE01 (Pixel 8): another worktree's; \
+                 devlab release --all-mine --all-worktrees ends it too
+",
+                two.display(),
+                one.display()
+            )
+            .as_str()
+        ),
+        "{released:?}"
+    );
+    assert_eq!(run(for_owner(&sandbox, &one, a.pid(), &["env"])).code, 0);
+    assert_eq!(run(for_owner(&sandbox, &two, a.pid(), &["env"])).code, 4);
+
+    let again = run(for_owner(
+        &sandbox,
+        &two,
+        a.pid(),
+        &["release", "--all-mine"],
+    ));
+    assert!(
+        again.stderr.starts_with(
+            "devlab: nothing held here
+"
+        ),
+        "{again:?}"
+    );
+}
+
+#[test]
+fn release_all_mine_all_worktrees_ends_every_lease_of_the_owner_and_no_one_elses() {
     let (sandbox, world) = lab();
     let (a, b) = (Agent::start(), Agent::start());
     let (one, two) = owner_holding_in_two_worktrees(&sandbox, &world, &a);
@@ -2777,7 +2829,7 @@ fn release_all_mine_ends_every_lease_of_the_owner_and_no_one_elses() {
         &sandbox,
         &elsewhere,
         a.pid(),
-        &["release", "--all-mine"],
+        &["release", "--all-mine", "--all-worktrees"],
     ));
 
     assert_eq!(
@@ -2878,7 +2930,7 @@ fn factory_lab_release_names_a_file_when_the_leases_it_ends_would_run_the_line_l
         &sandbox,
         &elsewhere,
         a.pid(),
-        &["lab", "release", "--all-mine"],
+        &["lab", "release", "--all-mine", "--all-worktrees"],
     );
 
     assert_eq!(out.code, 0, "{out:?}");
@@ -2910,7 +2962,7 @@ fn factory_lab_release_json_names_the_file_its_long_line_would_name() {
         &sandbox,
         &elsewhere,
         a.pid(),
-        &["lab", "release", "--all-mine", "--json"],
+        &["lab", "release", "--all-mine", "--all-worktrees", "--json"],
     );
 
     let json = one_json(&out);

@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# commit-msg: a subject must be a conventional commit of 72 characters or fewer, as CLAUDE.md asks.
+# git hands this hook the message file as $1, on commits and on merges (git merge -m runs it too).
+# Enable with: git config core.hooksPath .githooks. Skip it once with git commit --no-verify.
+#
+# The rules mirror PeekaBus's scripts/commit-subject.ts. Accepted: `type(scope)!: subject` (type
+# lowercase, scope and ! optional); git's own merge subjects, in the shapes git and GitHub word
+# them, at any length during a merge (a long branch name makes them long) and held to 72 otherwise;
+# `Revert "..."` and `Reapply "..."`, held to 72 unless git worded them (the body says "This
+# reverts commit <sha>"); and fixup!/squash!/amend! subjects at any length, since autosquash folds
+# them away. The subject is the message's first paragraph, its lines joined by a space, as git
+# log's %s shows it. A refusal is one line on stderr naming the rule and the length.
+set -euo pipefail
+# Lengths in characters, not bytes.
+export LC_ALL=C.UTF-8
+
+max=72
+message=$1
+
+# core.commentChar (or newer git's core.commentString); "auto" and unset mean git's default.
+cc=$(git config --get core.commentString || git config --get core.commentChar || true)
+[[ -z "$cc" || "$cc" == auto ]] && cc='#'
+scissors="$cc ------------------------ >8 ------------------------"
+
+# The message as git keeps it: comment lines and everything below git commit -v's scissors dropped.
+subject='' body='' in_body=0 started=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+  line=${line%$'\r'}
+  [[ "$line" == "$scissors" ]] && break
+  [[ "$line" == "$cc"* ]] && continue
+  line=${line%"${line##*[![:space:]]}"}
+  if ((in_body)); then
+    body+="$line"$'\n'
+  elif [[ -z "$line" ]]; then
+    ((started)) && in_body=1
+  else
+    started=1
+    subject+="${subject:+ }$line"
+  fi
+done <"$message"
+# An empty message: git aborts it on its own.
+[[ -z "$subject" ]] && exit 0
+
+sources="((remote-tracking )?branch(es)?|tags?|commits?) '[^']+'((, | and )'[^']+')*"
+gits_own_merge() {
+  [[ "$1" =~ ^Merge\ $sources((\;\ |,\ )$sources)*(\ of\ .+)?(\ into\ [^[:space:]]+)?$ ]] ||
+    [[ "$1" =~ ^Merge\ ([a-z+]+://|[[:alnum:]_.-]+@)[^[:space:]]+(\ into\ [^[:space:]]+)?$ ]] ||
+    [[ "$1" =~ ^Merge\ pull\ request\ \#[0-9]+\ from\ [^[:space:]]+$ ]]
+}
+merging() { git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; }
+
+[[ "$subject" =~ ^(fixup|squash|amend)!\  ]] && exit 0
+if merging && gits_own_merge "$subject"; then exit 0; fi
+
+length=${#subject}
+conventional='^[a-z]+(\([^()[:space:]][^()]*\))?!?: [^[:space:]]'
+revert='^(Revert|Reapply) ".+"$'
+if ! [[ "$subject" =~ $conventional || "$subject" =~ $revert ]] && ! gits_own_merge "$subject"; then
+  echo "commit-msg: subject is not a conventional commit (type(scope): subject), $length characters: $subject" >&2
+  exit 1
+fi
+if ((length > max)); then
+  if [[ "$subject" =~ $revert ]] && grep -qE '^This reverts commit [0-9a-f]{7,40}([^[:alnum:]_]|$)' <<<"$body"; then
+    exit 0
+  fi
+  echo "commit-msg: subject is $length characters, over the $max limit: $subject" >&2
+  exit 1
+fi

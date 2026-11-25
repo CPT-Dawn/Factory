@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{DeviceRow, device_line};
 use factory_core::lab::queue::{Holding, held_by, live_queue, owner_slot_counts, waiter_capped};
+use factory_core::lab::reserve::lapses_at;
 use factory_core::lab::slots::slot_project_id;
 use factory_core::lab::{ago, js_round};
 use serde::Serialize;
@@ -235,7 +236,14 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
                     || {
                         reserved.map_or_else(
                             || "free".to_owned(),
-                            |r| format!("reserved by {} (reservation {})", r.owner_label, r.id),
+                            |r| {
+                                format!(
+                                    "reserved by {} (reservation {}), {}",
+                                    r.owner_label,
+                                    r.id,
+                                    lapse(board.now, r)
+                                )
+                            },
                         )
                     },
                     |l| format!("lease {} {}", l.id, base_name(&l.worktree)),
@@ -337,6 +345,16 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
 }
 
 /// Whole minutes from `then` to `now`, rounded as [`ago`] rounds them.
+/// When an idle reservation goes back to the pool: `lapses in 20 min unless used`, rounded up.
+fn lapse(now: i64, r: &Reservation) -> String {
+    let secs = lapses_at(r.created, r.used) - now;
+    if secs <= 0 {
+        "lapses now unless used".to_owned()
+    } else {
+        format!("lapses in {} min unless used", (secs + 59) / 60)
+    }
+}
+
 fn minutes(now: i64, then: i64) -> i64 {
     #[allow(clippy::cast_precision_loss)]
     js_round((now - then) as f64 / 60.0)
