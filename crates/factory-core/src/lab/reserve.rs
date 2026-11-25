@@ -17,11 +17,27 @@ pub const MIN_ETA_SECS: i64 = 60;
 /// How long a reservation lasts after it was made or last used (#59).
 pub const UNUSED_SECS: i64 = 2 * 3600;
 
-/// A reservation made at `created` and last used at `used` (when a run gave its slot back) has
-/// expired at `now`: nobody used it for [`UNUSED_SECS`]. Seconds since the epoch.
+/// How long a reservation no lease holds stays set aside: one left idle goes back to the pool
+/// so an owner that waits gets its slot (the 2026-11-25 retro: a lead kept two idle for 1.2 h).
+pub const IDLE_SECS: i64 = 20 * 60;
+
+/// When a reservation made at `created` and last used at `used` (when the lease made from it
+/// ended) was last in use: the later of the two. A reservation is only a row while no lease
+/// holds its slot, so it has been idle since then.
+fn idle_since(created: i64, used: Option<i64>) -> i64 {
+    used.map_or(created, |used| used.max(created))
+}
+
+/// A reservation made at `created` and last used at `used` has expired at `now`: nobody used
+/// it for [`UNUSED_SECS`]. Seconds since the epoch.
 pub fn expired(created: i64, used: Option<i64>, now: i64) -> bool {
-    let since = used.map_or(created, |used| used.max(created));
-    now - since >= UNUSED_SECS
+    now - idle_since(created, used) >= UNUSED_SECS
+}
+
+/// When a reservation made at `created` and last used at `used` lapses for idling
+/// [`IDLE_SECS`], unless a lease uses it first. Seconds since the epoch.
+pub fn lapses_at(created: i64, used: Option<i64>) -> i64 {
+    idle_since(created, used) + IDLE_SECS
 }
 
 /// One reserve request.
@@ -399,6 +415,15 @@ mod tests {
             args(&["--lots", "2"]),
             Err("unknown option --lots; factory lab reserve --help".to_owned())
         );
+    }
+
+    #[test]
+    fn an_idle_reservation_lapses_20_minutes_after_it_was_made_or_last_used() {
+        const NOW: i64 = 1_800_000_000;
+        assert_eq!(lapses_at(NOW, None), NOW + 20 * 60);
+        assert_eq!(lapses_at(NOW - 3600, Some(NOW)), NOW + 20 * 60);
+        // A use stamped before it was made (a clock step) counts from when it was made.
+        assert_eq!(lapses_at(NOW, Some(NOW - 3600)), NOW + 20 * 60);
     }
 
     #[test]

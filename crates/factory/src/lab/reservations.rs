@@ -3,7 +3,7 @@
 
 use rusqlite::{Connection, Row, params};
 
-use factory_core::lab::reserve::{UNUSED_SECS, expired};
+use factory_core::lab::reserve::{IDLE_SECS, UNUSED_SECS, expired, lapses_at};
 
 use super::store;
 use super::wire::{Lease, Owner, Reservation};
@@ -126,7 +126,8 @@ pub fn drop_by_id(c: &Connection, id: i64, now: i64) -> rusqlite::Result<()> {
 }
 
 /// Drops every reservation whose owner exited, or that nobody used for two hours since it was
-/// made or last used ([`expired`]); a line per reservation dropped.
+/// made or last used ([`expired`]), or for 20 minutes ([`lapses_at`]); a line per reservation
+/// dropped. The 2 h reason shows only when no write came in the 20 minutes before it.
 pub fn gc(
     c: &Connection,
     now: i64,
@@ -138,6 +139,8 @@ pub fn gc(
             "owner exited".to_owned()
         } else if expired(r.created, r.used, now) {
             format!("unused for {} h", UNUSED_SECS / 3600)
+        } else if now >= lapses_at(r.created, r.used) {
+            format!("idle for {} min", IDLE_SECS / 60)
         } else {
             continue;
         };

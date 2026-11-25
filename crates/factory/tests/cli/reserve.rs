@@ -403,6 +403,74 @@ fn a_reservation_goes_when_its_owner_exits() {
     assert_eq!(slot_of(&out), "1");
 }
 
+/// The line `devlab status` shows for the lead's reservation `id`.
+fn reserved_line(sandbox: &Sandbox, wt: &Path, lead: &Agent, id: &str) -> String {
+    let status = as_agent(sandbox, wt, lead, &["status"]).stdout;
+    let mark = format!("reserved by {} (reservation {id})", lead.label());
+    status
+        .lines()
+        .find(|line| line.contains(&mark))
+        .unwrap_or_else(|| panic!("no {mark} in {status}"))
+        .to_owned()
+}
+
+#[test]
+fn a_reservation_no_lease_used_for_20_minutes_lapses_and_status_says_when() {
+    let (sandbox, world) = lab();
+    let skew = sandbox.path("clock-skew");
+    let sandbox = sandbox.env("FACTORY_CLOCK_SKEW_FILE", &skew);
+    let (lead, _other, wt) = lead_and_a_full_board(&sandbox, &world);
+    let id = reservation(&as_agent(&sandbox, &wt, &lead, &["reserve"]));
+    assert!(
+        reserved_line(&sandbox, &wt, &lead, &id).ends_with(", lapses in 20 min unless used"),
+        "{}",
+        reserved_line(&sandbox, &wt, &lead, &id)
+    );
+
+    // A child's run uses it at 15 min: the 20 minutes count again from when that lease ended.
+    std::fs::write(&skew, "900").expect("move the clock on");
+    let (child, dir) = (Agent::new(), world.worktree("demo-child"));
+    let used = run(call(
+        &sandbox,
+        &dir,
+        &child,
+        &[("DEVLAB_RESERVATION", &id)],
+        &["run", "--no-device", "--quiet", "--wait", "0", "--", "true"],
+    ));
+    assert_eq!(used.code, 0, "{used:?}");
+
+    std::fs::write(&skew, "2040").expect("move the clock on");
+    let early = as_agent(&sandbox, &wt, &lead, &["gc"]);
+    assert_eq!((early.code, early.stdout.as_str()), (0, ""), "{early:?}");
+    assert!(
+        reserved_line(&sandbox, &wt, &lead, &id).ends_with(", lapses in 1 min unless used"),
+        "{}",
+        reserved_line(&sandbox, &wt, &lead, &id)
+    );
+
+    // Lapsed: a higher-priority owner that was shut out gets the slot without waiting.
+    std::fs::write(&skew, "2101").expect("move the clock on");
+    let (outsider, elsewhere) = (Agent::new(), world.worktree("demo-outsider"));
+    let ask = ["acquire", "--no-device", "--quiet", "--wait", "0"];
+    assert_eq!(
+        slot_of(&as_agent(&sandbox, &elsewhere, &outsider, &ask)),
+        "1"
+    );
+    let gc = as_agent(&sandbox, &wt, &lead, &["gc"]);
+    assert_eq!(
+        (gc.code, gc.stdout.as_str()),
+        (
+            0,
+            format!(
+                "released reservation {id} ({}, idle for 20 min)\n",
+                lead.label()
+            )
+            .as_str()
+        ),
+        "{gc:?}"
+    );
+}
+
 #[test]
 fn a_reservation_nobody_used_for_two_hours_goes_and_gc_says_so() {
     let (sandbox, world) = lab();
@@ -411,11 +479,8 @@ fn a_reservation_nobody_used_for_two_hours_goes_and_gc_says_so() {
     let (lead, _other, wt) = lead_and_a_full_board(&sandbox, &world);
     let id = reservation(&as_agent(&sandbox, &wt, &lead, &["reserve"]));
 
-    // Not yet: a minute short of two hours.
-    std::fs::write(&skew, "7140").expect("move the clock on");
-    let early = as_agent(&sandbox, &wt, &lead, &["gc"]);
-    assert_eq!((early.code, early.stdout.as_str()), (0, ""), "{early:?}");
-
+    // No call reached the daemon for two hours (a laptop asleep, say): the 2 h expiry is the
+    // reason it gives, though the reservation idled past its 20 minutes long before.
     std::fs::write(&skew, "7201").expect("move the clock on");
     let gc = as_agent(&sandbox, &wt, &lead, &["gc"]);
     assert_eq!(

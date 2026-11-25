@@ -25,7 +25,9 @@ devlab reserve --release [--json]                  # give this owner's reservati
 - When no slot is free the request waits (`--wait`, default as for acquire) and prints exactly two
   lines in total: `devlab: waiting: <why>` when it starts to wait, and its answer.
 - Reservations live in the daemon's `lab.db`, so a daemon restart keeps them. They go when their
-  owner exits (`devlab gc`, and the daemon's own sweep).
+  owner exits, and when no lease has used one for 20 minutes since it was granted or its last
+  lease ended (or 2 h, when no call reached the daemon meanwhile): `devlab gc` says which and why,
+  and `devlab status` shows each one's `lapses in N min unless used`.
 
 ## The matching change for the harness repo (implement-spec)
 
