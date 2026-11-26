@@ -16,6 +16,13 @@ use factory_core::ci::PullRequest;
 
 use crate::output::Failure;
 
+/// The daemon's socket, the one systemd's socket unit may hold.
+const SOCKET: &str = "factory.sock";
+/// The socket only a running daemon binds: no longer a name than [`SOCKET`]'s, so a runtime dir
+/// whose socket path fits the kernel's limit fits both.
+const LIVE_SOCKET: &str = "live.sock";
+const _: () = assert!(LIVE_SOCKET.len() <= SOCKET.len());
+
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub state: PathBuf,
@@ -131,13 +138,13 @@ impl Paths {
     }
 
     pub fn socket(&self) -> PathBuf {
-        self.runtime.join("factory.sock")
+        self.runtime.join(SOCKET)
     }
 
     /// The socket the running daemon binds itself, beside the one systemd may hold: a call here
     /// reaches a daemon that runs, or nothing, and never makes systemd start one.
     pub fn live_socket(&self) -> PathBuf {
-        self.runtime.join("factory.live.sock")
+        self.runtime.join(LIVE_SOCKET)
     }
 
     /// Held by the running daemon for its whole life, so only one runs.

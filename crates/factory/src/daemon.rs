@@ -266,9 +266,10 @@ fn bind(socket: &Path) -> Result<StdListener, Failure> {
     StdListener::bind(socket).map_err(cannot)
 }
 
-/// Answers connections on both sockets, systemd's or its own and the live one, until the daemon
-/// is stopping, then lets the ones it took finish, for up to [`DRAIN_TIMEOUT`]. Connections it
-/// never took stay queued in the socket.
+/// Answers connections on both sockets, systemd's or its own and the live one, taking each in a
+/// fair turn, until the daemon is stopping, then lets the ones it took finish, for up to
+/// [`DRAIN_TIMEOUT`]. Connections it never took on systemd's socket stay queued there for the
+/// next daemon; those on a socket of its own are refused once it is gone.
 async fn serve(listeners: [UnixListener; 2], daemon: Arc<Daemon>, stop: Stop) {
     let [listener, live] = listeners;
     // The connections hear of the stop only once the listener is gone, so a call made after
@@ -277,18 +278,17 @@ async fn serve(listeners: [UnixListener; 2], daemon: Arc<Daemon>, stop: Stop) {
     let hung_up = Stop(hung_up);
     let mut connections = JoinSet::new();
     loop {
+        // Unbiased: when both sockets have callers, each is as likely to go first.
+        let accept = async {
+            tokio::select! {
+                accepted = listener.accept() => accepted,
+                accepted = live.accept() => accepted,
+            }
+        };
         tokio::select! {
             biased;
             () = stop.clone().stopping() => break,
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
-                    connections.spawn(answer(stream, Arc::clone(&daemon), hung_up.clone()));
-                }
-                Err(e) => {
-                    let _ = writeln!(io::stderr(), "factory: accept failed: {e}");
-                }
-            },
-            accepted = live.accept() => match accepted {
+            accepted = accept => match accepted {
                 Ok((stream, _)) => {
                     connections.spawn(answer(stream, Arc::clone(&daemon), hung_up.clone()));
                 }

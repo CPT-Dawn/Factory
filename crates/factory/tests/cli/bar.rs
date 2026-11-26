@@ -237,6 +237,40 @@ fn a_socket_with_no_daemon_behind_it_is_left_alone() {
 }
 
 #[test]
+fn a_live_socket_whose_backlog_is_full_keeps_the_hook_waiting_no_longer_than_its_patience() {
+    // A daemon too busy to accept: the kernel queues no more calls, and a connect waits for room.
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.path("run/factory")).unwrap();
+    let path = sandbox.path("run/factory/live.sock");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap();
+    let socket = runtime.block_on(async {
+        let socket = tokio::net::UnixSocket::new_stream().unwrap();
+        socket.bind(&path).unwrap();
+        socket.listen(0).unwrap().into_std().unwrap()
+    });
+    let queued = std::os::unix::net::UnixStream::connect(&path).unwrap();
+
+    let begun = std::time::Instant::now();
+    let hooked = sandbox.factory_stdin(
+        &["hook", "statusline"],
+        &statusline_input(40.0, now_secs() + HOUR, 12.0),
+    );
+    let took = begun.elapsed();
+
+    assert_eq!(
+        (hooked.code, hooked.stdout.as_str(), hooked.stderr.as_str()),
+        (0, "", ""),
+        "{hooked:?}"
+    );
+    // The hook's patience is a second; the rest is the binary's start.
+    assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+    drop((queued, socket));
+}
+
+#[test]
 fn a_bad_config_is_no_daemon_down_and_keeps_the_exit_table() {
     let sandbox = Sandbox::new();
     assert_eq!(sandbox.factory(&["monitor", "status"]).code, 0);

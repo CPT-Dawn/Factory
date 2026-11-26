@@ -385,6 +385,8 @@ impl Session {
         let mut line = serde_json::to_string(&request).map_err(|e| refused(&e))?;
         line.push('\n');
         let stream = self.reader.get_ref();
+        // A daemon that stops reading fills the socket's buffer, and a write would wait for room.
+        stream.set_write_timeout(patience).map_err(|e| lost(&e))?;
         (&*stream)
             .write_all(line.as_bytes())
             .map_err(|e| lost(&e))?;
@@ -440,7 +442,7 @@ pub enum Unanswered {
 }
 
 /// Sends a request to a daemon that is already running, and never starts one, giving up with exit
-/// 3 after `patience`: for the callers that must stay fast and leave nothing behind, the
+/// 3 once `patience` has passed since the connect began: for the callers that must stay fast and leave nothing behind, the
 /// status-line hook and the bar. It calls on the live socket, the one the running daemon binds
 /// itself: a call on systemd's, with the service stopped, would start the daemon.
 pub fn call_running<P: Serialize, R: DeserializeOwned>(
@@ -449,12 +451,30 @@ pub fn call_running<P: Serialize, R: DeserializeOwned>(
     params: &P,
     patience: Duration,
 ) -> Result<R, Unanswered> {
-    let stream = UnixStream::connect(paths.live_socket()).map_err(|e| {
+    let begun = Instant::now();
+    let socket = paths.live_socket();
+    let down = |reason: &dyn std::fmt::Display| {
         Unanswered::Down(Failure::precondition(format!(
-            "daemon unreachable at {}: {e}; factory status starts it",
-            paths.live_socket().display()
+            "daemon unreachable at {}: {reason}; factory status starts it",
+            socket.display()
         )))
-    })?;
+    };
+    // A daemon too busy to accept leaves a full backlog, and a connect would wait there for room.
+    let stream = within(patience, {
+        let socket = socket.clone();
+        move || UnixStream::connect(socket)
+    })
+    .ok_or_else(|| {
+        down(&format_args!(
+            "it did not accept within {}s",
+            patience.as_secs()
+        ))
+    })?
+    .map_err(|e| down(&e))?;
+    let left = patience.saturating_sub(begun.elapsed());
+    if left.is_zero() {
+        return Err(down(&"it accepted with no patience left"));
+    }
     let mut session = Session {
         reader: BufReader::new(stream),
         paths: paths.clone(),
@@ -464,7 +484,7 @@ pub fn call_running<P: Serialize, R: DeserializeOwned>(
         .exchange_raw(
             method,
             params,
-            Some(patience),
+            Some(left),
             Exit::Precondition,
             &mut |_| {},
             &mut |_| {},
