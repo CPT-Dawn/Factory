@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{DeviceRow, device_line};
 use factory_core::lab::queue::{Holding, held_by, live_queue, owner_slot_counts, waiter_capped};
+use factory_core::lab::ready::{Readiness, USB_DEBUGGING_OFF_WORDS};
 use factory_core::lab::reserve::lapses_at;
 use factory_core::lab::{ago, js_round};
 use serde::Serialize;
@@ -104,6 +105,10 @@ pub fn screen(board: &Board) -> Result<String, Failure> {
             // A phone adb calls ready shows its readiness (#55): locked, asleep, …
             let state = match &d.readiness {
                 Some(word) if d.kind == "phone" && d.state == "ready" => word.clone(),
+                // A phone adb doesn't list says what to do, not adb's word for it (#73).
+                Some(word) if word == Readiness::UsbDebuggingOff.word() => {
+                    USB_DEBUGGING_OFF_WORDS.to_owned()
+                }
                 _ => d.state.clone(),
             };
             out.push(device_line(&DeviceRow {

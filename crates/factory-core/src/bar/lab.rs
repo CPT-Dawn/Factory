@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Chip, Row, Section, Tone, glyph, stamp};
 use crate::lab::ago;
-use crate::lab::ready::{Readiness, phone_name};
+use crate::lab::ready::{Readiness, USB_DEBUGGING_OFF_WORDS, phone_name};
 
 /// How old, in ms, a free phone's readiness may be before the card shows its age.
 pub const STALE_MS: i64 = 5 * 60_000;
@@ -21,7 +21,7 @@ pub enum Shown {
 }
 
 /// The one table of what each phone's row asks of the owner, and its tone.
-pub const WORDS: [(Shown, &str, Tone); 7] = [
+pub const WORDS: [(Shown, &str, Tone); 8] = [
     (Shown::Free(Readiness::Ready), "ready", Tone::Ok),
     (Shown::Leased, "leased to", Tone::Busy),
     (Shown::Free(Readiness::Locked), "unlock it", Tone::Warn),
@@ -37,11 +37,24 @@ pub const WORDS: [(Shown, &str, Tone); 7] = [
         Tone::Critical,
     ),
     (Shown::Free(Readiness::Offline), "replug it", Tone::Critical),
+    (
+        Shown::Free(Readiness::UsbDebuggingOff),
+        USB_DEBUGGING_OFF_WORDS,
+        Tone::Warn,
+    ),
 ];
 
 /// The words and tone of a phone, from [`WORDS`]: `leased to <holder>` while a lease holds it,
-/// else what its readiness asks of the owner. None: a free phone not checked yet.
+/// else what its readiness asks of the owner; a leased phone adb lost for its USB debugging
+/// being off says both. None: a free phone not checked yet.
 pub fn phone_words(readiness: Option<Readiness>, holder: Option<&str>) -> Option<(String, Tone)> {
+    // A leased phone that adb has lost still asks for its USB debugging: the holder follows.
+    if let (Some(holder), Some(Readiness::UsbDebuggingOff)) = (holder, readiness) {
+        return Some((
+            format!("{USB_DEBUGGING_OFF_WORDS}, leased to {holder}"),
+            Tone::Warn,
+        ));
+    }
     let shown = match (holder, readiness) {
         (Some(_), _) => Shown::Leased,
         (None, Some(readiness)) => Shown::Free(readiness),

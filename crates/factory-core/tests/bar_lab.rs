@@ -49,6 +49,23 @@ fn tone(tone: Tone) -> Value {
 }
 
 #[test]
+fn a_leased_phone_adb_lost_still_asks_for_its_usb_debugging_beside_its_holder() {
+    assert_eq!(
+        phone_words(Some(Readiness::UsbDebuggingOff), Some("app-t1")).map(|(w, t)| (w, tone(t))),
+        Some((
+            "turn on USB debugging, leased to app-t1".to_owned(),
+            json!("warn")
+        ))
+    );
+    let mut held = phone("S1", "Pixel 8", Readiness::UsbDebuggingOff);
+    held.holder = Some("app-t1".to_owned());
+    assert_eq!(
+        row(&lab(vec![held]), "Pixel 8"),
+        json!({"kind": "text", "label": "Pixel 8", "text": "turn on USB debugging, leased to app-t1", "tone": "warn"})
+    );
+}
+
+#[test]
 fn the_wording_and_tones_come_from_one_table_as_the_spec_words_them() {
     let spec = [
         (Shown::Free(Readiness::Ready), "ready", "ok"),
@@ -66,6 +83,11 @@ fn the_wording_and_tones_come_from_one_table_as_the_spec_words_them() {
             "critical",
         ),
         (Shown::Free(Readiness::Offline), "replug it", "critical"),
+        (
+            Shown::Free(Readiness::UsbDebuggingOff),
+            "turn on USB debugging",
+            "warn",
+        ),
     ];
     assert_eq!(WORDS.len(), spec.len());
     for (shown, words, tone_name) in spec {
