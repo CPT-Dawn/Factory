@@ -274,7 +274,8 @@ fn a_live_socket_whose_backlog_is_full_keeps_the_hook_waiting_no_longer_than_its
 /// over and never an answer, until the hook hangs up; true once it got the request.
 fn chatter(sandbox: &Sandbox, reply: &'static [u8]) -> std::thread::JoinHandle<bool> {
     use std::io::{BufRead, BufReader, Write};
-    let enough = std::time::Duration::from_secs(10);
+    // Past the bar's patience, so the bar gives up before the stand-in does.
+    let enough = std::time::Duration::from_secs(20);
     std::fs::create_dir_all(sandbox.path("run/factory")).unwrap();
     let socket =
         std::os::unix::net::UnixListener::bind(sandbox.path("run/factory/live.sock")).unwrap();
@@ -294,7 +295,12 @@ fn chatter(sandbox: &Sandbox, reply: &'static [u8]) -> std::thread::JoinHandle<b
         stream.set_read_timeout(Some(enough)).unwrap();
         stream.set_write_timeout(Some(enough)).unwrap();
         let mut request = String::new();
-        if BufReader::new(&stream).read_line(&mut request).is_err() {
+        let read = BufReader::new(&stream).read_line(&mut request);
+        let call: Option<Value> = serde_json::from_str(&request).ok();
+        if read.is_err()
+            || !request.ends_with('\n')
+            || call.is_none_or(|call| call["method"].is_null())
+        {
             return false;
         }
         let begun = std::time::Instant::now();
@@ -327,6 +333,23 @@ fn a_daemon_that_only_sends_notes_keeps_the_hook_no_longer_than_its_patience() {
     let sandbox = Sandbox::new();
     let daemon = chatter(&sandbox, b"{\"id\":1,\"note\":\"busy\"}\n");
     assert_the_hook_keeps_its_patience(&sandbox, daemon);
+}
+
+#[test]
+fn a_daemon_that_never_answers_leaves_the_bar_a_next_step() {
+    let sandbox = Sandbox::new();
+    let daemon = chatter(&sandbox, b"{\"id\":1,\"note\":\"busy\"}\n");
+
+    let plain = bar(&sandbox, false);
+
+    assert_eq!((plain.code, plain.stdout.as_str()), (3, ""), "{plain:?}");
+    assert!(
+        plain.stderr.starts_with("factory: factory daemon down: ")
+            && plain.stderr.contains("did not answer within 10s; see ")
+            && plain.stderr.trim_end().ends_with(" and retry"),
+        "{plain:?}"
+    );
+    assert!(daemon.join().unwrap(), "the bar never sent its call");
 }
 
 #[test]

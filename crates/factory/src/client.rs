@@ -455,18 +455,21 @@ pub fn call_running<P: Serialize, R: DeserializeOwned + Send + 'static>(
     patience: Duration,
 ) -> Result<R, Unanswered> {
     let params = serde_json::to_value(params).map_err(|e| {
-        Unanswered::Refused(Failure::precondition(format!("cannot send {method}: {e}")))
+        Unanswered::Refused(Failure::precondition(format!(
+            "cannot send {method}: {e}; report it as a factory bug"
+        )))
     })?;
     let (paths, method) = (paths.clone(), method.to_owned());
-    let socket = paths.live_socket();
+    let (socket, log) = (paths.live_socket(), paths.daemon_log());
     within(patience, move || {
         call_live(&paths, &method, &params, patience)
     })
     .unwrap_or_else(|| {
         Err(Unanswered::Down(Failure::precondition(format!(
-            "the daemon at {} did not answer within {}s",
+            "the daemon at {} did not answer within {}s; see {} and retry",
             socket.display(),
-            patience.as_secs()
+            patience.as_secs(),
+            log.display()
         ))))
     })
 }
