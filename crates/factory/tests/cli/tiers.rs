@@ -240,13 +240,68 @@ fn hard_runs_codex_high_first() {
 fn a_spec_review_runs_gemini_4_neon_high_first_and_names_the_spec_tier() {
     let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
 
-    let out = lab.review(&["base", "spec-x-r1"]);
+    let out = lab.review(&["base", "spec-x-r1", "--json"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     assert_eq!(lab.who(), ["agy gemini-4-neon-high"]);
-    let event = lab.last_event();
-    assert_eq!(event["tier"], "spec", "{event}");
-    assert_eq!(event["tier_source"], "spec", "{event}");
+    let shown: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(shown["tier"], "spec", "{shown}");
+    assert_eq!(shown["tier_source"], "spec", "{shown}");
+}
+
+#[test]
+fn status_names_the_tier_of_each_review_running_on_a_pool() {
+    let lab = Lab::new("code", 0.9, 1.0, &["hold", "hold"]);
+    lab.configure(AGY_FIRST_HARD);
+    let holding = |args: &[&str]| {
+        let mut all = vec!["review"];
+        all.extend_from_slice(args);
+        let mut cmd = lab.sandbox.factory_command(&all);
+        cmd.current_dir(&lab.repo);
+        spawn(cmd)
+    };
+    let spec = holding(&["base", "spec-x-r1"]);
+    assert!(
+        world::poll_until(|| lab.runs().len() == 1),
+        "the spec review started"
+    );
+    let ticket = holding(&["--tier", "hard", "base", "t1-r1"]);
+    assert!(
+        world::poll_until(|| lab.runs().len() == 2),
+        "the ticket review started"
+    );
+
+    let json = lab.sandbox.factory(&["status", "--json"]);
+    let screen = lab.sandbox.factory(&["status"]);
+    fs::write(lab.file("release"), "").unwrap();
+
+    let shown: Value = serde_json::from_str(&json.stdout).unwrap();
+    let pool = |name: &str| {
+        shown["review"]
+            .as_array()
+            .and_then(|pools| pools.iter().find(|pool| pool["name"] == name))
+            .unwrap_or_else(|| panic!("no {name} in {shown}"))
+            .clone()
+    };
+    assert_eq!(
+        pool("agy-gemini")["tiers"],
+        json!(["hard", "spec"]),
+        "{shown}"
+    );
+    assert_eq!(pool("codex")["tiers"], json!([]), "{shown}");
+    let lines = screen.stdout_lines();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("  agy-gemini")
+                && line.ends_with("2/2 running (hard, spec)")),
+        "{screen:?}"
+    );
+    assert_eq!(finish(spec).code, 0);
+    assert_eq!(finish(ticket).code, 0);
+    let after: Value =
+        serde_json::from_str(&lab.sandbox.factory(&["status", "--json"]).stdout).unwrap();
+    assert_eq!(after["review"][0]["tiers"], json!([]), "{after}");
 }
 
 #[test]
@@ -289,6 +344,25 @@ fn the_spec_chain_is_configured_apart_from_the_hard_one() {
 }
 
 #[test]
+fn a_spec_review_follows_a_hard_chain_the_config_sets_until_it_sets_a_spec_one() {
+    let lab = Lab::new("code", 0.9, 1.0, &["ok", "ok"]);
+    lab.configure("[review.chains]\nhard = [\"codex:gpt-6.2-sol:medium\"]\n");
+
+    let spec = lab.review(&["base", "spec-x-r1"]);
+    let hard = lab.review(&["--tier", "hard", "base", "t1-r1"]);
+
+    assert_eq!((spec.code, hard.code), (0, 0), "{spec:?} {hard:?}");
+    let runs = lab.runs();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert!(runs.iter().all(|run| run.starts_with("codex ")), "{runs:?}");
+    assert!(
+        runs.iter()
+            .all(|run| run.contains("model_reasoning_effort=\"medium\"")),
+        "{runs:?}"
+    );
+}
+
+#[test]
 fn an_empty_spec_chain_is_refused_like_the_other_tiers() {
     for tier in ["hard", "standard", "trivial", "spec"] {
         let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
@@ -322,15 +396,18 @@ fn a_spec_chain_naming_an_unknown_pool_is_refused() {
 fn a_tiny_diff_never_downgrades_a_spec_review() {
     let lab = Lab::new("tiny", 0.9, 1.0, &["ok", "ok"]);
 
-    let named = lab.review(&["base", "spec-x-r1", "none", "--tier", "trivial"]);
-    let unnamed = lab.review(&["base", "spec-x-r2"]);
+    let named = lab.review(&["base", "spec-x-r1", "none", "--tier", "trivial", "--json"]);
+    let unnamed = lab.review(&["base", "spec-x-r2", "--json"]);
 
     assert_eq!((named.code, unnamed.code), (0, 0), "{named:?} {unnamed:?}");
     assert_eq!(
         lab.who(),
         ["agy gemini-4-neon-high", "agy gemini-4-neon-high"]
     );
-    assert_eq!(lab.last_event()["tier"], "spec");
+    for out in [&named, &unnamed] {
+        let shown: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(shown["tier"], "spec", "{shown}");
+    }
 }
 
 #[test]
@@ -475,12 +552,13 @@ fn standard_with_codex_at_its_limit_takes_agys_opus_high() {
 fn a_spec_review_is_hard_and_may_spend_the_reserve() {
     let lab = Lab::new("code", 0.1, 1.0, &["ok"]);
 
-    let out = lab.review(&["base", "spec-r1"]);
+    let out = lab.review(&["base", "spec-r1", "--json"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     assert_eq!(lab.who(), ["agy gemini-4-neon-high"]);
-    assert_eq!(lab.last_event()["tier_source"], "spec");
-    assert_eq!(lab.last_event()["tier"], "spec");
+    let shown: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(shown["tier_source"], "spec", "{shown}");
+    assert_eq!(shown["tier"], "spec", "{shown}");
 }
 
 #[test]

@@ -53,7 +53,7 @@ use crate::protocol::{
     WaitCiResult, WaitClaudeParams, WaitLeadParams, WaitLeaseParams, WaitReviewParams,
 };
 use crate::reviews::Reviews;
-use crate::router::Router;
+use crate::router::{Held as Slot, Router};
 use crate::status;
 use crate::steward::Steward;
 use crate::store::{Store, WaitRow};
@@ -310,7 +310,7 @@ async fn answer(stream: UnixStream, daemon: Arc<Daemon>, stop: Stop) {
 }
 
 /// The requests and answers of one connection; `held` names the review slot it holds.
-async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut Option<String>) {
+async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut Option<Slot>) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     let mut first = true;
@@ -382,7 +382,7 @@ async fn respond(
     request: serde_json::Result<Request>,
     daemon: &Daemon,
     stop: &Stop,
-    held: &mut Option<String>,
+    held: &mut Option<Slot>,
 ) -> Response {
     let request = match request {
         Ok(request) => request,

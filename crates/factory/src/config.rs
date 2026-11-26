@@ -57,14 +57,15 @@
 //! auth = "subscription"    # agy only: its "subscription" login, or an "api-key" in
 //!                          # GEMINI_API_KEY (default: subscription)
 //! reserve = 0.2            # agy only: below this share of its group's 5-hour bucket, only
-//!                          # hard reviews may take it
+//!                          # hard and spec reviews may take it
 //!
 //! [review]
 //! skill = "~/.agents/skills/code-review/SKILL.md"  # the reviewer skill every prompt carries
 //!
 //! [review.chains]          # per tier: "pool:model:effort", model and effort optional
 //! hard = ["agy:gemini-4-neon-high:high", "codex:gpt-6.2-sol:high"]
-//! spec = ["agy:gemini-4-neon-high:high"]   # reviews labelled spec-*; default: hard's old chain
+//! spec = ["agy:gemini-4-neon-high:high"]   # reviews labelled spec-*; default: hard's chain when
+//!                                          # set, else Neon high first (the old hard chain)
 //! standard = ["codex:gpt-6.2-sol:medium", "agy"]
 //! trivial = ["codex::low"]
 //! ```
@@ -532,8 +533,10 @@ pub fn review_setup(paths: &Paths) -> Result<ReviewSetup, Failure> {
     };
     let chains = review.chains;
     Ok(ReviewSetup {
-        hard: chain(Tier::Hard, chains.hard)?,
-        spec: chain(Tier::Spec, chains.spec)?,
+        hard: chain(Tier::Hard, chains.hard.clone())?,
+        // A config that sets `hard` and not `spec` keeps its spec reviews on that chain, as before
+        // the tier existed.
+        spec: chain(Tier::Spec, chains.spec.or_else(|| chains.hard.clone()))?,
         standard: chain(Tier::Standard, chains.standard)?,
         trivial: chain(Tier::Trivial, chains.trivial)?,
         skill: review.skill.map(|skill| expand_home(&skill)),

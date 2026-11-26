@@ -106,6 +106,9 @@ pub struct Backend {
     #[serde(default)]
     pub reason: Option<String>,
     pub running: u32,
+    /// The tier of each review running on it, sorted: `hard`, `spec` and so on.
+    #[serde(default)]
+    pub tiers: Vec<String>,
     pub concurrency: u32,
     /// `queue` or `next`.
     pub when_busy: String,
@@ -318,8 +321,12 @@ fn review(status: &Status, rows: &mut Vec<String>) {
             (QuotaState::Available, _) => "available".to_owned(),
             (QuotaState::Unknown, _) => "unknown".to_owned(),
         };
+        let tiers = match backend.tiers.is_empty() {
+            true => String::new(),
+            false => format!(" ({})", backend.tiers.join(", ")),
+        };
         rows.push(format!(
-            "  {:<width$}  {quota}, {}/{} running",
+            "  {:<width$}  {quota}, {}/{} running{tiers}",
             backend.name, backend.running, backend.concurrency
         ));
         // Why it is unknown, under it: a row of its own keeps the reason within the columns.

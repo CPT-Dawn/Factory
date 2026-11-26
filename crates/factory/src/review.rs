@@ -166,7 +166,7 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
 }
 
 /// The adapter that runs a chain's step on its backend, keeping the backend's reserve unless
-/// the review is hard.
+/// the review is hard or spec.
 fn reviewer(backend: &Backend, step: &Step, tier: Tier, paths: &Paths) -> Box<dyn Reviewer> {
     let model = step.model.clone().or_else(|| backend.model.clone());
     let effort = step.effort.clone().or_else(|| backend.effort.clone());
@@ -294,6 +294,7 @@ fn review(
         }
         let last = pools.len().saturating_sub(1);
         let slots = AcquireParams {
+            tier: Some(tier.as_str().to_owned()),
             review: Some(ReviewRef {
                 repo: run.repo.clone(),
                 label: args.label.clone(),
