@@ -16,6 +16,9 @@ mod bar_lab;
 mod ci;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
+mod ci_fleet;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
 mod claude;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
@@ -27,6 +30,9 @@ mod devlab_golden;
 mod durations;
 mod harness;
 mod help;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
+mod history;
 mod install;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]

@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod lab;
 
+use crate::fleet::{Ci, Mark, PullState};
 use crate::status::{self, ClaudeState};
 use crate::timestamp::Timestamp;
-use crate::usage::{UsageReading, WindowKind};
+use crate::usage::{UsageReading, WindowKind, WindowState};
 
 /// The cockpit format's version.
 pub const VERSION: u32 = 1;
@@ -24,8 +25,13 @@ pub struct Snapshot {
     /// When it was taken, in milliseconds since the epoch.
     pub now: i64,
     pub claude: status::Claude,
+    #[serde(default)]
+    pub agy: status::Agy,
     pub waits: Vec<status::Wait>,
     pub leads: status::Leads,
+    /// The watched repos' CI; none configured shows no CI chip or section.
+    #[serde(default)]
+    pub ci: crate::fleet::Ci,
     /// The lab as the daemon last checked it.
     #[serde(default)]
     pub lab: lab::Lab,
@@ -161,17 +167,125 @@ pub fn feed(snapshot: &Snapshot) -> Feed {
     Feed {
         version: VERSION,
         generated: stamp(snapshot.now),
-        glance: vec![
-            claude_chip(snapshot),
-            factory_chip(snapshot),
-            lab::chip(&snapshot.lab),
-        ],
-        sections: vec![
-            claude_section(snapshot),
-            factory_section(snapshot),
-            lab::section(&snapshot.lab),
-        ],
+        glance: [
+            Some(claude_chip(snapshot)),
+            Some(agy_chip(snapshot)),
+            Some(factory_chip(snapshot)),
+            Some(lab::chip(&snapshot.lab)),
+            ci_chip(snapshot),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        sections: [
+            Some(claude_section(snapshot)),
+            Some(agy_section(snapshot)),
+            Some(factory_section(snapshot)),
+            Some(lab::section(&snapshot.lab)),
+            ci_section(snapshot),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
     }
+}
+
+/// `✓`, `✗`, `busy`, or `?` before GitHub answered.
+fn ci_mark_text(ci: &Ci) -> &'static str {
+    match ci.mark() {
+        Mark::Unknown => "?",
+        Mark::Failing => "✗",
+        Mark::Busy => "busy",
+        Mark::Passing => "✓",
+    }
+}
+
+fn ci_chip(snapshot: &Snapshot) -> Option<Chip> {
+    let ci = &snapshot.ci;
+    if !ci.shown() {
+        return None;
+    }
+    let mark = ci.mark();
+    let (glyph, tone) = match mark {
+        Mark::Unknown => (glyph::CI_PASSING, Tone::Muted),
+        Mark::Failing => (glyph::CI_FAILING, Tone::Critical),
+        Mark::Busy => (glyph::CI_PASSING, Tone::Busy),
+        Mark::Passing => (glyph::CI_PASSING, Tone::Ok),
+    };
+    Some(Chip {
+        id: "ci".to_owned(),
+        label: glyph.char.to_string(),
+        text: ci_mark_text(ci).to_owned(),
+        tone,
+        tooltip: Some(format!("CI: {}", ci.summary(snapshot.now))),
+    })
+}
+
+/// Runners busy out of total, the queue and its oldest wait, and each open factory pull
+/// request with its link. A failed read keeps the last good numbers, marked stale.
+fn ci_section(snapshot: &Snapshot) -> Option<Section> {
+    let ci = &snapshot.ci;
+    if !ci.shown() {
+        return None;
+    }
+    let mut rows = Vec::new();
+    if ci.answered() {
+        let tally = ci.tally();
+        #[allow(clippy::cast_precision_loss)]
+        let value = if tally.total == 0 {
+            0.0
+        } else {
+            tally.busy as f64 / tally.total as f64
+        };
+        rows.push(Row::Meter {
+            label: "runners".to_owned(),
+            value,
+            text: tally.runners_text(),
+            tone: if tally.offline + tally.missing > 0 {
+                Tone::Warn
+            } else if tally.busy > 0 {
+                Tone::Busy
+            } else {
+                Tone::Ok
+            },
+            until: None,
+        });
+        let queue = tally.queue_text(snapshot.now);
+        rows.push(if tally.queued == 0 {
+            text("queue", queue, Tone::Muted)
+        } else {
+            text("queue", queue, Tone::Busy)
+        });
+        let pulls: Vec<Row> = ci
+            .repos
+            .iter()
+            .flat_map(|repo| {
+                let name = repo.repo.rsplit('/').next().unwrap_or(&repo.repo);
+                repo.pulls.iter().map(move |pull| Row::Text {
+                    label: format!("{name}#{}", pull.number),
+                    text: pull.state.word().to_owned(),
+                    tone: Some(match pull.state {
+                        PullState::Passing => Tone::Ok,
+                        PullState::Failing => Tone::Critical,
+                        PullState::Pending => Tone::Busy,
+                    }),
+                    url: Some(pull.url.clone()),
+                })
+            })
+            .collect();
+        if pulls.is_empty() {
+            rows.push(text("PRs", "no open factory PRs".to_owned(), Tone::Muted));
+        }
+        rows.extend(pulls);
+    }
+    Some(Section {
+        id: "ci".to_owned(),
+        title: "CI".to_owned(),
+        note: None,
+        error: ci.error(),
+        stale_since: ci.stale_since().map(stamp),
+        rows,
+    })
 }
 
 /// What `factory bar --json` prints when the daemon can't be asked: one critical chip.
@@ -197,8 +311,10 @@ pub fn daemon_down(reason: &str, now: i64) -> Feed {
     }
 }
 
-/// `claude 12/40 · 2 leads · lab 2/2`: each window's share (5-hour/weekly, `?` while unknown),
-/// the live leads (`? leads` while herdr can't tell), then the phones ready out of plugged in.
+/// `claude 12/40 · agy 30/63 · 2 leads · lab 2/2 · CI ✓`: each window's share (5-hour/weekly, `?` while
+/// unknown; agy's the worst of its quota groups, or `unreadable` while its usage is), the live
+/// leads (`? leads` while herdr can't tell), the phones ready out of plugged in, then CI's mark
+/// when repos are watched.
 pub fn line(snapshot: &Snapshot) -> String {
     let claude = &snapshot.claude;
     let share = |kind| {
@@ -214,8 +330,29 @@ pub fn line(snapshot: &Snapshot) -> String {
     } else {
         plural(live(snapshot).count(), "lead")
     };
+    let ci = if snapshot.ci.shown() {
+        format!(" · CI {}", ci_mark_text(&snapshot.ci))
+    } else {
+        String::new()
+    };
+    let agy_share = |kind| {
+        snapshot
+            .agy
+            .worst_of(kind, snapshot.now)
+            .map_or_else(|| "?".to_owned(), |used| used.to_string())
+    };
+    // An answer that can't be read is said so, apart from a reading not yet taken (`?/?`).
+    let agy = if snapshot.agy.error.is_some() {
+        "unreadable".to_owned()
+    } else {
+        format!(
+            "{}/{}",
+            agy_share(WindowKind::FiveHour),
+            agy_share(WindowKind::Weekly)
+        )
+    };
     format!(
-        "claude {}/{} · {leads} · {}",
+        "claude {}/{} · agy {agy} · {leads} · {}{ci}",
         share(WindowKind::FiveHour),
         share(WindowKind::Weekly),
         lab::line(&snapshot.lab),
@@ -336,6 +473,104 @@ fn claude_section(snapshot: &Snapshot) -> Section {
         note: hold_note(snapshot),
         error: None,
         stale_since,
+        rows,
+    }
+}
+
+/// The worst window across agy's quota groups, toned by its share; muted while agy's usage is
+/// unreadable or no window stands.
+fn agy_chip(snapshot: &Snapshot) -> Chip {
+    let agy = &snapshot.agy;
+    let label = glyph::AGY.char.to_string();
+    if let Some(problem) = agy.problem() {
+        return Chip {
+            id: "agy".to_owned(),
+            label,
+            text: "?".to_owned(),
+            tone: Tone::Muted,
+            tooltip: Some(problem),
+        };
+    }
+    let (text, tone) = match agy.worst(snapshot.now) {
+        Some(used) => (format!("{used}%"), share_tone(used)),
+        None => ("?".to_owned(), Tone::Muted),
+    };
+    let tooltip = if agy.groups.is_empty() {
+        "agy: no reading yet".to_owned()
+    } else {
+        let groups: Vec<String> = agy
+            .groups
+            .iter()
+            .map(|group| format!("{} {}", group.name, group.describe(snapshot.now, ", ")))
+            .collect();
+        format!("agy: {}", groups.join("; "))
+    };
+    Chip {
+        id: "agy".to_owned(),
+        label,
+        text,
+        tone,
+        tooltip: Some(tooltip),
+    }
+}
+
+/// One block per quota group: its name and windows, then a meter per window.
+fn agy_section(snapshot: &Snapshot) -> Section {
+    let agy = &snapshot.agy;
+    let now = snapshot.now;
+    let mut rows = Vec::new();
+    for group in &agy.groups {
+        rows.push(text(&group.name, group.describe(now, " · "), Tone::Muted));
+        for window in &group.windows {
+            let label = window.window.label().to_owned();
+            rows.push(match window.state {
+                WindowState::Used {
+                    used_percent,
+                    resets,
+                } if resets > now => Row::Meter {
+                    label,
+                    value: f64::from(used_percent) / 100.0,
+                    text: format!("{used_percent}%"),
+                    tone: share_tone(used_percent),
+                    until: Some(stamp(resets)),
+                },
+                WindowState::Used { resets, .. } => Row::Meter {
+                    label,
+                    value: 0.0,
+                    text: format!(
+                        "unknown, {} old",
+                        crate::lab::ago(now / 1000, agy.seen.unwrap_or(now) / 1000)
+                    ),
+                    tone: Tone::Muted,
+                    until: Some(stamp(resets)),
+                },
+                WindowState::Unused => Row::Meter {
+                    label,
+                    value: 0.0,
+                    text: "0%".to_owned(),
+                    tone: Tone::Ok,
+                    until: None,
+                },
+                WindowState::Unknown => Row::Meter {
+                    label,
+                    value: 0.0,
+                    text: "unknown".to_owned(),
+                    tone: Tone::Muted,
+                    until: None,
+                },
+            });
+        }
+    }
+    let stale =
+        agy.groups.iter().flat_map(|group| &group.windows).any(
+            |window| matches!(window.state, WindowState::Used { resets, .. } if resets <= now),
+        );
+    Section {
+        id: "agy".to_owned(),
+        title: "agy".to_owned(),
+        note: None,
+        error: agy.problem(),
+        stale_since: if stale { agy.seen.map(stamp) } else { None },
         rows,
     }
 }

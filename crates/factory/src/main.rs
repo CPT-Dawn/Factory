@@ -1,5 +1,6 @@
 //! `factory`: the CLI and the daemon of the agent software factory (spec #1).
 
+mod agy;
 mod bar;
 mod ci;
 mod claude;
@@ -9,6 +10,8 @@ mod clock;
 mod config;
 mod cutover;
 mod daemon;
+mod fleet;
+mod history;
 mod hook;
 mod install;
 mod lab;
@@ -111,6 +114,12 @@ fn run(command: Command, json: bool) -> ExitCode {
         Command::Quota {
             command: QuotaCommand::Claude,
         } => claude::quota(),
+        Command::Quota {
+            command: QuotaCommand::History { since },
+        } => history::run(since.as_deref(), json),
+        Command::Quota {
+            command: QuotaCommand::Agy,
+        } => agy::quota(json),
         Command::Bar => return bar::run(json),
         Command::Wait {
             command: WaitCommand::Claude { timeout },

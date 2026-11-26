@@ -25,8 +25,18 @@ The statusline is the only documented signal that gives both the share spent and
 - `factory quota claude` exits 0 to dispatch, naming both windows (`claude: 5h 40% resets …, weekly 12% resets …; dispatch`), or 75 naming what holds and every window read so far, a stale one with its age: `claude: hold: weekly 91%; hold new dispatches until <time>; 5h unknown (seen 3h ago), weekly 91%; …`, or `claude: hit its limit; …`.
 - `factory wait claude [--timeout 9m]` blocks, silent, until a lead may dispatch (exit 0), or exits 124 to wait again.
 - `factory status` shows one `claude:` row (`claude: hold: weekly 91% until 11-30 02:00Z; 5h 41%, weekly 91%`), and `--json` shows a `claude` object with each window's reading.
-- `factory bar` prints `claude 12/40 · 2 leads` (5-hour/weekly, `?` for a window not standing), and `factory bar --json` the bar feed with a Claude chip and card, a meter per window. Like the hook, the bar asks only a daemon that runs, and starts none. Only an unreachable daemon gives the bar's exit-0 "factory daemon down" document; a bad config exits 3 as usual.
+- `factory bar` prints `claude 12/40 · agy 30/63 · 2 leads · lab 2/2` (5-hour/weekly, `?` for a window not standing; agy's is the worst of its quota groups), and `factory bar --json` the bar feed with a Claude chip and card, a meter per window. Like the hook, the bar asks only a daemon that runs, and starts none. Only an unreachable daemon gives the bar's exit-0 "factory daemon down" document; a bad config exits 3 as usual.
 - The daemon's database keeps the quota (table `claude_quota`, with the weekly window's columns since schema 6), so a restart forgets no hold. A schema 5 store migrates in place.
+
+## agy's quota (spec #67)
+
+agy has no hook: the daemon's quota keeper asks `agy -p /usage --output-format json` itself, and shows what it read for five minutes, whoever looks (`factory status`, `factory bar`, `factory quota agy`). Routing keeps its own, separate 120 s freshness check on a file cache, so a dispatch never decides on a five-minute-old answer. A query takes seconds, so one runs on its own and at most once at a time; status and the bar wait four seconds for it and show the last reading (or `agy: no reading yet`) when it is slower.
+
+- Each quota group (`Gemini Models`, `Claude and GPT models`) has a 5-hour and a weekly window. A bucket that agy reports with the Unix epoch as its reset has no clock running: with a remaining fraction of 1 it is an unused window, 0%; with a lower fraction it is unknown, and routing treats the answer as unreadable. It is never "a reset that passed".
+- An answer that is garbage, or a query that fails, shows `agy usage unreadable: <why>` in `factory status`, `factory quota agy` and the bar (a muted `?` chip, and the card's `error`), never 0% or 100%. It is asked again after five minutes like any reading.
+- `factory quota agy` prints `agy: Gemini Models: 5h 30%, weekly 7%; Claude and GPT models: 5h 24%, weekly 63%` and exits 0, reading or not: it reports, and does not gate. Past 200 characters (many groups, or long names) the line becomes a summary naming `agy-quota.txt` in the state dir, which has a row for each group; if that file can't be written the command says so and exits non-zero (the state dir is the daemon's too, so it is broken anyway), and `--json`, which writes no file, has every group. `--json` has `groups`, `error` and `seen`.
+- The bar's agy chip shows the worst window across the groups, toned by its share. The card has one block per quota group: a text row naming it, then a meter per window.
+- The keeper holds the reading in memory: a restart asks again.
 
 ## Wiring (DotFiles)
 
@@ -40,3 +50,9 @@ The statusline is the only documented signal that gives both the share spent and
 glowline pipes the JSON it reads to `factory hook statusline` and draws the line itself.
 
 implement-spec runs `factory quota claude` before each dispatch. On exit 75 it runs `factory wait claude` until that exits 0, then dispatches.
+
+## Usage history
+
+Every reading the quota keeper stores is also kept in the `usage_history` table when it differs from the window's last row (harness, quota group, window, share used, reset, time seen); a reading that only came later adds nothing. The keeper writes a harness's own state and its history rows in one transaction, in one shared path (`QuotaKeeper::store_readings`), so a harness that stores its readings there is covered with no code of its own. Rows are kept 90 days: the keeper prunes when it starts and, while the daemon runs, once 23 hours have passed since the last prune by either clock (it looks every few seconds, so an idle daemon prunes too).
+
+`factory quota history [--since <time>]` reads it, oldest first. `--since` takes a UTC time (`2026-11-20T00:00:00Z`), a date (`2026-11-20`) or an age (`6h`, `7d`). `--json` prints `{"rows": [{"harness", "group", "window", "used_percent", "resets", "seen"}, …]}`, times in milliseconds since the epoch. Without it, a few rows print on the one line; more are written to `quota-history-<hash>.json` in the state dir (one file per result, named from its content), and the line names it. A file stays a day.

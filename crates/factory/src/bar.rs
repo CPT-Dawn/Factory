@@ -8,6 +8,7 @@
 //! failure (a bad config, a daemon that refuses), it follows the exit-code table.
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use factory_core::bar::{self, Snapshot};
 use serde_json::{Value, json};
@@ -15,11 +16,12 @@ use serde_json::{Value, json};
 use crate::client::{self, ANSWER_TIMEOUT, Unanswered};
 use crate::clock;
 use crate::config;
+use crate::fleet::Fleet;
 use crate::leads::Leads;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{BAR, BarParams};
-use crate::quotas::QuotaKeeper;
+use crate::quotas::{AGY_GLANCE, QuotaKeeper};
 use crate::status;
 use crate::steward::Steward;
 
@@ -59,19 +61,23 @@ fn request() -> Result<(Paths, BarParams), Failure> {
     Ok((paths, BarParams { claude_hold_at }))
 }
 
-/// The daemon's side: everything the bar shows, from memory.
-pub fn snapshot(
+/// The daemon's side: everything the bar shows, from memory, and agy's last reading (its usage
+/// is asked at most every five minutes, and never waited on for long).
+pub async fn snapshot(
     params: &BarParams,
     leads: &Leads,
     steward: &Steward,
-    quotas: &QuotaKeeper,
+    quotas: &Arc<QuotaKeeper>,
+    fleet: &Fleet,
     lab: bar::lab::Lab,
 ) -> Snapshot {
     Snapshot {
         now: clock::now().unix_millis(),
         claude: quotas.claude(params.claude_hold_at),
+        agy: quotas.agy(AGY_GLANCE).await,
         waits: leads.registered(),
         leads: status::leads_seen(leads, steward),
+        ci: fleet.snapshot(),
         lab,
     }
 }
