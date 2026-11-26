@@ -207,6 +207,44 @@ fn with_the_daemon_down_the_json_feed_is_one_critical_chip_and_exits_0() {
 }
 
 #[test]
+fn a_socket_with_no_daemon_behind_it_is_left_alone() {
+    // systemd's socket with the service stopped: a call on it would start the daemon.
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.path("run/factory")).unwrap();
+    let socket =
+        std::os::unix::net::UnixListener::bind(sandbox.path("run/factory/factory.sock")).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    // A pid file a dead daemon left behind.
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    gone.wait().unwrap();
+    std::fs::write(
+        sandbox.path("run/factory/daemon.pid"),
+        format!("{}\n", gone.id()),
+    )
+    .unwrap();
+
+    let begun = std::time::Instant::now();
+    let hooked = sandbox.factory_stdin(
+        &["hook", "statusline"],
+        &statusline_input(40.0, now_secs() + HOUR, 12.0),
+    );
+    assert_eq!(
+        (hooked.code, hooked.stdout.as_str(), hooked.stderr.as_str()),
+        (0, "", ""),
+        "{hooked:?}"
+    );
+    assert!(begun.elapsed() < std::time::Duration::from_millis(500));
+    let document = feed(&sandbox);
+    assert_eq!(chip(&document, "factory")["text"], "factory daemon down");
+    assert_eq!(bar(&sandbox, false).code, 3);
+
+    assert!(
+        matches!(socket.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "a call reached the socket"
+    );
+}
+
+#[test]
 fn a_bad_config_is_no_daemon_down_and_keeps_the_exit_table() {
     let sandbox = Sandbox::new();
     assert_eq!(sandbox.factory(&["monitor", "status"]).code, 0);
