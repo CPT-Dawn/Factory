@@ -410,7 +410,7 @@ fn a_run_that_queued_and_completed_between_two_reads_keeps_its_jobs_times() {
     assert!(
         reads
             .iter()
-            .any(|path| path.ends_with("/runs/8/jobs?filter=latest&per_page=100")),
+            .any(|path| path.ends_with("/runs/8/jobs?filter=all&per_page=100")),
         "{reads:?}"
     );
     assert!(
@@ -425,6 +425,50 @@ fn a_run_that_queued_and_completed_between_two_reads_keeps_its_jobs_times() {
             "started": 1_767_261_630_000_i64, "finished": 1_767_261_660_000_i64,
         }]),
         "{shop}"
+    );
+}
+
+#[test]
+fn a_run_past_the_first_page_of_runs_updated_since_the_last_read_keeps_its_jobs_times() {
+    let sandbox = watching(2);
+    let github = FakeGitHub::install(&sandbox);
+    github.pulls(&[(12, "factory/s1-t2")]);
+    github.checks(&[(1, "test", "completed", Some("success"))]);
+    assert_eq!(sandbox.factory(&["wait", "ci", "12"]).code, 0);
+    awaits_next_read(&sandbox);
+
+    // A busy minute: a full page of newer runs, and the one that ran lint on the next.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let now = factory_core::timestamp::Timestamp::from_unix_millis(
+        i64::try_from(now.as_millis()).unwrap(),
+    )
+    .to_string();
+    let newer: Vec<(u64, &str)> = (1000..1100).map(|id| (id, now.as_str())).collect();
+    github.latest_runs(&newer);
+    github.latest_runs_page(2, &[(8, &now), (9, "2026-01-01T09:00:00Z")]);
+    github.jobs(
+        8,
+        &[Job {
+            id: 80,
+            name: "lint",
+            status: "completed",
+            conclusion: Some("failure"),
+            created: "2026-01-01T10:00:00Z",
+            started: Some("2026-01-01T10:00:30Z"),
+            completed: Some("2026-01-01T10:01:00Z"),
+            runner: Some("ci-2"),
+        }],
+    );
+    move_clock(&sandbox, 61);
+    let shop = shop_when(&sandbox, |shop| shop["finished"] != json!([]));
+    assert_eq!(shop["finished"][0]["id"], 80, "{shop}");
+    // Page two holds a run created before the last read: no older page is read.
+    let reads = github.watcher_reads(&sandbox);
+    assert!(
+        !reads.iter().any(|path| path.ends_with("&page=3")),
+        "{reads:?}"
     );
 }
 
