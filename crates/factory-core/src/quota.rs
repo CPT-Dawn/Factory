@@ -235,13 +235,14 @@ pub fn agy_usage(usage: &str, group: &str) -> AgyUsage {
         match (left, reset) {
             // The epoch is no reset: the bucket has been used, or it has not. Only a whole
             // quota left says it has not.
-            (Some(left), Some(reset)) if reset.unix_millis() == AGY_EPOCH_MILLIS => {
-                if left < 1.0 {
-                    return AgyUsage::Unreadable(format!(
-                        "a {group} bucket has used some quota but reports no reset"
-                    ));
-                }
+            (Some(left), Some(reset))
+                if reset.unix_millis() == AGY_EPOCH_MILLIS && !epoch_means_unused(left) =>
+            {
+                return AgyUsage::Unreadable(format!(
+                    "a {group} bucket has used some quota but reports no reset"
+                ));
             }
+            (Some(_), Some(reset)) if reset.unix_millis() == AGY_EPOCH_MILLIS => {}
             (Some(left), _) if left > 0.0 => {}
             (Some(_), Some(reset)) => until = until.max(Some(reset)),
             _ => {
@@ -269,30 +270,64 @@ pub fn agy_groups(usage: &str) -> Result<Vec<QuotaGroup>, String> {
         .and_then(Value::as_array)
         .filter(|groups| !groups.is_empty())
         .ok_or_else(|| "its answer lists no quota groups".to_owned())?;
-    let groups: Vec<QuotaGroup> = listed
-        .iter()
-        .filter_map(|group| {
-            let name = group.get("name")?.as_str()?.to_owned();
-            let mut windows: Vec<GroupWindow> = Vec::new();
-            for bucket in group.get("buckets")?.as_array()? {
-                let Some(kind) = bucket_window(bucket) else {
-                    continue;
-                };
-                if windows.iter().all(|seen| seen.window != kind) {
-                    windows.push(GroupWindow {
-                        window: kind,
-                        state: bucket_state(bucket),
-                    });
-                }
+    let (mut placed, mut read) = (false, false);
+    let mut groups = Vec::new();
+    for group in listed {
+        let (Some(name), Some(buckets)) = (
+            group.get("name").and_then(Value::as_str),
+            group.get("buckets").and_then(Value::as_array),
+        ) else {
+            return Err("a quota group of its answer has no name or buckets".to_owned());
+        };
+        // Both windows of every group, so a bucket the answer leaves out is an unknown window
+        // on the screen and not a window that is not there.
+        let mut windows = [WindowKind::FiveHour, WindowKind::Weekly].map(|window| GroupWindow {
+            window,
+            state: WindowState::Unknown,
+        });
+        let mut seen = [false; 2];
+        for bucket in buckets {
+            let Some(kind) = bucket_window(bucket) else {
+                continue;
+            };
+            let at = usize::from(kind == WindowKind::Weekly);
+            if !std::mem::replace(&mut seen[at], true) {
+                placed = true;
+                read |= read_bucket(bucket).is_some();
+                windows[at].state = bucket_state(bucket);
             }
-            windows.sort_by_key(|window| window.window);
-            (!windows.is_empty()).then_some(QuotaGroup { name, windows })
-        })
-        .collect();
-    if groups.is_empty() {
+        }
+        groups.push(QuotaGroup {
+            name: name.to_owned(),
+            windows: windows.to_vec(),
+        });
+    }
+    if !placed {
         return Err("its answer lists no 5-hour or weekly window".to_owned());
     }
+    if !read {
+        return Err("its answer has no bucket it can read".to_owned());
+    }
     Ok(groups)
+}
+
+/// Whether a bucket with the epoch as its reset, which has no clock running, is untouched: only
+/// when the whole quota is left.
+fn epoch_means_unused(left: f64) -> bool {
+    (left - 1.0).abs() < f64::EPSILON
+}
+
+/// A bucket as agy printed it: the share left, 0 to 1, and when it resets.
+fn read_bucket(bucket: &Value) -> Option<(f64, i64)> {
+    let left = bucket
+        .get("remaining_fraction")
+        .and_then(Value::as_f64)
+        .filter(|left| (0.0..=1.0).contains(left))?;
+    let resets = bucket
+        .get("reset_time")
+        .and_then(Value::as_str)
+        .and_then(Timestamp::parse)?;
+    Some((left, resets.unix_millis()))
 }
 
 /// Which window a bucket is: its `window` (`5h`, `weekly`), else what its id or name says.
@@ -314,24 +349,15 @@ fn bucket_window(bucket: &Value) -> Option<WindowKind> {
 
 /// What a bucket says of its window.
 fn bucket_state(bucket: &Value) -> WindowState {
-    let left = bucket
-        .get("remaining_fraction")
-        .and_then(Value::as_f64)
-        .filter(|left| (0.0..=1.0).contains(left));
-    let reset = bucket
-        .get("reset_time")
-        .and_then(Value::as_str)
-        .and_then(Timestamp::parse)
-        .map(Timestamp::unix_millis);
-    match (left, reset) {
-        (Some(left), Some(resets)) if resets == AGY_EPOCH_MILLIS => {
-            if left >= 1.0 {
+    match read_bucket(bucket) {
+        Some((left, resets)) if resets == AGY_EPOCH_MILLIS => {
+            if epoch_means_unused(left) {
                 WindowState::Unused
             } else {
                 WindowState::Unknown
             }
         }
-        (Some(left), Some(resets)) if usage::representable(resets) => WindowState::Used {
+        Some((left, resets)) if usage::representable(resets) => WindowState::Used {
             // Rounded to a millionth first: 1 - 0.9 is 0.0999... in floats, and 10% used.
             used_percent: usage::whole_percent(((1.0 - left) * 100.0 * 1e6).round() / 1e6),
             resets,

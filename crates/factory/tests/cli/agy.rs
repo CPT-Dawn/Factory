@@ -1501,7 +1501,7 @@ fn assert_unreadable(sandbox: &Sandbox, why: &str) {
     assert!(!agy_card(&feed).to_string().contains('%'), "{feed}");
     assert_eq!(
         sandbox.factory(&["bar"]).stdout,
-        "claude ?/? · agy ?/? · ? leads\n"
+        "claude ?/? · agy unreadable · ? leads\n"
     );
 
     let status = sandbox.factory(&["status"]);
@@ -1585,5 +1585,112 @@ fn a_second_bar_within_five_minutes_asks_agy_nothing_and_routing_asks_again_afte
         usage_queries(&sandbox),
         3,
         "the bar's reading is still fresh"
+    );
+}
+
+/// A fake agy whose usage query waits for `gate` to exist before it answers with `answer`.
+fn agy_says_when(gate: &std::path::Path, answer: &str) -> String {
+    format!(
+        "until [ -e '{}' ]; do sleep 0.05; done\n{}",
+        gate.display(),
+        agy_says(answer)
+    )
+}
+
+#[test]
+fn a_slow_usage_query_is_asked_once_and_holds_no_bar_up() {
+    let sandbox = Sandbox::new();
+    let gate = sandbox.path("agy-may-answer");
+    sandbox.fake("agy", &agy_says_when(&gate, &two_groups()));
+    start(&sandbox);
+
+    let begun = Instant::now();
+    let first = bar_json(&sandbox);
+    let waited = begun.elapsed();
+    let second = bar_json(&sandbox);
+
+    // The bar gave up on the query after a few seconds, not its ten, and showed no reading.
+    assert!(waited < Duration::from_secs(8), "the bar waited {waited:?}");
+    assert_eq!(agy_chip(&first)["text"], "?", "{first}");
+    assert_eq!(agy_chip(&second)["text"], "?", "{second}");
+    assert_eq!(usage_queries(&sandbox), 1, "{:?}", sandbox.calls("agy"));
+
+    // The query finishes on its own once agy answers: the next look has it, and asks nothing.
+    fs::write(&gate, "").expect("let agy answer");
+    assert!(
+        until_it(|| agy_chip(&bar_json(&sandbox))["text"] == "63%"),
+        "the late answer never landed"
+    );
+    assert_eq!(usage_queries(&sandbox), 1, "{:?}", sandbox.calls("agy"));
+}
+
+#[test]
+fn a_reading_is_shown_for_five_minutes_and_asked_again_after() {
+    let skew = Sandbox::new();
+    let clock = skew.path("clock-skew");
+    let sandbox = skew.env("FACTORY_CLOCK_SKEW_FILE", &clock);
+    sandbox.fake("agy", &agy_says(&two_groups()));
+    start(&sandbox);
+    bar_json(&sandbox);
+    assert_eq!(usage_queries(&sandbox), 1, "{:?}", sandbox.calls("agy"));
+
+    fs::write(&clock, "299").expect("move the clock on");
+    bar_json(&sandbox);
+    quota_agy(&sandbox);
+    assert_eq!(usage_queries(&sandbox), 1, "{:?}", sandbox.calls("agy"));
+
+    fs::write(&clock, "301").expect("move the clock on");
+    let out = quota_agy(&sandbox);
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(usage_queries(&sandbox), 2, "{:?}", sandbox.calls("agy"));
+}
+
+#[test]
+fn a_failed_usage_query_is_not_repeated_for_five_minutes_either() {
+    let skew = Sandbox::new();
+    let clock = skew.path("clock-skew");
+    let sandbox = skew.env("FACTORY_CLOCK_SKEW_FILE", &clock);
+    sandbox.fake("agy", "exit 3");
+    start(&sandbox);
+
+    bar_json(&sandbox);
+    sandbox.factory(&["status"]);
+    let quota = quota_agy(&sandbox);
+    assert_eq!(
+        quota.stdout, "agy usage unreadable: exited 3\n",
+        "{quota:?}"
+    );
+    assert_eq!(usage_queries(&sandbox), 1, "{:?}", sandbox.calls("agy"));
+
+    fs::write(&clock, "301").expect("move the clock on");
+    quota_agy(&sandbox);
+    assert_eq!(usage_queries(&sandbox), 2, "{:?}", sandbox.calls("agy"));
+}
+
+#[test]
+fn many_quota_groups_are_a_summary_line_and_a_row_each() {
+    let sandbox = Sandbox::new();
+    let bucket = |window: &str, left: f64| json!({"window": window, "remaining_fraction": left, "reset_time": "2099-01-01T00:00:00Z"});
+    let groups: Vec<Value> = (1..=12)
+        .map(|n| json!({"name": format!("Quota group number {n} of the plan"), "buckets": [bucket("5h", 0.5), bucket("weekly", 0.9)]}))
+        .collect();
+    let answer = json!({"command": {"data": {"groups": groups}}}).to_string();
+    sandbox.fake("agy", &agy_says(&answer));
+
+    let out = quota_agy(&sandbox);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let lines = out.stdout_lines();
+    assert_eq!(lines.len(), 13, "{out:?}");
+    assert_eq!(lines[0], "agy: 12 quota groups, worst window 50%");
+    assert_eq!(
+        lines[1],
+        "  Quota group number 1 of the plan: 5h 50%, weekly 10%"
+    );
+    assert!(lines.iter().all(|line| line.chars().count() <= 200));
+    let json = sandbox.factory(&["quota", "agy", "--json"]);
+    assert_eq!(
+        shown(&json.stdout)["groups"].as_array().map(Vec::len),
+        Some(12)
     );
 }

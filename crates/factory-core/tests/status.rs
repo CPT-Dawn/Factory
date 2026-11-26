@@ -697,3 +697,42 @@ fn agy_with_no_reading_yet_says_so() {
         shown.join("\n")
     );
 }
+
+const USAGE: &str = r#"{"command":{"data":{"groups":[{"name":"Gemini Models","buckets":[
+    {"window":"5h","remaining_fraction":0.7,"reset_time":"2099-01-01T00:00:00Z"},
+    {"window":"weekly","remaining_fraction":0.93,"reset_time":"2099-01-07T00:00:00Z"}]}]}}}"#;
+
+#[test]
+fn an_answer_that_reads_is_a_reading_of_its_groups_taken_when_it_landed() {
+    let agy = Agy::read(Ok(USAGE.to_owned()), 1_700_000_000_000);
+
+    assert_eq!(agy.error, None);
+    assert_eq!(agy.seen, Some(1_700_000_000_000));
+    assert_eq!(agy.groups.len(), 1);
+    assert_eq!(agy.groups[0].name, "Gemini Models");
+}
+
+#[test]
+fn a_failed_query_and_a_garbled_answer_are_each_a_reading_with_a_reason_and_no_group() {
+    let failed = Agy::read(Err("exited 127".to_owned()), 5);
+    assert_eq!(failed.error.as_deref(), Some("exited 127"));
+    assert!(failed.groups.is_empty());
+    assert_eq!(failed.seen, Some(5));
+
+    let garbled = Agy::read(Ok("not json".to_owned()), 5);
+    assert_eq!(garbled.error.as_deref(), Some("its answer is not JSON"));
+    assert!(garbled.groups.is_empty());
+}
+
+#[test]
+fn a_reading_is_fresh_for_the_time_it_is_given_from_when_it_was_taken() {
+    let agy = Agy::read(Ok(USAGE.to_owned()), 1_000_000);
+    let five_minutes = 300_000;
+
+    assert!(agy.fresh(1_000_000, five_minutes));
+    assert!(agy.fresh(1_000_000 + five_minutes - 1, five_minutes));
+    assert!(!agy.fresh(1_000_000 + five_minutes, five_minutes));
+    // A clock that went back does not make an old reading new.
+    assert!(!agy.fresh(1_000_000 - 1, five_minutes));
+    assert!(!Agy::default().fresh(1_000_000, five_minutes), "none taken");
+}

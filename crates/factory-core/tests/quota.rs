@@ -592,6 +592,14 @@ fn an_epoch_reset_is_an_unused_window_at_a_full_fraction_and_an_unknown_one_othe
     }
 }
 
+/// An answer of one group `G` whose 5-hour bucket is `bucket`, beside a weekly one that reads.
+fn with_5h_bucket(bucket: &str) -> String {
+    format!(
+        r#"{{"command":{{"data":{{"groups":[{{"name":"G","buckets":[{bucket},
+        {{"window":"weekly","remaining_fraction":0.5,"reset_time":"2026-11-30T01:54:01Z"}}]}}]}}}}}}"#
+    )
+}
+
 #[test]
 fn a_bucket_with_no_fraction_or_no_reset_it_can_read_is_an_unknown_window() {
     for (case, bucket) in [
@@ -608,20 +616,97 @@ fn a_bucket_with_no_fraction_or_no_reset_it_can_read_is_an_unknown_window() {
             "a garbled reset",
             r#"{"window":"5h","remaining_fraction":0.5,"reset_time":"soon"}"#,
         ),
+        (
+            "a fraction that is a string",
+            r#"{"window":"5h","remaining_fraction":"0.5","reset_time":"2026-11-24T03:32:03Z"}"#,
+        ),
     ] {
-        let usage = format!(
-            r#"{{"command":{{"data":{{"groups":[{{"name":"G","buckets":[{bucket}]}}]}}}}}}"#
-        );
-        let groups = quota::agy_groups(&usage).expect("it reads");
+        let groups = quota::agy_groups(&with_5h_bucket(bucket)).expect("it reads");
         assert_eq!(
             groups,
             vec![QuotaGroup {
                 name: "G".to_owned(),
-                windows: vec![window(WindowKind::FiveHour, WindowState::Unknown)],
+                windows: vec![
+                    window(WindowKind::FiveHour, WindowState::Unknown),
+                    window(WindowKind::Weekly, used(50, "2026-11-30T01:54:01Z")),
+                ],
             }],
             "{case}"
         );
     }
+}
+
+#[test]
+fn an_answer_whose_every_bucket_is_garbled_is_unreadable_not_a_row_of_unknowns() {
+    let garbled = r#"{"command":{"data":{"groups":[{"name":"G","buckets":[
+        {"window":"5h","remaining_fraction":"most","reset_time":"2026-11-24T03:32:03Z"},
+        {"window":"weekly","remaining_fraction":0.5,"reset_time":"soon"}]}]}}}"#;
+    assert_eq!(
+        quota::agy_groups(garbled),
+        Err("its answer has no bucket it can read".to_owned())
+    );
+}
+
+#[test]
+fn a_lower_fraction_at_the_epoch_is_a_reading_that_is_placed_as_unknown_not_a_garbled_answer() {
+    let epoch = r#"{"command":{"data":{"groups":[{"name":"G","buckets":[
+        {"window":"5h","remaining_fraction":0.4,"reset_time":"1970-01-01T00:00:00Z"}]}]}}}"#;
+    let groups = quota::agy_groups(epoch).expect("it reads");
+    assert_eq!(
+        groups[0].windows[0],
+        window(WindowKind::FiveHour, WindowState::Unknown)
+    );
+}
+
+#[test]
+fn a_group_always_has_both_windows_and_a_missing_one_is_unknown() {
+    let only_5h = r#"{"command":{"data":{"groups":[
+        {"name":"A","buckets":[{"window":"5h","remaining_fraction":0.5,"reset_time":"2026-11-24T03:32:03Z"}]},
+        {"name":"B","buckets":[]}]}}}"#;
+    let groups = quota::agy_groups(only_5h).expect("it reads");
+    assert_eq!(
+        groups,
+        vec![
+            QuotaGroup {
+                name: "A".to_owned(),
+                windows: vec![
+                    window(WindowKind::FiveHour, used(50, "2026-11-24T03:32:03Z")),
+                    window(WindowKind::Weekly, WindowState::Unknown),
+                ],
+            },
+            QuotaGroup {
+                name: "B".to_owned(),
+                windows: vec![
+                    window(WindowKind::FiveHour, WindowState::Unknown),
+                    window(WindowKind::Weekly, WindowState::Unknown),
+                ],
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_group_with_no_name_or_no_buckets_list_makes_the_answer_unreadable() {
+    for usage in [
+        r#"{"command":{"data":{"groups":[{"buckets":[]}]}}}"#,
+        r#"{"command":{"data":{"groups":[{"name":"G"}]}}}"#,
+        r#"{"command":{"data":{"groups":["G"]}}}"#,
+    ] {
+        assert_eq!(
+            quota::agy_groups(usage),
+            Err("a quota group of its answer has no name or buckets".to_owned()),
+            "{usage}"
+        );
+    }
+}
+
+#[test]
+fn an_epoch_reset_with_a_fraction_above_one_is_not_an_unused_window_to_routing_either() {
+    let usage = agy_usage_with("3p-5h", 1.5, EPOCH);
+    assert!(matches!(
+        quota::agy_usage(&usage, CLAUDE_GPT),
+        AgyUsage::Unreadable(_)
+    ));
 }
 
 #[test]

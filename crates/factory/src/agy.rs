@@ -7,12 +7,13 @@ use serde_json::{Value, json};
 
 use crate::client;
 use crate::clock;
-use crate::output::{Done, Failure};
+use crate::output::{Done, Failure, LINE_LIMIT};
 use crate::paths::Paths;
 use crate::protocol::AGY_QUOTA;
 use crate::quotas::AGY_QUERY;
 
-/// `factory quota agy`: one row per quota group, `Gemini Models: 5h 30%, weekly 7%`; or
+/// `factory quota agy`: each quota group's windows, `Gemini Models: 5h 30%, weekly 7%`, on one
+/// line, or under a summary line when they are too long for one; or
 /// `agy usage unreadable: <why>`, never a share it did not read. It exits 0 either way: it
 /// reports, and does not gate (`factory quota claude` does).
 pub fn quota() -> Result<Done, Failure> {
@@ -42,5 +43,21 @@ fn said(agy: &Agy, now: i64, json: Value) -> Done {
     if groups.is_empty() {
         return Done::new("agy: no reading yet; try again", json);
     }
-    Done::new(format!("agy: {}", groups.join("; ")), json)
+    let line = format!("agy: {}", groups.join("; "));
+    if line.chars().count() <= LINE_LIMIT {
+        return Done::new(line, json);
+    }
+    // Too many groups, or names too long, for one line: a summary, and a row for each group.
+    let worst = agy
+        .worst(now)
+        .map_or_else(|| "unknown".to_owned(), |used| format!("{used}%"));
+    let mut done = Done::new(
+        format!("agy: {} quota groups, worst window {worst}", groups.len()),
+        json,
+    );
+    done.more = groups
+        .into_iter()
+        .map(|group| format!("  {group}"))
+        .collect();
+    done
 }

@@ -161,6 +161,32 @@ pub struct Agy {
 }
 
 impl Agy {
+    /// What agy's usage `answer` (its JSON, or why the query gave none) says, taken at `now`
+    /// (milliseconds since the epoch): its quota groups, or why it can't be read. An answer
+    /// that can't be read is a reading too, with no group in it.
+    pub fn read(answer: Result<String, String>, now: i64) -> Agy {
+        let seen = Some(now);
+        match answer.and_then(|usage| crate::quota::agy_groups(&usage)) {
+            Ok(groups) => Agy {
+                groups,
+                error: None,
+                seen,
+            },
+            Err(why) => Agy {
+                groups: Vec::new(),
+                error: Some(why),
+                seen,
+            },
+        }
+    }
+
+    /// Whether the reading was taken less than `within` milliseconds before `now`, and not
+    /// after it: none taken is never fresh, nor is one a clock that went back would keep.
+    pub fn fresh(&self, now: i64, within: i64) -> bool {
+        self.seen
+            .is_some_and(|seen| (0..within).contains(&(now - seen)))
+    }
+
     /// `agy usage unreadable: <why>` while the answer can't be read.
     pub fn problem(&self) -> Option<String> {
         self.error

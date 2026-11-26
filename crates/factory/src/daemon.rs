@@ -32,6 +32,7 @@ use tokio::task::JoinSet;
 
 use factory_adapters::herdr::Herdr;
 use factory_adapters::inbox::Inbox;
+use factory_adapters::reviewer::{AgyAuth, AgyUsageCli};
 use listenfd::ListenFd;
 
 use crate::clock;
@@ -103,7 +104,10 @@ pub fn run(json: bool) -> Result<(), Failure> {
     )?;
     let pollers = Arc::new(Pollers::new(paths.clone(), Gh));
     let router = Arc::new(Router::open(Store::open(&paths.database())?)?);
-    let quotas = Arc::new(QuotaKeeper::open(Store::open(&paths.database())?)?);
+    let quotas = Arc::new(QuotaKeeper::open(
+        Store::open(&paths.database())?,
+        Arc::new(AgyUsageCli(AgyAuth::Subscription)),
+    )?);
     let steward = Steward::new(
         paths.clone(),
         Arc::clone(&leads),

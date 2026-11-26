@@ -669,7 +669,7 @@ fn the_bar_line_gives_agys_worst_share_of_each_window_after_claudes() {
     assert_eq!(line_of(agy_read()), "claude 12/40 · agy 30/63 · 0 leads");
     assert_eq!(
         line_of(agy_unreadable()),
-        "claude 12/40 · agy ?/? · 0 leads"
+        "claude 12/40 · agy unreadable · 0 leads"
     );
     assert_eq!(line_of(Agy::default()), "claude 12/40 · agy ?/? · 0 leads");
 }

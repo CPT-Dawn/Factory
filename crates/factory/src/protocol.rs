@@ -68,7 +68,8 @@ pub const AGY_QUOTA: &str = "agy.quota";
 /// with exit 124 when the time runs out first.
 pub const WAIT_CLAUDE: &str = "wait.claude";
 
-/// What the daemon holds, as one record, read from its own state and running no command:
+/// What the daemon holds, as one record, read from its own state; it runs no command but, when
+/// agy's reading is stale, the one usage query the quota keeper makes in the background:
 /// [`StatusParams`] in, [`factory_core::status::Status`] out.
 pub const STATUS: &str = "status";
 /// Everything the bar shows, in one answer: [`BarParams`] in,

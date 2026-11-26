@@ -197,9 +197,35 @@ const AGY_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long after its own print timeout agy is killed with its process group.
 const AGY_KILL_GRACE: Duration = Duration::from_secs(30);
 
-/// agy's free usage query, `agy -p /usage --output-format json`, as `auth` runs agy: its
-/// answer as it printed it, or why there is none (`exited 127`, `timed out after 60s`).
-pub fn agy_usage_query(auth: AgyAuth) -> Result<String, String> {
+/// agy's free usage query: its JSON answer as it printed it, or why there is none (`exited
+/// 127`, `timed out after 60s`).
+pub trait AgyUsage: Send + Sync {
+    fn query(&self) -> Result<String, String>;
+}
+
+/// `agy -p /usage --output-format json` from PATH, as `auth` runs agy.
+pub struct AgyUsageCli(pub AgyAuth);
+
+impl AgyUsage for AgyUsageCli {
+    fn query(&self) -> Result<String, String> {
+        agy_usage_query(self.0)
+    }
+}
+
+/// A usage query that answers as it was told, and counts how often it was asked.
+pub struct FakeAgyUsage {
+    pub answer: Result<String, String>,
+    pub asked: std::sync::atomic::AtomicUsize,
+}
+
+impl AgyUsage for FakeAgyUsage {
+    fn query(&self) -> Result<String, String> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.answer.clone()
+    }
+}
+
+fn agy_usage_query(auth: AgyAuth) -> Result<String, String> {
     let mut cmd = Command::new("agy");
     if auth == AgyAuth::Subscription {
         cmd.env_remove("GEMINI_API_KEY");

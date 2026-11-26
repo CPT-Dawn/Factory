@@ -195,7 +195,7 @@ pub fn daemon_down(reason: &str, now: i64) -> Feed {
 }
 
 /// `claude 12/40 · agy 30/63 · 2 leads`: each window's share (5-hour/weekly, `?` while
-/// unknown; agy's the worst of its quota groups), then the live leads (`? leads` while herdr
+/// unknown; agy's the worst of its quota groups, or `unreadable` while its usage is), then the live leads (`? leads` while herdr
 /// can't tell).
 pub fn line(snapshot: &Snapshot) -> String {
     let claude = &snapshot.claude;
@@ -212,18 +212,26 @@ pub fn line(snapshot: &Snapshot) -> String {
     } else {
         plural(live(snapshot).count(), "lead")
     };
-    let agy = |kind| {
+    let agy_share = |kind| {
         snapshot
             .agy
             .worst_of(kind, snapshot.now)
             .map_or_else(|| "?".to_owned(), |used| used.to_string())
     };
+    // An answer that can't be read is said so, apart from a reading not yet taken (`?/?`).
+    let agy = if snapshot.agy.error.is_some() {
+        "unreadable".to_owned()
+    } else {
+        format!(
+            "{}/{}",
+            agy_share(WindowKind::FiveHour),
+            agy_share(WindowKind::Weekly)
+        )
+    };
     format!(
-        "claude {}/{} · agy {}/{} · {leads}",
+        "claude {}/{} · agy {agy} · {leads}",
         share(WindowKind::FiveHour),
         share(WindowKind::Weekly),
-        agy(WindowKind::FiveHour),
-        agy(WindowKind::Weekly),
     )
 }
 
