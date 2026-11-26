@@ -137,18 +137,27 @@ impl Router {
             // A first look, from the quotas as they stand now: only a review that is about to take
             // Codex asks about its plan, and it waits for the answer, so none starts on a plan
             // that a reading on its way would have held.
-            let takes_codex = {
+            // The hold the stored reading names is laid over it, so a held Codex is stepped over
+            // even when its slots are full, and the ask starts under the same lock as the pick.
+            let standing = Hold::of(&keeper.codex_standing(&params.codex));
+            let (takes_codex, asking) = {
                 let state = lock(&self.state);
-                let candidates = candidates(&state, &wanted, &on_codex, None, clock::now());
-                matches!(
-                    quota::pick(&candidates, clock::now()),
+                let now = clock::now();
+                let candidates = candidates(&state, &wanted, &on_codex, standing.as_ref(), now);
+                let takes_codex = matches!(
+                    quota::pick(&candidates, now),
                     Pick::Take(index) if on_codex[index]
+                );
+                (
+                    takes_codex,
+                    takes_codex && keeper.ask_codex_for_dispatch(&params.codex),
                 )
             };
-            let hold = if takes_codex {
-                Hold::of(&keeper.codex_settled(&params.codex).await)
+            let hold = if asking {
+                keeper.codex_asked().await;
+                Hold::of(&keeper.codex_standing(&params.codex))
             } else {
-                None
+                standing
             };
             let now = clock::now();
             let next_reset = {

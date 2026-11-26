@@ -86,20 +86,26 @@ impl QuotaKeeper {
         record
     }
 
-    /// Codex's quota once its ask has ended, however long that takes: an ask ends by itself,
-    /// killed at its own timeout, whoever started it. A dispatch waits for this where a look does
-    /// not, so a review never starts on a plan that a reading on its way would have held.
-    pub async fn codex_settled(
-        self: &Arc<Self>,
-        params: &CodexParams,
-    ) -> factory_core::status::Codex {
+    /// Codex's quota as it stands, asking nothing: what a dispatch lays over each pick.
+    pub fn codex_standing(&self, params: &CodexParams) -> factory_core::status::Codex {
         self.keep_codex();
-        if self.start_codex_ask(params) {
-            self.await_codex_ask(None).await;
-        }
         lock(&self.codex)
             .clone()
             .record(clock::now(), params.hold_at)
+    }
+
+    /// For a dispatch whose pick has just fallen to Codex, under the lock it picked with: starts
+    /// an ask when the reading is stale and none is out. Whether an ask is out, for
+    /// [`QuotaKeeper::codex_asked`] to wait on.
+    pub fn ask_codex_for_dispatch(self: &Arc<Self>, params: &CodexParams) -> bool {
+        self.start_codex_ask(params)
+    }
+
+    /// Waits for the ask that is out to end, however long that takes: an ask ends by itself,
+    /// killed at its own timeout, whoever started it. A dispatch waits for this where a look does
+    /// not, so a review never starts on a plan that a reading on its way would have held.
+    pub async fn codex_asked(&self) {
+        self.await_codex_ask(None).await;
     }
 
     /// Whether a review may dispatch on Codex now: `codex` with the mark it held to.
