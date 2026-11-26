@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::lab::{ago, base_name};
 use crate::steward::kilo;
 use crate::timestamp::Timestamp;
+use crate::usage::UsageReading;
 
 /// Everything `factory status` shows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,12 +128,18 @@ pub enum QuotaState {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claude {
     pub verdict: ClaudeState,
-    /// The window's spent share, rounded; none when no current window was seen.
+    /// The 5-hour window's spent share, rounded; none while no reading of it stands.
     pub used_percent: Option<u32>,
-    /// When the window resets, in milliseconds since the epoch.
+    /// When the 5-hour window resets, in milliseconds since the epoch.
     pub resets: Option<i64>,
     /// When a hold ends, in milliseconds since the epoch.
     pub until: Option<i64>,
+    /// What holds dispatches: `weekly 91%`, `5h 93%` or `limit hit`.
+    #[serde(default)]
+    pub hold: Option<String>,
+    /// The last reading of each window, the 5-hour one first.
+    #[serde(default)]
+    pub windows: Vec<UsageReading>,
 }
 
 /// Whether a lead may dispatch on the Claude plan.
@@ -338,19 +345,34 @@ fn review(status: &Status, rows: &mut Vec<String>) {
 
 fn claude(status: &Status, rows: &mut Vec<String>) {
     let claude = &status.claude;
-    let used = claude
-        .used_percent
-        .map(|used| format!("{used}% of 5h used"));
-    let row = match (claude.verdict, claude.until, claude.resets, used) {
-        (ClaudeState::Hold, Some(until), _, used) => format!(
-            "claude: holding dispatches until {}, {}",
-            moment(until, status.now),
-            used.unwrap_or_else(|| "its limit hit".to_owned())
-        ),
-        (ClaudeState::Go, _, Some(resets), Some(used)) => {
-            format!("claude: {used}, resets {}", moment(resets, status.now))
+    let now = status.now;
+    let row = match (claude.verdict, claude.until, &claude.hold) {
+        (ClaudeState::Hold, Some(until), hold) => {
+            let mut row = format!(
+                "claude: hold: {} until {}",
+                hold.as_deref().unwrap_or("limit hit"),
+                moment(until, now)
+            );
+            if !claude.windows.is_empty() {
+                let windows: Vec<String> = claude
+                    .windows
+                    .iter()
+                    .map(|window| window.describe(now))
+                    .collect();
+                row.push_str("; ");
+                row.push_str(&windows.join(", "));
+            }
+            row
         }
-        _ => "claude: no plan window seen".to_owned(),
+        _ if claude.windows.is_empty() => "claude: no plan window seen".to_owned(),
+        _ => {
+            let windows: Vec<String> = claude
+                .windows
+                .iter()
+                .map(|window| window.describe_with_reset(now, |resets| moment(resets, now)))
+                .collect();
+            format!("claude: {}", windows.join(", "))
+        }
     };
     rows.push(row);
 }
@@ -454,7 +476,7 @@ fn minute(millis: i64) -> String {
 }
 
 /// `04:13Z` on the day of `now`, else `11-24 01:00Z`.
-fn moment(millis: i64, now: i64) -> String {
+pub(crate) fn moment(millis: i64, now: i64) -> String {
     let (day, now_day) = (
         Timestamp::from_unix_millis(millis).to_string(),
         Timestamp::from_unix_millis(now).to_string(),

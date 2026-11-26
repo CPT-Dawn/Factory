@@ -84,8 +84,8 @@ pub enum Command {
         #[command(subcommand)]
         command: QuotaCommand,
     },
-    /// Claude Code's statusline: its JSON on stdin; records the plan's window, prints one line
-    Statusline,
+    /// The bar feed: one line of each harness's windows and the leads; --json, Zenith's cockpit v1 document
+    Bar,
     /// Run the daemon; other commands start it when it isn't running
     Daemon,
     /// Install or upgrade factory in ~/.local/bin and its systemd units, and start the socket
@@ -123,11 +123,13 @@ pub enum HookCommand {
     SubagentStop,
     /// When a turn ends on an API error: a rate limit holds Claude dispatches until its reset
     StopFailure,
+    /// The status line's JSON, handed on: records Claude's 5-hour and weekly windows, prints nothing, exits 0
+    Statusline,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum QuotaCommand {
-    /// The Claude plan's 5-hour window: dispatch (exit 0) or hold until its reset (exit 75)
+    /// The Claude plan's 5-hour and weekly windows: dispatch (exit 0) or hold until the holding one resets (exit 75)
     Claude,
 }
 
@@ -204,7 +206,7 @@ pub enum WaitCommand {
         #[arg(long, default_value = "9m", value_parser = duration)]
         timeout: Duration,
     },
-    /// Until a lead may dispatch on the Claude plan again: its window has room (exit 0)
+    /// Until a lead may dispatch on the Claude plan again: both windows have room (exit 0)
     Claude {
         /// Give up after this long with exit 124: seconds, or 90s, 9m or 1h
         #[arg(long, default_value = "9m", value_parser = duration)]

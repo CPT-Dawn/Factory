@@ -1,6 +1,10 @@
 //! The exit codes of every `factory` command: the one table (spec #1, "Output contract").
 //!
 //! The `devlab` name keeps devlab's own codes and text; `run` passes its child's code through.
+//!
+//! One deliberate exception: `factory bar --json` exits 0 with a valid feed holding a single
+//! critical "factory daemon down" chip when the daemon is unreachable, so the bar says what is
+//! wrong instead of going blank (ADR 0001). `factory bar` without `--json` exits 3 as usual.
 
 /// What a command's exit code says; the discriminant is the code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

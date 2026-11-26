@@ -6,6 +6,7 @@ use factory_core::status::{
     Reservation, Slot, Status, Subagent, Wait, screen,
 };
 use factory_core::timestamp::Timestamp;
+use factory_core::usage::{UsageReading, WindowKind};
 
 /// 2026-11-23 04:13:00 UTC, in seconds.
 fn now() -> i64 {
@@ -495,26 +496,97 @@ fn a_reservation_holds_its_slot_and_is_listed_with_its_lead() {
     );
 }
 
+fn reading(window: WindowKind, used: u32, resets: &str, seen: &str) -> UsageReading {
+    let at = |t: &str| Timestamp::parse(t).map_or(0, Timestamp::unix_millis);
+    UsageReading {
+        window,
+        used_percent: used,
+        resets: at(resets),
+        seen: at(seen),
+        current: at(resets) > now() * 1000,
+    }
+}
+
 #[test]
-fn the_claude_row_shows_the_window_or_the_hold() {
+fn the_claude_row_shows_both_windows_or_what_holds() {
     let mut status = idle();
     let at = |t: &str| Timestamp::parse(t).map(Timestamp::unix_millis);
+    let five = reading(
+        WindowKind::FiveHour,
+        41,
+        "2026-11-23T07:00:00Z",
+        "2026-11-23T04:10:00Z",
+    );
+    let weekly = |used| {
+        reading(
+            WindowKind::Weekly,
+            used,
+            "2026-11-30T02:00:00Z",
+            "2026-11-23T04:10:00Z",
+        )
+    };
     status.claude = Claude {
         verdict: ClaudeState::Go,
         used_percent: Some(41),
         resets: at("2026-11-23T07:00:00Z"),
         until: None,
+        hold: None,
+        windows: vec![five.clone(), weekly(12)],
     };
-    assert_eq!(rows(&status)[3], "claude: 41% of 5h used, resets 07:00Z");
+    assert_eq!(
+        rows(&status)[3],
+        "claude: 5h 41% resets 07:00Z, weekly 12% resets 11-30 02:00Z"
+    );
+
+    status.claude = Claude {
+        verdict: ClaudeState::Hold,
+        until: at("2026-11-30T02:00:00Z"),
+        hold: Some("weekly 91%".to_owned()),
+        windows: vec![five.clone(), weekly(91)],
+        ..status.claude.clone()
+    };
+    assert_eq!(
+        rows(&status)[3],
+        "claude: hold: weekly 91% until 11-30 02:00Z; 5h 41%, weekly 91%"
+    );
 
     status.claude = Claude {
         verdict: ClaudeState::Hold,
         used_percent: None,
         resets: None,
         until: at("2026-11-24T01:30:00Z"),
+        hold: Some("limit hit".to_owned()),
+        windows: Vec::new(),
     };
     assert_eq!(
         rows(&status)[3],
-        "claude: holding dispatches until 11-24 01:30Z, its limit hit"
+        "claude: hold: limit hit until 11-24 01:30Z"
+    );
+}
+
+#[test]
+fn a_window_past_its_reset_shows_as_unknown_with_its_age() {
+    let mut status = idle();
+    status.claude = Claude {
+        verdict: ClaudeState::Go,
+        windows: vec![
+            reading(
+                WindowKind::FiveHour,
+                80,
+                "2026-11-23T03:00:00Z",
+                "2026-11-23T01:13:00Z",
+            ),
+            reading(
+                WindowKind::Weekly,
+                12,
+                "2026-11-30T02:00:00Z",
+                "2026-11-23T04:10:00Z",
+            ),
+        ],
+        ..Claude::default()
+    };
+    assert_eq!(
+        rows(&status)[3],
+        "claude: 5h unknown (seen 3h ago), weekly 12% resets 11-30 02:00Z"
     );
 }

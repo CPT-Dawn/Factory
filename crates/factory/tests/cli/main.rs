@@ -7,6 +7,9 @@
 #[cfg(test)]
 mod adb_stream;
 mod agy;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
+mod bar;
 mod ci;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]

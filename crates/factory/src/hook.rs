@@ -1,5 +1,6 @@
 //! `factory hook pre-tool|post-tool|subagent-stop|stop-failure`: Claude Code's hook JSON on stdin,
-//! answered in its hook protocol on stdout.
+//! answered in its hook protocol on stdout. `factory hook statusline` is the status line's
+//! hand-off, not a hook call: see [`crate::claude::statusline_hook`].
 //!
 //! A hook runs on every tool call, so it never talks to the daemon and reads no more than it
 //! must; only stop-failure, which runs when a turn ends on an API error, tells the daemon. It
@@ -27,6 +28,10 @@ use crate::output::{self, Failure};
 use crate::paths;
 
 pub fn run(command: &HookCommand, json: bool) -> ExitCode {
+    // Its input is the status line's, not a hook call's, and it fails in silence.
+    if matches!(command, HookCommand::Statusline) {
+        return crate::claude::statusline_hook();
+    }
     match answer(command) {
         Ok(Some(line)) => {
             let _ = writeln!(io::stdout().lock(), "{line}");
@@ -64,6 +69,7 @@ fn answer(command: &HookCommand) -> Result<Option<Value>, Failure> {
             crate::claude::stop_failure(&input)?;
             None
         }
+        HookCommand::Statusline => None,
         HookCommand::SubagentStop => {
             let settings = config::hook_settings(&paths::config_dir())?;
             subagent_stop(&input, &settings.templates)

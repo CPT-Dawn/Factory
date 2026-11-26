@@ -4,6 +4,7 @@
 //! that table tests can drive.
 
 pub mod agy;
+pub mod bar;
 pub mod ci;
 pub mod claude;
 pub mod cutover;
@@ -20,4 +21,5 @@ pub mod status;
 pub mod steward;
 pub mod tier;
 pub mod timestamp;
+pub mod usage;
 pub mod wait;

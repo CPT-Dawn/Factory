@@ -121,7 +121,7 @@ pub fn hold<P: Serialize, R: DeserializeOwned>(
                 &mut |row| heard = Some(row),
             ) {
                 Ok(answer) => return Ok(answer),
-                Err(Ended::Refused(failure)) => return Err(failure),
+                Err(Ended::Refused(failure) | Ended::Silent(failure)) => return Err(failure),
                 Err(Ended::Lost(failure)) => failure,
             },
             Err(failure) if !retry => return Err(failure),
@@ -204,12 +204,14 @@ pub fn call_queued_on<P: Serialize, R: DeserializeOwned>(
                         &mut |_| {},
                     ) {
                         Ok(_) => return Ok((answer, session)),
-                        Err(Ended::Refused(failure) | Ended::Lost(failure)) => {
+                        Err(
+                            Ended::Refused(failure) | Ended::Silent(failure) | Ended::Lost(failure),
+                        ) => {
                             asked = true;
                             failure
                         }
                     },
-                    Err(Ended::Refused(failure)) => return Err(failure),
+                    Err(Ended::Refused(failure) | Ended::Silent(failure)) => return Err(failure),
                     Err(Ended::Lost(failure)) => {
                         asked = true;
                         failure
@@ -250,7 +252,7 @@ pub fn reattach<P: Serialize>(paths: &Paths, method: &str, params: &P) -> Result
                 &mut |_| {},
             ) {
                 Ok(_) => return Ok(session),
-                Err(Ended::Refused(failure)) => return Err(failure),
+                Err(Ended::Refused(failure) | Ended::Silent(failure)) => return Err(failure),
                 Err(Ended::Lost(failure)) => failure,
             },
             Err(failure) => failure,
@@ -266,6 +268,8 @@ pub fn reattach<P: Serialize>(paths: &Paths, method: &str, params: &P) -> Result
 enum Ended {
     /// The daemon said no.
     Refused(Failure),
+    /// It said nothing within the patience.
+    Silent(Failure),
     /// The connection broke first.
     Lost(Failure),
 }
@@ -347,7 +351,7 @@ impl Session {
     ) -> Result<R, Failure> {
         self.exchange_raw(method, params, patience, impatient, on_note, &mut |_| {})
             .map_err(|ended| match ended {
-                Ended::Refused(failure) | Ended::Lost(failure) => failure,
+                Ended::Refused(failure) | Ended::Silent(failure) | Ended::Lost(failure) => failure,
             })
     }
 
@@ -392,7 +396,7 @@ impl Session {
                 Ok(0) => return Err(lost(&"it closed the connection without answering")),
                 Ok(_) => {}
                 Err(e) if is_timeout(&e) => {
-                    return Err(Ended::Refused(Failure::new(
+                    return Err(Ended::Silent(Failure::new(
                         impatient,
                         format!(
                             "the daemon did not answer within {}s; see {}",
@@ -424,6 +428,83 @@ fn is_timeout(e: &std::io::Error) -> bool {
         e.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
     )
+}
+
+/// Why a daemon that was not started gave no answer.
+#[derive(Debug)]
+pub enum Unanswered {
+    /// Nothing answered: no daemon listens, it hung up, or it said nothing within the patience.
+    Down(Failure),
+    /// The daemon answered, refusing.
+    Refused(Failure),
+}
+
+/// Sends a request to a daemon that is already running, and never starts one, giving up with exit
+/// 3 once `patience` has passed: for the callers that must stay fast and leave nothing behind,
+/// the status-line hook and the bar. It calls on the live socket, the one the running daemon
+/// binds itself: a call on systemd's, with the service stopped, would start the daemon.
+///
+/// The whole call, connect to answer, runs on a thread of its own, and the caller waits for it
+/// only until the patience is up: a daemon too busy to accept, or one that answers a byte at a
+/// time, holds the caller no longer. A call given up on is left to its thread, which goes with
+/// the process: the hook and the bar exit straight after.
+pub fn call_running<P: Serialize, R: DeserializeOwned + Send + 'static>(
+    paths: &Paths,
+    method: &str,
+    params: &P,
+    patience: Duration,
+) -> Result<R, Unanswered> {
+    let params = serde_json::to_value(params).map_err(|e| {
+        Unanswered::Refused(Failure::precondition(format!(
+            "cannot send {method}: {e}; report it as a factory bug"
+        )))
+    })?;
+    let (paths, method) = (paths.clone(), method.to_owned());
+    let (socket, log) = (paths.live_socket(), paths.daemon_log());
+    within(patience, move || {
+        call_live(&paths, &method, &params, patience)
+    })
+    .unwrap_or_else(|| {
+        Err(Unanswered::Down(Failure::precondition(format!(
+            "the daemon at {} did not answer within {}s; see {} and retry",
+            socket.display(),
+            patience.as_secs(),
+            log.display()
+        ))))
+    })
+}
+
+/// [`call_running`]'s call, connect to answer, with no bound of its own on the connect.
+fn call_live<R: DeserializeOwned>(
+    paths: &Paths,
+    method: &str,
+    params: &serde_json::Value,
+    patience: Duration,
+) -> Result<R, Unanswered> {
+    let stream = UnixStream::connect(paths.live_socket()).map_err(|e| {
+        Unanswered::Down(Failure::precondition(format!(
+            "daemon unreachable at {}: {e}; factory status starts it",
+            paths.live_socket().display()
+        )))
+    })?;
+    let mut session = Session {
+        reader: BufReader::new(stream),
+        paths: paths.clone(),
+        next_id: 1,
+    };
+    session
+        .exchange_raw(
+            method,
+            params,
+            Some(patience),
+            Exit::Precondition,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .map_err(|ended| match ended {
+            Ended::Refused(failure) => Unanswered::Refused(failure),
+            Ended::Silent(failure) | Ended::Lost(failure) => Unanswered::Down(failure),
+        })
 }
 
 /// Connects to the daemon, starting it first when nothing answers on the socket.

@@ -1,12 +1,12 @@
 # The Claude plan's quota
 
-At 08:30 IST on 2026-11-23 the plan's 5-hour limit (HTTP 429) ended six subagents mid-ticket. The daemon now keeps a quota for the Claude plan, beside the reviewer quotas, so a lead holds new dispatches when the window is nearly spent and resumes once it resets.
+At 08:30 IST on 2026-11-23 the plan's 5-hour limit (HTTP 429) ended six subagents mid-ticket. The daemon's quota keeper now keeps the Claude plan's two usage windows, the 5-hour and the weekly, beside the reviewer quotas, so a lead holds new dispatches when either window is nearly spent and resumes once it resets.
 
 ## Signals, and the one chosen
 
 | Signal | Documented | Gives | Used |
 |---|---|---|---|
-| Statusline stdin JSON, `rate_limits.five_hour.used_percentage` and `resets_at` (epoch seconds) | yes: [statusline](https://code.claude.com/docs/en/statusline) | share spent and reset, Pro/Max only, after a session's first answer | **primary** |
+| Statusline stdin JSON, `rate_limits.five_hour` and `rate_limits.seven_day`, each `used_percentage` and `resets_at` (epoch seconds) | yes: [statusline](https://code.claude.com/docs/en/statusline) | share spent and reset, Pro/Max only, after a session's first answer | **primary** |
 | `StopFailure` hook, `error: "rate_limit"` and `last_assistant_message` | yes: [hooks](https://code.claude.com/docs/en/hooks) | that a turn hit a limit; the reset only as message text | **fallback** |
 | Limit messages: `You've hit your session limit · resets 3:45pm`, `... weekly limit · resets Mon 12:00am` | yes: [errors](https://code.claude.com/docs/en/errors) | a local wall-clock reset with no date or zone | parsed by the fallback |
 | `/usage` | interactive only: [commands](https://code.claude.com/docs/en/commands) | nothing a daemon can read | no |
@@ -17,21 +17,26 @@ The statusline is the only documented signal that gives both the share spent and
 
 ## How it works
 
-- `factory statusline` is Claude Code's `statusLine` command. It reads the statusline JSON, sends the 5-hour window to the daemon, and prints `<model> · 5h <n>% · resets HH:MM` (with `--json`, one object holding the line, the model and the window). A daemon that doesn't answer costs the line nothing.
-- `factory hook stop-failure` is the `StopFailure` hook. A turn that ended on a rate limit records a limit until the reset its message names. Without a named reset, the limit lasts until the window's known reset, else one hour. A limit that is already holding keeps its reset unless a later one is named. Another error counts only when its message names a plan limit; otherwise it changes nothing.
-- A statusline window with room (under 100%), seen after a limit was recorded, lifts the limit, because that 429 was a capacity limit and not the plan's.
-- `factory quota claude` exits 0 to dispatch, or 75 with `hold new dispatches until <time>`. It holds once `[claude] hold_at_percent` (default 90) of the window is spent, or while a limit holds.
+- `factory hook statusline` takes the status line's JSON. The status line command (glowline) hands it its own stdin on every refresh. The hook sends both windows, `five_hour` and `seven_day`, to a daemon that is already running and prints nothing. It exits 0 at once on any input (valid, partial, empty or garbage) and when the daemon is down, and it never starts a daemon, not even through systemd's socket: it calls only on the live socket (`live.sock`, beside `factory.sock` in the runtime dir and no longer a name), which the running daemon binds itself beside systemd's and removes as it stops, so with no daemon the call is refused. A status line must not fail or wait. A window the input lacks or garbles (a share outside 0 to 100, a reset before the epoch or past the year 9999) keeps its last reading.
+- `factory hook stop-failure` is the `StopFailure` hook. A turn that ended on a rate limit records a limit until the reset its message names. Without a named reset, the limit lasts until the 5-hour window's known reset, else one hour. A limit that is already holding keeps its reset unless a later one is named. Another error counts only when its message names a plan limit; otherwise it changes nothing.
+- Once both windows have been read since a limit was recorded, each standing and with room (under 100%), the limit lifts, because that 429 was a capacity limit and not the plan's. A window not read since the limit, or read past its reset, is no evidence of room.
+- Dispatch holds once `[claude] hold_at_percent` (default 90) of either window is spent, until that window resets; with both over the mark, until the later reset. A limit holds as well, and the later of the two holds wins.
+- A reading whose window has reset since is unknown, not 0%: `5h unknown (seen 3h ago)`. It holds nothing.
+- `factory quota claude` exits 0 to dispatch, naming both windows (`claude: 5h 40% resets …, weekly 12% resets …; dispatch`), or 75 naming what holds and every window read so far, a stale one with its age: `claude: hold: weekly 91%; hold new dispatches until <time>; 5h unknown (seen 3h ago), weekly 91%; …`, or `claude: hit its limit; …`.
 - `factory wait claude [--timeout 9m]` blocks, silent, until a lead may dispatch (exit 0), or exits 124 to wait again.
-- `factory status` shows one `claude:` row, and `--json` shows a `claude` object.
-- The daemon's database keeps the quota (table `claude_quota`, schema 4), so a restart forgets no hold.
+- `factory status` shows one `claude:` row (`claude: hold: weekly 91% until 11-30 02:00Z; 5h 41%, weekly 91%`), and `--json` shows a `claude` object with each window's reading.
+- `factory bar` prints `claude 12/40 · 2 leads` (5-hour/weekly, `?` for a window not standing), and `factory bar --json` the bar feed with a Claude chip and card, a meter per window. Like the hook, the bar asks only a daemon that runs, and starts none. Only an unreachable daemon gives the bar's exit-0 "factory daemon down" document; a bad config exits 3 as usual.
+- The daemon's database keeps the quota (table `claude_quota`, with the weekly window's columns since schema 6), so a restart forgets no hold. A schema 5 store migrates in place.
 
 ## Wiring (DotFiles)
 
 `~/.claude/settings.json`:
 
 ```json
-"statusLine": {"type": "command", "command": "factory statusline"},
+"statusLine": {"type": "command", "command": "glowline"},
 "hooks": {"StopFailure": [{"matcher": "rate_limit", "hooks": [{"type": "command", "command": "factory hook stop-failure"}]}]}
 ```
+
+glowline pipes the JSON it reads to `factory hook statusline` and draws the line itself.
 
 implement-spec runs `factory quota claude` before each dispatch. On exit 75 it runs `factory wait claude` until that exits 0, then dispatches.
