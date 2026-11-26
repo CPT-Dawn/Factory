@@ -165,6 +165,9 @@ impl Sandbox {
             .env("XDG_STATE_HOME", self.path("state"))
             .env("XDG_CONFIG_HOME", self.path("config"))
             .env("XDG_RUNTIME_DIR", self.path("run"))
+            // The USB bus of the sandbox, empty unless a test lays one out: the machine's own is
+            // never read (#73).
+            .env("FACTORY_SYSFS_ROOT", self.path("sysfs"))
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .current_dir(self.dir.path())
             .stdin(Stdio::null());

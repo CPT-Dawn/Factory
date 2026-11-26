@@ -66,6 +66,11 @@ fn the_wording_and_tones_come_from_one_table_as_the_spec_words_them() {
             "critical",
         ),
         (Shown::Free(Readiness::Offline), "replug it", "critical"),
+        (
+            Shown::Free(Readiness::UsbDebuggingOff),
+            "turn on USB debugging",
+            "warn",
+        ),
     ];
     assert_eq!(WORDS.len(), spec.len());
     for (shown, words, tone_name) in spec {

@@ -119,6 +119,9 @@ pub struct Lab {
     stacks: Mutex<BTreeMap<(String, u32), bool>>,
     /// Wakes the stack sweep, once it runs: a change to the lab may have made or ended a slot.
     sweep: OnceLock<mpsc::Sender<()>>,
+    /// The phones the phone watcher's last sweep of the USB bus found with their USB debugging
+    /// off, and when ([`Lab::hidden_phones`]).
+    hidden: Mutex<phones::Hidden>,
     /// Tells the ledger's thread that events are queued: it alone appends them, so no lab
     /// call waits on the ledger (#62).
     wake: mpsc::Sender<()>,
@@ -230,6 +233,7 @@ impl Lab {
             stopping: Mutex::new(keeper::Stopping::default()),
             stacks: Mutex::new(BTreeMap::new()),
             sweep: OnceLock::new(),
+            hidden: Mutex::new(phones::Hidden::default()),
             callers: Mutex::new(HashSet::new()),
             wake,
         })
@@ -819,6 +823,7 @@ fn status(lab: &Lab, seen: &[Attached]) -> Answer<Board> {
                 idle_since: e.idle_since,
             })
             .collect();
+        let (_, hidden) = lab.hidden_phones();
         let devices = device_rows(seen, &held, &emulators, now)
             .into_iter()
             .map(|r| DeviceLine {
@@ -832,6 +837,15 @@ fn status(lab: &Lab, seen: &[Attached]) -> Answer<Board> {
                 state: r.state,
                 holder: r.holder,
             })
+            // Then each phone adb doesn't list but the USB bus shows (#73).
+            .chain(hidden.into_iter().map(|h| DeviceLine {
+                serial: h.serial,
+                kind: "phone".to_owned(),
+                model: h.vendor.to_owned(),
+                state: Readiness::UsbDebuggingOff.word().to_owned(),
+                holder: "-".to_owned(),
+                readiness: Some(Readiness::UsbDebuggingOff.word().to_owned()),
+            }))
             .collect();
         let running = activity::running(c, &host::alive)?
             .into_iter()
@@ -1017,7 +1031,8 @@ fn plan(
             Some(Readiness::StayAwakeOff) => unready.stay_awake_off += 1,
             Some(Readiness::Unauthorized) => unready.unauthorized += 1,
             // A ready probe too old that was not made again in time: not known to be anything.
-            None | Some(Readiness::Offline) => unready.offline += 1,
+            // (No phone adb lists is found with its USB debugging off: that is one adb doesn't.)
+            None | Some(Readiness::Offline | Readiness::UsbDebuggingOff) => unready.offline += 1,
         }
     }
     let input = PlanInput {

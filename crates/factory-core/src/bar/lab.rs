@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Chip, Row, Section, Tone, glyph, stamp};
 use crate::lab::ago;
-use crate::lab::ready::{Readiness, phone_name};
+use crate::lab::ready::{Readiness, USB_DEBUGGING_OFF_WORDS, phone_name};
 
 /// How old, in ms, a free phone's readiness may be before the card shows its age.
 pub const STALE_MS: i64 = 5 * 60_000;
@@ -21,7 +21,7 @@ pub enum Shown {
 }
 
 /// The one table of what each phone's row asks of the owner, and its tone.
-pub const WORDS: [(Shown, &str, Tone); 7] = [
+pub const WORDS: [(Shown, &str, Tone); 8] = [
     (Shown::Free(Readiness::Ready), "ready", Tone::Ok),
     (Shown::Leased, "leased to", Tone::Busy),
     (Shown::Free(Readiness::Locked), "unlock it", Tone::Warn),
@@ -37,6 +37,11 @@ pub const WORDS: [(Shown, &str, Tone); 7] = [
         Tone::Critical,
     ),
     (Shown::Free(Readiness::Offline), "replug it", Tone::Critical),
+    (
+        Shown::Free(Readiness::UsbDebuggingOff),
+        USB_DEBUGGING_OFF_WORDS,
+        Tone::Warn,
+    ),
 ];
 
 /// The words and tone of a phone, from [`WORDS`]: `leased to <holder>` while a lease holds it,

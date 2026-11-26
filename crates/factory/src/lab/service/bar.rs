@@ -9,6 +9,7 @@ use std::time::Duration;
 use factory_core::bar::lab::{Emulator, Lab as BarLab, Phone, Stack};
 use factory_core::lab::base_name;
 use factory_core::lab::emulator::State;
+use factory_core::lab::ready::Readiness;
 
 use super::super::wire::{SlotRow, slot_inventory};
 use super::super::{context, host, readiness, stack};
@@ -32,6 +33,7 @@ impl Lab {
         let cfg = context::machine_config().unwrap_or_default();
         let shown = self.attached.borrow().shown.clone();
         let stacks_seen = lock_ignoring_poison(&self.stacks).clone();
+        let (swept, hidden) = self.hidden_phones();
         self.read(|c| {
             let leases = store::leases(c)?;
             let holder = |serial: &str| {
@@ -54,7 +56,7 @@ impl Lab {
                     .map(|r| (r.serial.clone(), r.model.clone()))
                     .collect(),
             };
-            let phones = serials
+            let mut phones: Vec<Phone> = serials
                 .into_iter()
                 .map(|(serial, model)| {
                     let row = rows.iter().find(|r| r.serial == serial);
@@ -70,6 +72,14 @@ impl Lab {
                     }
                 })
                 .collect();
+            // A phone adb doesn't list, but the USB bus shows: its USB debugging is off.
+            phones.extend(hidden.into_iter().map(|h| Phone {
+                serial: h.serial,
+                model: h.vendor.to_owned(),
+                readiness: Some(Readiness::UsbDebuggingOff),
+                probed: Some(swept),
+                holder: None,
+            }));
             let emulators = store::emulators(c)?
                 .into_iter()
                 .map(|e| Emulator {
