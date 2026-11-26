@@ -512,11 +512,13 @@ fn codex_hold_note(snapshot: &Snapshot) -> Option<String> {
 }
 
 /// The worst window's share, as Claude's chip does; muted `?` while Codex can't be read, so an
-/// unreadable source is never a calm 0%.
+/// unreadable source is never a calm 0%, unless a reading that still stands holds dispatch:
+/// then the hold is shown, critical, with why the plan could not be read again beside it.
 fn codex_chip(snapshot: &Snapshot) -> Chip {
     let codex = &snapshot.codex;
     let note = codex_hold_note(snapshot);
-    if let Some(line) = codex.unreadable_line() {
+    let held = codex.verdict == ClaudeState::Hold;
+    if let Some(line) = codex.unreadable_line().filter(|_| !held) {
         let tooltip = match &note {
             Some(note) => format!("Codex: {line} · {note}"),
             None => format!("Codex: {line}"),
@@ -535,7 +537,6 @@ fn codex_chip(snapshot: &Snapshot) -> Chip {
         .filter(|reading| reading.current)
         .map(|reading| reading.used_percent)
         .max();
-    let held = codex.verdict == ClaudeState::Hold;
     let (text, tone) = match (worst, held) {
         (Some(used), true) => (format!("{used}%"), Tone::Critical),
         (Some(used), false) => (format!("{used}%"), share_tone(used)),
@@ -552,6 +553,10 @@ fn codex_chip(snapshot: &Snapshot) -> Chip {
             .collect();
         format!("Codex: {}", windows.join(", "))
     };
+    if let Some(line) = codex.unreadable_line() {
+        tooltip.push_str(" · ");
+        tooltip.push_str(&line);
+    }
     if let Some(note) = note {
         tooltip.push_str(" · ");
         tooltip.push_str(&note);

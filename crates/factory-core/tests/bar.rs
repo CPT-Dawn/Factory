@@ -709,6 +709,38 @@ fn the_codex_chip_shows_the_worst_window_toned_by_its_share() {
 }
 
 #[test]
+fn an_unreadable_codex_whose_standing_reading_still_holds_shows_the_hold_critical() {
+    let held = Codex {
+        verdict: ClaudeState::Hold,
+        until: Some(at("2026-11-23T07:00:00Z")),
+        hold: Some("5h 93%".to_owned()),
+        unreadable: Some("it did not answer within 20s".to_owned()),
+        ..codex(vec![five(93)])
+    };
+    assert_eq!(codex_chip(held.clone()), ("93%".into(), "critical".into()));
+
+    let mut shot = snapshot(Claude::default(), Vec::new());
+    shot.codex = held;
+    let document = json(&feed(&shot));
+    let tooltip = chip(&document, "codex")["tooltip"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        tooltip.contains("codex usage unreadable: it did not answer within 20s"),
+        "{tooltip}"
+    );
+    assert!(tooltip.contains("hold: 5h 93% until"), "{tooltip}");
+
+    // Unreadable with nothing holding stays a muted ?.
+    let open = Codex {
+        unreadable: Some("it did not answer within 20s".to_owned()),
+        ..codex(vec![five(18)])
+    };
+    assert_eq!(codex_chip(open), ("?".into(), "muted".into()));
+}
+
+#[test]
 fn an_unreadable_agy_answer_is_a_muted_chip_and_a_card_with_an_error_never_a_share() {
     let document = json(&feed(&with_agy(agy_unreadable())));
 

@@ -174,6 +174,22 @@ fn a_bad_codex_config_is_a_precondition() {
     );
 }
 
+#[test]
+fn an_app_server_timeout_past_the_specs_20_seconds_is_refused() {
+    let sandbox = Sandbox::new();
+    configure(&sandbox, "[codex]\ntimeout_seconds = 21\n");
+
+    let out = quota(&sandbox);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(
+        out.stderr
+            .contains("[codex] timeout_seconds is 21; give it from 1 to 20"),
+        "{out:?}"
+    );
+    assert!(sandbox.calls(APP_SERVER).is_empty(), "Codex was not asked");
+}
+
 /// An app-server that fails some way: the status and the bar say it could not be read, never 0%.
 fn unreadable(sandbox: &Sandbox, why: &str) {
     let row = codex_row(sandbox);
@@ -399,7 +415,7 @@ fn a_review_waits_out_an_ask_that_a_look_gives_up_on() {
     let repo = sandbox.repo();
     configure(
         &sandbox,
-        "[codex]\ntimeout_seconds = 60\n\n[[review.backend]]\ncli = \"codex\"\n",
+        "[codex]\ntimeout_seconds = 20\n\n[[review.backend]]\ncli = \"codex\"\n",
     );
     // Codex answers only once the gate opens, after a look has given up on the ask.
     let gate = gate(&sandbox);
@@ -456,6 +472,40 @@ fn a_failed_ask_is_not_repeated_by_a_restart_within_five_minutes() {
         "{row}: Codex was not pressed again"
     );
     assert_eq!(sandbox.calls(APP_SERVER).len(), 1);
+}
+
+#[test]
+fn a_failed_ask_puts_no_pruned_reading_back_into_the_history() {
+    let sandbox = Sandbox::new();
+    let skew = sandbox.path("clock-skew");
+    let sandbox = sandbox.env("FACTORY_CLOCK_SKEW_FILE", &skew);
+    answers(&sandbox, &reply(18.0, 40.0));
+    assert_eq!(quota(&sandbox).code, 0);
+    let codex_rows = |sandbox: &Sandbox| -> Vec<Value> {
+        let out = sandbox.factory(&["quota", "history", "--json"]);
+        assert_eq!(out.code, 0, "{out:?}");
+        let document: Value = serde_json::from_str(&out.stdout).unwrap();
+        document["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["harness"] == "codex")
+            .cloned()
+            .collect()
+    };
+    assert_eq!(codex_rows(&sandbox).len(), 2, "one row per window");
+
+    // 91 days on, a new daemon prunes both rows; the next ask fails.
+    std::fs::write(&skew, (91 * 86_400).to_string()).unwrap();
+    crate::router::kill_daemon(&sandbox);
+    sandbox.fake(APP_SERVER, "exit 1");
+    assert!(
+        codex_row(&sandbox).starts_with("codex usage unreadable: "),
+        "the ask fails"
+    );
+
+    assert_eq!(codex_rows(&sandbox), Vec::<Value>::new());
+    assert_eq!(sandbox.calls(APP_SERVER).len(), 2);
 }
 
 /// `body`, with a child of its own beside it; it notes both pids in `codex-app-server.pids`.
