@@ -331,7 +331,8 @@ impl Watcher {
     }
 
     /// A new list: unplugged phones are forgotten, each phone that has just become `device`
-    /// is prepped and probed, and one adb can't use is kept as adb says it is.
+    /// is prepped and probed (a leased one only when it was replugged), and one adb can't use
+    /// is kept as adb says it is.
     fn frame(&mut self, list: Vec<Attached>) {
         let phones: Vec<Attached> = list.into_iter().filter(|a| a.kind == "phone").collect();
         let rows = self.lab.write(|c, _| readiness::all(c)).unwrap_or_default();
@@ -368,13 +369,12 @@ impl Watcher {
                 continue;
             }
             if phone.state == "device" {
-                // adb's stream came back and still shows it as it was: a free phone may have
-                // been plugged in again meanwhile, and is readied again; a leased one is left
-                // to its holder.
-                let stayed = lost
-                    .iter()
-                    .any(|l| l.serial == phone.serial && l.state == "device");
-                if stayed && !self.free(&phone.serial) {
+                // Replugged: missing from the list before, and from the one before adb's
+                // stream ended. Anything else is adb's own transition (offline or unauthorized
+                // to device, or its stream coming back): a free phone is readied again, a
+                // leased one is left to its holder, unprepped and unprobed.
+                let replugged = was.is_none() && !lost.iter().any(|l| l.serial == phone.serial);
+                if !replugged && !self.free(&phone.serial) {
                     continue;
                 }
                 let cfg = config();
