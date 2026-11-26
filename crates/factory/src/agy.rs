@@ -54,8 +54,8 @@ fn said(agy: &Agy, now: i64, json: Value, listing: &Path) -> Done {
         .worst(now)
         .map_or_else(|| "unknown".to_owned(), |used| format!("{used}%"));
     let count = groups.len();
-    // A listing that can't be written is said on stderr and in the line: the reading is still
-    // good, and `--json` has every group.
+    // A listing that can't be written is not why the windows go unsaid: they come under the
+    // summary line instead.
     match fs::write(listing, groups.join("\n") + "\n") {
         Ok(()) => {
             let mut done = Done::new(
@@ -69,15 +69,16 @@ fn said(agy: &Agy, now: i64, json: Value, listing: &Path) -> Done {
             done.whole = true;
             done
         }
-        Err(e) => {
+        // No file to name: the rows themselves are the answer, under the summary.
+        Err(_) => {
             let mut done = Done::new(
-                format!("agy: {count} quota groups, worst window {worst}; listing not written"),
+                format!("agy: {count} quota groups, worst window {worst}"),
                 json,
             );
-            done.notes.push(format!(
-                "cannot write {}: {e}; check the disk and FACTORY_STATE, or use --json",
-                listing.display()
-            ));
+            done.more = groups
+                .into_iter()
+                .map(|group| format!("  {group}"))
+                .collect();
             done
         }
     }
