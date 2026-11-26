@@ -24,12 +24,17 @@ pub fn quota() -> Result<Done, Failure> {
     let agy: Agy =
         client::call_streaming(&paths, AGY_QUOTA, &json!({}), Some(AGY_QUERY), &mut |_| {})?;
     let json = serde_json::to_value(&agy).unwrap_or(Value::Null);
-    said(&agy, clock::now().unix_millis(), json, &paths.agy_quota())
+    Ok(said(
+        &agy,
+        clock::now().unix_millis(),
+        json,
+        &paths.agy_quota(),
+    ))
 }
 
-fn said(agy: &Agy, now: i64, json: Value, listing: &Path) -> Result<Done, Failure> {
+fn said(agy: &Agy, now: i64, json: Value, listing: &Path) -> Done {
     if let Some(problem) = agy.problem() {
-        return Ok(Done::new(problem, json));
+        return Done::new(problem, json);
     }
     let groups: Vec<String> = agy
         .groups
@@ -37,29 +42,43 @@ fn said(agy: &Agy, now: i64, json: Value, listing: &Path) -> Result<Done, Failur
         .map(|group| format!("{}: {}", group.name, group.describe(now, ", ")))
         .collect();
     if groups.is_empty() {
-        return Ok(Done::new("agy: no reading yet; try again", json));
+        return Done::new("agy: no reading yet; try again", json);
     }
     let line = format!("agy: {}", groups.join("; "));
     if line.chars().count() <= LINE_LIMIT {
-        return Ok(Done::new(line, json));
+        return Done::new(line, json);
     }
     // Too many groups, or names too long, for one line: a summary naming the file that has a
     // row for each.
     let worst = agy
         .worst(now)
         .map_or_else(|| "unknown".to_owned(), |used| format!("{used}%"));
-    fs::write(listing, groups.join("\n") + "\n").map_err(|e| {
-        Failure::precondition(format!(
-            "cannot write {}: {e}; check the disk and FACTORY_STATE",
-            listing.display()
-        ))
-    })?;
-    Ok(Done::new(
-        format!(
-            "agy: {} quota groups, worst window {worst}; listing in {}",
-            groups.len(),
-            listing.display()
-        ),
-        json,
-    ))
+    let count = groups.len();
+    // A listing that can't be written is said on stderr and in the line: the reading is still
+    // good, and `--json` has every group.
+    match fs::write(listing, groups.join("\n") + "\n") {
+        Ok(()) => {
+            let mut done = Done::new(
+                format!(
+                    "agy: {count} quota groups, worst window {worst}; listing in {}",
+                    listing.display()
+                ),
+                json,
+            );
+            // The file is the line's to name whole, however deep its path.
+            done.whole = true;
+            done
+        }
+        Err(e) => {
+            let mut done = Done::new(
+                format!("agy: {count} quota groups, worst window {worst}; listing not written"),
+                json,
+            );
+            done.notes.push(format!(
+                "cannot write {}: {e}; check the disk and FACTORY_STATE, or use --json",
+                listing.display()
+            ));
+            done
+        }
+    }
 }

@@ -290,8 +290,9 @@ pub fn agy_groups(usage: &str) -> Result<Vec<QuotaGroup>, String> {
             let at = usize::from(kind == WindowKind::Weekly);
             if !std::mem::replace(&mut seen[at], true) {
                 placed = true;
-                read |= read_bucket(bucket).is_some();
-                windows[at].state = bucket_state(bucket);
+                let reading = read_bucket(bucket);
+                read |= reading.is_some();
+                windows[at].state = bucket_state(reading);
             }
         }
         groups.push(QuotaGroup {
@@ -357,8 +358,8 @@ fn bucket_window(bucket: &Value) -> Option<WindowKind> {
 }
 
 /// What a bucket says of its window.
-fn bucket_state(bucket: &Value) -> WindowState {
-    match read_bucket(bucket) {
+fn bucket_state(reading: Option<(f64, i64)>) -> WindowState {
+    match reading {
         Some((left, resets)) if resets == AGY_EPOCH_MILLIS => {
             if epoch_means_unused(left) {
                 WindowState::Unused

@@ -1703,3 +1703,31 @@ fn many_quota_groups_are_a_summary_line_naming_a_file_with_a_row_each() {
         Some(12)
     );
 }
+
+#[test]
+fn a_listing_that_cannot_be_written_is_said_and_json_still_has_every_group() {
+    let sandbox = Sandbox::new();
+    let bucket = |window: &str| json!({"window": window, "remaining_fraction": 0.5, "reset_time": "2099-01-01T00:00:00Z"});
+    let groups: Vec<Value> = (1..=12)
+        .map(|n| json!({"name": format!("Quota group number {n} of the plan"), "buckets": [bucket("5h"), bucket("weekly")]}))
+        .collect();
+    let answer = json!({"command": {"data": {"groups": groups}}}).to_string();
+    sandbox.fake("agy", &agy_says(&answer));
+    // A directory where the listing goes: nothing can be written there.
+    fs::create_dir_all(sandbox.path("state/factory/agy-quota.txt")).expect("block the listing");
+
+    let out = quota_agy(&sandbox);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(
+        out.stdout,
+        "agy: 12 quota groups, worst window 50%; listing not written\n"
+    );
+    assert!(out.stderr.contains("cannot write"), "{out:?}");
+    let json = sandbox.factory(&["quota", "agy", "--json"]);
+    assert_eq!(json.code, 0, "{json:?}");
+    assert_eq!(
+        shown(&json.stdout)["groups"].as_array().map(Vec::len),
+        Some(12)
+    );
+}
