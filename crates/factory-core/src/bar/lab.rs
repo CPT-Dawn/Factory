@@ -11,33 +11,47 @@ use crate::lab::ready::{Readiness, phone_name};
 /// How old, in ms, a free phone's readiness may be before the card shows its age.
 pub const STALE_MS: i64 = 5 * 60_000;
 
-/// What a free phone's readiness asks of the owner, and its tone: one row per readiness.
-pub const WORDS: [(Readiness, &str, Tone); 6] = [
-    (Readiness::Ready, "ready", Tone::Ok),
-    (Readiness::Locked, "unlock it", Tone::Warn),
-    (Readiness::Asleep, "wake it", Tone::Warn),
-    (Readiness::StayAwakeOff, "turn on Stay awake", Tone::Warn),
+/// What a phone's row says: whose it is, and for a free phone what its readiness is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shown {
+    /// No lease holds it: what its last check found.
+    Free(Readiness),
+    /// A lease holds it, whatever it was last found: its words are followed by the holder.
+    Leased,
+}
+
+/// The one table of what each phone's row asks of the owner, and its tone.
+pub const WORDS: [(Shown, &str, Tone); 7] = [
+    (Shown::Free(Readiness::Ready), "ready", Tone::Ok),
+    (Shown::Leased, "leased to", Tone::Busy),
+    (Shown::Free(Readiness::Locked), "unlock it", Tone::Warn),
+    (Shown::Free(Readiness::Asleep), "wake it", Tone::Warn),
     (
-        Readiness::Unauthorized,
+        Shown::Free(Readiness::StayAwakeOff),
+        "turn on Stay awake",
+        Tone::Warn,
+    ),
+    (
+        Shown::Free(Readiness::Unauthorized),
         "allow USB debugging",
         Tone::Critical,
     ),
-    (Readiness::Offline, "replug it", Tone::Critical),
+    (Shown::Free(Readiness::Offline), "replug it", Tone::Critical),
 ];
 
-/// The tone of a phone a lease holds, whatever it was last found.
-pub const LEASED: Tone = Tone::Busy;
-
-/// The words and tone of a phone: `leased to <holder>` while a lease holds it, else what its
-/// readiness asks of the owner ([`WORDS`]).
-pub fn phone_words(readiness: Readiness, holder: Option<&str>) -> (String, Tone) {
-    if let Some(holder) = holder {
-        return (format!("leased to {holder}"), LEASED);
-    }
-    WORDS.iter().find(|(r, _, _)| *r == readiness).map_or(
-        ("replug it".to_owned(), Tone::Critical),
-        |(_, words, tone)| ((*words).to_owned(), *tone),
-    )
+/// The words and tone of a phone, from [`WORDS`]: `leased to <holder>` while a lease holds it,
+/// else what its readiness asks of the owner. None: a free phone not checked yet.
+pub fn phone_words(readiness: Option<Readiness>, holder: Option<&str>) -> Option<(String, Tone)> {
+    let shown = match (holder, readiness) {
+        (Some(_), _) => Shown::Leased,
+        (None, Some(readiness)) => Shown::Free(readiness),
+        (None, None) => return None,
+    };
+    let (_, words, tone) = WORDS.iter().find(|(s, _, _)| *s == shown)?;
+    Some(match holder {
+        Some(holder) => (format!("{words} {holder}"), *tone),
+        None => ((*words).to_owned(), *tone),
+    })
 }
 
 /// The lab as the daemon last checked it.
@@ -114,23 +128,15 @@ fn phone_lines(lab: &Lab) -> Vec<PhoneLine> {
                     .iter()
                     .any(|other| other.serial != phone.serial && other.model == phone.model);
             let name = phone_name(&phone.model, &phone.serial, shared);
-            let Some(readiness) = phone.readiness else {
+            let Some((words, tone)) = phone_words(phone.readiness, phone.holder.as_deref()) else {
                 return PhoneLine {
                     name,
-                    text: phone.holder.as_ref().map_or_else(
-                        || "checking".to_owned(),
-                        |holder| format!("leased to {holder}"),
-                    ),
-                    tone: if phone.holder.is_some() {
-                        LEASED
-                    } else {
-                        Tone::Muted
-                    },
+                    text: "checking".to_owned(),
+                    tone: Tone::Muted,
                     ready: false,
                     stale_since: None,
                 };
             };
-            let (words, tone) = phone_words(readiness, phone.holder.as_deref());
             let stale_since = phone
                 .probed
                 .filter(|probed| phone.holder.is_none() && lab.now - probed > STALE_MS);
@@ -146,7 +152,7 @@ fn phone_lines(lab: &Lab) -> Vec<PhoneLine> {
                     name,
                     text: words,
                     tone,
-                    ready: readiness == Readiness::Ready,
+                    ready: phone.readiness == Some(Readiness::Ready),
                     stale_since,
                 },
             }

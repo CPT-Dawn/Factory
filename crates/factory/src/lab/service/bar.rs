@@ -10,6 +10,7 @@ use factory_core::bar::lab::{Emulator, Lab as BarLab, Phone, Stack};
 use factory_core::lab::base_name;
 use factory_core::lab::emulator::State;
 
+use super::super::wire::{SlotRow, slot_inventory};
 use super::super::{context, host, readiness, stack};
 use super::{Answer, Lab, lock_ignoring_poison, now_ms, reservations, store};
 
@@ -31,7 +32,7 @@ impl Lab {
         let cfg = context::machine_config().unwrap_or_default();
         let shown = self.attached.borrow().shown.clone();
         let stacks_seen = lock_ignoring_poison(&self.stacks).clone();
-        self.write(|c, _| {
+        self.read(|c| {
             let leases = store::leases(c)?;
             let holder = |serial: &str| {
                 leases
@@ -78,7 +79,18 @@ impl Lab {
                 })
                 .collect();
             let held = reservations::all(c)?;
-            let stacks = slot_rows(c)?
+            // The slots the store knows, and those only the sweep found a stack on.
+            let mut rows = slot_inventory(&store::slots(c)?, &held);
+            for (project, slot) in stacks_seen.keys() {
+                if !rows
+                    .iter()
+                    .any(|r| &r.project == project && r.slot == *slot)
+                {
+                    rows.push(unrecorded(project, *slot));
+                }
+            }
+            rows.sort_by(|a, b| (&a.project, a.slot).cmp(&(&b.project, b.slot)));
+            let stacks = rows
                 .into_iter()
                 .map(|row| {
                     let lease = leases.iter().find(|lease| {
@@ -126,19 +138,20 @@ impl Lab {
             .spawn(move || {
                 loop {
                     let cfg = context::machine_config().unwrap_or_default();
-                    let slots = lab.write(|c, _| slot_rows(c)).unwrap_or_default();
-                    let seen: BTreeMap<(String, u32), bool> = slots
-                        .into_iter()
-                        .map(|row| {
-                            let id = stack::slot_stack_id(
-                                &row.project,
-                                row.slot,
-                                row.last_worktree.as_deref(),
-                            );
-                            ((row.project, row.slot), stack::running(&id))
-                        })
-                        .collect();
-                    *lock_ignoring_poison(&lab.stacks) = seen;
+                    if let Ok(slots) = lab.read(every_slot) {
+                        let seen: BTreeMap<(String, u32), bool> = slots
+                            .into_iter()
+                            .map(|row| {
+                                let id = stack::slot_stack_id(
+                                    &row.project,
+                                    row.slot,
+                                    row.last_worktree.as_deref(),
+                                );
+                                ((row.project, row.slot), stack::running(&id))
+                            })
+                            .collect();
+                        *lock_ignoring_poison(&lab.stacks) = seen;
+                    }
                     let every = Duration::try_from_secs_f64(cfg.readiness_check_sec)
                         .unwrap_or(Duration::from_secs(120));
                     match woken.recv_timeout(every) {
@@ -152,24 +165,48 @@ impl Lab {
     }
 }
 
-/// Every slot the store knows, and each reserved one that was never leased, by project and slot.
-fn slot_rows(c: &rusqlite::Connection) -> rusqlite::Result<Vec<crate::lab::wire::SlotRow>> {
-    let mut rows = store::slots(c)?;
-    for r in reservations::all(c)? {
-        if !rows
-            .iter()
-            .any(|s| s.project == r.project && s.slot == r.slot)
-        {
-            rows.push(crate::lab::wire::SlotRow {
-                project: r.project,
-                slot: r.slot,
-                last_worktree: None,
-                stack_ours: false,
-                idle_since: None,
-                stopping: false,
-            });
+/// Every slot the sweep looks at: each one the store knows or a reservation holds, and every
+/// other slot of each project the lab has seen, by the `devlab.json` of a worktree that held or
+/// reserved one of its slots: a stack the owner started on a slot no lease took is theirs.
+/// Read while the store is: the configs are read after.
+fn every_slot(c: &rusqlite::Connection) -> rusqlite::Result<Vec<SlotRow>> {
+    let held = reservations::all(c)?;
+    let mut rows = slot_inventory(&store::slots(c)?, &held);
+    let mut worktrees: BTreeMap<String, String> = BTreeMap::new();
+    let seen = rows
+        .iter()
+        .filter_map(|r| Some((r.project.clone(), r.last_worktree.clone()?)))
+        .chain(
+            store::leases(c)?
+                .into_iter()
+                .filter_map(|l| Some((l.project?, l.worktree))),
+        )
+        .chain(held.into_iter().map(|r| (r.project, r.worktree)));
+    for (project, worktree) in seen {
+        worktrees.entry(project).or_insert(worktree);
+    }
+    for (project, worktree) in worktrees {
+        let Some(p) = context::project_config(&worktree).ok().flatten() else {
+            continue;
+        };
+        for slot in 0..p.max_slots {
+            if !rows.iter().any(|r| r.project == project && r.slot == slot) {
+                rows.push(unrecorded(&project, slot));
+            }
         }
     }
     rows.sort_by(|a, b| (&a.project, a.slot).cmp(&(&b.project, b.slot)));
     Ok(rows)
+}
+
+/// Slot `slot` of `project`, which no lease has held.
+fn unrecorded(project: &str, slot: u32) -> SlotRow {
+    SlotRow {
+        project: project.to_owned(),
+        slot,
+        last_worktree: None,
+        stack_ours: false,
+        idle_since: None,
+        stopping: false,
+    }
 }

@@ -2,11 +2,14 @@
 //! from the daemon's stored checks. The phone watcher re-checks each free phone's readiness
 //! and leaves leased ones alone.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
 use serde_json::Value;
 
 use crate::lab::{Agent, for_owner, lab, owned, write_machine_config};
 use crate::support::world::{World, poll_until};
-use crate::support::{Sandbox, run};
+use crate::support::{Sandbox, SetOnDrop, run};
 
 const PIXEL: &str = "plug FAKEPHONE01 device usb:1-1 model:Pixel_8";
 
@@ -39,6 +42,15 @@ fn row(feed: &Value, label: &str) -> Value {
         .and_then(|rows| rows.iter().find(|row| row["label"] == label))
         .cloned()
         .unwrap_or(Value::Null)
+}
+
+/// How many adb calls were made to phone `serial`.
+fn calls_to(sandbox: &Sandbox, serial: &str) -> usize {
+    sandbox
+        .calls("adb")
+        .iter()
+        .filter(|c| c.first().is_some_and(|a| a == "-s") && c.get(1).is_some_and(|s| s == serial))
+        .count()
 }
 
 /// How many times phone `serial`'s screen was probed.
@@ -118,7 +130,7 @@ fn a_leased_phone_gets_no_recheck_and_shows_its_holder() {
     assert_eq!(row(&last, leased.1)["tone"], "busy", "{last}");
 
     world.apply(&format!("lock {}", leased.0)).unwrap();
-    let before = probes(&sandbox, leased.0);
+    let before = calls_to(&sandbox, leased.0);
     let free_before = probes(&sandbox, free.0);
     assert!(
         poll_until(|| probes(&sandbox, free.0) >= free_before + 10),
@@ -126,7 +138,19 @@ fn a_leased_phone_gets_no_recheck_and_shows_its_holder() {
         probes(&sandbox, free.0) - free_before
     );
 
-    assert_eq!(probes(&sandbox, leased.0), before);
+    assert_eq!(calls_to(&sandbox, leased.0), before);
+
+    // adb's stream ends and comes back: the free phone is prepped and probed again, as it may
+    // have been replugged meanwhile, and the leased one is still its holder's.
+    world.restart_trackers(|| {});
+    let free_before = probes(&sandbox, free.0);
+    assert!(poll_until(|| probes(&sandbox, free.0) >= free_before + 5));
+    assert_eq!(
+        calls_to(&sandbox, leased.0),
+        before,
+        "{:?}",
+        sandbox.calls("adb")
+    );
     let last = feed(&sandbox);
     assert_eq!(
         row(&last, leased.1)["text"],
@@ -213,4 +237,79 @@ fn a_stack_started_outside_the_factory_shows_as_yours() {
             .is_some_and(|t| t.ends_with(" 1")),
         "{last}"
     );
+}
+
+#[test]
+fn a_stack_started_outside_the_factory_on_a_slot_never_leased_shows_as_yours() {
+    let (sandbox, world) = watching();
+    let wt = world.worktree("demo-seen");
+    let held = owned(&sandbox, &wt, &["acquire", "--no-device", "--quiet"]);
+    assert_eq!(held.code, 0, "{held:?}");
+    assert_eq!(owned(&sandbox, &wt, &["release"]).code, 0);
+    // demo has two slots; slot 1 was never leased.
+    let (listed, last) = feed_until(&sandbox, |f| row(f, "demo slot 1")["text"] == "down, free");
+    assert!(listed, "{last}");
+
+    world.apply("container supabase_db_demo_s1").unwrap();
+    let (yours, last) = feed_until(&sandbox, |f| row(f, "demo slot 1")["text"] == "up, yours");
+    assert!(yours, "{last}");
+}
+
+#[test]
+fn the_bar_reads_the_lab_without_writing_to_it() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-read");
+    let held = owned(&sandbox, &wt, &["acquire", "--no-device", "--quiet"]);
+    assert_eq!(held.code, 0, "{held:?}");
+    // The grant's event is in the ledger: no write of the daemon's own is left to make.
+    assert!(poll_until(|| std::fs::read_to_string(sandbox.ledger())
+        .is_ok_and(|ledger| ledger.contains("demo-read"))));
+    let (seen, last) = feed_until(&sandbox, |f| {
+        row(f, "demo slot 0")["text"] != "unchecked, demo-read"
+    });
+    assert!(seen, "{last}");
+
+    // Another writer holds the store: a bar that wrote would wait for it, one that reads doesn't.
+    let db = rusqlite::Connection::open(sandbox.path("state/factory/lab.db")).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = Instant::now();
+    let last = feed(&sandbox);
+    let took = started.elapsed();
+    db.execute_batch("ROLLBACK").unwrap();
+
+    assert_eq!(
+        row(&last, "demo slot 0")["text"],
+        "down, demo-read",
+        "{last}"
+    );
+    assert!(took < Duration::from_secs(3), "{took:?}");
+}
+
+#[test]
+fn the_watcher_keeps_its_rechecks_while_adbs_list_keeps_changing() {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""readinessCheckSec": 0.3"#);
+    let wt = world.worktree("plain-churn");
+    assert_eq!(run(crate::lab::devlab(&sandbox, &wt, &["status"])).code, 0);
+    world.apply(PIXEL).unwrap();
+    let (ready, last) = feed_until(&sandbox, |f| row(f, "Pixel 8")["text"] == "ready");
+    assert!(ready, "{last}");
+
+    let done = AtomicBool::new(false);
+    let locked = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !done.load(Ordering::Relaxed) && Instant::now() < deadline {
+                world
+                    .apply("plug FAKEPHONE02 device usb:1-2 model:Pixel_7")
+                    .unwrap();
+                world.apply("unplug FAKEPHONE02").unwrap();
+            }
+        });
+        let _stop = SetOnDrop(&done);
+        world.apply("lock FAKEPHONE01").unwrap();
+        feed_until(&sandbox, |f| row(f, "Pixel 8")["text"] == "unlock it")
+    });
+
+    assert!(locked.0, "{}", locked.1);
 }

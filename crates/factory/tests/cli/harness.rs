@@ -1,9 +1,10 @@
 //! The sandbox's fakes behave as later tests rely on.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::support::world::World;
-use crate::support::{Sandbox, run};
+use crate::support::{Sandbox, SetOnDrop, run};
 
 #[test]
 fn an_unscripted_fake_refuses_and_records_its_call() {
@@ -46,7 +47,8 @@ fn a_world_step_never_shows_the_fakes_a_half_written_world() {
 
     let failed = std::thread::scope(|scope| {
         scope.spawn(|| {
-            while !done.load(Ordering::Relaxed) {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !done.load(Ordering::Relaxed) && Instant::now() < deadline {
                 world
                     .apply("plug FAKEPHONE02 device usb:1-2 model:Pixel_8")
                     .unwrap();
@@ -55,6 +57,7 @@ fn a_world_step_never_shows_the_fakes_a_half_written_world() {
                     .unwrap();
             }
         });
+        let _stop = SetOnDrop(&done);
         let failed: Vec<_> = (0..150)
             .map(|_| {
                 run(sandbox.command(
@@ -69,7 +72,6 @@ fn a_world_step_never_shows_the_fakes_a_half_written_world() {
             })
             .filter(|out| out.code != 0)
             .collect();
-        done.store(true, Ordering::Relaxed);
         failed
     });
 

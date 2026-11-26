@@ -1,8 +1,8 @@
 //! The daemon's watch over phones (#55): a phone is prepped when adb's stream first shows it as
 //! `device` and after every replug, every free phone is probed every `readinessCheckSec` (two
 //! minutes unless set, #72; a leased one is its holder's and isn't), and its readiness is kept
-//! in the store. Each change of it posts one desktop notification saying what to do: one per change of a phone, told by its serial and named the same way each
-//! time, and an offline that its unplug soon follows is said as the unplug alone (#63). One
+//! in the store. Each change of it posts one desktop notification saying what to do: one per
+//! change of a phone, told by its serial and named the same way each time, and an offline that its unplug soon follows is said as the unplug alone (#63). One
 //! thread does it all, so the probes, the store's rows and the notifications follow the stream's
 //! order; `devlab check` is answered on it too.
 
@@ -67,6 +67,7 @@ impl Lab {
                     adb: Box::new(AdbCli),
                     desktop: Box::new(NotifySend),
                     shown: Vec::new(),
+                    lost: Vec::new(),
                     since: BTreeMap::new(),
                     said_missing: false,
                     doubted: HashSet::new(),
@@ -142,6 +143,8 @@ struct Watcher {
     desktop: Box<dyn Desktop>,
     /// The phones the last list showed.
     shown: Vec<Attached>,
+    /// The phones the last list before adb's stream ended showed, until the next list comes.
+    lost: Vec<Attached>,
     /// Which attachment of each device the last list shows.
     since: BTreeMap<String, i64>,
     /// Whether the log already said notify-send is missing.
@@ -176,6 +179,13 @@ impl Watcher {
     fn run(&mut self, jobs: &mpsc::Receiver<Job>) {
         let mut next = Instant::now() + every(&config());
         loop {
+            // What is due goes first, however many jobs wait: a stream of them that never lets
+            // up holds back no re-check and no offline.
+            self.say_held();
+            if Instant::now() >= next {
+                self.recheck();
+                next = Instant::now() + every(&config());
+            }
             let until = self
                 .held
                 .values()
@@ -188,9 +198,13 @@ impl Watcher {
                     // Its probes are written: a request waiting for a phone looks again.
                     self.lab.notify();
                 }
-                // The next list's phones are all new to it: each is prepped and probed again.
+                // The next list's phones are all new to it: each free one is prepped and probed
+                // again, and the ones it showed are kept to tell a leased phone that stayed.
                 Ok(Job::StreamEnded) => {
-                    self.shown.clear();
+                    let shown = std::mem::take(&mut self.shown);
+                    if !shown.is_empty() {
+                        self.lost = shown;
+                    }
                     self.since.clear();
                 }
                 Ok(Job::Check(serials, fresh, reply)) => {
@@ -200,25 +214,30 @@ impl Watcher {
                     self.refresh(&serials, by);
                     let _ = reply.send(());
                 }
-                Err(RecvTimeoutError::Timeout) if Instant::now() < next => self.say_held(),
-                Err(RecvTimeoutError::Timeout) => {
-                    self.say_held();
-                    // A leased phone is its holder's: a probe would wake its screen mid-run.
-                    let leased: HashSet<String> = self
-                        .lab
-                        .write(|c, _| store::taken(c))
-                        .map(|serials| serials.into_iter().collect())
-                        .unwrap_or_default();
-                    for phone in self.shown.clone() {
-                        if phone.state == "device" && !leased.contains(&phone.serial) {
-                            self.probe(&phone);
-                        }
-                    }
-                    next = Instant::now() + every(&config());
-                }
+                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
+    }
+
+    /// Probes each free phone adb can use. A leased phone is its holder's, whose run the
+    /// watcher leaves alone: no prep or probe of its own touches the phone while a lease holds
+    /// it (#72). Whether one does is read right before each probe, so a lease granted during
+    /// the round is seen by the next phone's.
+    fn recheck(&mut self) {
+        for phone in self.shown.clone() {
+            if phone.state == "device" && self.free(&phone.serial) {
+                self.probe(&phone);
+            }
+        }
+    }
+
+    /// Whether no lease holds phone `serial`. A store that can't be read leaves it unknown,
+    /// which is not free: the phone may be someone's.
+    fn free(&self, serial: &str) -> bool {
+        self.lab
+            .read(store::taken)
+            .is_ok_and(|taken| !taken.iter().any(|s| s == serial))
     }
 
     /// A new list: unplugged phones are forgotten, each phone that has just become `device`
@@ -251,6 +270,7 @@ impl Watcher {
             self.models.insert(p.serial.clone(), p.model.clone());
         }
         let before = std::mem::replace(&mut self.shown, phones.clone());
+        let lost = std::mem::take(&mut self.lost);
         self.doubted.clear();
         for phone in &phones {
             let was = before.iter().find(|b| b.serial == phone.serial);
@@ -258,6 +278,15 @@ impl Watcher {
                 continue;
             }
             if phone.state == "device" {
+                // adb's stream came back and still shows it as it was: a free phone may have
+                // been plugged in again meanwhile, and is readied again; a leased one is left
+                // to its holder.
+                let stayed = lost
+                    .iter()
+                    .any(|l| l.serial == phone.serial && l.state == "device");
+                if stayed && !self.free(&phone.serial) {
+                    continue;
+                }
                 let cfg = config();
                 let _ = self.adb.shell(
                     &phone.serial,

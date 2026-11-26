@@ -87,6 +87,8 @@ pub use reserve::reserve;
 pub struct Lab {
     path: PathBuf,
     store: Mutex<Store>,
+    /// Reads that change nothing, beside the writes: what the bar and the sweeps look at.
+    reader: Mutex<store::Reader>,
     /// Bumped on every change a waiter could be waiting for.
     changed: watch::Sender<u64>,
     /// What `adb track-devices` showed last, and whether its stream still follows it.
@@ -187,6 +189,8 @@ impl Lab {
     pub fn open(path: &Path, ledger: Arc<Ledger>) -> Result<Lab, String> {
         let store =
             Store::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let looker = store::Reader::open(path)
+            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         // The ledger's thread, on its own connection: it appends what the lab's transactions
         // queued, when told to and at least every few seconds, so a backlog an earlier daemon
         // left goes out too.
@@ -214,6 +218,7 @@ impl Lab {
         Ok(Lab {
             path: path.to_owned(),
             store: Mutex::new(store),
+            reader: Mutex::new(looker),
             changed: watch::Sender::new(0),
             attached: watch::Sender::new(DeviceList::default()),
             tracking: Once::new(),
@@ -340,6 +345,17 @@ impl Lab {
     /// were given are taken back beside it, after the transaction.
     fn write<T>(&self, work: impl FnOnce(&Connection, i64) -> rusqlite::Result<T>) -> Answer<T> {
         self.write_inner(false, work).map(|(out, _)| out)
+    }
+
+    /// One read transaction, on a connection of its own: it waits for no write and drops
+    /// nothing, so what only looks at the lab (the bar, the sweeps) changes none of it.
+    fn read<T>(&self, work: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Answer<T> {
+        lock_ignoring_poison(&self.reader)
+            .read(work)
+            .map_err(|e| ErrorBody {
+                code: Exit::Precondition.code(),
+                message: format!("lab store {}: {e}; retry", self.path.display()),
+            })
     }
 
     /// [`Lab::write`], and a line for each lease this very write dropped because its owner

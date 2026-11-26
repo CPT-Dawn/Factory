@@ -12,7 +12,7 @@ use serde::Serialize;
 use super::context::{self, project_config};
 use super::host::mem_available_mb;
 use super::stack;
-use super::wire::{Board, DeviceLine, Lease, Reservation, STATUS, SlotRow, Waiter};
+use super::wire::{Board, DeviceLine, Lease, Reservation, STATUS, Waiter, slot_inventory};
 use crate::client;
 use crate::output::Failure;
 use crate::paths::Paths;
@@ -185,24 +185,7 @@ pub fn screen(board: &Board) -> Result<String, Failure> {
 }
 
 fn report(board: &Board, cfg: &MachineConfig) -> Report {
-    // A reserved slot that was never leased has no row of its own yet.
-    let mut rows: Vec<SlotRow> = board.slots.clone();
-    for r in &board.reservations {
-        if !rows
-            .iter()
-            .any(|s| s.project == r.project && s.slot == r.slot)
-        {
-            rows.push(SlotRow {
-                project: r.project.clone(),
-                slot: r.slot,
-                last_worktree: None,
-                stack_ours: false,
-                idle_since: None,
-                stopping: false,
-            });
-        }
-    }
-    rows.sort_by(|a, b| (&a.project, a.slot).cmp(&(&b.project, b.slot)));
+    let rows = slot_inventory(&board.slots, &board.reservations);
     let slots = rows
         .iter()
         .map(|s| {

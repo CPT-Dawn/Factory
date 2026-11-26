@@ -3,7 +3,7 @@
 
 use factory_core::bar::Tone;
 use factory_core::bar::lab::{
-    Emulator, LEASED, Lab, Phone, STALE_MS, Stack, WORDS, chip, line, phone_words, section,
+    Emulator, Lab, Phone, STALE_MS, Shown, Stack, WORDS, chip, line, phone_words, section,
 };
 use factory_core::lab::ready::Readiness;
 use serde_json::{Value, json};
@@ -51,31 +51,64 @@ fn tone(tone: Tone) -> Value {
 #[test]
 fn the_wording_and_tones_come_from_one_table_as_the_spec_words_them() {
     let spec = [
-        (Readiness::Ready, "ready", "ok"),
-        (Readiness::Locked, "unlock it", "warn"),
-        (Readiness::Asleep, "wake it", "warn"),
-        (Readiness::StayAwakeOff, "turn on Stay awake", "warn"),
-        (Readiness::Unauthorized, "allow USB debugging", "critical"),
-        (Readiness::Offline, "replug it", "critical"),
+        (Shown::Free(Readiness::Ready), "ready", "ok"),
+        (Shown::Leased, "leased to", "busy"),
+        (Shown::Free(Readiness::Locked), "unlock it", "warn"),
+        (Shown::Free(Readiness::Asleep), "wake it", "warn"),
+        (
+            Shown::Free(Readiness::StayAwakeOff),
+            "turn on Stay awake",
+            "warn",
+        ),
+        (
+            Shown::Free(Readiness::Unauthorized),
+            "allow USB debugging",
+            "critical",
+        ),
+        (Shown::Free(Readiness::Offline), "replug it", "critical"),
     ];
     assert_eq!(WORDS.len(), spec.len());
-    for (readiness, words, tone_name) in spec {
-        let (said, toned) = phone_words(readiness, None);
-        assert_eq!((said.as_str(), tone(toned)), (words, json!(tone_name)));
+    for (shown, words, tone_name) in spec {
+        let entry = WORDS.iter().find(|(s, _, _)| *s == shown);
+        assert_eq!(
+            entry.map(|(_, w, t)| (*w, tone(*t))),
+            Some((words, json!(tone_name))),
+            "{shown:?}"
+        );
+    }
+    for (shown, words, tone_name) in spec {
+        let Shown::Free(readiness) = shown else {
+            continue;
+        };
+        assert_eq!(
+            phone_words(Some(readiness), None),
+            Some((
+                words.to_owned(),
+                WORDS.iter().find(|(s, _, _)| *s == shown).unwrap().2
+            ))
+        );
         let card = lab(vec![phone("S1", "Pixel 8", readiness)]);
         assert_eq!(
             row(&card, "Pixel 8"),
             json!({"kind": "text", "label": "Pixel 8", "text": words, "tone": tone_name})
         );
     }
-    // A leased phone is its holder's, whatever it was last found.
-    for (readiness, _, _) in WORDS {
+    // A leased phone is its holder's, whatever it was last found, and before its first check.
+    for readiness in [None, Some(Readiness::Ready), Some(Readiness::Locked)] {
         assert_eq!(
-            phone_words(readiness, Some("app-t1")),
-            ("leased to app-t1".to_owned(), LEASED)
+            phone_words(readiness, Some("app-t1")).map(|(w, t)| (w, tone(t))),
+            Some(("leased to app-t1".to_owned(), json!("busy")))
+        );
+        let mut held = phone("S1", "Pixel 8", Readiness::Ready);
+        held.readiness = readiness;
+        held.holder = Some("app-t1".to_owned());
+        assert_eq!(
+            row(&lab(vec![held]), "Pixel 8"),
+            json!({"kind": "text", "label": "Pixel 8", "text": "leased to app-t1", "tone": "busy"})
         );
     }
-    assert_eq!(tone(LEASED), json!("busy"));
+    // A free phone not checked yet has no words of the table's.
+    assert_eq!(phone_words(None, None), None);
 }
 
 #[test]
