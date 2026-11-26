@@ -3,6 +3,7 @@
 
 use factory_core::quota::{self, AgyUsage, Candidate, Pick, Quota, Reset, WhenBusy};
 use factory_core::timestamp::Timestamp;
+use factory_core::usage::{GroupWindow, QuotaGroup, WindowKind, WindowState};
 
 /// Seconds since the epoch, from `date -u -d <moment> +%s`.
 fn at(seconds: i64) -> Timestamp {
@@ -471,4 +472,175 @@ fn a_groups_bucket_under_a_fraction_is_below_its_reserve() {
     assert!(!quota::agy_below(usage, "Gemini 4 Argon", "5h", 0.2));
     assert!(!quota::agy_below(usage, "Claude and GPT models", "5h", 0.2));
     assert!(!quota::agy_below("not json", "Gemini Models", "5h", 0.2));
+}
+
+/// The real usage with this bucket's fraction and reset set.
+fn agy_usage_with(id: &str, left: f64, reset: &str) -> String {
+    let mut usage: serde_json::Value = serde_json::from_str(AGY_USAGE).unwrap_or_default();
+    let groups = usage
+        .pointer_mut("/command/data/groups")
+        .and_then(serde_json::Value::as_array_mut);
+    let buckets = groups
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get_mut("buckets")?.as_array_mut())
+        .flatten();
+    for bucket in buckets {
+        if bucket.get("id").and_then(serde_json::Value::as_str) == Some(id) {
+            bucket["remaining_fraction"] = left.into();
+            bucket["reset_time"] = reset.into();
+        }
+    }
+    usage.to_string()
+}
+
+const EPOCH: &str = "1970-01-01T00:00:00Z";
+const CLAUDE_GPT: &str = "Claude and GPT models";
+
+#[test]
+fn an_epoch_reset_leaves_the_group_available_only_when_the_whole_quota_is_left() {
+    // agy 1.5.17 reports the untouched Claude and GPT group's windows with the epoch's reset.
+    let untouched = agy_usage_with("3p-5h", 1.0, EPOCH);
+    assert_eq!(quota::agy_usage(&untouched, CLAUDE_GPT), AgyUsage::Left);
+
+    // Any less is a reading it cannot place: never "the reset has passed, so quota is back".
+    for left in [0.0, 0.4, 0.999] {
+        let usage = agy_usage_with("3p-5h", left, EPOCH);
+        assert!(
+            matches!(
+                quota::agy_usage(&usage, CLAUDE_GPT),
+                AgyUsage::Unreadable(_)
+            ),
+            "{left} left with the epoch's reset: {:?}",
+            quota::agy_usage(&usage, CLAUDE_GPT)
+        );
+    }
+}
+
+fn window(kind: WindowKind, state: WindowState) -> GroupWindow {
+    GroupWindow {
+        window: kind,
+        state,
+    }
+}
+
+fn used(percent: u32, resets: &str) -> WindowState {
+    WindowState::Used {
+        used_percent: percent,
+        resets: Timestamp::parse(resets).map_or(0, Timestamp::unix_millis),
+    }
+}
+
+#[test]
+fn agys_usage_reads_each_quota_groups_five_hour_and_weekly_windows() {
+    let groups = quota::agy_groups(AGY_USAGE).expect("the real answer reads");
+
+    assert_eq!(
+        groups,
+        vec![
+            QuotaGroup {
+                name: "Gemini Models".to_owned(),
+                windows: vec![
+                    window(WindowKind::FiveHour, used(30, "2026-11-24T03:32:03Z")),
+                    window(WindowKind::Weekly, used(7, "2026-11-30T22:32:03Z")),
+                ],
+            },
+            QuotaGroup {
+                name: CLAUDE_GPT.to_owned(),
+                windows: vec![
+                    window(WindowKind::FiveHour, used(24, "2026-11-24T03:33:56Z")),
+                    window(WindowKind::Weekly, used(63, "2026-11-30T01:54:01Z")),
+                ],
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_whole_percent_is_not_lost_to_float_noise() {
+    // 1 - 0.9 is 0.09999999999999998 in floats: 10% used all the same.
+    let usage = agy_usage_with("gemini-5h", 0.9, "2026-11-24T03:32:03Z");
+    let groups = quota::agy_groups(&usage).expect("it reads");
+    assert_eq!(
+        groups[0].windows[0],
+        window(WindowKind::FiveHour, used(10, "2026-11-24T03:32:03Z"))
+    );
+}
+
+#[test]
+fn an_epoch_reset_is_an_unused_window_at_a_full_fraction_and_an_unknown_one_otherwise() {
+    let usage = agy_usage_with("3p-5h", 1.0, EPOCH);
+    let groups = quota::agy_groups(&usage).expect("it reads");
+    assert_eq!(
+        groups[1].windows[0],
+        window(WindowKind::FiveHour, WindowState::Unused)
+    );
+
+    for left in [0.0, 0.4, 0.999] {
+        let usage = agy_usage_with("3p-5h", left, EPOCH);
+        let groups = quota::agy_groups(&usage).expect("it reads");
+        assert_eq!(
+            groups[1].windows[0],
+            window(WindowKind::FiveHour, WindowState::Unknown),
+            "{left} left"
+        );
+        // The group's other window is read as it is.
+        assert_eq!(
+            groups[1].windows[1],
+            window(WindowKind::Weekly, used(63, "2026-11-30T01:54:01Z"))
+        );
+    }
+}
+
+#[test]
+fn a_bucket_with_no_fraction_or_no_reset_it_can_read_is_an_unknown_window() {
+    for (case, bucket) in [
+        (
+            "no fraction",
+            r#"{"window":"5h","reset_time":"2026-11-24T03:32:03Z"}"#,
+        ),
+        (
+            "a fraction above 1",
+            r#"{"window":"5h","remaining_fraction":1.5,"reset_time":"2026-11-24T03:32:03Z"}"#,
+        ),
+        ("no reset", r#"{"window":"5h","remaining_fraction":0.5}"#),
+        (
+            "a garbled reset",
+            r#"{"window":"5h","remaining_fraction":0.5,"reset_time":"soon"}"#,
+        ),
+    ] {
+        let usage = format!(
+            r#"{{"command":{{"data":{{"groups":[{{"name":"G","buckets":[{bucket}]}}]}}}}}}"#
+        );
+        let groups = quota::agy_groups(&usage).expect("it reads");
+        assert_eq!(
+            groups,
+            vec![QuotaGroup {
+                name: "G".to_owned(),
+                windows: vec![window(WindowKind::FiveHour, WindowState::Unknown)],
+            }],
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn an_answer_with_no_quota_group_to_read_says_why_it_is_unreadable() {
+    let failed = r#"{"conversation_id":"","status":"ERROR","response":"","error":"Eligibility check failed"}"#;
+    for (case, usage, why) in [
+        (
+            "not json",
+            "Eligibility check failed",
+            "its answer is not JSON",
+        ),
+        ("an error", failed, "its answer lists no quota groups"),
+        ("empty", "", "its answer is not JSON"),
+        (
+            "groups with no window",
+            r#"{"command":{"data":{"groups":[{"name":"G","buckets":[{"window":"monthly"}]}]}}}"#,
+            "its answer lists no 5-hour or weekly window",
+        ),
+    ] {
+        assert_eq!(quota::agy_groups(usage), Err(why.to_owned()), "{case}");
+    }
 }

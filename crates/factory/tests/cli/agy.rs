@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
 
-use crate::support::{BWRAP_PASSES, PROXY_LISTENS, Sandbox, finish, spawn};
+use crate::support::{BWRAP_PASSES, PROXY_LISTENS, Run, Sandbox, finish, spawn};
 
 const CLEAN_REPORT: &str = r#"## Standards
 
@@ -1219,7 +1219,9 @@ fn a_cached_usage_whose_empty_bucket_has_reset_is_asked_again() {
 
     assert_eq!(later.code, 0, "{later:?}");
     assert_eq!(shown(&later.stdout)["backend"], "agy", "{later:?}");
-    assert_eq!(usage_queries(&sandbox), 2, "{:?}", sandbox.calls("agy"));
+    // Two by routing, which asks again once its own cache is stale, and one by the daemon's
+    // display of agy's quota, which the polling of `factory status` set going.
+    assert_eq!(usage_queries(&sandbox), 3, "{:?}", sandbox.calls("agy"));
 }
 
 /// Whether the process `pid` has died (a zombie has), within a deadline.
@@ -1365,5 +1367,223 @@ fn agy_out_of_quota_is_not_granted_again_while_the_review_waits_for_codex() {
         reviews_run(&sandbox).len(),
         2,
         "agy is not granted to t2 again"
+    );
+}
+
+/// agy's usage with two quota groups, each with a 5-hour and a weekly window, as agy prints it:
+/// Gemini 30% and 7% spent, Claude and GPT 24% and 63%, all resetting far ahead.
+fn two_groups() -> String {
+    let bucket = |window: &str, left: f64| json!({"id": window, "name": window, "window": window, "remaining_fraction": left, "reset_time": "2099-01-01T00:00:00Z"});
+    json!({"status": "SUCCESS", "command": {"name": "usage", "data": {"groups": [
+        {"name": "Gemini Models", "buckets": [bucket("weekly", 0.93), bucket("5h", 0.7)]},
+        {"name": "Claude and GPT models", "buckets": [bucket("5h", 0.76), bucket("weekly", 0.37)]},
+    ]}}})
+    .to_string()
+}
+
+/// A fake agy that answers its usage query with `answer`.
+fn agy_says(answer: &str) -> String {
+    format!("cat <<'USAGE'\n{answer}\nUSAGE")
+}
+
+fn quota_agy(sandbox: &Sandbox) -> Run {
+    sandbox.factory(&["quota", "agy"])
+}
+
+/// Starts the daemon, which the bar never does: `factory status` does.
+fn start(sandbox: &Sandbox) {
+    let out = sandbox.factory(&["status"]);
+    assert_eq!(out.code, 0, "{out:?}");
+}
+
+fn bar_json(sandbox: &Sandbox) -> Value {
+    let out = sandbox.factory(&["bar", "--json"]);
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    serde_json::from_str(&out.stdout).unwrap_or(Value::Null)
+}
+
+fn agy_chip(feed: &Value) -> Value {
+    feed["glance"]
+        .as_array()
+        .and_then(|chips| chips.iter().find(|chip| chip["id"] == "agy"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn agy_card(feed: &Value) -> Value {
+    feed["sections"]
+        .as_array()
+        .and_then(|cards| cards.iter().find(|card| card["id"] == "agy"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+#[test]
+fn quota_agy_lists_each_quota_groups_windows() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", &agy_says(&two_groups()));
+
+    let out = quota_agy(&sandbox);
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    assert_eq!(
+        out.stdout,
+        "agy: Gemini Models: 5h 30%, weekly 7%; Claude and GPT models: 5h 24%, weekly 63%\n"
+    );
+    let json = sandbox.factory(&["quota", "agy", "--json"]);
+    let shown = shown(&json.stdout);
+    assert_eq!(shown["groups"].as_array().map(Vec::len), Some(2), "{shown}");
+    assert_eq!(shown["error"], Value::Null, "{shown}");
+}
+
+#[test]
+fn the_bar_shows_the_worst_window_and_a_block_per_quota_group() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", &agy_says(&two_groups()));
+    start(&sandbox);
+
+    let feed = bar_json(&sandbox);
+
+    let chip = agy_chip(&feed);
+    assert_eq!(
+        (&chip["text"], &chip["tone"]),
+        (&json!("63%"), &json!("ok")),
+        "{feed}"
+    );
+    let rows = agy_card(&feed)["rows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let meters: Vec<(&str, &str)> = rows
+        .iter()
+        .filter(|row| row["kind"] == "meter")
+        .map(|row| {
+            (
+                row["label"].as_str().unwrap_or(""),
+                row["text"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        meters,
+        [
+            ("5h", "30%"),
+            ("weekly", "7%"),
+            ("5h", "24%"),
+            ("weekly", "63%")
+        ]
+    );
+    let groups: Vec<&str> = rows
+        .iter()
+        .filter(|row| row["kind"] == "text")
+        .map(|row| row["label"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(groups, ["Gemini Models", "Claude and GPT models"]);
+    assert_eq!(
+        sandbox.factory(&["bar"]).stdout,
+        "claude ?/? · agy 30/63 · ? leads\n"
+    );
+}
+
+/// What a failed or garbled usage query shows everywhere: not a share, but "agy usage
+/// unreadable" and why.
+fn assert_unreadable(sandbox: &Sandbox, why: &str) {
+    let said = format!("agy usage unreadable: {why}");
+    start(sandbox);
+    let feed = bar_json(sandbox);
+    let chip = agy_chip(&feed);
+    assert_eq!(
+        (&chip["text"], &chip["tone"]),
+        (&json!("?"), &json!("muted")),
+        "{feed}"
+    );
+    assert_eq!(agy_card(&feed)["error"], said, "{feed}");
+    assert!(!agy_card(&feed).to_string().contains('%'), "{feed}");
+    assert_eq!(
+        sandbox.factory(&["bar"]).stdout,
+        "claude ?/? · agy ?/? · ? leads\n"
+    );
+
+    let status = sandbox.factory(&["status"]);
+    assert!(status.stdout_lines().contains(&said.as_str()), "{status:?}");
+    let quota = quota_agy(sandbox);
+    assert_eq!(
+        (quota.code, quota.stdout.as_str()),
+        (0, format!("{said}\n").as_str()),
+        "{quota:?}"
+    );
+}
+
+#[test]
+fn a_failed_usage_query_is_unreadable_everywhere_never_a_share() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", "exit 3");
+
+    assert_unreadable(&sandbox, "exited 3");
+}
+
+#[test]
+fn a_garbled_usage_answer_is_unreadable_everywhere_never_a_share() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", &agy_says("this is not json"));
+
+    assert_unreadable(&sandbox, "its answer is not JSON");
+}
+
+#[test]
+fn a_used_bucket_with_no_reset_is_unreadable_never_a_reset_that_passed() {
+    let sandbox = Sandbox::new();
+    let used = two_groups().replace("2099-01-01T00:00:00Z", "1970-01-01T00:00:00Z");
+    sandbox.fake("agy", &agy_says(&used));
+
+    let out = quota_agy(&sandbox);
+
+    // Every bucket of that answer is used and without a reset: each window is unknown.
+    assert_eq!(
+        out.stdout,
+        "agy: Gemini Models: 5h unknown, weekly unknown; Claude and GPT models: 5h unknown, weekly unknown\n",
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_second_bar_within_five_minutes_asks_agy_nothing_and_routing_asks_again_after_two() {
+    let sandbox = sandboxed();
+    agy_then_codex(&sandbox);
+    let repo = sandbox.repo();
+    sandbox.fake("agy", &agy(&two_groups(), &agy_writes(CLEAN_REPORT)));
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+
+    start(&sandbox);
+    bar_json(&sandbox);
+    bar_json(&sandbox);
+    sandbox.factory(&["bar"]);
+    sandbox.factory(&["status"]);
+    quota_agy(&sandbox);
+
+    assert_eq!(usage_queries(&sandbox), 1, "{:?}", sandbox.calls("agy"));
+
+    // A review asks on its own cache, which the daemon's display never fills, and keeps it for
+    // 120 s: a second review close behind asks nothing, and one after them asks again.
+    let first = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let second = sandbox.factory_in(&repo, &["review", "main", "t2"]);
+    assert_eq!((first.code, second.code), (0, 0), "{first:?} {second:?}");
+    assert_eq!(usage_queries(&sandbox), 2, "{:?}", sandbox.calls("agy"));
+    let cache = sandbox.path("state/factory/agy-usage.json");
+    let stale = SystemTime::now() - Duration::from_secs(121);
+    fs::File::options()
+        .write(true)
+        .open(&cache)
+        .and_then(|file| file.set_modified(stale))
+        .expect("age the routing cache");
+    let third = sandbox.factory_in(&repo, &["review", "main", "t3"]);
+    assert_eq!(third.code, 0, "{third:?}");
+    assert_eq!(usage_queries(&sandbox), 3, "{:?}", sandbox.calls("agy"));
+
+    bar_json(&sandbox);
+    assert_eq!(
+        usage_queries(&sandbox),
+        3,
+        "the bar's reading is still fresh"
     );
 }

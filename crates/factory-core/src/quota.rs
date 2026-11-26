@@ -5,6 +5,7 @@
 use serde_json::Value;
 
 use crate::timestamp::Timestamp;
+use crate::usage::{self, GroupWindow, QuotaGroup, WindowKind, WindowState};
 
 const MILLIS_PER_MINUTE: i64 = 60_000;
 const MILLIS_PER_DAY: i64 = 86_400_000;
@@ -199,6 +200,9 @@ fn codex_error(line: &str) -> Option<String> {
     message.and_then(Value::as_str).map(str::to_owned)
 }
 
+/// The reset agy reports for a window nobody has used: the Unix epoch.
+const AGY_EPOCH_MILLIS: i64 = 0;
+
 /// What agy's free usage query (`agy -p /usage --output-format json`) says of one model
 /// group's quota.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -229,6 +233,15 @@ pub fn agy_usage(usage: &str, group: &str) -> AgyUsage {
             .and_then(Value::as_str)
             .and_then(Timestamp::parse);
         match (left, reset) {
+            // The epoch is no reset: the bucket has been used, or it has not. Only a whole
+            // quota left says it has not.
+            (Some(left), Some(reset)) if reset.unix_millis() == AGY_EPOCH_MILLIS => {
+                if left < 1.0 {
+                    return AgyUsage::Unreadable(format!(
+                        "a {group} bucket has used some quota but reports no reset"
+                    ));
+                }
+            }
             (Some(left), _) if left > 0.0 => {}
             (Some(_), Some(reset)) => until = until.max(Some(reset)),
             _ => {
@@ -239,6 +252,92 @@ pub fn agy_usage(usage: &str, group: &str) -> AgyUsage {
         }
     }
     until.map_or(AgyUsage::Left, |until| AgyUsage::Empty { until })
+}
+
+/// Every quota group agy's usage answer lists, each with its 5-hour and weekly windows as the
+/// answer reads them, or why the answer can't be read at all.
+///
+/// A bucket that agy reports with the Unix epoch as its reset has no clock running: it is an
+/// unused window when its remaining fraction is 1, and unknown otherwise. It is never read as
+/// a reset that has passed.
+pub fn agy_groups(usage: &str) -> Result<Vec<QuotaGroup>, String> {
+    let Ok(usage) = serde_json::from_str::<Value>(usage) else {
+        return Err("its answer is not JSON".to_owned());
+    };
+    let listed = usage
+        .pointer("/command/data/groups")
+        .and_then(Value::as_array)
+        .filter(|groups| !groups.is_empty())
+        .ok_or_else(|| "its answer lists no quota groups".to_owned())?;
+    let groups: Vec<QuotaGroup> = listed
+        .iter()
+        .filter_map(|group| {
+            let name = group.get("name")?.as_str()?.to_owned();
+            let mut windows: Vec<GroupWindow> = Vec::new();
+            for bucket in group.get("buckets")?.as_array()? {
+                let Some(kind) = bucket_window(bucket) else {
+                    continue;
+                };
+                if windows.iter().all(|seen| seen.window != kind) {
+                    windows.push(GroupWindow {
+                        window: kind,
+                        state: bucket_state(bucket),
+                    });
+                }
+            }
+            windows.sort_by_key(|window| window.window);
+            (!windows.is_empty()).then_some(QuotaGroup { name, windows })
+        })
+        .collect();
+    if groups.is_empty() {
+        return Err("its answer lists no 5-hour or weekly window".to_owned());
+    }
+    Ok(groups)
+}
+
+/// Which window a bucket is: its `window` (`5h`, `weekly`), else what its id or name says.
+fn bucket_window(bucket: &Value) -> Option<WindowKind> {
+    ["window", "id", "name"]
+        .into_iter()
+        .filter_map(|key| bucket.get(key)?.as_str())
+        .find_map(|text| {
+            let text = text.to_lowercase();
+            if text.contains("5h") || text.contains("five hour") || text.contains("5-hour") {
+                Some(WindowKind::FiveHour)
+            } else if text.contains("week") {
+                Some(WindowKind::Weekly)
+            } else {
+                None
+            }
+        })
+}
+
+/// What a bucket says of its window.
+fn bucket_state(bucket: &Value) -> WindowState {
+    let left = bucket
+        .get("remaining_fraction")
+        .and_then(Value::as_f64)
+        .filter(|left| (0.0..=1.0).contains(left));
+    let reset = bucket
+        .get("reset_time")
+        .and_then(Value::as_str)
+        .and_then(Timestamp::parse)
+        .map(Timestamp::unix_millis);
+    match (left, reset) {
+        (Some(left), Some(resets)) if resets == AGY_EPOCH_MILLIS => {
+            if left >= 1.0 {
+                WindowState::Unused
+            } else {
+                WindowState::Unknown
+            }
+        }
+        (Some(left), Some(resets)) if usage::representable(resets) => WindowState::Used {
+            // Rounded to a millionth first: 1 - 0.9 is 0.0999... in floats, and 10% used.
+            used_percent: usage::whole_percent(((1.0 - left) * 100.0 * 1e6).round() / 1e6),
+            resets,
+        },
+        _ => WindowState::Unknown,
+    }
 }
 
 /// Whether a bucket of agy's model `group` over `window` (`5h`, `weekly`) has less than

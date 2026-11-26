@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::lab::{ago, base_name};
 use crate::steward::kilo;
 use crate::timestamp::Timestamp;
-use crate::usage::UsageReading;
+use crate::usage::{QuotaGroup, UsageReading, WindowKind};
 
 /// Everything `factory status` shows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +22,9 @@ pub struct Status {
     pub review: Vec<Backend>,
     /// The Claude plan's 5-hour window, and whether a lead may dispatch.
     pub claude: Claude,
+    /// agy's quota groups, each with its windows.
+    #[serde(default)]
+    pub agy: Agy,
     pub waits: Vec<Wait>,
     pub leads: Leads,
 }
@@ -142,6 +145,49 @@ pub struct Claude {
     pub windows: Vec<UsageReading>,
 }
 
+/// What agy's usage query said when the daemon last asked it: each quota group's windows, or
+/// why the answer could not be read. Never a share it did not read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Agy {
+    /// Each quota group of the answer, with its 5-hour and weekly windows.
+    #[serde(default)]
+    pub groups: Vec<QuotaGroup>,
+    /// Why the answer could not be read: the query failed, or said nothing it could place.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// When the answer was read, in milliseconds since the epoch; none before the first.
+    #[serde(default)]
+    pub seen: Option<i64>,
+}
+
+impl Agy {
+    /// `agy usage unreadable: <why>` while the answer can't be read.
+    pub fn problem(&self) -> Option<String> {
+        self.error
+            .as_ref()
+            .map(|error| format!("agy usage unreadable: {error}"))
+    }
+
+    /// The largest share any quota group has spent of its `window` at `now`, among those
+    /// that stand; none when none does.
+    pub fn worst_of(&self, window: WindowKind, now: i64) -> Option<u32> {
+        self.groups
+            .iter()
+            .flat_map(|group| &group.windows)
+            .filter(|reading| reading.window == window)
+            .filter_map(|reading| reading.used_percent(now))
+            .max()
+    }
+
+    /// The largest share of any window of any group that stands at `now`.
+    pub fn worst(&self, now: i64) -> Option<u32> {
+        [WindowKind::FiveHour, WindowKind::Weekly]
+            .into_iter()
+            .filter_map(|window| self.worst_of(window, now))
+            .max()
+    }
+}
+
 /// Whether a lead may dispatch on the Claude plan.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -221,6 +267,7 @@ pub fn screen(status: &Status) -> Vec<String> {
     lab(status, &mut rows);
     review(status, &mut rows);
     claude(status, &mut rows);
+    agy(status, &mut rows);
     waits(status, &mut rows);
     leads(status, &mut rows);
     rows.iter().map(|row| fit(row)).collect()
@@ -375,6 +422,23 @@ fn claude(status: &Status, rows: &mut Vec<String>) {
         }
     };
     rows.push(row);
+}
+
+fn agy(status: &Status, rows: &mut Vec<String>) {
+    let agy = &status.agy;
+    if let Some(problem) = agy.problem() {
+        rows.push(problem);
+    } else if agy.groups.is_empty() {
+        rows.push("agy: no reading yet".to_owned());
+    }
+    for group in &agy.groups {
+        let windows: Vec<String> = group
+            .windows
+            .iter()
+            .map(|window| window.describe(status.now))
+            .collect();
+        rows.push(format!("agy {}: {}", group.name, windows.join(", ")));
+    }
 }
 
 fn waits(status: &Status, rows: &mut Vec<String>) {

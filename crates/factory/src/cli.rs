@@ -131,6 +131,8 @@ pub enum HookCommand {
 pub enum QuotaCommand {
     /// The Claude plan's 5-hour and weekly windows: dispatch (exit 0) or hold until the holding one resets (exit 75)
     Claude,
+    /// agy's quota groups and their 5-hour and weekly windows, or why its usage can't be read
+    Agy,
 }
 
 #[derive(Subcommand, Debug)]

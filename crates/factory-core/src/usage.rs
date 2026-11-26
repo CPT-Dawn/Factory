@@ -122,6 +122,58 @@ impl UsageReading {
     }
 }
 
+/// One quota group's window as a reading saw it: agy's model groups each have a 5-hour and a
+/// weekly window of their own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupWindow {
+    pub window: WindowKind,
+    pub state: WindowState,
+}
+
+/// What a reading says of one window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WindowState {
+    /// Some of it is spent, and it resets at `resets` (milliseconds since the epoch).
+    Used { used_percent: u32, resets: i64 },
+    /// None of it is spent, and nothing has started its clock: agy reports the reset of a
+    /// window never touched as the Unix epoch.
+    Unused,
+    /// The reading can't be placed: no share, or a reset that is not a time.
+    Unknown,
+}
+
+impl GroupWindow {
+    /// The share spent at `now` (milliseconds since the epoch), in whole percent: none when
+    /// the reading is unknown or its window has reset since. A window nobody has used is 0.
+    pub fn used_percent(&self, now: i64) -> Option<u32> {
+        match self.state {
+            WindowState::Used {
+                used_percent,
+                resets,
+            } if resets > now => Some(used_percent),
+            WindowState::Unused => Some(0),
+            _ => None,
+        }
+    }
+
+    /// `5h 30%`, or `5h unknown` when no share stands.
+    pub fn describe(&self, now: i64) -> String {
+        let label = self.window.label();
+        match self.used_percent(now) {
+            Some(used) => format!("{label} {used}%"),
+            None => format!("{label} unknown"),
+        }
+    }
+}
+
+/// A harness's quota group and its windows, the 5-hour one first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaGroup {
+    pub name: String,
+    pub windows: Vec<GroupWindow>,
+}
+
 /// What a harness's windows say of dispatching now.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Verdict {

@@ -61,6 +61,9 @@ pub const CLAUDE_WINDOW: &str = "claude.window";
 pub const CLAUDE_LIMIT: &str = "claude.limit";
 /// Whether a lead may dispatch now: [`ClaudeQuotaParams`] in, [`ClaudeVerdict`] out.
 pub const CLAUDE_QUOTA: &str = "claude.quota";
+/// agy's quota groups and their windows, from the keeper's reading of its usage query: no
+/// params in, [`factory_core::status::Agy`] out. It waits for a query that is under way.
+pub const AGY_QUOTA: &str = "agy.quota";
 /// Answered once a lead may dispatch: [`WaitClaudeParams`] in, [`ClaudeVerdict`] out; an error
 /// with exit 124 when the time runs out first.
 pub const WAIT_CLAUDE: &str = "wait.claude";

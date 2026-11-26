@@ -44,7 +44,7 @@ use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::pollers::Pollers;
 use crate::protocol::{
-    BAR, BarParams, CLAUDE_LIMIT, CLAUDE_QUOTA, CLAUDE_WINDOW, ClaudeLimitParams,
+    AGY_QUOTA, BAR, BarParams, CLAUDE_LIMIT, CLAUDE_QUOTA, CLAUDE_WINDOW, ClaudeLimitParams,
     ClaudeQuotaParams, ClaudeWindowParams, ErrorBody, LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LOG,
     LeadParams, LogParams, LogResult, MISMATCH, MONITOR_START, MONITOR_STATUS, MONITOR_STOP,
     NotifyParams, Outcome, REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, ReviewRef, STATUS,
@@ -475,13 +475,13 @@ async fn respond(
             ),
             Err(refused) => refused,
         },
+        AGY_QUOTA => answered(Ok::<_, Failure>(
+            daemon.quotas.agy(crate::quotas::AGY_QUERY).await,
+        )),
         BAR => match params::<BarParams>(BAR, request.params) {
-            Ok(params) => answered(Ok::<_, Failure>(crate::bar::snapshot(
-                &params,
-                &daemon.leads,
-                &daemon.steward,
-                &daemon.quotas,
-            ))),
+            Ok(params) => answered(Ok::<_, Failure>(
+                crate::bar::snapshot(&params, &daemon.leads, &daemon.steward, &daemon.quotas).await,
+            )),
             Err(refused) => refused,
         },
         LOG => {
