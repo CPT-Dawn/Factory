@@ -138,6 +138,19 @@ pub fn migration_head(worktree: &str) -> Option<String> {
         .map(|(_, name)| name)
 }
 
+/// The project id of slot `slot` of `project`'s stack: as its last worktree's supabase config
+/// names it, else as the project's name would make it.
+pub fn slot_stack_id(project: &str, slot: u32, last_worktree: Option<&str>) -> String {
+    last_worktree
+        .and_then(|wt| {
+            let p = project_config(wt).ok().flatten()?;
+            info(&p, wt, slot).ok().flatten()
+        })
+        .map(|info| info.project_id)
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| slot_project_id(project, slot))
+}
+
 pub fn running(project_id: &str) -> bool {
     Docker.running(&format!("supabase_db_{project_id}"))
 }

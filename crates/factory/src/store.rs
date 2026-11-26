@@ -1,7 +1,9 @@
 //! The daemon's SQLite database, `<state>/factory.db`, in WAL mode: what a daemon restart must
 //! not lose: each review backend's quota, the Claude and Codex plans' quotas, the leads spawned whose end is not yet in the
 //! ledger, whether the context steward runs and what it has done to each session, each wait
-//! that outlives its CLI (`--notify`), and each blocking `factory wait` the daemon holds.
+//! that outlives its CLI (`--notify`), each blocking `factory wait` the daemon holds, and the
+//! watched repos' CI as GitHub last answered it, with every job's queued, started and finished
+//! times.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -9,6 +11,7 @@ use std::path::Path;
 
 use factory_core::claude::{ClaudeQuota, Limit};
 use factory_core::codex::CodexQuota;
+use factory_core::fleet::{Job, Pull, PullState, RepoCi, Runner, RunnerState};
 use factory_core::quota::Quota;
 use factory_core::timestamp::Timestamp;
 use factory_core::usage::{UsageWindow, WindowKind};
@@ -155,6 +158,19 @@ impl Store {
                  started_ms INTEGER,
                  finished_ms INTEGER,
                  PRIMARY KEY (repo, id)
+             );
+             CREATE TABLE IF NOT EXISTS ci_pull (
+                 repo TEXT NOT NULL,
+                 number INTEGER NOT NULL,
+                 branch TEXT NOT NULL,
+                 url TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 seen_ms INTEGER NOT NULL,
+                 PRIMARY KEY (repo, number)
+             );
+             CREATE TABLE IF NOT EXISTS ci_seen (
+                 repo TEXT PRIMARY KEY,
+                 seen_ms INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS wait (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -392,6 +408,157 @@ impl Store {
         )?;
         Ok(())
     }
+    /// Records a repo's CI as GitHub just answered it: its runners and open factory pull
+    /// requests replace the last ones, and every job read keeps the times it had.
+    pub fn record_ci(&mut self, ci: &RepoCi, read: &[Job]) -> rusqlite::Result<()> {
+        let seen = ci.seen.unwrap_or_default();
+        let tx = self.db.transaction()?;
+        tx.execute("DELETE FROM ci_runner WHERE repo = ?1", params![ci.repo])?;
+        for runner in &ci.runners {
+            let (status, busy) = runner.state.github();
+            tx.execute(
+                "INSERT INTO ci_runner (repo, id, name, status, busy, seen_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![ci.repo, sql(runner.id), runner.name, status, busy, seen],
+            )?;
+        }
+        for job in read {
+            tx.execute(
+                "INSERT INTO ci_job (repo, id, run_id, name, status, conclusion, runner,
+                     queued_ms, started_ms, finished_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT (repo, id) DO UPDATE SET run_id = ?3, name = ?4, status = ?5,
+                     conclusion = ?6, runner = COALESCE(?7, runner),
+                     queued_ms = COALESCE(?8, queued_ms), started_ms = COALESCE(?9, started_ms),
+                     finished_ms = COALESCE(?10, finished_ms)",
+                params![
+                    ci.repo,
+                    sql(job.id),
+                    sql(job.run_id),
+                    job.name,
+                    job.status,
+                    job.conclusion,
+                    job.runner,
+                    job.queued,
+                    job.started,
+                    job.finished,
+                ],
+            )?;
+        }
+        tx.execute("DELETE FROM ci_pull WHERE repo = ?1", params![ci.repo])?;
+        for pull in &ci.pulls {
+            tx.execute(
+                "INSERT INTO ci_pull (repo, number, branch, url, state, seen_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    ci.repo,
+                    sql(pull.number),
+                    pull.branch,
+                    pull.url,
+                    pull.state.word(),
+                    seen
+                ],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO ci_seen (repo, seen_ms) VALUES (?1, ?2)
+             ON CONFLICT (repo) DO UPDATE SET seen_ms = ?2",
+            params![ci.repo, seen],
+        )?;
+        tx.commit()
+    }
+
+    /// A repo's CI as last recorded: its runners, its jobs not yet completed, its open factory
+    /// pull requests and its latest completed jobs; nothing, and never seen, before the first
+    /// answer.
+    pub fn ci(&self, repo: &str) -> rusqlite::Result<RepoCi> {
+        let seen = self
+            .db
+            .query_row(
+                "SELECT seen_ms FROM ci_seen WHERE repo = ?1",
+                params![repo],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut runners = self
+            .db
+            .prepare("SELECT id, name, status, busy FROM ci_runner WHERE repo = ?1 ORDER BY id")?;
+        let runners = runners
+            .query_map(params![repo], |row| {
+                let status: String = row.get(2)?;
+                Ok(Runner {
+                    id: unsql(row.get(0)?),
+                    name: row.get(1)?,
+                    state: RunnerState::of(&status, row.get(3)?),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let jobs = self.ci_jobs(repo, "status != 'completed' ORDER BY id", u32::MAX)?;
+        let finished = self.ci_jobs(
+            repo,
+            "status = 'completed' ORDER BY finished_ms DESC, id DESC",
+            FINISHED_KEPT,
+        )?;
+        let mut pulls = self.db.prepare(
+            "SELECT number, branch, url, state FROM ci_pull WHERE repo = ?1 ORDER BY number",
+        )?;
+        let pulls = pulls
+            .query_map(params![repo], |row| {
+                let state: String = row.get(3)?;
+                Ok(Pull {
+                    number: unsql(row.get(0)?),
+                    branch: row.get(1)?,
+                    url: row.get(2)?,
+                    state: PullState::parse(&state),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(RepoCi {
+            repo: repo.to_owned(),
+            seen,
+            error: None,
+            runners,
+            jobs,
+            pulls,
+            finished,
+        })
+    }
+
+    /// At most `limit` of `repo`'s jobs, those `filter` (a SQL condition and order) picks.
+    fn ci_jobs(&self, repo: &str, filter: &str, limit: u32) -> rusqlite::Result<Vec<Job>> {
+        let mut jobs = self.db.prepare(&format!(
+            "SELECT id, run_id, name, status, conclusion, runner, queued_ms, started_ms,
+                 finished_ms
+             FROM ci_job WHERE repo = ?1 AND {filter} LIMIT ?2"
+        ))?;
+        jobs.query_map(params![repo, limit], |row| {
+            Ok(Job {
+                id: unsql(row.get(0)?),
+                run_id: unsql(row.get(1)?),
+                name: row.get(2)?,
+                status: row.get(3)?,
+                conclusion: row.get(4)?,
+                runner: row.get(5)?,
+                queued: row.get(6)?,
+                started: row.get(7)?,
+                finished: row.get(8)?,
+            })
+        })?
+        .collect()
+    }
+}
+
+/// How many of a repo's latest completed jobs `factory status --json` shows.
+const FINISHED_KEPT: u32 = 10;
+
+/// A GitHub id as SQLite keeps it.
+fn sql(id: u64) -> i64 {
+    i64::try_from(id).unwrap_or(i64::MAX)
+}
+
+/// A GitHub id SQLite kept.
+fn unsql(id: i64) -> u64 {
+    u64::try_from(id).unwrap_or_default()
 }
 
 /// Schema 6's weekly columns, on a `claude_quota` table an older schema made without them.

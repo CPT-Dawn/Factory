@@ -55,7 +55,7 @@ fn an_idle_factory_says_so_in_every_section() {
     assert_eq!(
         sections,
         [
-            "factory", "lab", "review", "claude", "codex", "waits", "leads"
+            "factory", "lab", "review", "claude", "codex", "agy", "waits", "leads"
         ],
         "{out:?}"
     );
@@ -83,8 +83,12 @@ fn json_gives_every_field_of_every_section() {
     };
     assert_eq!(
         keys(&shown),
-        ["claude", "codex", "lab", "leads", "now", "review", "waits"]
+        [
+            "agy", "ci", "claude", "codex", "lab", "leads", "now", "review", "waits"
+        ]
     );
+    assert_eq!(keys(&shown["agy"]), ["error", "groups", "seen"]);
+    assert_eq!(keys(&shown["ci"]), ["error", "expected", "next", "repos"]);
     assert_eq!(
         keys(&shown["claude"]),
         [

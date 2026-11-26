@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use factory_adapters::codex::AppServer;
-use factory_adapters::gh::Gh;
+use factory_adapters::gh::{Gh, GhActions};
 use factory_core::duration;
 use factory_core::event::Event;
 use factory_core::exit::Exit;
@@ -33,9 +33,11 @@ use tokio::task::JoinSet;
 
 use factory_adapters::herdr::Herdr;
 use factory_adapters::inbox::Inbox;
+use factory_adapters::reviewer::{AgyAuth, AgyUsageCli};
 use listenfd::ListenFd;
 
 use crate::clock;
+use crate::fleet::Fleet;
 use crate::lab::service::{self, Lab};
 use crate::lab::wire::{ACQUIRE, RESERVE, RUN_RESUME};
 use crate::leads::{Leads, Registered};
@@ -45,13 +47,13 @@ use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::pollers::Pollers;
 use crate::protocol::{
-    BAR, BarParams, CLAUDE_LIMIT, CLAUDE_QUOTA, CLAUDE_WINDOW, CODEX_QUOTA, ClaudeLimitParams,
-    ClaudeQuotaParams, ClaudeWindowParams, CodexQuotaParams, ErrorBody, LEAD_LIST, LEAD_SPAWN,
-    LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH, MONITOR_START, MONITOR_STATUS,
-    MONITOR_STOP, NotifyParams, Outcome, REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response,
-    ReviewRef, STATUS, SpawnParams, StatusParams, WAIT_CI, WAIT_CLAUDE, WAIT_LEAD, WAIT_LEASE,
-    WAIT_NOTIFY, WAIT_REVIEW, WaitCiParams, WaitCiResult, WaitClaudeParams, WaitLeadParams,
-    WaitLeaseParams, WaitReviewParams,
+    AGY_QUOTA, BAR, BarParams, CLAUDE_LIMIT, CLAUDE_QUOTA, CLAUDE_WINDOW, CODEX_QUOTA,
+    ClaudeLimitParams, ClaudeQuotaParams, ClaudeWindowParams, CodexQuotaParams, ErrorBody,
+    LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH,
+    MONITOR_START, MONITOR_STATUS, MONITOR_STOP, NotifyParams, Outcome, REVIEW_ACQUIRE,
+    REVIEW_QUOTA, Request, Response, ReviewRef, STATUS, SpawnParams, StatusParams, WAIT_CI,
+    WAIT_CLAUDE, WAIT_LEAD, WAIT_LEASE, WAIT_NOTIFY, WAIT_REVIEW, WaitCiParams, WaitCiResult,
+    WaitClaudeParams, WaitLeadParams, WaitLeaseParams, WaitReviewParams,
 };
 use crate::quotas::QuotaKeeper;
 use crate::reviews::Reviews;
@@ -73,6 +75,7 @@ struct Daemon {
     steward: Arc<Steward>,
     notifier: Arc<Notifier>,
     quotas: Arc<QuotaKeeper>,
+    fleet: Arc<Fleet>,
 }
 
 /// How long a stopping daemon gives the connections it holds to finish their requests.
@@ -107,7 +110,13 @@ pub fn run(json: bool) -> Result<(), Failure> {
     let quotas = Arc::new(QuotaKeeper::open(
         Store::open(&paths.database())?,
         Arc::new(AppServer::new()),
+        Arc::new(AgyUsageCli(AgyAuth::Subscription)),
     )?);
+    let fleet = Arc::new(Fleet::open(
+        crate::config::ci_watch(&paths),
+        Store::open(&paths.database())?,
+        GhActions::default(),
+    ));
     let steward = Steward::new(
         paths.clone(),
         Arc::clone(&leads),
@@ -168,11 +177,13 @@ pub fn run(json: bool) -> Result<(), Failure> {
         );
         tokio::spawn(Arc::clone(&leads).start());
         tokio::spawn(Arc::clone(&steward).resume());
+        tokio::spawn(Arc::clone(&fleet).run(pollers.watched()));
         let lab = Arc::new(lab);
         lab.recover();
         notifier.resume();
         lab.keep();
         lab.watch_phones();
+        lab.sweep_stacks();
         let daemon = Daemon {
             ledger,
             leads,
@@ -183,6 +194,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
             steward,
             notifier,
             quotas,
+            fleet,
         };
         serve([listener, live], Arc::new(daemon), stop).await;
         Ok(())
@@ -480,15 +492,30 @@ async fn respond(
                     &daemon.leads,
                     &daemon.steward,
                     &daemon.quotas,
+                    &daemon.fleet,
                 )
                 .await,
             ),
             Err(refused) => refused,
         },
+        AGY_QUOTA => answered(Ok::<_, Failure>(
+            daemon.quotas.agy(crate::quotas::AGY_QUERY).await,
+        )),
         BAR => match params::<BarParams>(BAR, request.params) {
-            Ok(params) => answered(Ok::<_, Failure>(
-                crate::bar::snapshot(&params, &daemon.leads, &daemon.steward, &daemon.quotas).await,
-            )),
+            Ok(params) => {
+                let lab = daemon.lab.bar().await;
+                answered(Ok::<_, Failure>(
+                    crate::bar::snapshot(
+                        &params,
+                        &daemon.leads,
+                        &daemon.steward,
+                        &daemon.quotas,
+                        &daemon.fleet,
+                        lab,
+                    )
+                    .await,
+                ))
+            }
             Err(refused) => refused,
         },
         LOG => {

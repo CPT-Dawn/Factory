@@ -87,6 +87,8 @@ pub use reserve::reserve;
 pub struct Lab {
     path: PathBuf,
     store: Mutex<Store>,
+    /// Reads that change nothing, beside the writes: what the bar and the sweeps look at.
+    reader: Mutex<store::Reader>,
     /// Bumped on every change a waiter could be waiting for.
     changed: watch::Sender<u64>,
     /// What `adb track-devices` showed last, and whether its stream still follows it.
@@ -112,6 +114,11 @@ pub struct Lab {
     watched: Mutex<HashSet<String>>,
     /// What the keeper is stopping because it idled; no grant hands it out meanwhile.
     stopping: Mutex<keeper::Stopping>,
+    /// Whether each slot's stack ran at the stack sweep's last look, by project and slot
+    /// ([`Lab::sweep_stacks`]): what the bar says of the stacks.
+    stacks: Mutex<BTreeMap<(String, u32), bool>>,
+    /// Wakes the stack sweep, once it runs: a change to the lab may have made or ended a slot.
+    sweep: OnceLock<mpsc::Sender<()>>,
     /// Tells the ledger's thread that events are queued: it alone appends them, so no lab
     /// call waits on the ledger (#62).
     wake: mpsc::Sender<()>,
@@ -173,6 +180,7 @@ fn lock_ignoring_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+mod bar;
 mod overview;
 
 type Answer<T> = Result<T, ErrorBody>;
@@ -181,6 +189,8 @@ impl Lab {
     pub fn open(path: &Path, ledger: Arc<Ledger>) -> Result<Lab, String> {
         let store =
             Store::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let read_only = store::Reader::open(path)
+            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         // The ledger's thread, on its own connection: it appends what the lab's transactions
         // queued, when told to and at least every few seconds, so a backlog an earlier daemon
         // left goes out too.
@@ -208,6 +218,7 @@ impl Lab {
         Ok(Lab {
             path: path.to_owned(),
             store: Mutex::new(store),
+            reader: Mutex::new(read_only),
             changed: watch::Sender::new(0),
             attached: watch::Sender::new(DeviceList::default()),
             tracking: Once::new(),
@@ -217,6 +228,8 @@ impl Lab {
             list_gate: Mutex::new(()),
             watched: Mutex::new(HashSet::new()),
             stopping: Mutex::new(keeper::Stopping::default()),
+            stacks: Mutex::new(BTreeMap::new()),
+            sweep: OnceLock::new(),
             callers: Mutex::new(HashSet::new()),
             wake,
         })
@@ -334,6 +347,17 @@ impl Lab {
         self.write_inner(false, work).map(|(out, _)| out)
     }
 
+    /// One read transaction, on a connection of its own: it waits for no write and drops
+    /// nothing, so what only looks at the lab (the bar, the sweeps) changes none of it.
+    fn read<T>(&self, work: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Answer<T> {
+        lock_ignoring_poison(&self.reader)
+            .read(work)
+            .map_err(|e| ErrorBody {
+                code: Exit::Precondition.code(),
+                message: format!("lab store {}: {e}; retry", self.path.display()),
+            })
+    }
+
     /// [`Lab::write`], and a line for each lease this very write dropped because its owner
     /// exited, and for each reservation dropped since the last such call: what `devlab gc`
     /// reports. A lease the keeper dropped earlier is not told again. A reservation is freed by
@@ -443,6 +467,9 @@ impl Lab {
 
     fn notify(&self) {
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
+        if let Some(sweep) = self.sweep.get() {
+            let _ = sweep.send(());
+        }
     }
 
     /// Gives lease `lease` back whole, its devices as they are now, and ends request `waiter`:

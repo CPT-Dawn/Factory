@@ -133,6 +133,8 @@ pub enum QuotaCommand {
     Claude,
     /// The Codex plan's 5-hour and weekly windows: dispatch (exit 0) or hold reviews until the holding one resets (exit 75)
     Codex,
+    /// agy's quota groups and their 5-hour and weekly windows, or why its usage can't be read
+    Agy,
 }
 
 #[derive(Subcommand, Debug)]

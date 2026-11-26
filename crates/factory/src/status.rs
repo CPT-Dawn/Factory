@@ -4,21 +4,23 @@
 //! answers from its own state: the lease store, the router's quotas, the Claude plan's quota, the picture of the leads, the
 //! wait registry and the context steward's table. No call to adb, docker or herdr is made.
 
+use std::sync::Arc;
+
 use factory_core::status::{self, Status};
 use serde_json::json;
 
 use crate::client;
 use crate::config;
+use crate::fleet::Fleet;
 use crate::lab::service::Lab;
 use crate::leads::Leads;
 use crate::output::{Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{BackendSlots, LeadContext, STATUS, StatusParams};
-use crate::quotas::QuotaKeeper;
+use crate::quotas::{AGY_GLANCE, QuotaKeeper};
 use crate::router::Router;
 use crate::steward::Steward;
 use factory_core::quota::WhenBusy;
-use std::sync::Arc;
 
 pub fn run() -> Result<Done, Failure> {
     let paths = Paths::from_env()?;
@@ -59,21 +61,25 @@ pub async fn gather(
     leads: &Leads,
     steward: &Steward,
     quotas: &Arc<QuotaKeeper>,
+    fleet: &Fleet,
 ) -> Result<Status, Failure> {
     let now = crate::clock::now();
     let lab = lab
         .overview()
         .await
         .map_err(|e| Failure::precondition(e.message))?;
-    let codex = quotas.codex(&params.codex).await;
+    // Both looks wait at once, so their patience together stays under the client's.
+    let (codex, agy) = tokio::join!(quotas.codex(&params.codex), quotas.agy(AGY_GLANCE));
     Ok(Status {
         now: now.unix_millis(),
         lab,
         review: router.snapshot(&params.backends, now, &codex),
         claude: quotas.claude(params.claude_hold_at),
         codex,
+        agy,
         waits: leads.registered(),
         leads: leads_seen(leads, steward),
+        ci: fleet.snapshot(),
     })
 }
 

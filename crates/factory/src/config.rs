@@ -23,7 +23,8 @@
 //! for a slot on the chain's last.
 //!
 //! Its `[ci]` table sets how often a wait on CI polls GitHub when it can't listen for events,
-//! and its `[monitor]` table the context steward's thresholds.
+//! and which repos' runner fleets, jobs and open `factory/*` pull requests the daemon watches
+//! for the status screen and the bar; its `[monitor]` table the context steward's thresholds.
 //! Its `[codex]` table sets `hold_at_percent` (default 90), the share of Codex's 5-hour or weekly
 //! window from which reviews hold off Codex, and `timeout_seconds` (default 20), how long its
 //! `app-server` may take to give the windows.
@@ -33,6 +34,8 @@
 //! ```toml
 //! [ci]
 //! poll = "30s"             # a duration: 90s, 9m, 2h
+//! repos = ["owner/name"]   # on github.com; read every 60s, only while something needs watching
+//! expected = 7             # self-hosted runners the owner runs across those repos
 //!
 //! [monitor]
 //! ask = 300000             # context at which an idle lead is asked to stop, then compacted
@@ -234,6 +237,37 @@ struct MonitorSection {
 #[serde(deny_unknown_fields)]
 struct CiSection {
     poll: Option<String>,
+    #[serde(default)]
+    repos: Vec<String>,
+    expected: Option<u32>,
+}
+
+/// The repos whose CI the daemon watches, and the runners the owner expects across them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CiWatch {
+    pub repos: Vec<String>,
+    pub expected: u32,
+}
+
+/// The `[ci]` repos to watch; none without the file.
+pub fn ci_watch(paths: &Paths) -> Result<CiWatch, Failure> {
+    let (path, file) = load_config(paths)?;
+    let mut repos: Vec<String> = Vec::new();
+    for repo in file.ci.repos {
+        if !factory_core::fleet::is_repo(&repo) {
+            return Err(Failure::precondition(format!(
+                "{}: ci.repos: {repo:?} is not owner/name; fix the config",
+                path.display()
+            )));
+        }
+        if !repos.contains(&repo) {
+            repos.push(repo);
+        }
+    }
+    Ok(CiWatch {
+        repos,
+        expected: file.ci.expected.unwrap_or(0),
+    })
 }
 
 /// The file as the hooks read it: `[hook]` alone, so a mistake in `[review]` cannot stop a

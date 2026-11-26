@@ -1,5 +1,5 @@
 //! Phones readied on plug-in, watched, announced and checked (#55): the daemon preps a phone
-//! when adb's stream first shows it and after every replug, probes each attached phone every
+//! when adb's stream first shows it and after every replug, probes each free phone every
 //! `readinessCheckSec`, posts one desktop notification per change of its readiness, and
 //! `devlab check` says per phone whether it can run unattended.
 

@@ -16,11 +16,12 @@ use serde_json::{Value, json};
 use crate::client::{self, ANSWER_TIMEOUT, Unanswered};
 use crate::clock;
 use crate::config;
+use crate::fleet::Fleet;
 use crate::leads::Leads;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{BAR, BarParams};
-use crate::quotas::QuotaKeeper;
+use crate::quotas::{AGY_GLANCE, QuotaKeeper};
 use crate::status;
 use crate::steward::Steward;
 
@@ -68,18 +69,25 @@ fn request() -> Result<(Paths, BarParams), Failure> {
 }
 
 /// The daemon's side: everything the bar shows, from memory but for a Codex reading older than
-/// 5 minutes, which is asked of Codex first.
+/// 5 minutes, which is asked of Codex first, and agy's last reading (its usage is asked at most
+/// every five minutes). Neither is waited on for long, and both are waited on at once.
 pub async fn snapshot(
     params: &BarParams,
     leads: &Leads,
     steward: &Steward,
     quotas: &Arc<QuotaKeeper>,
+    fleet: &Fleet,
+    lab: bar::lab::Lab,
 ) -> Snapshot {
+    let (codex, agy) = tokio::join!(quotas.codex(&params.codex), quotas.agy(AGY_GLANCE));
     Snapshot {
         now: clock::now().unix_millis(),
         claude: quotas.claude(params.claude_hold_at),
-        codex: quotas.codex(&params.codex).await,
+        codex,
+        agy,
         waits: leads.registered(),
         leads: status::leads_seen(leads, steward),
+        ci: fleet.snapshot(),
+        lab,
     }
 }

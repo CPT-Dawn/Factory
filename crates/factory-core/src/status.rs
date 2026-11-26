@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::lab::{ago, base_name};
 use crate::steward::kilo;
 use crate::timestamp::Timestamp;
-use crate::usage::UsageReading;
+use crate::usage::{QuotaGroup, UsageReading, WindowKind};
 
 /// Everything `factory status` shows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,8 +25,14 @@ pub struct Status {
     /// The Codex plan's windows, and whether a review may dispatch on it.
     #[serde(default)]
     pub codex: Codex,
+    /// agy's quota groups, each with its windows.
+    #[serde(default)]
+    pub agy: Agy,
     pub waits: Vec<Wait>,
     pub leads: Leads,
+    /// The watched repos' runner fleets, queued jobs and open factory pull requests.
+    #[serde(default)]
+    pub ci: crate::fleet::Ci,
 }
 
 /// The lab's leases, slots and queue.
@@ -174,6 +180,75 @@ impl Codex {
     }
 }
 
+/// What agy's usage query said when the daemon last asked it: each quota group's windows, or
+/// why the answer could not be read. Never a share it did not read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Agy {
+    /// Each quota group of the answer, with its 5-hour and weekly windows.
+    #[serde(default)]
+    pub groups: Vec<QuotaGroup>,
+    /// Why the answer could not be read: the query failed, or said nothing it could place.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// When the answer was read, in milliseconds since the epoch; none before the first.
+    #[serde(default)]
+    pub seen: Option<i64>,
+}
+
+impl Agy {
+    /// What agy's usage `answer` (its JSON, or why the query gave none) says, taken at `now`
+    /// (milliseconds since the epoch): its quota groups, or why it can't be read. An answer
+    /// that can't be read is a reading too, with no group in it.
+    pub fn read(answer: Result<String, String>, now: i64) -> Agy {
+        let seen = Some(now);
+        match answer.and_then(|usage| crate::quota::agy_groups(&usage)) {
+            Ok(groups) => Agy {
+                groups,
+                error: None,
+                seen,
+            },
+            Err(why) => Agy {
+                groups: Vec::new(),
+                error: Some(why),
+                seen,
+            },
+        }
+    }
+
+    /// Whether the reading was taken less than `within` milliseconds before `now`, and not
+    /// after it: none taken is never fresh, nor is one a clock that went back would keep.
+    pub fn fresh(&self, now: i64, within: i64) -> bool {
+        self.seen
+            .is_some_and(|seen| (0..within).contains(&(now - seen)))
+    }
+
+    /// `agy usage unreadable: <why>` while the answer can't be read.
+    pub fn problem(&self) -> Option<String> {
+        self.error
+            .as_ref()
+            .map(|error| format!("agy usage unreadable: {error}"))
+    }
+
+    /// The largest share any quota group has spent of its `window` at `now`, among those
+    /// that stand; none when none does.
+    pub fn worst_of(&self, window: WindowKind, now: i64) -> Option<u32> {
+        self.groups
+            .iter()
+            .flat_map(|group| &group.windows)
+            .filter(|reading| reading.window == window)
+            .filter_map(|reading| reading.used_percent(now))
+            .max()
+    }
+
+    /// The largest share of any window of any group that stands at `now`.
+    pub fn worst(&self, now: i64) -> Option<u32> {
+        [WindowKind::FiveHour, WindowKind::Weekly]
+            .into_iter()
+            .filter_map(|window| self.worst_of(window, now))
+            .max()
+    }
+}
+
 /// Whether a lead may dispatch on a harness's plan: the Claude plan's, and the Codex plan's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -240,8 +315,10 @@ pub const ROWS: usize = 24;
 pub const COLUMNS: usize = 80;
 
 /// The most rows each section lists before it says how many it left out. The lab the ticket
-/// names (three slots, three backends, five leads) takes at most 23 rows with every section at
-/// its cap, the Claude plan's row included.
+/// names (three slots, three backends, five leads) takes at most 24 rows with every section at
+/// its cap, the Claude plan's row and the CI row included, and agy's quota is one row more at
+/// most: the screen holds each group's worst window, and `factory quota agy` and the bar hold the
+/// rest.
 const LAB_ROWS: usize = 5;
 const QUEUE_ROWS: usize = 2;
 const WAIT_ROWS: usize = 3;
@@ -254,9 +331,18 @@ pub fn screen(status: &Status) -> Vec<String> {
     review(status, &mut rows);
     claude(status, &mut rows);
     codex(status, &mut rows);
+    ci(status, &mut rows);
+    agy(status, &mut rows);
     waits(status, &mut rows);
     leads(status, &mut rows);
     rows.iter().map(|row| fit(row)).collect()
+}
+
+/// One line, only when the owner watches repos' CI.
+fn ci(status: &Status, rows: &mut Vec<String>) {
+    if status.ci.shown() {
+        rows.push(format!("ci: {}", status.ci.summary(status.now)));
+    }
 }
 
 fn lab(status: &Status, rows: &mut Vec<String>) {
@@ -455,6 +541,28 @@ fn codex(status: &Status, rows: &mut Vec<String>) {
         (None, ..) => format!("codex: {}", windows.join(", ")),
     };
     rows.push(row);
+}
+
+fn agy(status: &Status, rows: &mut Vec<String>) {
+    let agy = &status.agy;
+    if let Some(problem) = agy.problem() {
+        rows.push(problem);
+    } else if agy.groups.is_empty() {
+        rows.push("agy: no reading yet".to_owned());
+    }
+    // One row, whatever the groups: the screen is full at 24 rows, and `factory quota agy` and
+    // the bar's card hold each window.
+    if !agy.groups.is_empty() {
+        let groups: Vec<String> = agy
+            .groups
+            .iter()
+            .map(|group| match group.worst(status.now) {
+                Some(used) => format!("{} {used}%", group.name),
+                None => format!("{} unknown", group.name),
+            })
+            .collect();
+        rows.push(format!("agy: {}", groups.join("; ")));
+    }
 }
 
 fn waits(status: &Status, rows: &mut Vec<String>) {
