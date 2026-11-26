@@ -243,7 +243,7 @@ impl Watcher {
                     self.frame(list);
                     self.sweep_usb();
                     // Its probes are written: a request waiting for a phone looks again.
-                    self.lab.notify();
+                    self.lab.notify_waiters();
                 }
                 // The next list's phones are all new to it: each free one is prepped and probed
                 // again, and the ones it showed are kept to tell a leased phone that stayed.
@@ -549,7 +549,7 @@ impl Watcher {
         }
         if changed {
             // A request waiting for a phone looks again.
-            self.lab.notify();
+            self.lab.notify_waiters();
         }
         Some(row)
     }

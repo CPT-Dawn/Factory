@@ -7,7 +7,10 @@ frame() { awk '{ printf "%s\t%s\n", $1, $2 }' "$w/devices"; }
 yank() {
   grep -qxF "$1" "$w/yanked" || return 1
   grep -vxF "$1" "$w/yanked" > "$w/yanked.new"; mv "$w/yanked.new" "$w/yanked"
-  awk -v s="$1" '$1 != s' "$w/devices" > "$w/devices.new"; mv "$w/devices.new" "$w/devices"
+  (
+    flock 9
+    awk -v s="$1" '$1 != s' "$w/devices" > "$w/devices.new"; mv "$w/devices.new" "$w/devices"
+  ) 9> "$w/devices.lock"
   n=0
   while [ "$n" -lt 200 ]; do
     now=$(cat "$w/devices") shown=1
@@ -99,15 +102,25 @@ track-devices)
     done
     exit 0 ;;
   emu)
-    # emu kill: the emulator saves its snapshot and exits, and its unit with it.
+    # emu kill: the emulator saves its snapshot and exits, and its unit with it. Adb forgets
+    # it first and the unit ends last: whoever sees the unit end (the daemon that stops an
+    # emulator waits for that) may start a new emulator on the serial at once, and one line of
+    # the world must not take the new one with it. Each file is changed under its lock, as
+    # the harness changes it.
     if [ "$2" = kill ]; then
       unit=$(awk -v p="${serial#emulator-}" '$2 == p { print $1 }' "$w/unit-ports" | tail -1)
+      (
+        flock 9
+        awk -v s="$serial" '$1 != s' "$w/devices" > "$w/devices.new"
+        mv "$w/devices.new" "$w/devices"
+      ) 9> "$w/devices.lock"
       if [ -n "$unit" ]; then
-        grep -vxF "$unit" "$w/units" > "$w/units.new"
-        mv "$w/units.new" "$w/units"
+        (
+          flock 9
+          grep -vxF "$unit" "$w/units" > "$w/units.new"
+          mv "$w/units.new" "$w/units"
+        ) 9> "$w/units.lock"
       fi
-      awk -v s="$serial" '$1 != s' "$w/devices" > "$w/devices.new"
-      mv "$w/devices.new" "$w/devices"
     fi
     exit 0 ;;
   reverse)

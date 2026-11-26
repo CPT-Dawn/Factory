@@ -340,7 +340,14 @@ fn two_phones_of_one_model_are_told_apart_by_the_end_of_their_serials() {
         ["Pixel 8 (NE01) ready", "Pixel 8 (NE02) ready"]
     );
     // Its twin gone, a phone keeps the name it had.
+    // Each change is waited for before the next: the unplug reaches the daemon by adb's stream
+    // and the lock by a probe, and the two are not told in the order they were made.
     world.apply("unplug FAKEPHONE02").unwrap();
+    assert!(
+        poll_until(|| summaries(&sandbox).len() == 5),
+        "{:?}",
+        summaries(&sandbox)
+    );
     world.apply("lock FAKEPHONE01").unwrap();
     assert!(
         poll_until(|| summaries(&sandbox).len() == 6),
