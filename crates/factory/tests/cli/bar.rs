@@ -270,29 +270,40 @@ fn a_live_socket_whose_backlog_is_full_keeps_the_hook_waiting_no_longer_than_its
     drop((queued, socket));
 }
 
-#[test]
-fn a_daemon_that_only_sends_notes_keeps_the_hook_no_longer_than_its_patience() {
-    // Every line in time, the answer never: the patience is one deadline, not one per line.
+/// A stand-in daemon on the live socket that takes the hook's call, then sends `reply` over and
+/// over and never an answer, until the hook hangs up; true once it got the request.
+fn chatter(sandbox: &Sandbox, reply: &'static [u8]) -> std::thread::JoinHandle<bool> {
     use std::io::{BufRead, BufReader, Write};
-    let sandbox = Sandbox::new();
+    let enough = std::time::Duration::from_secs(10);
     std::fs::create_dir_all(sandbox.path("run/factory")).unwrap();
     let socket =
         std::os::unix::net::UnixListener::bind(sandbox.path("run/factory/live.sock")).unwrap();
-    let chatter = std::thread::spawn(move || {
-        let (stream, _) = socket.accept().unwrap();
-        let mut request = String::new();
-        BufReader::new(&stream).read_line(&mut request).unwrap();
-        let begun = std::time::Instant::now();
-        while begun.elapsed() < std::time::Duration::from_secs(10) {
-            if (&stream)
-                .write_all(b"{\"id\":1,\"note\":\"busy\"}\n")
-                .is_err()
-            {
-                break;
-            }
+    socket.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let mut accepted = None;
+        if !poll_until(|| {
+            accepted = socket.accept().ok();
+            accepted.is_some()
+        }) {
+            return false;
         }
-    });
+        let Some((stream, _)) = accepted else {
+            return false;
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(enough)).unwrap();
+        stream.set_write_timeout(Some(enough)).unwrap();
+        let mut request = String::new();
+        if BufReader::new(&stream).read_line(&mut request).is_err() {
+            return false;
+        }
+        let begun = std::time::Instant::now();
+        while begun.elapsed() < enough && (&stream).write_all(reply).is_ok() {}
+        true
+    })
+}
 
+fn assert_the_hook_keeps_its_patience(sandbox: &Sandbox, daemon: std::thread::JoinHandle<bool>) {
     let begun = std::time::Instant::now();
     let hooked = sandbox.factory_stdin(
         &["hook", "statusline"],
@@ -305,8 +316,25 @@ fn a_daemon_that_only_sends_notes_keeps_the_hook_no_longer_than_its_patience() {
         (0, "", ""),
         "{hooked:?}"
     );
+    // The hook's patience is a second; the rest is the binary's start.
     assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
-    chatter.join().unwrap();
+    assert!(daemon.join().unwrap(), "the hook never sent its call");
+}
+
+#[test]
+fn a_daemon_that_only_sends_notes_keeps_the_hook_no_longer_than_its_patience() {
+    // Every line in time, the answer never: the patience is one deadline, not one per line.
+    let sandbox = Sandbox::new();
+    let daemon = chatter(&sandbox, b"{\"id\":1,\"note\":\"busy\"}\n");
+    assert_the_hook_keeps_its_patience(&sandbox, daemon);
+}
+
+#[test]
+fn a_reply_that_never_ends_its_line_keeps_the_hook_no_longer_than_its_patience() {
+    // Bytes in time, never a whole line: no socket read waits out a timeout.
+    let sandbox = Sandbox::new();
+    let daemon = chatter(&sandbox, &[b' '; 64]);
+    assert_the_hook_keeps_its_patience(&sandbox, daemon);
 }
 
 #[test]

@@ -280,9 +280,6 @@ pub struct Session {
     reader: BufReader<UnixStream>,
     paths: Paths,
     next_id: u64,
-    /// When set, the one moment by which an exchange ends, whatever the patience: each write
-    /// and read gets only the time left, however many notes come first.
-    deadline: Option<Instant>,
 }
 
 impl Session {
@@ -291,7 +288,6 @@ impl Session {
             reader: BufReader::new(connect(paths)?),
             paths: paths.clone(),
             next_id: 1,
-            deadline: None,
         })
     }
 
@@ -388,46 +384,27 @@ impl Session {
         self.next_id += 1;
         let mut line = serde_json::to_string(&request).map_err(|e| refused(&e))?;
         line.push('\n');
-        let silent = || {
-            Ended::Silent(Failure::new(
-                impatient,
-                format!(
-                    "the daemon did not answer within {}s; see {}",
-                    patience.unwrap_or_default().as_secs(),
-                    paths.daemon_log().display()
-                ),
-            ))
-        };
-        // Without a deadline each line gets the whole patience; with one, only the time left.
-        let deadline = self.deadline;
-        let allowance = || match deadline {
-            None => Ok(patience),
-            Some(deadline) => Some(deadline.saturating_duration_since(Instant::now()))
-                .filter(|left| !left.is_zero())
-                .map(Some)
-                .ok_or_else(silent),
-        };
         let stream = self.reader.get_ref();
-        // A daemon that stops reading fills the socket's buffer, and a write would wait for room.
-        stream
-            .set_write_timeout(allowance()?)
+        (&*stream)
+            .write_all(line.as_bytes())
             .map_err(|e| lost(&e))?;
-        match (&*stream).write_all(line.as_bytes()) {
-            Ok(()) => {}
-            Err(e) if is_timeout(&e) => return Err(silent()),
-            Err(e) => return Err(lost(&e)),
-        }
-        // Notes may come before the answer.
+        stream.set_read_timeout(patience).map_err(|e| lost(&e))?;
+        // Notes may come before the answer; each line gets the whole patience.
         loop {
             let mut answer = String::new();
-            self.reader
-                .get_ref()
-                .set_read_timeout(allowance()?)
-                .map_err(|e| lost(&e))?;
             match self.reader.read_line(&mut answer) {
                 Ok(0) => return Err(lost(&"it closed the connection without answering")),
                 Ok(_) => {}
-                Err(e) if is_timeout(&e) => return Err(silent()),
+                Err(e) if is_timeout(&e) => {
+                    return Err(Ended::Silent(Failure::new(
+                        impatient,
+                        format!(
+                            "the daemon did not answer within {}s; see {}",
+                            patience.unwrap_or_default().as_secs(),
+                            paths.daemon_log().display()
+                        ),
+                    )));
+                }
                 Err(e) => return Err(lost(&e)),
             }
             let response: Response = serde_json::from_str(&answer).map_err(|e| refused(&e))?;
@@ -463,41 +440,54 @@ pub enum Unanswered {
 }
 
 /// Sends a request to a daemon that is already running, and never starts one, giving up with exit
-/// 3 once `patience` has passed since the connect began, one deadline across the connect, the
-/// write and every line read: for the callers that must stay fast and leave nothing behind, the
-/// status-line hook and the bar. It calls on the live socket, the one the running daemon binds
-/// itself: a call on systemd's, with the service stopped, would start the daemon.
-pub fn call_running<P: Serialize, R: DeserializeOwned>(
+/// 3 once `patience` has passed: for the callers that must stay fast and leave nothing behind,
+/// the status-line hook and the bar. It calls on the live socket, the one the running daemon
+/// binds itself: a call on systemd's, with the service stopped, would start the daemon.
+///
+/// The whole call, connect to answer, runs on a thread of its own, and the caller waits for it
+/// only until the patience is up: a daemon too busy to accept, or one that answers a byte at a
+/// time, holds the caller no longer. A call given up on is left to its thread, which goes with
+/// the process: the hook and the bar exit straight after.
+pub fn call_running<P: Serialize, R: DeserializeOwned + Send + 'static>(
     paths: &Paths,
     method: &str,
     params: &P,
     patience: Duration,
 ) -> Result<R, Unanswered> {
-    let deadline = Instant::now() + patience;
+    let params = serde_json::to_value(params).map_err(|e| {
+        Unanswered::Refused(Failure::precondition(format!("cannot send {method}: {e}")))
+    })?;
+    let (paths, method) = (paths.clone(), method.to_owned());
     let socket = paths.live_socket();
-    let down = |reason: &dyn std::fmt::Display| {
-        Unanswered::Down(Failure::precondition(format!(
-            "daemon unreachable at {}: {reason}; factory status starts it",
-            socket.display()
-        )))
-    };
-    // A daemon too busy to accept leaves a full backlog, and a connect would wait there for room.
-    let stream = within(patience, {
-        let socket = socket.clone();
-        move || UnixStream::connect(socket)
+    within(patience, move || {
+        call_live(&paths, &method, &params, patience)
     })
-    .ok_or_else(|| {
-        down(&format_args!(
-            "it did not accept within {}s",
+    .unwrap_or_else(|| {
+        Err(Unanswered::Down(Failure::precondition(format!(
+            "the daemon at {} did not answer within {}s",
+            socket.display(),
             patience.as_secs()
-        ))
-    })?
-    .map_err(|e| down(&e))?;
+        ))))
+    })
+}
+
+/// [`call_running`]'s call, connect to answer, with no bound of its own on the connect.
+fn call_live<R: DeserializeOwned>(
+    paths: &Paths,
+    method: &str,
+    params: &serde_json::Value,
+    patience: Duration,
+) -> Result<R, Unanswered> {
+    let stream = UnixStream::connect(paths.live_socket()).map_err(|e| {
+        Unanswered::Down(Failure::precondition(format!(
+            "daemon unreachable at {}: {e}; factory status starts it",
+            paths.live_socket().display()
+        )))
+    })?;
     let mut session = Session {
         reader: BufReader::new(stream),
         paths: paths.clone(),
         next_id: 1,
-        deadline: Some(deadline),
     };
     session
         .exchange_raw(
