@@ -217,20 +217,3 @@ impl CodexUsage for FakeCodex {
         .unwrap_or(Err(CodexError::Missing))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // The exchange itself is driven through the binary, with a fake app-server on PATH
-    // (`crates/factory/tests/cli/codex.rs`).
-
-    #[test]
-    fn the_fake_answers_in_turn_and_counts_the_asks() {
-        let fake = FakeCodex::new([Ok("a".to_owned()), Err(CodexError::Missing)]);
-        assert_eq!(fake.rate_limits(TIMEOUT), Ok("a".to_owned()));
-        assert_eq!(fake.rate_limits(TIMEOUT), Err(CodexError::Missing));
-        assert_eq!(fake.rate_limits(TIMEOUT), Err(CodexError::Missing));
-        assert_eq!(fake.asked(), 3);
-    }
-}

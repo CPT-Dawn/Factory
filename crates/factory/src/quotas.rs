@@ -166,26 +166,32 @@ impl QuotaKeeper {
         let usage = Arc::clone(&self.codex_usage);
         let answer = tokio::task::spawn_blocking(move || usage.rate_limits(timeout)).await;
         let now = clock::now();
-        let mut next = lock(&self.codex).clone();
-        match answer {
-            Ok(Ok(reply)) => match codex::read_usage(&reply, now) {
-                Ok(read) => next.see(read, now),
-                Err(why) => next.fail(why, now),
-            },
-            Ok(Err(why)) => next.fail(why.to_string(), now),
-            Err(why) => next.fail(format!("its reader stopped: {why}"), now),
+        {
+            // The marker, the reading and its write are taken in the order `keep_codex` takes
+            // them, and held until the new reading is out: no look can write an older reading
+            // over it, or take the marker that says it is still to be written.
+            let mut unsaved = lock(&self.codex_unsaved);
+            let mut quota = lock(&self.codex);
+            let mut next = quota.clone();
+            match answer {
+                Ok(Ok(reply)) => match codex::read_usage(&reply, now) {
+                    Ok(read) => next.see(read, now),
+                    Err(why) => next.fail(why, now),
+                },
+                Ok(Err(why)) => next.fail(why.to_string(), now),
+                Err(why) => next.fail(format!("its reader stopped: {why}"), now),
+            }
+            // A reading that could not be kept still holds this run, and says so beside it: the
+            // next look writes it again.
+            *unsaved = None;
+            if let Err(e) = lock(&self.store).set_codex_quota(&next) {
+                *unsaved = Some(next.unreadable.take());
+                next.unreadable = Some(format!(
+                    "its reading could not be kept: {e}; check the disk and FACTORY_STATE"
+                ));
+            }
+            *quota = next;
         }
-        // A reading that could not be kept still holds this run, and says so beside it: the next
-        // look writes it again.
-        let kept = lock(&self.store).set_codex_quota(&next);
-        *lock(&self.codex_unsaved) = None;
-        if let Err(e) = kept {
-            *lock(&self.codex_unsaved) = Some(next.unreadable.take());
-            next.unreadable = Some(format!(
-                "its reading could not be kept: {e}; check the disk and FACTORY_STATE"
-            ));
-        }
-        *lock(&self.codex) = next;
         *lock(&self.codex_asking) = false;
         self.codex_asked.notify_waiters();
     }

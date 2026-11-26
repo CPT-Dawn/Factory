@@ -280,10 +280,29 @@ pub(crate) fn gate(sandbox: &Sandbox) -> std::path::PathBuf {
     gate
 }
 
-/// Lets one waiting fake through `gate`, blocking until one opens it. Open it again only
-/// once the next fake waits, as the last one may still hold it open.
+/// Lets one waiting fake through `gate` once it waits there, for up to [`support::DEADLINE`]:
+/// a fake that never comes fails the test instead of hanging it. Open it again only once the
+/// next fake waits, as the last one may still hold it open.
 pub(crate) fn open(gate: &std::path::Path) {
-    fs::write(gate, "go\n").unwrap_or_default();
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Without a reader, a FIFO refuses a writer that will not wait (ENXIO), so each try returns.
+    let nonblock = i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).unwrap_or_default();
+    let mut writer = None;
+    let waited = world::poll_until(|| {
+        writer = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nonblock)
+            .open(gate)
+            .ok();
+        writer.is_some()
+    });
+    assert!(waited, "no fake waited at {gate:?}");
+    let written = writer.map(|mut writer| writer.write_all(b"go\n"));
+    assert!(
+        matches!(written, Some(Ok(()))),
+        "the gate {gate:?} took no go: {written:?}"
+    );
 }
 
 fn codex_log(sandbox: &Sandbox) -> Vec<String> {

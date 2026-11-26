@@ -170,6 +170,7 @@ impl Store {
              ",
             )
             .map_err(cannot)?;
+        add_codex_asked_column(&migration).map_err(cannot)?;
         if version < VERSION {
             add_weekly_columns(&migration).map_err(cannot)?;
             migration
@@ -405,6 +406,24 @@ fn add_weekly_columns(db: &Connection) -> rusqlite::Result<()> {
                 "ALTER TABLE claude_quota ADD COLUMN {name} {kind};"
             ))?;
         }
+    }
+    Ok(())
+}
+
+/// `codex_quota.asked_ms`, on a table an earlier build made without it (at this same schema):
+/// the last ask is taken to be the last window it saw, so a restart soon after it asks nothing.
+fn add_codex_asked_column(db: &Connection) -> rusqlite::Result<()> {
+    let present: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('codex_quota') WHERE name = 'asked_ms'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        db.execute_batch(
+            "ALTER TABLE codex_quota ADD COLUMN asked_ms INTEGER;
+             UPDATE codex_quota
+                 SET asked_ms = NULLIF(MAX(COALESCE(seen_ms, 0), COALESCE(weekly_seen_ms, 0)), 0);",
+        )?;
     }
     Ok(())
 }

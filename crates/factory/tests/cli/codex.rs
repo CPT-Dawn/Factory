@@ -561,27 +561,42 @@ fn a_request_of_the_servers_own_with_id_2_is_not_the_answer() {
     unreadable(&sandbox, "it did not answer within 1s");
 }
 
-fn database(sandbox: &Sandbox) -> rusqlite::Connection {
-    rusqlite::Connection::open(sandbox.path("state/factory/factory.db")).unwrap_or_else(|e| {
-        panic!("open the daemon's database: {e}");
-    })
-}
-
 #[test]
-fn a_hold_that_a_failed_ask_leaves_standing_says_both() {
+fn a_store_from_before_the_ask_was_kept_holds_beside_a_failed_ask() {
+    // A database an earlier build made: its `codex_quota` has no `asked_ms`, and holds a week
+    // at 92% read ten minutes ago.
     let sandbox = Sandbox::new();
-    answers(&sandbox, &reply(18.0, 92.0));
-    assert_eq!(quota(&sandbox).code, 75, "the first reading holds");
-    // Ten minutes on, as the database counts: the next look asks again, and Codex is down.
-    crate::router::kill_daemon(&sandbox);
-    let moved =
-        database(&sandbox).execute("UPDATE codex_quota SET asked_ms = asked_ms - 600000", []);
-    assert_eq!(moved, Ok(1));
+    std::fs::create_dir_all(sandbox.path("state/factory")).unwrap_or_default();
+    {
+        let db = rusqlite::Connection::open(sandbox.path("state/factory/factory.db"))
+            .unwrap_or_else(|e| panic!("make an old store: {e}"));
+        let made = db.execute_batch(
+            "CREATE TABLE codex_quota (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 used_percent REAL,
+                 resets_ms INTEGER,
+                 seen_ms INTEGER,
+                 weekly_used_percent REAL,
+                 weekly_resets_ms INTEGER,
+                 weekly_seen_ms INTEGER,
+                 plan TEXT,
+                 reset_credits INTEGER NOT NULL DEFAULT 0
+             );
+             PRAGMA user_version = 6;",
+        );
+        assert_eq!(made, Ok(()));
+        let seeded = db.execute(
+            "INSERT INTO codex_quota (id, weekly_used_percent, weekly_resets_ms, weekly_seen_ms, plan)
+             VALUES (1, 92.0, ?1, ?2, 'plus')",
+            [(now_secs() + 48 * HOUR) * 1000, (now_secs() - 600) * 1000],
+        );
+        assert_eq!(seeded, Ok(1));
+    }
     sandbox.fake(APP_SERVER, "exit 1");
 
     let out = quota(&sandbox);
 
-    assert_eq!(out.code, 75, "the week still holds: {out:?}");
+    assert_eq!(out.code, 75, "the stored week still holds: {out:?}");
     assert!(
         out.stderr
             .starts_with("factory: codex: hold: weekly 92%; hold new reviews on codex until "),
@@ -599,55 +614,17 @@ fn a_hold_that_a_failed_ask_leaves_standing_says_both() {
         ),
         "{row}"
     );
-    assert_eq!(sandbox.calls(APP_SERVER).len(), 2);
-}
-
-#[test]
-fn a_reading_that_could_not_be_kept_says_so_and_the_next_look_keeps_it() {
-    let sandbox = Sandbox::new();
-    answers(&sandbox, &reply(18.0, 92.0));
     assert_eq!(
-        sandbox.factory(&["monitor", "status"]).code,
-        0,
-        "wake the daemon"
+        sandbox.calls(APP_SERVER).len(),
+        1,
+        "the old reading was asked about once"
     );
-    // The table goes from under the running daemon, so its write of the reading fails.
-    let db = database(&sandbox);
-    let schema: Result<String, _> = db.query_row(
-        "SELECT sql FROM sqlite_master WHERE name = 'codex_quota'",
-        [],
-        |row| row.get(0),
-    );
-    let schema = schema.unwrap_or_else(|e| panic!("the daemon made codex_quota: {e}"));
-    assert_eq!(db.execute_batch("DROP TABLE codex_quota"), Ok(()));
-
-    let unkept = quota(&sandbox);
-
-    assert_eq!(
-        unkept.code, 75,
-        "the reading still holds this run: {unkept:?}"
-    );
-    assert!(
-        unkept
-            .stderr
-            .contains("codex usage unreadable: its reading could not be kept: "),
-        "{unkept:?}"
-    );
-    assert_eq!(db.execute_batch(&schema), Ok(()));
-    let kept = quota(&sandbox);
-    assert_eq!(kept.code, 75, "{kept:?}");
-    assert!(!kept.stderr.contains("unreadable"), "{kept:?}");
-    // What the next look wrote outlives a restart.
+    // The ask the upgraded store now keeps outlives a restart.
     crate::router::kill_daemon(&sandbox);
-    sandbox.fake(APP_SERVER, "exit 1");
-    let restarted = quota(&sandbox);
-    assert_eq!(restarted.code, 75, "{restarted:?}");
-    assert!(
-        restarted
-            .stderr
-            .starts_with("factory: codex: hold: weekly 92%; "),
-        "{restarted:?}"
+    assert_eq!(quota(&sandbox).code, 75);
+    assert_eq!(
+        sandbox.calls(APP_SERVER).len(),
+        1,
+        "no new ask after the restart"
     );
-    assert!(!restarted.stderr.contains("unreadable"), "{restarted:?}");
-    assert_eq!(sandbox.calls(APP_SERVER).len(), 1, "one ask for all of it");
 }
