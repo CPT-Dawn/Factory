@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use factory_core::exit::Exit;
-use rustix::process::{Pid, Signal, kill_process_group, test_kill_process};
+use rustix::process::{Pid, Signal, kill_process_group};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -441,24 +441,18 @@ pub enum Unanswered {
 
 /// Sends a request to a daemon that is already running, and never starts one, giving up with exit
 /// 3 after `patience`: for the callers that must stay fast and leave nothing behind, the
-/// status-line hook and the bar. It connects only while the pid the daemon wrote is alive: a
-/// call on systemd's socket with the service stopped would start the daemon.
+/// status-line hook and the bar. It calls on the live socket, the one the running daemon binds
+/// itself: a call on systemd's, with the service stopped, would start the daemon.
 pub fn call_running<P: Serialize, R: DeserializeOwned>(
     paths: &Paths,
     method: &str,
     params: &P,
     patience: Duration,
 ) -> Result<R, Unanswered> {
-    if !daemon_alive(paths) {
-        return Err(Unanswered::Down(Failure::precondition(format!(
-            "no daemon runs ({} names no live process); factory status starts it",
-            paths.daemon_pid().display()
-        ))));
-    }
-    let stream = UnixStream::connect(paths.socket()).map_err(|e| {
+    let stream = UnixStream::connect(paths.live_socket()).map_err(|e| {
         Unanswered::Down(Failure::precondition(format!(
             "daemon unreachable at {}: {e}; factory status starts it",
-            paths.socket().display()
+            paths.live_socket().display()
         )))
     })?;
     let mut session = Session {
@@ -479,19 +473,6 @@ pub fn call_running<P: Serialize, R: DeserializeOwned>(
             Ended::Refused(failure) => Unanswered::Refused(failure),
             Ended::Silent(failure) | Ended::Lost(failure) => Unanswered::Down(failure),
         })
-}
-
-/// Whether the process the daemon's pid file names is alive. One that can't be signalled for
-/// want of permission is alive too.
-fn daemon_alive(paths: &Paths) -> bool {
-    let pid = fs::read_to_string(paths.daemon_pid())
-        .ok()
-        .and_then(|text| text.trim().parse::<i32>().ok())
-        .and_then(Pid::from_raw);
-    pid.is_some_and(|pid| match test_kill_process(pid) {
-        Ok(()) => true,
-        Err(e) => e == rustix::io::Errno::PERM,
-    })
 }
 
 /// Connects to the daemon, starting it first when nothing answers on the socket.

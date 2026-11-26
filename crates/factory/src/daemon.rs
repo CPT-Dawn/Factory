@@ -11,7 +11,7 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::net::UnixListener as StdListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -122,14 +122,14 @@ pub fn run(json: bool) -> Result<(), Failure> {
     })?;
     let listener = match activated {
         Some(listener) => listener,
-        None => bind(&paths)?,
+        None => bind(&paths.socket())?,
     };
-    listener.set_nonblocking(true).map_err(|e| {
-        Failure::precondition(format!(
-            "cannot listen on {}: {e}; retry",
-            paths.socket().display()
-        ))
-    })?;
+    let live = bind(&paths.live_socket())?;
+    for (listener, socket) in [(&listener, paths.socket()), (&live, paths.live_socket())] {
+        listener.set_nonblocking(true).map_err(|e| {
+            Failure::precondition(format!("cannot listen on {}: {e}; retry", socket.display()))
+        })?;
+    }
     let pid = std::process::id();
     fs::write(paths.daemon_pid(), format!("{pid}\n")).map_err(|e| {
         Failure::precondition(format!(
@@ -145,9 +145,13 @@ pub fn run(json: bool) -> Result<(), Failure> {
         })?;
     let socket = paths.socket();
     runtime.block_on(async {
-        let listener = UnixListener::from_std(listener).map_err(|e| {
-            Failure::precondition(format!("cannot listen on {}: {e}; retry", socket.display()))
-        })?;
+        let listen = |listener, socket: PathBuf| {
+            UnixListener::from_std(listener).map_err(|e| {
+                Failure::precondition(format!("cannot listen on {}: {e}; retry", socket.display()))
+            })
+        };
+        let listener = listen(listener, socket.clone())?;
+        let live = listen(live, paths.live_socket())?;
         // Before the ready line, so a stop that follows it drains, and a failure is the one line.
         let stop = stop_on_signal()?;
         // Ready only once requests can be answered, so this is the one line the daemon prints.
@@ -176,9 +180,11 @@ pub fn run(json: bool) -> Result<(), Failure> {
             notifier,
             quotas,
         };
-        serve(listener, Arc::new(daemon), stop).await;
+        serve([listener, live], Arc::new(daemon), stop).await;
         Ok(())
     })?;
+    // Nothing listens on it any more: a call there is refused, as with no daemon.
+    let _ = fs::remove_file(paths.live_socket());
     // Nothing is left to answer; the herdr watcher and any stray task may go.
     runtime.shutdown_timeout(Duration::from_secs(1));
     Ok(())
@@ -244,26 +250,27 @@ fn take_daemon_lock(paths: &Paths) -> Result<File, Failure> {
     }
 }
 
-/// Binds the socket, replacing one a dead daemon left behind (the daemon lock says none runs).
-fn bind(paths: &Paths) -> Result<StdListener, Failure> {
-    let socket = paths.socket();
+/// Binds `socket`, replacing one a dead daemon left behind (the daemon lock says none runs).
+fn bind(socket: &Path) -> Result<StdListener, Failure> {
     let cannot = |e: io::Error| {
         Failure::precondition(format!(
             "cannot listen on {}: {e}; check XDG_RUNTIME_DIR (a socket path must be under 108 bytes)",
             socket.display()
         ))
     };
-    match fs::remove_file(&socket) {
+    match fs::remove_file(socket) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(cannot(e)),
     }
-    StdListener::bind(&socket).map_err(cannot)
+    StdListener::bind(socket).map_err(cannot)
 }
 
-/// Answers connections until the daemon is stopping, then lets the ones it took finish, for
-/// up to [`DRAIN_TIMEOUT`]. Connections it never took stay queued in the socket.
-async fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Stop) {
+/// Answers connections on both sockets, systemd's or its own and the live one, until the daemon
+/// is stopping, then lets the ones it took finish, for up to [`DRAIN_TIMEOUT`]. Connections it
+/// never took stay queued in the socket.
+async fn serve(listeners: [UnixListener; 2], daemon: Arc<Daemon>, stop: Stop) {
+    let [listener, live] = listeners;
     // The connections hear of the stop only once the listener is gone, so a call made after
     // a cut-short answer queues for the next daemon instead of in this one's closing backlog.
     let (hang_up, hung_up) = watch::channel(false);
@@ -281,10 +288,19 @@ async fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Stop) {
                     let _ = writeln!(io::stderr(), "factory: accept failed: {e}");
                 }
             },
+            accepted = live.accept() => match accepted {
+                Ok((stream, _)) => {
+                    connections.spawn(answer(stream, Arc::clone(&daemon), hung_up.clone()));
+                }
+                Err(e) => {
+                    let _ = writeln!(io::stderr(), "factory: accept failed: {e}");
+                }
+            },
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
     drop(listener);
+    drop(live);
     // Before the connections hear of it: the waits they hold stay for the next daemon.
     daemon.leads.stop();
     let _ = hang_up.send(true);

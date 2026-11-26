@@ -134,6 +134,12 @@ impl Paths {
         self.runtime.join("factory.sock")
     }
 
+    /// The socket the running daemon binds itself, beside the one systemd may hold: a call here
+    /// reaches a daemon that runs, or nothing, and never makes systemd start one.
+    pub fn live_socket(&self) -> PathBuf {
+        self.runtime.join("factory.live.sock")
+    }
+
     /// Held by the running daemon for its whole life, so only one runs.
     pub fn daemon_lock(&self) -> PathBuf {
         self.runtime.join("daemon.lock")

@@ -214,14 +214,6 @@ fn a_socket_with_no_daemon_behind_it_is_left_alone() {
     let socket =
         std::os::unix::net::UnixListener::bind(sandbox.path("run/factory/factory.sock")).unwrap();
     socket.set_nonblocking(true).unwrap();
-    // A pid file a dead daemon left behind.
-    let mut gone = std::process::Command::new("true").spawn().unwrap();
-    gone.wait().unwrap();
-    std::fs::write(
-        sandbox.path("run/factory/daemon.pid"),
-        format!("{}\n", gone.id()),
-    )
-    .unwrap();
 
     let begun = std::time::Instant::now();
     let hooked = sandbox.factory_stdin(
