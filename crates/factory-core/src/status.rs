@@ -24,6 +24,9 @@ pub struct Status {
     pub claude: Claude,
     pub waits: Vec<Wait>,
     pub leads: Leads,
+    /// The watched repos' runner fleets, queued jobs and open factory pull requests.
+    #[serde(default)]
+    pub ci: crate::fleet::Ci,
 }
 
 /// The lab's leases, slots and queue.
@@ -221,9 +224,20 @@ pub fn screen(status: &Status) -> Vec<String> {
     lab(status, &mut rows);
     review(status, &mut rows);
     claude(status, &mut rows);
+    ci(status, &mut rows);
     waits(status, &mut rows);
     leads(status, &mut rows);
     rows.iter().map(|row| fit(row)).collect()
+}
+
+/// One line, only when the owner watches repos' CI.
+fn ci(status: &Status, rows: &mut Vec<String>) {
+    let ci = &status.ci;
+    if !ci.repos.is_empty() || ci.error.is_some() {
+        let (fleet, pulls) = ci.summary_lines(status.now);
+        rows.push(format!("ci: {fleet}"));
+        rows.extend(pulls.map(|pulls| format!("  {pulls}")));
+    }
 }
 
 fn lab(status: &Status, rows: &mut Vec<String>) {

@@ -13,6 +13,9 @@ mod bar;
 mod ci;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
+mod ci_fleet;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
 mod claude;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]

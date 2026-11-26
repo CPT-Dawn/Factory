@@ -44,6 +44,8 @@ pub struct Pollers<G: PullRequests = Gh> {
     gh: Arc<G>,
     paths: Paths,
     running: Mutex<HashMap<PullRequest, Weak<Poller>>>,
+    /// The pull request a wait last joined a poller on, for the CI watcher it wakes.
+    watched: watch::Sender<Option<PullRequest>>,
 }
 
 /// One pull request's poller; it stops when the last wait holding it drops it.
@@ -79,7 +81,13 @@ impl<G: PullRequests> Pollers<G> {
             gh: Arc::new(gh),
             paths,
             running: Mutex::new(HashMap::new()),
+            watched: watch::Sender::new(None),
         }
+    }
+
+    /// Hears each pull request a wait starts watching.
+    pub fn watched(&self) -> watch::Receiver<Option<PullRequest>> {
+        self.watched.subscribe()
     }
 
     /// Finds the pull request `pr` names from `cwd`, and joins its poller, starting one that
@@ -102,6 +110,7 @@ impl<G: PullRequests> Pollers<G> {
         let pr = PullRequest::from_url(&url).map_err(|e| {
             Failure::precondition(format!("gh pr view answered {e}; check gh's version"))
         })?;
+        self.watched.send_replace(Some(pr.clone()));
         let mut running = self
             .running
             .lock()

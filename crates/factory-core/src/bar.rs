@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::fleet::{Ci, Mark, PullState};
 use crate::status::{self, ClaudeState};
 use crate::timestamp::Timestamp;
 use crate::usage::{UsageReading, WindowKind};
@@ -24,6 +25,9 @@ pub struct Snapshot {
     pub claude: status::Claude,
     pub waits: Vec<status::Wait>,
     pub leads: status::Leads,
+    /// The watched repos' CI; none configured shows no CI chip or section.
+    #[serde(default)]
+    pub ci: crate::fleet::Ci,
 }
 
 /// A cockpit v1 document.
@@ -156,9 +160,140 @@ pub fn feed(snapshot: &Snapshot) -> Feed {
     Feed {
         version: VERSION,
         generated: stamp(snapshot.now),
-        glance: vec![claude_chip(snapshot), factory_chip(snapshot)],
-        sections: vec![claude_section(snapshot), factory_section(snapshot)],
+        glance: [
+            Some(claude_chip(snapshot)),
+            Some(factory_chip(snapshot)),
+            ci_chip(snapshot),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        sections: [
+            Some(claude_section(snapshot)),
+            Some(factory_section(snapshot)),
+            ci_section(snapshot),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
     }
+}
+
+/// Whether the owner configured repos to watch, or tried to: the CI chip and card show then.
+fn ci_shown(ci: &Ci) -> bool {
+    !ci.repos.is_empty() || ci.error.is_some()
+}
+
+/// `✓`, `✗`, `busy`, or `?` before GitHub answered.
+fn ci_mark_text(ci: &Ci) -> &'static str {
+    match ci.mark() {
+        Mark::Unknown => "?",
+        Mark::Failing => "✗",
+        Mark::Busy => "busy",
+        Mark::Passing => "✓",
+    }
+}
+
+fn ci_chip(snapshot: &Snapshot) -> Option<Chip> {
+    let ci = &snapshot.ci;
+    if !ci_shown(ci) {
+        return None;
+    }
+    let mark = ci.mark();
+    let (glyph, tone) = match mark {
+        Mark::Unknown => (glyph::CI_PASSING, Tone::Muted),
+        Mark::Failing => (glyph::CI_FAILING, Tone::Critical),
+        Mark::Busy => (glyph::CI_PASSING, Tone::Busy),
+        Mark::Passing => (glyph::CI_PASSING, Tone::Ok),
+    };
+    Some(Chip {
+        id: "ci".to_owned(),
+        label: glyph.char.to_string(),
+        text: ci_mark_text(ci).to_owned(),
+        tone,
+        tooltip: Some(format!("CI: {}", ci.summary(snapshot.now))),
+    })
+}
+
+/// Runners busy out of total, the queue and its oldest wait, and each open factory pull
+/// request with its link. A failed read keeps the last good numbers, marked stale.
+fn ci_section(snapshot: &Snapshot) -> Option<Section> {
+    let ci = &snapshot.ci;
+    if !ci_shown(ci) {
+        return None;
+    }
+    let mut rows = Vec::new();
+    if ci.answered() {
+        let tally = ci.tally();
+        let mut runners = format!("{}/{} busy", tally.busy, tally.total);
+        if tally.offline > 0 {
+            runners.push_str(&format!(", {} offline", tally.offline));
+        }
+        if tally.missing > 0 {
+            runners.push_str(&format!(", {} missing", tally.missing));
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let value = if tally.total == 0 {
+            0.0
+        } else {
+            tally.busy as f64 / tally.total as f64
+        };
+        rows.push(Row::Meter {
+            label: "runners".to_owned(),
+            value,
+            text: runners,
+            tone: if tally.offline + tally.missing > 0 {
+                Tone::Warn
+            } else if tally.busy > 0 {
+                Tone::Busy
+            } else {
+                Tone::Ok
+            },
+            until: None,
+        });
+        rows.push(match (tally.queued, tally.oldest) {
+            (0, _) => text("queued", "none".to_owned(), Tone::Muted),
+            (queued, oldest) => {
+                let mut jobs = plural(queued, "job");
+                if let Some(oldest) = oldest {
+                    jobs.push_str(&format!(
+                        ", oldest {}",
+                        crate::lab::ago(snapshot.now / 1000, oldest / 1000)
+                    ));
+                }
+                text("queued", jobs, Tone::Busy)
+            }
+        });
+        let pulls: Vec<Row> = ci
+            .repos
+            .iter()
+            .flat_map(|repo| {
+                let name = repo.repo.rsplit('/').next().unwrap_or(&repo.repo);
+                repo.pulls.iter().map(move |pull| Row::Text {
+                    label: format!("{name}#{}", pull.number),
+                    text: pull.state.word().to_owned(),
+                    tone: Some(match pull.state {
+                        PullState::Passing => Tone::Ok,
+                        PullState::Failing => Tone::Critical,
+                        PullState::Pending => Tone::Busy,
+                    }),
+                    url: Some(pull.url.clone()),
+                })
+            })
+            .collect();
+        if pulls.is_empty() {
+            rows.push(text("PRs", "no open factory PRs".to_owned(), Tone::Muted));
+        }
+        rows.extend(pulls);
+    }
+    Some(Section {
+        id: "ci".to_owned(),
+        title: "CI".to_owned(),
+        note: None,
+        error: ci.error(),
+        stale_since: ci.stale_since().map(stamp),
+        rows,
+    })
 }
 
 /// What `factory bar --json` prints when the daemon can't be asked: one critical chip.
@@ -184,8 +319,8 @@ pub fn daemon_down(reason: &str, now: i64) -> Feed {
     }
 }
 
-/// `claude 12/40 · 2 leads`: each window's share (5-hour/weekly, `?` while unknown), then
-/// the live leads (`? leads` while herdr can't tell).
+/// `claude 12/40 · 2 leads · CI ✓`: each window's share (5-hour/weekly, `?` while unknown),
+/// the live leads (`? leads` while herdr can't tell), then CI's mark when repos are watched.
 pub fn line(snapshot: &Snapshot) -> String {
     let claude = &snapshot.claude;
     let share = |kind| {
@@ -201,8 +336,13 @@ pub fn line(snapshot: &Snapshot) -> String {
     } else {
         plural(live(snapshot).count(), "lead")
     };
+    let ci = if ci_shown(&snapshot.ci) {
+        format!(" · CI {}", ci_mark_text(&snapshot.ci))
+    } else {
+        String::new()
+    };
     format!(
-        "claude {}/{} · {leads}",
+        "claude {}/{} · {leads}{ci}",
         share(WindowKind::FiveHour),
         share(WindowKind::Weekly),
     )

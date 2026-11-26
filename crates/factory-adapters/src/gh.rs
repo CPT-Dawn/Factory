@@ -7,6 +7,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use factory_core::ci::{CheckRun, PullRequest};
+use factory_core::fleet::{Job, Runner, RunnerState};
+use factory_core::timestamp::Timestamp;
 use rustix::process::{Pid, Signal, kill_process_group};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -172,12 +174,12 @@ impl Gh {
     /// [`Fetched::NotModified`] on a 304 (which gh exits 1 on).
     fn conditional(
         &self,
-        pr: &PullRequest,
+        host: &str,
         path: &str,
         etag: Option<&str>,
     ) -> Result<Fetched<Value>, GhError> {
         let mut cmd = Command::new("gh");
-        cmd.args(["api", "--hostname", &pr.host, "-i"]);
+        cmd.args(["api", "--hostname", host, "-i"]);
         if let Some(etag) = etag {
             cmd.arg("-H").arg(format!("If-None-Match: {etag}"));
         }
@@ -208,12 +210,12 @@ impl Gh {
     /// whole.
     fn paged(
         &self,
-        pr: &PullRequest,
+        host: &str,
         path: &str,
         list: &str,
         etag: Option<&str>,
     ) -> Result<Fetched<Vec<Value>>, GhError> {
-        let (mut etag, page) = match self.conditional(pr, path, etag)? {
+        let (mut etag, page) = match self.conditional(host, path, etag)? {
             Fetched::NotModified => return Ok(Fetched::NotModified),
             Fetched::Fresh { etag, value } => (etag, value),
         };
@@ -226,7 +228,7 @@ impl Gh {
         while all.len() < total {
             number += 1;
             etag = None;
-            let more = match self.conditional(pr, &format!("{path}&page={number}"), None)? {
+            let more = match self.conditional(host, &format!("{path}&page={number}"), None)? {
                 Fetched::Fresh { value, .. } => entries(&value, list),
                 Fetched::NotModified => Vec::new(),
             };
@@ -256,7 +258,7 @@ impl PullRequests for Gh {
 
     fn head(&self, pr: &PullRequest, etag: Option<&str>) -> Result<Fetched<String>, GhError> {
         let path = format!("repos/{}/{}/pulls/{}", pr.owner, pr.repo, pr.number);
-        match self.conditional(pr, &path, etag)? {
+        match self.conditional(&pr.host, &path, etag)? {
             Fetched::NotModified => Ok(Fetched::NotModified),
             Fetched::Fresh { etag, value } => {
                 let head = value["head"]["sha"]
@@ -280,7 +282,7 @@ impl PullRequests for Gh {
             "repos/{}/{}/commits/{head}/check-runs?per_page={PAGE}",
             pr.owner, pr.repo
         );
-        Ok(match self.paged(pr, &path, "check_runs", etag)? {
+        Ok(match self.paged(&pr.host, &path, "check_runs", etag)? {
             Fetched::NotModified => Fetched::NotModified,
             Fetched::Fresh { etag, value } => Fetched::Fresh {
                 etag,
@@ -299,7 +301,7 @@ impl PullRequests for Gh {
             "repos/{}/{}/commits/{head}/status?per_page={PAGE}",
             pr.owner, pr.repo
         );
-        Ok(match self.paged(pr, &path, "statuses", etag)? {
+        Ok(match self.paged(&pr.host, &path, "statuses", etag)? {
             Fetched::NotModified => Fetched::NotModified,
             Fetched::Fresh { etag, value } => Fetched::Fresh {
                 etag,
@@ -461,6 +463,231 @@ fn failed(stderr: &[u8]) -> GhError {
             .trim()
             .to_owned(),
     )
+}
+
+/// The host the CI watcher reads its repos on.
+pub const HOST: &str = "github.com";
+
+/// An open pull request: its number, branch, head commit and where a person reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenPull {
+    pub number: u64,
+    pub branch: String,
+    pub head: String,
+    pub url: String,
+}
+
+/// What the CI watcher reads of a repo (`owner/name` on [`HOST`]): its self-hosted runners,
+/// its workflow runs and their jobs, and its open pull requests' checks.
+pub trait Actions: Send + Sync + 'static {
+    fn runners(&self, repo: &str) -> Result<Vec<Runner>, GhError>;
+    /// The ids of the workflow runs queued or in progress.
+    fn active_runs(&self, repo: &str) -> Result<Vec<u64>, GhError>;
+    /// The latest attempt's jobs of the workflow run `run`.
+    fn jobs(&self, repo: &str, run: u64) -> Result<Vec<Job>, GhError>;
+    fn open_pulls(&self, repo: &str) -> Result<Vec<OpenPull>, GhError>;
+    /// The check runs and commit statuses on the pull request's head.
+    fn checks(&self, repo: &str, pull: &OpenPull) -> Result<Vec<CheckRun>, GhError>;
+}
+
+impl Actions for Gh {
+    fn runners(&self, repo: &str) -> Result<Vec<Runner>, GhError> {
+        let path = format!("repos/{repo}/actions/runners?per_page={PAGE}");
+        Ok(fresh_list(self.paged(HOST, &path, "runners", None)?)
+            .iter()
+            .filter_map(runner)
+            .collect())
+    }
+
+    fn active_runs(&self, repo: &str) -> Result<Vec<u64>, GhError> {
+        let mut ids = Vec::new();
+        for status in ["queued", "in_progress"] {
+            let path = format!("repos/{repo}/actions/runs?status={status}&per_page={PAGE}");
+            let runs = fresh_list(self.paged(HOST, &path, "workflow_runs", None)?);
+            ids.extend(runs.iter().filter_map(|run| run["id"].as_u64()));
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    fn jobs(&self, repo: &str, run: u64) -> Result<Vec<Job>, GhError> {
+        let path = format!("repos/{repo}/actions/runs/{run}/jobs?filter=latest&per_page={PAGE}");
+        Ok(fresh_list(self.paged(HOST, &path, "jobs", None)?)
+            .iter()
+            .filter_map(|value| job(value, run))
+            .collect())
+    }
+
+    fn open_pulls(&self, repo: &str) -> Result<Vec<OpenPull>, GhError> {
+        let mut pulls = Vec::new();
+        for number in 1.. {
+            let path = format!("repos/{repo}/pulls?state=open&per_page={PAGE}&page={number}");
+            let page = match self.conditional(HOST, &path, None)? {
+                Fetched::Fresh { value, .. } => value.as_array().cloned().unwrap_or_default(),
+                Fetched::NotModified => Vec::new(),
+            };
+            pulls.extend(page.iter().filter_map(open_pull));
+            if page.len() < PAGE {
+                break;
+            }
+        }
+        Ok(pulls)
+    }
+
+    fn checks(&self, repo: &str, pull: &OpenPull) -> Result<Vec<CheckRun>, GhError> {
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| GhError(format!("{repo:?} is not owner/name")))?;
+        let pr = PullRequest {
+            host: HOST.to_owned(),
+            owner: owner.to_owned(),
+            repo: name.to_owned(),
+            number: pull.number,
+        };
+        let mut runs = fresh_list(self.check_runs(&pr, &pull.head, None)?);
+        runs.extend(fresh_list(self.statuses(&pr, &pull.head, None)?));
+        Ok(runs)
+    }
+}
+
+/// What a read sent without an ETag answered: a 304 can't come back, and counts as nothing.
+fn fresh_list<T>(fetched: Fetched<Vec<T>>) -> Vec<T> {
+    match fetched {
+        Fetched::Fresh { value, .. } => value,
+        Fetched::NotModified => Vec::new(),
+    }
+}
+
+/// One entry of a `runners` response; none when it lacks a field.
+fn runner(value: &Value) -> Option<Runner> {
+    Some(Runner {
+        id: value["id"].as_u64()?,
+        name: value["name"].as_str()?.to_owned(),
+        state: RunnerState::of(value["status"].as_str()?, value["busy"].as_bool()?),
+    })
+}
+
+/// One entry of a run's `jobs` response; none when it lacks a field. GitHub sets
+/// `started_at` on a job still queued, so it counts only once the job left the queue.
+fn job(value: &Value, run: u64) -> Option<Job> {
+    let time = |key: &str| {
+        value[key]
+            .as_str()
+            .and_then(Timestamp::parse)
+            .map(Timestamp::unix_millis)
+    };
+    let status = value["status"].as_str()?.to_owned();
+    let mut job = Job {
+        id: value["id"].as_u64()?,
+        run_id: value["run_id"].as_u64().unwrap_or(run),
+        name: value["name"].as_str()?.to_owned(),
+        status,
+        conclusion: value["conclusion"].as_str().map(str::to_owned),
+        runner: value["runner_name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned),
+        queued: time("created_at"),
+        started: time("started_at"),
+        finished: time("completed_at"),
+    };
+    if job.waiting() {
+        job.started = None;
+    }
+    if !job.completed() {
+        job.finished = None;
+    }
+    Some(job)
+}
+
+/// One entry of a `pulls` response; none when it lacks a field.
+fn open_pull(value: &Value) -> Option<OpenPull> {
+    Some(OpenPull {
+        number: value["number"].as_u64()?,
+        branch: value["head"]["ref"].as_str()?.to_owned(),
+        head: value["head"]["sha"].as_str()?.to_owned(),
+        url: value["html_url"].as_str()?.to_owned(),
+    })
+}
+
+/// A repo's CI held in memory, for tests of code that watches it.
+#[derive(Default)]
+pub struct FakeActions {
+    pub state: Mutex<FakeFleet>,
+}
+
+#[derive(Default)]
+pub struct FakeFleet {
+    pub runners: Vec<Runner>,
+    /// Each workflow run's id and jobs; a run counts as active while a job of it is not
+    /// completed.
+    pub runs: Vec<(u64, Vec<Job>)>,
+    /// Each open pull request and the runs on its head.
+    pub pulls: Vec<(OpenPull, Vec<CheckRun>)>,
+    /// What every read fails with, while set.
+    pub failing: Option<String>,
+    /// How many reads were made.
+    pub reads: u64,
+}
+
+impl FakeActions {
+    fn read(&self) -> Result<std::sync::MutexGuard<'_, FakeFleet>, GhError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.reads += 1;
+        match &state.failing {
+            Some(why) => Err(GhError(why.clone())),
+            None => Ok(state),
+        }
+    }
+}
+
+impl Actions for FakeActions {
+    fn runners(&self, _repo: &str) -> Result<Vec<Runner>, GhError> {
+        Ok(self.read()?.runners.clone())
+    }
+
+    fn active_runs(&self, _repo: &str) -> Result<Vec<u64>, GhError> {
+        Ok(self
+            .read()?
+            .runs
+            .iter()
+            .filter(|(_, jobs)| jobs.iter().any(|job| !job.completed()))
+            .map(|(id, _)| *id)
+            .collect())
+    }
+
+    fn jobs(&self, _repo: &str, run: u64) -> Result<Vec<Job>, GhError> {
+        Ok(self
+            .read()?
+            .runs
+            .iter()
+            .find(|(id, _)| *id == run)
+            .map(|(_, jobs)| jobs.clone())
+            .unwrap_or_default())
+    }
+
+    fn open_pulls(&self, _repo: &str) -> Result<Vec<OpenPull>, GhError> {
+        Ok(self
+            .read()?
+            .pulls
+            .iter()
+            .map(|(pull, _)| pull.clone())
+            .collect())
+    }
+
+    fn checks(&self, _repo: &str, pull: &OpenPull) -> Result<Vec<CheckRun>, GhError> {
+        Ok(self
+            .read()?
+            .pulls
+            .iter()
+            .find(|(open, _)| open.number == pull.number)
+            .map(|(_, runs)| runs.clone())
+            .unwrap_or_default())
+    }
 }
 
 /// A GitHub held in memory, for tests of code that waits on CI.

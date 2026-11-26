@@ -74,8 +74,9 @@ fn json_gives_every_field_of_every_section() {
     };
     assert_eq!(
         keys(&shown),
-        ["claude", "lab", "leads", "now", "review", "waits"]
+        ["ci", "claude", "lab", "leads", "now", "review", "waits"]
     );
+    assert_eq!(keys(&shown["ci"]), ["error", "expected", "repos"]);
     assert_eq!(
         keys(&shown["claude"]),
         [

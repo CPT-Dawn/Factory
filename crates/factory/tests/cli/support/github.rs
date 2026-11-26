@@ -6,6 +6,10 @@
 //! sends it back, as GitHub does) and on its commit statuses, `gh api` on a job's logs, and `gh event listen`, which
 //! refuses as an account without event subscriptions does unless a test scripts it. Each read
 //! of the check runs is logged with its time and status in `github/polls`.
+//!
+//! For the CI watcher it also serves the repo's self-hosted runners, its queued and running
+//! workflow runs, each run's jobs and its open pull requests, and can be made to fail those reads
+//! as GitHub or gh does (a 403, a rate limit, a timeout).
 
 use std::fs;
 use std::path::PathBuf;
@@ -23,6 +27,32 @@ pub const HEAD: &str = "c0ffee1234567890c0ffee1234567890c0ffee12";
 const NOT_ENABLED: &str = "event subscriptions are in preview and not enabled for this account: \
      HTTP 403: Event subscriptions are not enabled for this account \
      (https://api.github.com/event-subscriptions)";
+
+/// GitHub refusing a token that can't read the runners.
+pub const FORBIDDEN: &str =
+    "printf 'HTTP/2.0 403 Forbidden\\n\\n{\"message\":\"Resource not accessible by integration\"}'
+echo 'gh: Resource not accessible by integration (HTTP 403)' >&2
+exit 1";
+/// GitHub's primary rate limit, spent.
+pub const RATE_LIMITED: &str = "printf 'HTTP/2.0 403 Forbidden\\nX-Ratelimit-Remaining: 0\\n\\n{\"message\":\"API rate limit exceeded\"}'
+echo 'gh: API rate limit exceeded for user ID 1. (HTTP 403)' >&2
+exit 1";
+/// gh's own client giving up on GitHub.
+pub const TIMED_OUT: &str = "echo 'Get \"https://api.github.com/repos/acme/shop/actions/runners?per_page=100\": net/http: request canceled (Client.Timeout exceeded while awaiting headers)' >&2
+exit 1";
+
+/// One job of a workflow run, as GitHub's jobs API lists it.
+#[derive(Clone, Copy)]
+pub struct Job<'a> {
+    pub id: u64,
+    pub name: &'a str,
+    pub status: &'a str,
+    pub conclusion: Option<&'a str>,
+    pub created: &'a str,
+    pub started: Option<&'a str>,
+    pub completed: Option<&'a str>,
+    pub runner: Option<&'a str>,
+}
 
 /// A check run: `(id, name, status, conclusion, app)`.
 pub type Run<'a> = (u64, &'a str, &'a str, Option<&'a str>, &'a str);
@@ -49,8 +79,103 @@ impl FakeGitHub {
         github.push(HEAD);
         github.checks(&[]);
         github.statuses(&[]);
+        github.runners(&[]);
+        github.workflow_runs("queued", &[]);
+        github.workflow_runs("in_progress", &[]);
+        github.pulls(&[]);
+        github.put("no-jobs.json", &json!({"total_count": 0, "jobs": []}));
         sandbox.fake("gh", &script(&github.dir));
         github
+    }
+
+    /// Sets the repo's self-hosted runners, each `(id, name, status, busy)`.
+    pub fn runners(&self, runners: &[(u64, &str, &str, bool)]) {
+        let runners: Vec<Value> = runners
+            .iter()
+            .map(|(id, name, status, busy)| {
+                json!({"id": id, "name": name, "os": "Linux", "status": status, "busy": busy})
+            })
+            .collect();
+        self.put(
+            "runners.json",
+            &json!({"total_count": runners.len(), "runners": runners}),
+        );
+    }
+
+    /// Sets the ids of the repo's workflow runs whose status is `status` (`queued` or
+    /// `in_progress`).
+    pub fn workflow_runs(&self, status: &str, ids: &[u64]) {
+        let runs: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({"id": id, "status": status, "name": "CI"}))
+            .collect();
+        self.put(
+            &format!("runs-{status}.json"),
+            &json!({"total_count": runs.len(), "workflow_runs": runs}),
+        );
+    }
+
+    /// Sets the jobs of the workflow run `run`.
+    pub fn jobs(&self, run: u64, jobs: &[Job]) {
+        let jobs: Vec<Value> = jobs
+            .iter()
+            .map(|job| {
+                json!({
+                    "id": job.id,
+                    "run_id": run,
+                    "name": job.name,
+                    "status": job.status,
+                    "conclusion": job.conclusion,
+                    "created_at": job.created,
+                    "started_at": job.started,
+                    "completed_at": job.completed,
+                    "runner_name": job.runner,
+                    "html_url": format!("https://github.com/acme/shop/actions/runs/{run}/job/{}", job.id),
+                })
+            })
+            .collect();
+        self.put(
+            &format!("jobs-{run}.json"),
+            &json!({"total_count": jobs.len(), "jobs": jobs}),
+        );
+    }
+
+    /// Sets the repo's open pull requests, each `(number, branch)`, all at [`HEAD`].
+    pub fn pulls(&self, pulls: &[(u64, &str)]) {
+        let pulls: Vec<Value> = pulls
+            .iter()
+            .map(|(number, branch)| {
+                json!({
+                    "number": number,
+                    "state": "open",
+                    "html_url": format!("https://github.com/acme/shop/pull/{number}"),
+                    "head": {"ref": branch, "sha": HEAD},
+                })
+            })
+            .collect();
+        self.put("pulls.json", &Value::Array(pulls));
+    }
+
+    /// Makes every read of the runners, workflow runs, jobs and open pull requests fail: `body`
+    /// is shell run in their place, as [`FORBIDDEN`], [`RATE_LIMITED`] or [`TIMED_OUT`].
+    pub fn fail_actions(&self, body: &str) {
+        fs::write(self.dir.join("fail.sh"), body).expect("write the failure script");
+    }
+
+    /// Lets those reads answer again.
+    pub fn heal_actions(&self) {
+        fs::remove_file(self.dir.join("fail.sh")).expect("remove the failure script");
+    }
+
+    /// Every `gh api` path the fake was asked for that reads the runner fleet, workflow runs,
+    /// jobs or open pull requests: the CI watcher's reads, and no wait's.
+    pub fn watcher_reads(&self, sandbox: &Sandbox) -> Vec<String> {
+        sandbox
+            .calls("gh")
+            .into_iter()
+            .filter_map(|call| call.into_iter().find(|arg| arg.starts_with("repos/")))
+            .filter(|path| path.contains("/actions/run") || path.contains("/pulls?"))
+            .collect()
     }
 
     /// Moves the pull request's head to `sha`.
@@ -200,7 +325,18 @@ api)
         shift
     done
     case "$path" in
+    repos/acme/shop/actions/*|repos/acme/shop/pulls\?*)
+        if [ -f "$G/fail.sh" ]; then . "$G/fail.sh"; exit $?; fi ;;
+    esac
+    case "$path" in
     repos/acme/shop/pulls/12) file="$G/pull.json" ;;
+    repos/acme/shop/pulls\?*) file="$G/pulls.json" ;;
+    repos/acme/shop/actions/runners\?*) file="$G/runners.json" ;;
+    repos/acme/shop/actions/runs\?status=queued*) file="$G/runs-queued.json" ;;
+    repos/acme/shop/actions/runs\?status=in_progress*) file="$G/runs-in_progress.json" ;;
+    repos/acme/shop/actions/runs/*/jobs*)
+        id="${{path#repos/acme/shop/actions/runs/}}"; id="${{id%%/*}}"
+        file="$G/jobs-$id.json"; [ -f "$file" ] || file="$G/no-jobs.json" ;;
     repos/acme/shop/commits/*/check-runs*'&page='*) file="$G/checks-${{path##*&page=}}.json" ;;
     repos/acme/shop/commits/*/check-runs*) file="$G/checks.json" ;;
     repos/acme/shop/commits/*/status\?*) file="$G/status.json" ;;
