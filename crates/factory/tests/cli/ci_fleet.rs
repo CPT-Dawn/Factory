@@ -1,6 +1,6 @@
 //! The CI watcher: the daemon reads each configured repo's self-hosted runner fleet, its queued
 //! and running jobs and its open `factory/*` pull requests' checks, against a fake GitHub behind
-//! the fake `gh`, and only while something needs watching.
+//! the fake `gh`, once as the daemon starts and then only while something needs watching.
 
 use serde_json::{Value, json};
 
@@ -182,25 +182,39 @@ fn bar_ci(sandbox: &Sandbox) -> (Value, Value) {
 }
 
 #[test]
-fn an_idle_factory_costs_github_nothing_across_minutes_of_daemon_time() {
+fn an_idle_factory_reads_github_once_at_start_and_then_nothing_across_minutes() {
     let sandbox = watching(2);
     let github = FakeGitHub::install(&sandbox);
+    github.runners(&[(1, "ci-1", "online", false), (2, "ci-2", "online", false)]);
 
-    // The daemon runs, with no wait, no open factory pull request and no job: no read is due.
+    // The daemon reads each repo once as it starts, so the fleet shows on an idle night (#79).
+    let first = idle(&sandbox);
+    assert_eq!(
+        first["repos"][0]["runners"].as_array().map(Vec::len),
+        Some(2),
+        "{first}"
+    );
+    let (_, card) = bar_ci(&sandbox);
+    assert_eq!(card["rows"][0]["text"], "0/2 busy", "{card}");
+    let at_start = github.watcher_reads(&sandbox);
+    assert!(!at_start.is_empty());
+
+    // With no wait, no open factory pull request and no job, no read is due after that.
     for minutes in [1, 3, 10] {
         move_clock(&sandbox, minutes * 60);
-        let ci = status(&sandbox)["ci"].clone();
-        assert!(ci["next"].is_null(), "{ci}");
-        assert!(ci["repos"][0]["seen"].is_null(), "{ci}");
+        assert!(status(&sandbox)["ci"]["next"].is_null());
     }
-    assert_eq!(sandbox.calls("gh"), Vec::<Vec<String>>::new());
+    assert_eq!(github.watcher_reads(&sandbox), at_start);
 
     // A wait on a pull request no longer open wakes one read, which finds nothing to watch.
     github.checks(&[(1, "test", "completed", Some("success"))]);
     assert_eq!(sandbox.factory(&["wait", "ci", "12"]).code, 0);
+    assert!(
+        poll_until(|| github.watcher_reads(&sandbox).len() > at_start.len()),
+        "the wait woke no read"
+    );
     idle(&sandbox);
     let reads = github.watcher_reads(&sandbox);
-    assert!(!reads.is_empty());
     for minutes in [13, 20, 60] {
         move_clock(&sandbox, minutes * 60);
         assert!(status(&sandbox)["ci"]["next"].is_null());
@@ -633,10 +647,11 @@ fn a_live_lead_on_a_factory_branch_of_the_repo_wakes_the_watcher_with_no_wait() 
 }
 
 #[test]
-fn a_lead_on_another_repo_or_off_the_factory_branches_costs_github_nothing() {
+fn a_lead_on_another_repo_or_off_the_factory_branches_wakes_no_read_past_the_one_at_start() {
     let sandbox = watching(2);
     let github = FakeGitHub::install(&sandbox);
-    github.pulls(&[(12, "factory/s1-t2")]);
+    // No open factory pull request, so the read at start finds nothing to watch.
+    github.pulls(&[(12, "feature/by-hand")]);
     let blog = sandbox.path("work/blog");
     checkout(
         &sandbox,
@@ -655,10 +670,12 @@ fn a_lead_on_another_repo_or_off_the_factory_branches_costs_github_nothing() {
     lead_in(&herdr, 1, "blog", &blog);
     lead_in(&herdr, 2, "shop", &by_hand);
 
+    // The read at start is the only one: these leads wake none.
+    idle(&sandbox);
+    let at_start = github.watcher_reads(&sandbox);
     for minutes in [1, 3, 10] {
         move_clock(&sandbox, minutes * 60);
-        let ci = status(&sandbox)["ci"].clone();
-        assert!(ci["repos"][0]["seen"].is_null(), "{ci}");
+        assert!(status(&sandbox)["ci"]["next"].is_null());
     }
-    assert_eq!(sandbox.calls("gh"), Vec::<Vec<String>>::new());
+    assert_eq!(github.watcher_reads(&sandbox), at_start);
 }
