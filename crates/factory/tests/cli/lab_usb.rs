@@ -213,7 +213,7 @@ fn a_leased_phone_that_left_adb_but_not_the_bus_is_one_row_and_keeps_its_holder(
         "{text}"
     );
     let (shown, last) = feed_until(&sandbox, |f| {
-        row(f, "Google")["text"] == "leased to plain-held"
+        row(f, "Google")["text"] == "turn on USB debugging, leased to plain-held"
     });
     assert!(shown, "{last}");
 }
@@ -228,6 +228,24 @@ fn a_phone_said_to_have_its_debugging_off_is_forgotten_when_unplugged_while_adb_
     assert!(shown, "{last}");
 
     world.restart_trackers(|| unplug_usb(&sandbox, "1-2"));
+    let (gone, last) = feed_until(&sandbox, |f| row(f, "Samsung")["text"].is_null());
+    assert!(gone, "{last}");
+}
+
+#[test]
+fn a_device_that_is_no_phone_does_not_keep_an_unplugged_phones_warning_while_adb_is_away() {
+    let (sandbox, world) = watching();
+    plug_usb(&sandbox, "1-2", "04e8", "SHARED0001");
+    let (shown, last) = feed_until(&sandbox, |f| {
+        row(f, "Samsung")["text"] == "turn on USB debugging"
+    });
+    assert!(shown, "{last}");
+
+    // The phone goes and a keyboard with its serial takes its port.
+    world.restart_trackers(|| {
+        unplug_usb(&sandbox, "1-2");
+        plug_usb(&sandbox, "1-2", "046d", "SHARED0001");
+    });
     let (gone, last) = feed_until(&sandbox, |f| row(f, "Samsung")["text"].is_null());
     assert!(gone, "{last}");
 }

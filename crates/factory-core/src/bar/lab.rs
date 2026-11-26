@@ -45,8 +45,16 @@ pub const WORDS: [(Shown, &str, Tone); 8] = [
 ];
 
 /// The words and tone of a phone, from [`WORDS`]: `leased to <holder>` while a lease holds it,
-/// else what its readiness asks of the owner. None: a free phone not checked yet.
+/// else what its readiness asks of the owner; a leased phone adb lost for its USB debugging
+/// being off says both. None: a free phone not checked yet.
 pub fn phone_words(readiness: Option<Readiness>, holder: Option<&str>) -> Option<(String, Tone)> {
+    // A leased phone that adb has lost still asks for its USB debugging: the holder follows.
+    if let (Some(holder), Some(Readiness::UsbDebuggingOff)) = (holder, readiness) {
+        return Some((
+            format!("{USB_DEBUGGING_OFF_WORDS}, leased to {holder}"),
+            Tone::Warn,
+        ));
+    }
     let shown = match (holder, readiness) {
         (Some(_), _) => Shown::Leased,
         (None, Some(readiness)) => Shown::Free(readiness),

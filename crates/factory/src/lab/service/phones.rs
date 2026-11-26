@@ -22,7 +22,7 @@ use factory_core::lab::ready::{
     STAY_ON_PROBE, after, auth_timeout_warning, judge, notice, phone_name, refresh_again,
     unplugged,
 };
-use factory_core::lab::usb::{HiddenPhone, hidden_phones};
+use factory_core::lab::usb::{HiddenPhone, hidden_phones, vendor_name};
 
 use super::super::check::PhoneCheck;
 use super::super::readiness::{self, ReadyRow};
@@ -276,9 +276,12 @@ impl Watcher {
         if !self.following {
             let on_bus = self.usb.devices();
             let mut hidden = lock_ignoring_poison(&self.lab.hidden);
-            hidden
-                .phones
-                .retain(|h| on_bus.iter().any(|d| d.serial == h.serial));
+            // Still the same device: its serial and a vendor of the same maker.
+            hidden.phones.retain(|h| {
+                on_bus
+                    .iter()
+                    .any(|d| d.serial == h.serial && vendor_name(&d.vendor) == Some(h.vendor))
+            });
             return;
         }
         let listed: Vec<&str> = self
