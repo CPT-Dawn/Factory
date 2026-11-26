@@ -672,7 +672,8 @@ impl Drop for Agent {
 }
 
 /// The world's fake of `tool`, except that its first `holds` calls of `verb` each mark that they
-/// began, then hold until the test opens their gate (or the test deadline passes).
+/// began, then hold until the test opens their gate (or the test deadline passes). A call that
+/// outlives its sandbox exits rather than counting up forever for a holds dir that is gone.
 fn hold(sandbox: &Sandbox, tool: &str, verb: &str, holds: u32) -> Holds {
     let dir = sandbox.path(format!("holds-{tool}"));
     fs::create_dir_all(&dir).expect("create the holds dir");
@@ -681,7 +682,7 @@ fn hold(sandbox: &Sandbox, tool: &str, verb: &str, holds: u32) -> Holds {
         .replace("@WORLD@", &sandbox.path("world").display().to_string());
     let hold = format!(
         "if [ \"$1\" = {verb} ]; then\n\
-         \x20 n=1; while ! mkdir '{dir}/began-'$n 2>/dev/null; do n=$((n+1)); done\n\
+         \x20 n=1; while ! mkdir '{dir}/began-'$n 2>/dev/null; do [ -d '{dir}' ] || exit 1; n=$((n+1)); done\n\
          \x20 if [ $n -le {holds} ]; then i=0\n\
          \x20   while [ ! -e '{dir}/gate-'$n ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done\n\
          \x20 fi\n\
