@@ -355,6 +355,31 @@ fn a_held_codex_with_no_other_backend_refuses_the_review_with_75() {
 }
 
 #[test]
+fn a_review_held_off_codex_by_a_stale_reading_asks_the_plan_again_first() {
+    let sandbox = Sandbox::new();
+    let skew = sandbox.path("clock-skew");
+    let sandbox = sandbox.env("FACTORY_CLOCK_SKEW_FILE", &skew);
+    let repo = sandbox.repo();
+    configure(&sandbox, "[[review.backend]]\ncli = \"codex\"\n");
+    answers(&sandbox, &reply(93.0, 20.0));
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+    assert_eq!(quota(&sandbox).code, 75, "the 5-hour window holds");
+
+    // Six minutes on, the reading is stale and the plan has room again, before the old reset.
+    std::fs::write(&skew, "360").unwrap();
+    answers(&sandbox, &reply(10.0, 20.0));
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1-r1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(sandbox.calls("codex").len(), 1, "Codex took the review");
+    assert_eq!(
+        sandbox.calls(APP_SERVER).len(),
+        2,
+        "the plan was asked again"
+    );
+}
+
+#[test]
 fn an_unreadable_codex_does_not_stop_a_review() {
     let sandbox = Sandbox::new();
     let repo = sandbox.repo();
