@@ -280,8 +280,14 @@ fn the_chip_shows_the_worst_window_and_the_card_has_a_meter_for_each_and_the_pla
     let sandbox = Sandbox::new();
     answers(&sandbox, &reply(18.0, 92.0));
 
-    let feed = bar_document(&sandbox);
+    let _ = bar_document(&sandbox);
+    let mut feed = Value::Null;
+    let landed = world::poll_until(|| {
+        feed = bar_document(&sandbox);
+        chip(&feed, "codex")["text"] != "?"
+    });
 
+    assert!(landed, "{feed}");
     let codex = chip(&feed, "codex");
     assert_eq!(codex["text"], "92%", "{feed}");
     assert_eq!(codex["tone"], "critical", "{feed}");
@@ -300,6 +306,51 @@ fn the_chip_shows_the_worst_window_and_the_card_has_a_meter_for_each_and_the_pla
     let text = card.to_string();
     assert!(text.contains("plus"), "{card}");
     assert!(text.contains("reset credits"), "{card}");
+}
+
+#[test]
+fn a_bar_run_waits_on_no_codex_ask_and_shows_the_reading_once_it_lands() {
+    let sandbox = Sandbox::new();
+    let gate = gate(&sandbox);
+    sandbox.fake(
+        APP_SERVER,
+        &format!(
+            "read a; read b; read c\nread go < '{}'\necho '{}'\nexec sleep 60",
+            gate.display(),
+            reply(18.0, 40.0)
+        ),
+    );
+    // The daemon's first look gives up on the ask after its patience; the ask stays out.
+    assert_eq!(sandbox.factory(&["monitor", "status"]).code, 0);
+
+    let started = std::time::Instant::now();
+    let out = sandbox.factory(&["bar", "--json"]);
+    let took = started.elapsed();
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    assert!(
+        took < std::time::Duration::from_secs(3),
+        "the bar waited {took:?}"
+    );
+    let feed: Value = serde_json::from_str(&out.stdout).unwrap_or(Value::Null);
+    let codex = chip(&feed, "codex");
+    assert_eq!(
+        (codex["text"].as_str(), codex["tone"].as_str()),
+        (Some("?"), Some("muted")),
+        "{feed}"
+    );
+    assert!(
+        codex["tooltip"].to_string().contains("still being asked"),
+        "{feed}"
+    );
+    open(&gate);
+    let mut feed = Value::Null;
+    let landed = world::poll_until(|| {
+        feed = bar_document(&sandbox);
+        chip(&feed, "codex")["text"] == "40%"
+    });
+    assert!(landed, "{feed}");
+    assert_eq!(sandbox.calls(APP_SERVER).len(), 1, "one ask for every run");
 }
 
 #[test]

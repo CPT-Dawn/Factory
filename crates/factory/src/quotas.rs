@@ -134,6 +134,20 @@ impl QuotaKeeper {
         if self.start_codex_ask(params) {
             self.await_codex_ask(Some(Instant::now() + PATIENCE)).await;
         }
+        self.codex_as_asked(params)
+    }
+
+    /// Codex's quota as the keeper holds it, waiting on nothing: a stale reading starts an ask
+    /// that lands for the next look. What the bar shows, so a bar run is one fast call however
+    /// slow Codex is.
+    pub fn codex_glance(self: &Arc<Self>, params: &CodexParams) -> factory_core::status::Codex {
+        self.keep_codex();
+        self.start_codex_ask(params);
+        self.codex_as_asked(params)
+    }
+
+    /// The reading as it stands, saying so when there is none yet because the first ask is out.
+    fn codex_as_asked(&self, params: &CodexParams) -> factory_core::status::Codex {
         let quota = lock(&self.codex).clone();
         let mut record = quota.record(clock::now(), params.hold_at);
         if *lock(&self.codex_asking) && quota.asked.is_none() && record.windows.is_empty() {
