@@ -280,6 +280,9 @@ pub struct Session {
     reader: BufReader<UnixStream>,
     paths: Paths,
     next_id: u64,
+    /// When set, the one moment by which an exchange ends, whatever the patience: each write
+    /// and read gets only the time left, however many notes come first.
+    deadline: Option<Instant>,
 }
 
 impl Session {
@@ -288,6 +291,7 @@ impl Session {
             reader: BufReader::new(connect(paths)?),
             paths: paths.clone(),
             next_id: 1,
+            deadline: None,
         })
     }
 
@@ -384,29 +388,46 @@ impl Session {
         self.next_id += 1;
         let mut line = serde_json::to_string(&request).map_err(|e| refused(&e))?;
         line.push('\n');
+        let silent = || {
+            Ended::Silent(Failure::new(
+                impatient,
+                format!(
+                    "the daemon did not answer within {}s; see {}",
+                    patience.unwrap_or_default().as_secs(),
+                    paths.daemon_log().display()
+                ),
+            ))
+        };
+        // Without a deadline each line gets the whole patience; with one, only the time left.
+        let deadline = self.deadline;
+        let allowance = || match deadline {
+            None => Ok(patience),
+            Some(deadline) => Some(deadline.saturating_duration_since(Instant::now()))
+                .filter(|left| !left.is_zero())
+                .map(Some)
+                .ok_or_else(silent),
+        };
         let stream = self.reader.get_ref();
         // A daemon that stops reading fills the socket's buffer, and a write would wait for room.
-        stream.set_write_timeout(patience).map_err(|e| lost(&e))?;
-        (&*stream)
-            .write_all(line.as_bytes())
+        stream
+            .set_write_timeout(allowance()?)
             .map_err(|e| lost(&e))?;
-        stream.set_read_timeout(patience).map_err(|e| lost(&e))?;
-        // Notes may come before the answer; each line gets the whole patience.
+        match (&*stream).write_all(line.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if is_timeout(&e) => return Err(silent()),
+            Err(e) => return Err(lost(&e)),
+        }
+        // Notes may come before the answer.
         loop {
             let mut answer = String::new();
+            self.reader
+                .get_ref()
+                .set_read_timeout(allowance()?)
+                .map_err(|e| lost(&e))?;
             match self.reader.read_line(&mut answer) {
                 Ok(0) => return Err(lost(&"it closed the connection without answering")),
                 Ok(_) => {}
-                Err(e) if is_timeout(&e) => {
-                    return Err(Ended::Silent(Failure::new(
-                        impatient,
-                        format!(
-                            "the daemon did not answer within {}s; see {}",
-                            patience.unwrap_or_default().as_secs(),
-                            paths.daemon_log().display()
-                        ),
-                    )));
-                }
+                Err(e) if is_timeout(&e) => return Err(silent()),
                 Err(e) => return Err(lost(&e)),
             }
             let response: Response = serde_json::from_str(&answer).map_err(|e| refused(&e))?;
@@ -442,7 +463,8 @@ pub enum Unanswered {
 }
 
 /// Sends a request to a daemon that is already running, and never starts one, giving up with exit
-/// 3 once `patience` has passed since the connect began: for the callers that must stay fast and leave nothing behind, the
+/// 3 once `patience` has passed since the connect began, one deadline across the connect, the
+/// write and every line read: for the callers that must stay fast and leave nothing behind, the
 /// status-line hook and the bar. It calls on the live socket, the one the running daemon binds
 /// itself: a call on systemd's, with the service stopped, would start the daemon.
 pub fn call_running<P: Serialize, R: DeserializeOwned>(
@@ -451,7 +473,7 @@ pub fn call_running<P: Serialize, R: DeserializeOwned>(
     params: &P,
     patience: Duration,
 ) -> Result<R, Unanswered> {
-    let begun = Instant::now();
+    let deadline = Instant::now() + patience;
     let socket = paths.live_socket();
     let down = |reason: &dyn std::fmt::Display| {
         Unanswered::Down(Failure::precondition(format!(
@@ -471,20 +493,17 @@ pub fn call_running<P: Serialize, R: DeserializeOwned>(
         ))
     })?
     .map_err(|e| down(&e))?;
-    let left = patience.saturating_sub(begun.elapsed());
-    if left.is_zero() {
-        return Err(down(&"it accepted with no patience left"));
-    }
     let mut session = Session {
         reader: BufReader::new(stream),
         paths: paths.clone(),
         next_id: 1,
+        deadline: Some(deadline),
     };
     session
         .exchange_raw(
             method,
             params,
-            Some(left),
+            Some(patience),
             Exit::Precondition,
             &mut |_| {},
             &mut |_| {},

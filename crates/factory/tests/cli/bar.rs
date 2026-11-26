@@ -271,6 +271,45 @@ fn a_live_socket_whose_backlog_is_full_keeps_the_hook_waiting_no_longer_than_its
 }
 
 #[test]
+fn a_daemon_that_only_sends_notes_keeps_the_hook_no_longer_than_its_patience() {
+    // Every line in time, the answer never: the patience is one deadline, not one per line.
+    use std::io::{BufRead, BufReader, Write};
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.path("run/factory")).unwrap();
+    let socket =
+        std::os::unix::net::UnixListener::bind(sandbox.path("run/factory/live.sock")).unwrap();
+    let chatter = std::thread::spawn(move || {
+        let (stream, _) = socket.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(&stream).read_line(&mut request).unwrap();
+        let begun = std::time::Instant::now();
+        while begun.elapsed() < std::time::Duration::from_secs(10) {
+            if (&stream)
+                .write_all(b"{\"id\":1,\"note\":\"busy\"}\n")
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let begun = std::time::Instant::now();
+    let hooked = sandbox.factory_stdin(
+        &["hook", "statusline"],
+        &statusline_input(40.0, now_secs() + HOUR, 12.0),
+    );
+    let took = begun.elapsed();
+
+    assert_eq!(
+        (hooked.code, hooked.stdout.as_str(), hooked.stderr.as_str()),
+        (0, "", ""),
+        "{hooked:?}"
+    );
+    assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+    chatter.join().unwrap();
+}
+
+#[test]
 fn a_bad_config_is_no_daemon_down_and_keeps_the_exit_table() {
     let sandbox = Sandbox::new();
     assert_eq!(sandbox.factory(&["monitor", "status"]).code, 0);
