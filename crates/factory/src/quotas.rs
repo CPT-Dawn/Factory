@@ -207,7 +207,7 @@ impl QuotaKeeper {
             return;
         };
         let mut quota = lock(&self.codex);
-        if lock(&self.store).set_codex_quota(&quota).is_ok() {
+        if self.store_codex(&quota).is_ok() {
             quota.unreadable = unreadable;
         } else {
             *unsaved = Some(unreadable);
@@ -238,7 +238,7 @@ impl QuotaKeeper {
             // A reading that could not be kept still holds this run, and says so beside it: the
             // next look writes it again.
             *unsaved = None;
-            if let Err(e) = lock(&self.store).set_codex_quota(&next) {
+            if let Err(e) = self.store_codex(&next) {
                 *unsaved = Some(next.unreadable.take());
                 next.unreadable = Some(format!(
                     "its reading could not be kept: {e}; check the disk and FACTORY_STATE"
@@ -366,6 +366,18 @@ impl QuotaKeeper {
                 store.append_history(&HistoryRow::of(harness, group, window))?;
             }
             Ok(())
+        })
+    }
+
+    /// Stores Codex's reading, its windows joining the history, by the shared path. The caller
+    /// holds the Codex lock.
+    fn store_codex(&self, quota: &CodexQuota) -> rusqlite::Result<()> {
+        let windows: Vec<UsageWindow> = [quota.five_hour, quota.weekly]
+            .into_iter()
+            .flatten()
+            .collect();
+        self.store_readings("codex", None, &windows, |store| {
+            store.set_codex_quota(quota)
         })
     }
 

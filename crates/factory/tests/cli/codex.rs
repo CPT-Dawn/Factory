@@ -628,3 +628,38 @@ fn a_store_from_before_the_ask_was_kept_holds_beside_a_failed_ask() {
         "no new ask after the restart"
     );
 }
+
+#[test]
+fn each_codex_reading_joins_the_usage_history_once() {
+    let sandbox = Sandbox::new();
+    answers(&sandbox, &reply(18.0, 40.0));
+
+    assert_eq!(quota(&sandbox).code, 0);
+    // A look within 5 minutes asks nothing, and adds nothing.
+    assert_eq!(quota(&sandbox).code, 0);
+
+    let out = sandbox.factory(&["quota", "history", "--json"]);
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    let document: Value = serde_json::from_str(&out.stdout).unwrap_or(Value::Null);
+    let rows: Vec<(String, String, f64)> = document["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["harness"] == "codex")
+        .map(|row| {
+            (
+                row["window"].as_str().unwrap_or_default().to_owned(),
+                row["group"].to_string(),
+                row["used_percent"].as_f64().unwrap_or(f64::NAN),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("five_hour".to_owned(), "null".to_owned(), 18.0),
+            ("weekly".to_owned(), "null".to_owned(), 40.0)
+        ],
+        "{document}"
+    );
+}

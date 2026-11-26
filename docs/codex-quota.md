@@ -34,4 +34,4 @@ hold_at_percent = 90   # more than 0, at most 100
 timeout_seconds = 20   # 1 to 3600: how long app-server may take before it is killed
 ```
 
-History of the readings is left to the usage ledger (#71).
+Each reading joins the usage history (harness `codex`, no quota group) through the keeper's shared store path, as Claude's do: `factory quota history` shows it (see [claude-quota.md](claude-quota.md)). A look that asks nothing adds nothing, nor does a failed ask.
