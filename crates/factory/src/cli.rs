@@ -137,6 +137,8 @@ pub enum QuotaCommand {
         #[arg(long, value_name = "TIME")]
         since: Option<String>,
     },
+    /// agy's quota groups and their 5-hour and weekly windows, or why its usage can't be read
+    Agy,
 }
 
 #[derive(Subcommand, Debug)]

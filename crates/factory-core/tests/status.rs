@@ -1,12 +1,13 @@
 //! The status screen's layout: what each section shows, what it cuts, and that the lab the
 //! ticket names (three slots, three backends, five leads) fits one terminal screen.
 
+use factory_core::fleet::Ci;
 use factory_core::status::{
-    Backend, COLUMNS, Claude, ClaudeState, Lab, Lead, Leads, Lease, Queued, QuotaState, ROWS,
+    Agy, Backend, COLUMNS, Claude, ClaudeState, Lab, Lead, Leads, Lease, Queued, QuotaState, ROWS,
     Reservation, Slot, Status, Subagent, Wait, screen,
 };
 use factory_core::timestamp::Timestamp;
-use factory_core::usage::{UsageReading, WindowKind};
+use factory_core::usage::{GroupWindow, QuotaGroup, UsageReading, WindowKind, WindowState};
 
 /// 2026-11-23 04:13:00 UTC, in seconds.
 fn now() -> i64 {
@@ -19,12 +20,14 @@ fn idle() -> Status {
         lab: Lab::default(),
         review: Vec::new(),
         claude: Claude::default(),
+        agy: Agy::default(),
         waits: Vec::new(),
         leads: Leads {
             error: None,
             monitor: false,
             leads: Vec::new(),
         },
+        ci: Ci::default(),
     }
 }
 
@@ -97,6 +100,7 @@ fn an_idle_factory_has_a_dated_title_and_one_line_per_section() {
             "lab: idle",
             "review: no backends configured",
             "claude: no plan window seen",
+            "agy: no reading yet",
             "waits: none",
             "leads: none, monitor off",
         ]
@@ -251,7 +255,7 @@ fn a_wait_names_who_waits_and_what_for() {
     ];
 
     assert_eq!(
-        &rows(&status)[4..8],
+        &rows(&status)[5..9],
         [
             "waits: 3",
             "  lead-pay -> ci o/r#12",
@@ -293,7 +297,7 @@ fn a_lead_shows_its_state_context_and_subagents() {
     status.leads.leads = vec![cart, pay, ship, lead("lead-docs", "finished", None)];
 
     assert_eq!(
-        &rows(&status)[5..10],
+        &rows(&status)[6..11],
         [
             "leads: 4, monitor on",
             "  lead-cart  working             212k  3 subs, most 170k",
@@ -310,7 +314,7 @@ fn leads_that_herdr_cannot_tell_are_one_line() {
     status.leads.error = Some("herdr unreachable at /x/herdr.sock: no such file".to_owned());
 
     assert_eq!(
-        rows(&status)[5],
+        rows(&status)[6],
         "leads: herdr unavailable, see factory lead list"
     );
 }
@@ -363,6 +367,23 @@ fn five_leads_three_slots_and_three_backends_fit_one_terminal_screen() {
             on: "CPT-Dawn/Factory#123".to_owned(),
         })
         .collect();
+    status.agy = Agy {
+        groups: vec![
+            gemini(
+                used(30, "2026-11-23T07:00:00Z"),
+                used(7, "2026-11-30T02:00:00Z"),
+            ),
+            QuotaGroup {
+                name: "Claude and GPT models".to_owned(),
+                ..gemini(
+                    used(24, "2026-11-23T06:30:00Z"),
+                    used(63, "2026-11-30T01:00:00Z"),
+                )
+            },
+        ],
+        error: None,
+        seen: Some(now() * 1000),
+    };
     status.leads.monitor = true;
     status.leads.leads = (0..5)
         .map(|n| {
@@ -589,4 +610,131 @@ fn a_window_past_its_reset_shows_as_unknown_with_its_age() {
         rows(&status)[3],
         "claude: 5h unknown (seen 3h ago), weekly 12% resets 11-30 02:00Z"
     );
+}
+
+fn gemini(five: WindowState, weekly: WindowState) -> QuotaGroup {
+    QuotaGroup {
+        name: "Gemini Models".to_owned(),
+        windows: vec![
+            GroupWindow {
+                window: WindowKind::FiveHour,
+                state: five,
+            },
+            GroupWindow {
+                window: WindowKind::Weekly,
+                state: weekly,
+            },
+        ],
+    }
+}
+
+fn used(percent: u32, resets: &str) -> WindowState {
+    WindowState::Used {
+        used_percent: percent,
+        resets: Timestamp::parse(resets).map_or(0, Timestamp::unix_millis),
+    }
+}
+
+#[test]
+fn agys_row_names_each_quota_group_and_its_worst_window() {
+    let mut status = idle();
+    status.agy = Agy {
+        groups: vec![
+            gemini(
+                used(30, "2026-11-23T07:00:00Z"),
+                used(7, "2026-11-30T02:00:00Z"),
+            ),
+            QuotaGroup {
+                name: "Claude and GPT models".to_owned(),
+                ..gemini(WindowState::Unused, WindowState::Unknown)
+            },
+        ],
+        error: None,
+        seen: Some(now() * 1000),
+    };
+
+    let shown = rows(&status);
+
+    assert!(
+        shown.contains(&"agy: Gemini Models 30%; Claude and GPT models 0%".to_owned()),
+        "{}",
+        shown.join("\n")
+    );
+    assert_eq!(
+        shown.iter().filter(|row| row.starts_with("agy")).count(),
+        1,
+        "one row, whatever the groups"
+    );
+}
+
+#[test]
+fn agys_unreadable_answer_is_said_in_one_row_never_as_a_share() {
+    let mut status = idle();
+    status.agy = Agy {
+        groups: Vec::new(),
+        error: Some("its usage query exited 127".to_owned()),
+        seen: Some(now() * 1000),
+    };
+
+    let shown = rows(&status);
+
+    assert!(
+        shown.contains(&"agy usage unreadable: its usage query exited 127".to_owned()),
+        "{}",
+        shown.join("\n")
+    );
+    assert!(
+        shown.iter().all(|row| !row.contains('%')),
+        "{}",
+        shown.join("\n")
+    );
+}
+
+#[test]
+fn agy_with_no_reading_yet_says_so() {
+    let shown = rows(&idle());
+    assert!(
+        shown.contains(&"agy: no reading yet".to_owned()),
+        "{}",
+        shown.join("\n")
+    );
+}
+
+const USAGE: &str = r#"{"command":{"data":{"groups":[{"name":"Gemini Models","buckets":[
+    {"window":"5h","remaining_fraction":0.7,"reset_time":"2099-01-01T00:00:00Z"},
+    {"window":"weekly","remaining_fraction":0.93,"reset_time":"2099-01-07T00:00:00Z"}]}]}}}"#;
+
+#[test]
+fn an_answer_that_reads_is_a_reading_of_its_groups_taken_when_it_landed() {
+    let agy = Agy::read(Ok(USAGE.to_owned()), 1_700_000_000_000);
+
+    assert_eq!(agy.error, None);
+    assert_eq!(agy.seen, Some(1_700_000_000_000));
+    assert_eq!(agy.groups.len(), 1);
+    assert_eq!(agy.groups[0].name, "Gemini Models");
+}
+
+#[test]
+fn a_failed_query_and_a_garbled_answer_are_each_a_reading_with_a_reason_and_no_group() {
+    let failed = Agy::read(Err("exited 127".to_owned()), 5);
+    assert_eq!(failed.error.as_deref(), Some("exited 127"));
+    assert!(failed.groups.is_empty());
+    assert_eq!(failed.seen, Some(5));
+
+    let garbled = Agy::read(Ok("not json".to_owned()), 5);
+    assert_eq!(garbled.error.as_deref(), Some("its answer is not JSON"));
+    assert!(garbled.groups.is_empty());
+}
+
+#[test]
+fn a_reading_is_fresh_for_the_time_it_is_given_from_when_it_was_taken() {
+    let agy = Agy::read(Ok(USAGE.to_owned()), 1_000_000);
+    let five_minutes = 300_000;
+
+    assert!(agy.fresh(1_000_000, five_minutes));
+    assert!(agy.fresh(1_000_000 + five_minutes - 1, five_minutes));
+    assert!(!agy.fresh(1_000_000 + five_minutes, five_minutes));
+    // A clock that went back does not make an old reading new.
+    assert!(!agy.fresh(1_000_000 - 1, five_minutes));
+    assert!(!Agy::default().fresh(1_000_000, five_minutes), "none taken");
 }

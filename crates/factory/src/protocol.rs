@@ -63,11 +63,15 @@ pub const CLAUDE_LIMIT: &str = "claude.limit";
 pub const CLAUDE_QUOTA: &str = "claude.quota";
 /// The usage-window history, oldest first: [`HistoryParams`] in, [`HistoryRows`] out.
 pub const QUOTA_HISTORY: &str = "quota.history";
+/// agy's quota groups and their windows, from the keeper's reading of its usage query: no
+/// params in, [`factory_core::status::Agy`] out. It waits for a query that is under way.
+pub const AGY_QUOTA: &str = "agy.quota";
 /// Answered once a lead may dispatch: [`WaitClaudeParams`] in, [`ClaudeVerdict`] out; an error
 /// with exit 124 when the time runs out first.
 pub const WAIT_CLAUDE: &str = "wait.claude";
 
-/// What the daemon holds, as one record, read from its own state and running no command:
+/// What the daemon holds, as one record, read from its own state; it runs no command but, when
+/// agy's reading is stale, the one usage query the quota keeper makes in the background:
 /// [`StatusParams`] in, [`factory_core::status::Status`] out.
 pub const STATUS: &str = "status";
 /// Everything the bar shows, in one answer: [`BarParams`] in,
