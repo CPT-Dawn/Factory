@@ -823,7 +823,7 @@ fn status(lab: &Lab, seen: &[Attached]) -> Answer<Board> {
                 idle_since: e.idle_since,
             })
             .collect();
-        let (_, hidden) = lab.hidden_phones(seen);
+        let hidden = lab.hidden_phones(seen).phones;
         let usb_off = Readiness::UsbDebuggingOff.word();
         let mut devices: Vec<DeviceLine> = device_rows(seen, &held, &emulators, now)
             .into_iter()

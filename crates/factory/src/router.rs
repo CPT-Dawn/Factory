@@ -118,19 +118,17 @@ impl Router {
             Ok(params) => params,
             Err(e) => return refuse(Exit::Usage, format!("bad acquire params: {e}; {MISMATCH}")),
         };
-        let wanted: Vec<(&str, u32, WhenBusy)> = params
+        let wanted: Vec<Wanted> = params
             .backends
             .iter()
-            .map(|backend| {
-                let when_busy = backend.when_busy.into();
-                (backend.name.as_str(), backend.concurrency, when_busy)
+            .map(|backend| Wanted {
+                name: backend.name.as_str(),
+                concurrency: backend.concurrency,
+                when_busy: backend.when_busy.into(),
+                codex: backend.cli.as_deref() == Some(CODEX),
             })
             .collect();
-        let on_codex: Vec<bool> = params
-            .backends
-            .iter()
-            .map(|backend| backend.cli.as_deref() == Some(CODEX))
-            .collect();
+        let has_codex = wanted.iter().any(|backend| backend.codex);
         loop {
             let mut changed = std::pin::pin!(self.changed.notified());
             changed.as_mut().enable();
@@ -139,39 +137,41 @@ impl Router {
             // that a reading on its way would have held.
             // The hold the stored reading names is laid over it, so a held Codex is stepped over
             // even when its slots are full, and the ask starts under the same lock as the pick.
-            let standing = Hold::of(&keeper.codex_standing(&params.codex));
+            // A review that a hold keeps off Codex, to wait or to be refused, asks too: a stale
+            // hold is looked at again before it turns a review away, and every 5 minutes while
+            // one waits on it.
             let (takes_codex, asking) = {
                 let state = lock(&self.state);
+                let standing = Hold::of(&keeper.codex_standing(&params.codex));
                 let now = clock::now();
-                let candidates = candidates(&state, &wanted, &on_codex, standing.as_ref(), now);
-                let takes_codex = matches!(
-                    quota::pick(&candidates, now),
-                    Pick::Take(index) if on_codex[index]
-                );
+                let candidates = candidates(&state, &wanted, standing.as_ref(), now);
+                let pick = quota::pick(&candidates, now);
+                let takes_codex = matches!(pick, Pick::Take(index) if wanted[index].codex);
+                let held_off = has_codex && standing.is_some() && !matches!(pick, Pick::Take(_));
                 (
                     takes_codex,
-                    takes_codex && keeper.ask_codex_for_dispatch(&params.codex),
+                    (takes_codex || held_off) && keeper.ask_codex_for_dispatch(&params.codex),
                 )
             };
-            let hold = if asking {
+            if asking {
                 keeper.codex_asked().await;
-                Hold::of(&keeper.codex_standing(&params.codex))
-            } else {
-                standing
-            };
+            }
             let now = clock::now();
-            let next_reset = {
+            let (next_reset, hold) = {
                 let mut state = lock(&self.state);
-                let candidates = candidates(&state, &wanted, &on_codex, hold.as_ref(), now);
-                match quota::pick(&candidates, now) {
+                // The hold as it stands under the lock the grant is made in: a reading that
+                // landed since the first look, whoever asked for it, is the one this pick obeys.
+                let hold = Hold::of(&keeper.codex_standing(&params.codex));
+                let candidates = candidates(&state, &wanted, hold.as_ref(), now);
+                let next_reset = match quota::pick(&candidates, now) {
                     Pick::Take(index) => {
-                        if on_codex[index] && !takes_codex {
+                        if wanted[index].codex && !takes_codex {
                             // The slot the first look counted on went to another review, so the
                             // pick fell to Codex, whose plan nobody has settled: look again. The
                             // next look settles it only if Codex is still the one it would take.
                             continue;
                         }
-                        let name = wanted[index].0.to_owned();
+                        let name = wanted[index].name.to_owned();
                         *state.running.entry(name.clone()).or_default() += 1;
                         if let Some(tier) = &params.tier {
                             state
@@ -190,7 +190,7 @@ impl Router {
                         );
                     }
                     Pick::OutOfQuota { until } => {
-                        return out_of_quota(&wanted, &candidates, until, &on_codex, hold.as_ref());
+                        return out_of_quota(&wanted, &candidates, until, hold.as_ref());
                     }
                     Pick::Wait => candidates
                         .iter()
@@ -199,7 +199,8 @@ impl Router {
                             _ => None,
                         })
                         .min(),
-                }
+                };
+                (next_reset, hold)
             };
             match next_reset {
                 Some(reset) => {
@@ -332,28 +333,39 @@ impl Router {
     }
 }
 
+/// One backend of a review's chain, as a pick weighs it.
+struct Wanted<'a> {
+    name: &'a str,
+    concurrency: u32,
+    when_busy: WhenBusy,
+    /// It runs on Codex, so a Codex hold is laid over its quota.
+    codex: bool,
+}
+
 /// The candidates for a pick at `now`: each backend's quota, with a Codex hold laid over those
 /// that run on Codex, and its load.
 fn candidates(
     state: &State,
-    wanted: &[(&str, u32, WhenBusy)],
-    on_codex: &[bool],
+    wanted: &[Wanted],
     hold: Option<&Hold>,
     now: Timestamp,
 ) -> Vec<Candidate> {
     wanted
         .iter()
-        .zip(on_codex)
-        .map(|(&(name, concurrency, when_busy), &codex)| {
-            let stored = state.quotas.get(name).copied().unwrap_or(Quota::Unknown);
+        .map(|backend| {
+            let stored = state
+                .quotas
+                .get(backend.name)
+                .copied()
+                .unwrap_or(Quota::Unknown);
             Candidate {
                 quota: match hold {
-                    Some(hold) if codex => hold.over(stored, now),
+                    Some(hold) if backend.codex => hold.over(stored, now),
                     _ => stored,
                 },
-                running: state.running.get(name).copied().unwrap_or(0),
-                concurrency,
-                when_busy,
+                running: state.running.get(backend.name).copied().unwrap_or(0),
+                concurrency: backend.concurrency,
+                when_busy: backend.when_busy,
             }
         })
         .collect()
@@ -361,10 +373,9 @@ fn candidates(
 
 /// Every backend is cooling down: exit 75, naming when each resets and the first reset.
 fn out_of_quota(
-    wanted: &[(&str, u32, WhenBusy)],
+    wanted: &[Wanted],
     candidates: &[Candidate],
     first: Option<Timestamp>,
-    on_codex: &[bool],
     hold: Option<&Hold>,
 ) -> Outcome {
     let Some(first) = first else {
@@ -376,11 +387,10 @@ fn out_of_quota(
     let each: Vec<String> = wanted
         .iter()
         .zip(candidates)
-        .zip(on_codex)
-        .filter_map(|((&(name, ..), candidate), &codex)| match candidate.quota {
-            Quota::CoolingDown { until } => Some(match hold.filter(|_| codex) {
-                Some(hold) => format!("{name} until {until}, held at {}", hold.by),
-                None => format!("{name} until {until}"),
+        .filter_map(|(backend, candidate)| match candidate.quota {
+            Quota::CoolingDown { until } => Some(match hold.filter(|_| backend.codex) {
+                Some(hold) => format!("{} until {until}, held at {}", backend.name, hold.by),
+                None => format!("{} until {until}", backend.name),
             }),
             _ => None,
         })

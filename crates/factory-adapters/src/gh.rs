@@ -107,6 +107,9 @@ pub const LISTEN_EVENTS: &str = "com.github.pull_request.check_suite.status.chan
                                  com.github.pull_request.head.changed.v1";
 /// How many entries one page of a list holds.
 const PAGE: usize = 100;
+
+/// The most pages of the latest workflow runs one read looks through: a thousand runs.
+pub const RUN_PAGES: usize = 10;
 /// How long one listener may run: an event subscription expires after 24 hours.
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 
@@ -486,9 +489,13 @@ pub trait Actions: Send + Sync + 'static {
     fn active_runs(&self, repo: &str) -> Result<Vec<u64>, GhError>;
     /// The ids of the latest workflow runs updated at or after `since` (milliseconds since the
     /// epoch), whatever their status: a run that queued and completed between two reads, or
-    /// the re-run of an earlier one.
+    /// the re-run of an earlier one. GitHub lists runs newest created first, so the pages are
+    /// read until one is not full or holds a run created before `since`, at most
+    /// [`RUN_PAGES`] of them: a re-run that queued and completed between two reads, of a run
+    /// created before the first of them and listed past the page where that stops, is missed.
     fn runs_since(&self, repo: &str, since: i64) -> Result<Vec<u64>, GhError>;
-    /// The latest attempt's jobs of the workflow run `run`.
+    /// The jobs of every attempt of the workflow run `run`: a re-run's earlier jobs keep
+    /// their times.
     fn jobs(&self, repo: &str, run: u64) -> Result<Vec<Job>, GhError>;
     fn open_pulls(&self, repo: &str) -> Result<Vec<OpenPull>, GhError>;
     /// The check runs and commit statuses on the pull request's head.
@@ -603,23 +610,41 @@ impl Actions for GhActions {
     }
 
     fn runs_since(&self, repo: &str, since: i64) -> Result<Vec<u64>, GhError> {
-        // The latest page only: GitHub lists the newest runs first.
+        let at = |run: &Value, key: &str| {
+            run[key]
+                .as_str()
+                .and_then(Timestamp::parse)
+                .map(Timestamp::unix_millis)
+        };
         let path = format!("repos/{repo}/actions/runs?per_page={PAGE}");
-        let page = self.page(&path)?;
-        Ok(entries(&page, "workflow_runs")
-            .iter()
-            .filter(|run| {
-                run["updated_at"]
-                    .as_str()
-                    .and_then(Timestamp::parse)
-                    .is_some_and(|updated| updated.unix_millis() >= since)
-            })
-            .filter_map(|run| run["id"].as_u64())
-            .collect())
+        let mut ids = Vec::new();
+        for number in 1..=RUN_PAGES {
+            let page = if number == 1 {
+                self.page(&path)?
+            } else {
+                self.page(&format!("{path}&page={number}"))?
+            };
+            let runs = entries(&page, "workflow_runs");
+            ids.extend(
+                runs.iter()
+                    .filter(|run| at(run, "updated_at").is_some_and(|updated| updated >= since))
+                    .filter_map(|run| run["id"].as_u64()),
+            );
+            // Newest created first: a page that reaches past `since` is the last that can
+            // hold a run created after it.
+            let older = runs
+                .last()
+                .and_then(|run| at(run, "created_at"))
+                .is_none_or(|created| created < since);
+            if runs.len() < PAGE || older {
+                break;
+            }
+        }
+        Ok(ids)
     }
 
     fn jobs(&self, repo: &str, run: u64) -> Result<Vec<Job>, GhError> {
-        let path = format!("repos/{repo}/actions/runs/{run}/jobs?filter=latest&per_page={PAGE}");
+        let path = format!("repos/{repo}/actions/runs/{run}/jobs?filter=all&per_page={PAGE}");
         Ok(self
             .list(&path, "jobs")?
             .iter()

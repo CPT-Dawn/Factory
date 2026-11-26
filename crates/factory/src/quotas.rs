@@ -44,12 +44,22 @@ const PRUNE_LOOK: Duration = Duration::from_secs(5);
 /// its own, shorter freshness check: a dispatch wants the newest answer, a bar poll does not.
 pub const AGY_DISPLAY_FRESH_MS: i64 = 300_000;
 
-/// How long status and the bar wait for a usage query that is under way: past it they show the
-/// last reading and the query finishes on its own, so a slow agy never holds a poll up.
+/// How long `factory status` waits for a usage query that is under way: past it, it shows the
+/// last reading and the query finishes on its own, so a slow agy never holds a look up. The bar
+/// waits for none.
 pub const AGY_GLANCE: Duration = Duration::from_secs(4);
 
 /// How long `factory quota agy` waits for a usage query: agy's own limit for it, and a margin.
 pub const AGY_QUERY: Duration = Duration::from_secs(65);
+
+/// A Codex reading that could not be written: its `unreadable`, to put back once a look has
+/// written it, and the windows it read then, which join the history with it. A failed ask
+/// read none: the windows it keeps were read before, and are in the history already, or
+/// pruned from it.
+struct Unsaved {
+    unreadable: Option<String>,
+    read: Vec<UsageWindow>,
+}
 
 #[derive(Default)]
 struct AgyState {
@@ -73,9 +83,8 @@ pub struct QuotaKeeper {
     codex_asking: Mutex<bool>,
     /// Woken when an ask of Codex ends.
     codex_asked: Notify,
-    /// Set while the last reading could not be written: what its `unreadable` was, to put back
-    /// once a look has written it.
-    codex_unsaved: Mutex<Option<Option<String>>>,
+    /// Set while the last reading could not be written: what it said, to write again.
+    codex_unsaved: Mutex<Option<Unsaved>>,
     agy: Mutex<AgyState>,
     /// Woken when agy's usage query ends.
     agy_asked: Notify,
@@ -126,6 +135,20 @@ impl QuotaKeeper {
         if self.start_codex_ask(params) {
             self.await_codex_ask(Some(Instant::now() + PATIENCE)).await;
         }
+        self.codex_as_asked(params)
+    }
+
+    /// Codex's quota as the keeper holds it, waiting on nothing: a stale reading starts an ask
+    /// that lands for the next look. What the bar shows, so a bar run is one fast call however
+    /// slow Codex is.
+    pub fn codex_glance(self: &Arc<Self>, params: &CodexParams) -> factory_core::status::Codex {
+        self.keep_codex();
+        self.start_codex_ask(params);
+        self.codex_as_asked(params)
+    }
+
+    /// The reading as it stands, saying so when there is none yet because the first ask is out.
+    fn codex_as_asked(&self, params: &CodexParams) -> factory_core::status::Codex {
         let quota = lock(&self.codex).clone();
         let mut record = quota.record(clock::now(), params.hold_at);
         if *lock(&self.codex_asking) && quota.asked.is_none() && record.windows.is_empty() {
@@ -203,14 +226,14 @@ impl QuotaKeeper {
     /// stands as it was once it has been.
     fn keep_codex(&self) {
         let mut unsaved = lock(&self.codex_unsaved);
-        let Some(unreadable) = unsaved.take() else {
+        let Some(reading) = unsaved.take() else {
             return;
         };
         let mut quota = lock(&self.codex);
-        if self.store_codex(&quota).is_ok() {
-            quota.unreadable = unreadable;
+        if self.store_codex(&quota, &reading.read).is_ok() {
+            quota.unreadable = reading.unreadable;
         } else {
-            *unsaved = Some(unreadable);
+            *unsaved = Some(reading);
         }
     }
 
@@ -235,11 +258,21 @@ impl QuotaKeeper {
                 Ok(Err(why)) => next.fail(why.to_string(), now),
                 Err(why) => next.fail(format!("its reader stopped: {why}"), now),
             }
+            // Only an answer read now joins the history: a failed ask keeps the windows it had,
+            // which are no new reading.
+            let read = if next.unreadable.is_none() {
+                next.windows()
+            } else {
+                Vec::new()
+            };
             // A reading that could not be kept still holds this run, and says so beside it: the
             // next look writes it again.
             *unsaved = None;
-            if let Err(e) = self.store_codex(&next) {
-                *unsaved = Some(next.unreadable.take());
+            if let Err(e) = self.store_codex(&next, &read) {
+                *unsaved = Some(Unsaved {
+                    unreadable: next.unreadable.take(),
+                    read,
+                });
                 next.unreadable = Some(format!(
                     "its reading could not be kept: {e}; check the disk and FACTORY_STATE"
                 ));
@@ -290,6 +323,20 @@ impl QuotaKeeper {
         let reading = Agy::read(answer, clock::lab_now_ms());
         {
             let mut state = lock(&self.agy);
+            // Each group's windows join the history by the shared path, under agy's lock, so
+            // readings land in the order they were taken. A write that fails costs only those
+            // rows: the next reading, unlike the last row kept, is written in full.
+            let seen = Timestamp::from_unix_millis(reading.seen.unwrap_or_default());
+            for group in &reading.groups {
+                let readings = group.readings(seen);
+                if let Err(e) = self.store_readings("agy", Some(&group.name), &readings, |_| Ok(()))
+                {
+                    eprintln!(
+                        "factory: agy's {} reading could not join the usage history: {e}; check the disk and FACTORY_STATE",
+                        group.name
+                    );
+                }
+            }
             state.reading = Some(reading);
             state.asking = false;
         }
@@ -369,16 +416,10 @@ impl QuotaKeeper {
         })
     }
 
-    /// Stores Codex's reading, its windows joining the history, by the shared path. The caller
-    /// holds the Codex lock.
-    fn store_codex(&self, quota: &CodexQuota) -> rusqlite::Result<()> {
-        let windows: Vec<UsageWindow> = [quota.five_hour, quota.weekly]
-            .into_iter()
-            .flatten()
-            .collect();
-        self.store_readings("codex", None, &windows, |store| {
-            store.set_codex_quota(quota)
-        })
+    /// Stores Codex's reading by the shared path, with `read`, the windows its ask read, joining
+    /// the history. The caller holds the Codex lock.
+    fn store_codex(&self, quota: &CodexQuota, read: &[UsageWindow]) -> rusqlite::Result<()> {
+        self.store_readings("codex", None, read, |store| store.set_codex_quota(quota))
     }
 
     /// The usage history from `params.since` on, oldest first.

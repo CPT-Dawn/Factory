@@ -4,7 +4,8 @@
 use factory_core::bar::{self, Snapshot};
 use factory_core::ci::CheckRun;
 use factory_core::fleet::{
-    Ci, Job, Mark, Pull, PullState, RepoCi, Runner, RunnerState, is_factory_branch, is_repo,
+    Ci, Job, Mark, Pull, PullState, RepoCi, Runner, RunnerState, github_repo, is_factory_branch,
+    is_repo,
 };
 use factory_core::status::{self, Claude, Leads, Status};
 use factory_core::timestamp::Timestamp;
@@ -101,6 +102,7 @@ fn snapshot(ci: Ci) -> Snapshot {
         claude: Claude::default(),
         codex: Default::default(),
         agy: Default::default(),
+        agy_hold_at: factory_core::quota::AGY_HOLD_AT_PERCENT,
         waits: Vec::new(),
         leads: no_leads(),
         ci,
@@ -294,4 +296,27 @@ fn the_status_screen_sums_the_ci_in_one_line() {
         !screen[at + 1..].iter().any(|row| row.starts_with("  ")),
         "one row: {screen:#?}"
     );
+}
+
+#[test]
+fn a_remote_on_github_names_its_repo_in_each_way_git_writes_one() {
+    for url in [
+        "git@github.com:acme/shop.git",
+        "git@github.com:acme/shop",
+        "https://github.com/acme/shop.git",
+        "https://github.com/acme/shop/",
+        "ssh://git@github.com/acme/shop.git",
+        "https://user@github.com/acme/shop",
+    ] {
+        assert_eq!(github_repo(url).as_deref(), Some("acme/shop"), "{url}");
+    }
+    for url in [
+        "git@gitlab.com:acme/shop.git",
+        "https://github.com/acme",
+        "https://github.com/acme/shop/tree/main",
+        "/srv/git/shop.git",
+        "",
+    ] {
+        assert_eq!(github_repo(url), None, "{url}");
+    }
 }

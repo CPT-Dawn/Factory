@@ -296,3 +296,44 @@ fn the_sweep_runs_no_process() {
     );
     assert!(Path::new(&sandbox.path("sysfs")).exists());
 }
+
+#[test]
+fn a_usb_bus_that_cannot_be_read_keeps_the_last_phones_and_says_why() {
+    let (sandbox, _world) = watching();
+    plug_usb(&sandbox, "1-2", "04e8", "SAMSUNG0001");
+    let (shown, last) = feed_until(&sandbox, |f| {
+        row(f, "Samsung")["text"] == "turn on USB debugging"
+    });
+    assert!(shown, "{last}");
+
+    // The bus goes unreadable: a file where its directory was.
+    let bus = sandbox.path("sysfs/bus/usb/devices");
+    std::fs::remove_dir_all(&bus).expect("remove the bus");
+    std::fs::write(&bus, "").expect("put a file in its place");
+    let lab_error = |f: &Value| {
+        f["sections"]
+            .as_array()
+            .and_then(|s| s.iter().find(|s| s["id"] == "lab"))
+            .and_then(|lab| lab["error"].as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (said, last) = feed_until(&sandbox, |f| {
+        lab_error(f).contains("the USB bus could not be read")
+    });
+    assert!(said, "{last}");
+    assert_eq!(
+        row(&last, "Samsung")["text"],
+        "turn on USB debugging",
+        "{last}"
+    );
+    assert_eq!(row(&last, "phones"), Value::Null, "{last}");
+
+    // Read again, empty: the phone is gone and so is the error.
+    std::fs::remove_file(&bus).expect("remove the file");
+    std::fs::create_dir_all(&bus).expect("bring the bus back");
+    let (cleared, last) = feed_until(&sandbox, |f| {
+        lab_error(f).is_empty() && row(f, "Samsung").is_null()
+    });
+    assert!(cleared, "{last}");
+}

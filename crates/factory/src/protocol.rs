@@ -176,10 +176,17 @@ pub struct BarParams {
     /// The config's say on Codex: its hold mark, and how long its app-server may take.
     #[serde(default)]
     pub codex: CodexParams,
+    /// The config's mark for holding a quota group of agy's, in percent of either window.
+    #[serde(default = "agy_hold_at_default")]
+    pub agy_hold_at: f64,
 }
 
 fn hold_at_default() -> f64 {
     factory_core::claude::HOLD_AT_PERCENT
+}
+
+fn agy_hold_at_default() -> f64 {
+    factory_core::quota::AGY_HOLD_AT_PERCENT
 }
 
 /// What the config says of Codex (`[codex]`): the daemon holds the quota, the config holds the

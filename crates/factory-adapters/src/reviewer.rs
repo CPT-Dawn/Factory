@@ -284,6 +284,9 @@ pub struct Agy {
     /// The share of its group's five-hour bucket this review leaves alone: below it, the
     /// review is not its to take.
     reserve: Option<f64>,
+    /// The percent of either bucket of its group from which it holds off, until that bucket
+    /// resets.
+    hold_at: f64,
 }
 
 impl Agy {
@@ -303,7 +306,15 @@ impl Agy {
             repos: Arc::new(Git),
             namespaces: Arc::new(Unshare),
             reserve: None,
+            hold_at: quota::AGY_HOLD_AT_PERCENT,
         }
+    }
+
+    /// The same backend, holding off once `hold_at` percent of either bucket of its group is
+    /// spent.
+    pub fn holding_at(mut self, hold_at: f64) -> Agy {
+        self.hold_at = hold_at;
+        self
     }
 
     /// The same backend, keeping `reserve` of its group's five-hour bucket for other reviews.
@@ -418,12 +429,12 @@ impl Agy {
         let model = self.quota_model();
         let (mut usage, cached) = self.usage(false)?;
         let mut group = quota::agy_group(&usage, &model);
-        let mut said = quota::agy_usage(&usage, &group);
+        let mut said = quota::agy_usage(&usage, &group, self.hold_at);
         // A cached answer may name an empty bucket whose reset has come since: ask again.
         if cached && matches!(said, quota::AgyUsage::Empty { until } if until <= now()) {
             usage = self.usage(true)?.0;
             group = quota::agy_group(&usage, &model);
-            said = quota::agy_usage(&usage, &group);
+            said = quota::agy_usage(&usage, &group, self.hold_at);
         }
         if let Some(reserve) = self.reserve
             && matches!(said, quota::AgyUsage::Left)

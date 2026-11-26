@@ -9,6 +9,7 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use factory_core::bar::{self, Snapshot};
 use serde_json::{Value, json};
@@ -21,7 +22,7 @@ use crate::leads::Leads;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{BAR, BarParams};
-use crate::quotas::{AGY_GLANCE, QuotaKeeper};
+use crate::quotas::QuotaKeeper;
 use crate::status;
 use crate::steward::Steward;
 
@@ -59,18 +60,20 @@ fn request() -> Result<(Paths, BarParams), Failure> {
     let paths = Paths::from_env()?;
     let claude_hold_at = config::claude_hold_at(&paths)?;
     let codex = config::codex_params(&paths)?;
+    let agy_hold_at = config::agy_hold_at(&paths)?;
     Ok((
         paths,
         BarParams {
             claude_hold_at,
             codex,
+            agy_hold_at,
         },
     ))
 }
 
-/// The daemon's side: everything the bar shows, from memory but for a Codex reading older than
-/// 5 minutes, which is asked of Codex first, and agy's last reading (its usage is asked at most
-/// every five minutes). Neither is waited on for long, and both are waited on at once.
+/// The daemon's side: everything the bar shows, from memory alone. A Codex reading older than
+/// 5 minutes, or an agy one, starts an ask in the background that lands for the next run: the
+/// bar shows what the keeper holds meanwhile, unknown when it holds nothing.
 pub async fn snapshot(
     params: &BarParams,
     leads: &Leads,
@@ -79,12 +82,12 @@ pub async fn snapshot(
     fleet: &Fleet,
     lab: bar::lab::Lab,
 ) -> Snapshot {
-    let (codex, agy) = tokio::join!(quotas.codex(&params.codex), quotas.agy(AGY_GLANCE));
     Snapshot {
         now: clock::now().unix_millis(),
         claude: quotas.claude(params.claude_hold_at),
-        codex,
-        agy,
+        codex: quotas.codex_glance(&params.codex),
+        agy: quotas.agy(Duration::ZERO).await,
+        agy_hold_at: params.agy_hold_at,
         waits: leads.registered(),
         leads: status::leads_seen(leads, steward),
         ci: fleet.snapshot(),

@@ -220,8 +220,16 @@ const AGY_USAGE: &str = include_str!("fixtures/agy-usage.json");
 /// lists no models.
 const AGY_USAGE_OLD: &str = include_str!("fixtures/agy-usage-2026-11-23.json");
 
+/// agy's hold mark by default, in percent.
+const HOLD: f64 = quota::AGY_HOLD_AT_PERCENT;
+
 /// The real usage with these buckets' `remaining_fraction` set to 0.
 fn agy_usage_with_empty(ids: &[&str]) -> String {
+    agy_usage_with_left(&ids.iter().map(|id| (*id, 0.0)).collect::<Vec<_>>())
+}
+
+/// The real usage with these buckets' `remaining_fraction` set as given.
+fn agy_usage_with_left(left: &[(&str, f64)]) -> String {
     let mut usage: serde_json::Value = serde_json::from_str(AGY_USAGE).unwrap_or_default();
     let groups = usage
         .pointer_mut("/command/data/groups")
@@ -233,8 +241,8 @@ fn agy_usage_with_empty(ids: &[&str]) -> String {
         .flatten();
     for bucket in buckets {
         let id = bucket.get("id").and_then(serde_json::Value::as_str);
-        if id.is_some_and(|id| ids.contains(&id)) {
-            bucket["remaining_fraction"] = 0.into();
+        if let Some(&(_, left)) = left.iter().find(|(given, _)| Some(*given) == id) {
+            bucket["remaining_fraction"] = left.into();
         }
     }
     usage.to_string()
@@ -269,7 +277,56 @@ fn agys_usage_says_whether_a_model_groups_buckets_have_quota_left() {
         ),
     ];
     for (case, usage, group, said) in cases {
-        assert_eq!(quota::agy_usage(&usage, group), said, "{case}");
+        assert_eq!(quota::agy_usage(&usage, group, HOLD), said, "{case}");
+    }
+}
+
+#[test]
+fn agy_holds_a_group_once_either_bucket_is_at_the_hold_mark() {
+    let gemini = "Gemini Models";
+    let five_hour = Timestamp::parse("2026-11-24T03:32:03Z").unwrap();
+    let weekly = Timestamp::parse("2026-11-30T22:32:03Z").unwrap();
+    let cases = [
+        (
+            "5h 90% spent",
+            vec![("gemini-5h", 0.1)],
+            HOLD,
+            AgyUsage::Empty { until: five_hour },
+        ),
+        (
+            "weekly 90% spent",
+            vec![("gemini-weekly", 0.1)],
+            HOLD,
+            AgyUsage::Empty { until: weekly },
+        ),
+        (
+            "5h 89% spent",
+            vec![("gemini-5h", 0.11)],
+            HOLD,
+            AgyUsage::Left,
+        ),
+        (
+            "both past it: the later reset",
+            vec![("gemini-5h", 0.05), ("gemini-weekly", 0.02)],
+            HOLD,
+            AgyUsage::Empty { until: weekly },
+        ),
+        (
+            "the configured mark",
+            vec![("gemini-5h", 0.6)],
+            40.0,
+            AgyUsage::Empty { until: five_hour },
+        ),
+        (
+            "under the configured mark",
+            vec![("gemini-5h", 0.6)],
+            50.0,
+            AgyUsage::Left,
+        ),
+    ];
+    for (case, left, hold_at, said) in cases {
+        let usage = agy_usage_with_left(&left);
+        assert_eq!(quota::agy_usage(&usage, gemini, hold_at), said, "{case}");
     }
 }
 
@@ -291,7 +348,10 @@ fn agys_usage_that_names_no_buckets_for_the_group_is_unreadable() {
             "Gemini 4 Carbon"
         };
         assert!(
-            matches!(quota::agy_usage(usage, group), AgyUsage::Unreadable(_)),
+            matches!(
+                quota::agy_usage(usage, group, HOLD),
+                AgyUsage::Unreadable(_)
+            ),
             "{case}"
         );
     }
@@ -501,18 +561,21 @@ const CLAUDE_GPT: &str = "Claude and GPT models";
 fn an_epoch_reset_leaves_the_group_available_only_when_the_whole_quota_is_left() {
     // agy 1.5.17 reports the untouched Claude and GPT group's windows with the epoch's reset.
     let untouched = agy_usage_with("3p-5h", 1.0, EPOCH);
-    assert_eq!(quota::agy_usage(&untouched, CLAUDE_GPT), AgyUsage::Left);
+    assert_eq!(
+        quota::agy_usage(&untouched, CLAUDE_GPT, HOLD),
+        AgyUsage::Left
+    );
 
     // Any less is a reading it cannot place: never "the reset has passed, so quota is back".
     for left in [0.0, 0.4, 0.999, 0.999_999_9] {
         let usage = agy_usage_with("3p-5h", left, EPOCH);
         assert!(
             matches!(
-                quota::agy_usage(&usage, CLAUDE_GPT),
+                quota::agy_usage(&usage, CLAUDE_GPT, HOLD),
                 AgyUsage::Unreadable(_)
             ),
             "{left} left with the epoch's reset: {:?}",
-            quota::agy_usage(&usage, CLAUDE_GPT)
+            quota::agy_usage(&usage, CLAUDE_GPT, HOLD)
         );
     }
 }
@@ -704,7 +767,7 @@ fn a_group_with_no_name_or_no_buckets_list_makes_the_answer_unreadable() {
 fn an_epoch_reset_with_a_fraction_above_one_is_not_an_unused_window_to_routing_either() {
     let usage = agy_usage_with("3p-5h", 1.5, EPOCH);
     assert!(matches!(
-        quota::agy_usage(&usage, CLAUDE_GPT),
+        quota::agy_usage(&usage, CLAUDE_GPT, HOLD),
         AgyUsage::Unreadable(_)
     ));
 }

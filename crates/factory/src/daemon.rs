@@ -178,7 +178,22 @@ pub fn run(json: bool) -> Result<(), Failure> {
         tokio::spawn(Arc::clone(&leads).start());
         tokio::spawn(Arc::clone(&steward).resume());
         tokio::spawn(Arc::clone(&quotas).keep());
-        tokio::spawn(Arc::clone(&fleet).run(pollers.watched()));
+        let working = Arc::clone(&leads);
+        let live_work = move |repos: &[String]| {
+            // The cwd of each lead whose agent herdr still shows; none while herdr is away.
+            let cwds = working
+                .seen()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|lead| lead.agent.is_some())
+                .filter_map(|lead| lead.cwd);
+            crate::fleet::live_repos(repos, cwds)
+        };
+        tokio::spawn(Arc::clone(&fleet).run(
+            pollers.watched(),
+            leads.changes(),
+            Arc::new(live_work),
+        ));
         let lab = Arc::new(lab);
         lab.recover();
         notifier.resume();

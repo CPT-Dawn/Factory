@@ -200,6 +200,10 @@ fn codex_error(line: &str) -> Option<String> {
     message.and_then(Value::as_str).map(str::to_owned)
 }
 
+/// The share of either bucket of agy's model group, in percent, from which reviews hold off
+/// that group by default: `[agy] hold_at_percent`.
+pub const AGY_HOLD_AT_PERCENT: f64 = 90.0;
+
 /// The reset agy reports for a window nobody has used: the Unix epoch.
 const AGY_EPOCH_MILLIS: i64 = 0;
 
@@ -207,17 +211,19 @@ const AGY_EPOCH_MILLIS: i64 = 0;
 /// group's quota.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgyUsage {
-    /// Every bucket of the group has some left.
+    /// Every bucket of the group is under the hold mark.
     Left,
-    /// A bucket is empty; the group has quota again once the last empty one resets.
+    /// A bucket is at the hold mark or empty; the group has quota again once the last such
+    /// bucket resets.
     Empty { until: Timestamp },
     /// The answer names no buckets for the group, or none it can read: why.
     Unreadable(String),
 }
 
 /// Reads agy's usage for the model `group` (`Gemini Models`): each of its buckets (five-hour,
-/// weekly) has a `remaining_fraction` and a `reset_time`.
-pub fn agy_usage(usage: &str, group: &str) -> AgyUsage {
+/// weekly) has a `remaining_fraction` and a `reset_time`. A bucket `hold_at` percent spent or
+/// more holds the group until it resets, as Claude's and Codex's windows hold theirs.
+pub fn agy_usage(usage: &str, group: &str, hold_at: f64) -> AgyUsage {
     let Ok(usage) = serde_json::from_str::<Value>(usage) else {
         return AgyUsage::Unreadable("its answer is not JSON".to_owned());
     };
@@ -240,7 +246,7 @@ pub fn agy_usage(usage: &str, group: &str) -> AgyUsage {
                 ));
             }
             (Some(_), Some(reset)) if reset.unix_millis() == AGY_EPOCH_MILLIS => {}
-            (Some(left), _) if left > 0.0 => {}
+            (Some(left), _) if used_percent(left) < hold_at => {}
             (Some(_), Some(reset)) => until = until.max(Some(reset)),
             _ => {
                 return AgyUsage::Unreadable(format!(
@@ -316,6 +322,12 @@ fn epoch_means_unused(left: f64) -> bool {
     left == 1.0
 }
 
+/// The percent of a bucket spent, from the share left. Rounded to a millionth: 1 - 0.9 is
+/// 0.0999... in floats, and 10% spent.
+fn used_percent(left: f64) -> f64 {
+    ((1.0 - left) * 100.0 * 1e6).round() / 1e6
+}
+
 /// The share of a bucket left, 0 to 1, as agy printed it.
 fn bucket_left(bucket: &Value) -> Option<f64> {
     bucket
@@ -368,8 +380,7 @@ fn bucket_state(reading: Option<(f64, i64)>) -> WindowState {
             }
         }
         Some((left, resets)) if usage::representable(resets) => WindowState::Used {
-            // Rounded to a millionth first: 1 - 0.9 is 0.0999... in floats, and 10% used.
-            used_percent: usage::whole_percent(((1.0 - left) * 100.0 * 1e6).round() / 1e6),
+            used_percent: usage::whole_percent(used_percent(left)),
             resets,
         },
         _ => WindowState::Unknown,

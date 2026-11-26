@@ -525,7 +525,7 @@ fn a_touched_doc_travels_whole() {
 
 #[test]
 fn standard_skips_gemini_under_the_20_percent_reserve_and_takes_codex_medium() {
-    let lab = Lab::new("code", 0.1, 1.0, &["ok"]);
+    let lab = Lab::new("code", 0.15, 1.0, &["ok"]);
 
     let out = lab.review(&["base", "t2-r1"]);
 
@@ -546,7 +546,7 @@ fn standard_skips_gemini_under_the_20_percent_reserve_and_takes_codex_medium() {
 
 #[test]
 fn standard_with_codex_at_its_limit_takes_agys_opus_high() {
-    let lab = Lab::new("code", 0.1, 1.0, &["limit", "ok"]);
+    let lab = Lab::new("code", 0.15, 1.0, &["limit", "ok"]);
 
     let out = lab.review(&["base", "t2b-r1", "--json"]);
 
@@ -558,7 +558,7 @@ fn standard_with_codex_at_its_limit_takes_agys_opus_high() {
 
 #[test]
 fn a_spec_review_is_hard_and_may_spend_the_reserve() {
-    let lab = Lab::new("code", 0.1, 1.0, &["ok"]);
+    let lab = Lab::new("code", 0.15, 1.0, &["ok"]);
 
     let out = lab.review(&["base", "spec-r1", "--json"]);
 
@@ -669,8 +669,44 @@ fn an_empty_bucket_skips_its_pool() {
 }
 
 #[test]
+fn a_bucket_at_the_hold_mark_skips_its_pool_and_the_mark_is_the_configs() {
+    for (left, config) in [
+        (0.1, String::new()),
+        (0.5, "[agy]\nhold_at_percent = 40\n\n".to_owned()),
+    ] {
+        let lab = Lab::new("code", left, 1.0, &["ok"]);
+        lab.configure(&format!("{config}{AGY_FIRST_HARD}"));
+
+        let out = lab.review(&["--tier", "hard", "base", "t4-r1", "--json"]);
+
+        assert_eq!(out.code, 0, "{left}: {out:?}");
+        assert_eq!(
+            lab.who(),
+            ["agy claude-opus-5-5-high"],
+            "{left}: Gemini held"
+        );
+    }
+}
+
+#[test]
+fn an_agy_hold_mark_out_of_range_is_a_precondition() {
+    let lab = Lab::new("code", 1.0, 1.0, &["ok"]);
+    lab.configure(&format!("[agy]\nhold_at_percent = 0\n\n{AGY_FIRST_HARD}"));
+
+    let out = lab.review(&["--tier", "hard", "base", "t4-r1"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(
+        out.stderr
+            .contains("[agy] hold_at_percent is 0; give it more than 0 and at most 100"),
+        "{out:?}"
+    );
+    assert!(lab.runs().is_empty(), "no reviewer ran");
+}
+
+#[test]
 fn a_docs_only_diff_is_trivial_and_under_the_reserve_goes_to_codex_at_low() {
-    let lab = Lab::new("docs", 0.1, 0.0, &["ok"]);
+    let lab = Lab::new("docs", 0.15, 0.0, &["ok"]);
 
     let out = lab.review(&["base", "t5-r1"]);
 
@@ -692,7 +728,7 @@ fn a_docs_only_diff_is_trivial_and_under_the_reserve_goes_to_codex_at_low() {
 
 #[test]
 fn codex_runs_without_web_search_or_sub_agents() {
-    let lab = Lab::new("docs", 0.1, 0.0, &["ok"]);
+    let lab = Lab::new("docs", 0.15, 0.0, &["ok"]);
 
     let out = lab.review(&["base", "t5-r1"]);
 
@@ -916,7 +952,7 @@ fn standard_and_trivial_skip_an_argon_step_under_the_20_percent_reserve_and_hard
         ("docs", "trivial", "codex"),
         ("code", "hard", "agy gemini-4-argon-high"),
     ] {
-        let lab = Lab::new(change, 0.1, 1.0, &["ok"]);
+        let lab = Lab::new(change, 0.15, 1.0, &["ok"]);
         lab.configure(chains);
         let mut args = vec!["base", "t15-r1", "--json"];
         if tier == "hard" {

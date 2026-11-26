@@ -87,6 +87,10 @@ pub struct Lab {
     /// Why the lab couldn't be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Why the USB bus couldn't be read at the last sweep: the phones with USB debugging off
+    /// are then the last ones found, and may be out of date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usb_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,7 +256,7 @@ pub fn chip(lab: &Lab) -> Chip {
         .filter(|line| matches!(line.tone, Tone::Warn | Tone::Critical))
         .map(|line| format!("{}: {}", line.name, line.text))
         .collect();
-    let tooltip = if needs.is_empty() {
+    let mut tooltip = if needs.is_empty() {
         format!(
             "Lab: {} phones ready, {} emulators, {} stacks up",
             phones_ready(&phones),
@@ -262,6 +266,10 @@ pub fn chip(lab: &Lab) -> Chip {
     } else {
         format!("Lab: {}", needs.join("; "))
     };
+    if let Some(why) = usb_unread(lab) {
+        tooltip.push_str(" · ");
+        tooltip.push_str(&why);
+    }
     Chip {
         id: "lab".to_owned(),
         label,
@@ -278,6 +286,15 @@ pub fn chip(lab: &Lab) -> Chip {
     }
 }
 
+/// What the card and the chip say while the USB bus can't be read.
+fn usb_unread(lab: &Lab) -> Option<String> {
+    lab.usb_error.as_ref().map(|why| {
+        format!(
+            "the USB bus could not be read ({why}): a phone with USB debugging off may be missing"
+        )
+    })
+}
+
 fn text(label: &str, text: String, tone: Tone) -> Row {
     Row::Text {
         label: label.to_owned(),
@@ -292,8 +309,11 @@ pub fn section(lab: &Lab) -> Section {
     let phones = phone_lines(lab);
     let mut rows = Vec::new();
     if lab.error.is_none() {
-        if phones.is_empty() {
+        // A bus that can't be read says nothing of what is plugged in.
+        if phones.is_empty() && lab.usb_error.is_none() {
             rows.push(text("phones", "none plugged in".to_owned(), Tone::Muted));
+        } else if phones.is_empty() {
+            rows.push(text("phones", "unknown".to_owned(), Tone::Muted));
         }
         for line in &phones {
             rows.push(text(&line.name, line.text.clone(), line.tone));
@@ -331,7 +351,7 @@ pub fn section(lab: &Lab) -> Section {
         id: "lab".to_owned(),
         title: "Lab".to_owned(),
         note: None,
-        error: lab.error.clone(),
+        error: lab.error.clone().or_else(|| usb_unread(lab)),
         stale_since: phones
             .iter()
             .filter_map(|line| line.stale_since)

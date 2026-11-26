@@ -174,6 +174,22 @@ fn a_bad_codex_config_is_a_precondition() {
     );
 }
 
+#[test]
+fn an_app_server_timeout_past_the_specs_20_seconds_is_refused() {
+    let sandbox = Sandbox::new();
+    configure(&sandbox, "[codex]\ntimeout_seconds = 21\n");
+
+    let out = quota(&sandbox);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(
+        out.stderr
+            .contains("[codex] timeout_seconds is 21; give it from 1 to 20"),
+        "{out:?}"
+    );
+    assert!(sandbox.calls(APP_SERVER).is_empty(), "Codex was not asked");
+}
+
 /// An app-server that fails some way: the status and the bar say it could not be read, never 0%.
 fn unreadable(sandbox: &Sandbox, why: &str) {
     let row = codex_row(sandbox);
@@ -264,8 +280,14 @@ fn the_chip_shows_the_worst_window_and_the_card_has_a_meter_for_each_and_the_pla
     let sandbox = Sandbox::new();
     answers(&sandbox, &reply(18.0, 92.0));
 
-    let feed = bar_document(&sandbox);
+    let _ = bar_document(&sandbox);
+    let mut feed = Value::Null;
+    let landed = world::poll_until(|| {
+        feed = bar_document(&sandbox);
+        chip(&feed, "codex")["text"] != "?"
+    });
 
+    assert!(landed, "{feed}");
     let codex = chip(&feed, "codex");
     assert_eq!(codex["text"], "92%", "{feed}");
     assert_eq!(codex["tone"], "critical", "{feed}");
@@ -284,6 +306,51 @@ fn the_chip_shows_the_worst_window_and_the_card_has_a_meter_for_each_and_the_pla
     let text = card.to_string();
     assert!(text.contains("plus"), "{card}");
     assert!(text.contains("reset credits"), "{card}");
+}
+
+#[test]
+fn a_bar_run_waits_on_no_codex_ask_and_shows_the_reading_once_it_lands() {
+    let sandbox = Sandbox::new();
+    let gate = gate(&sandbox);
+    sandbox.fake(
+        APP_SERVER,
+        &format!(
+            "read a; read b; read c\nread go < '{}'\necho '{}'\nexec sleep 60",
+            gate.display(),
+            reply(18.0, 40.0)
+        ),
+    );
+    // The daemon's first look gives up on the ask after its patience; the ask stays out.
+    assert_eq!(sandbox.factory(&["monitor", "status"]).code, 0);
+
+    let started = std::time::Instant::now();
+    let out = sandbox.factory(&["bar", "--json"]);
+    let took = started.elapsed();
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    assert!(
+        took < std::time::Duration::from_secs(3),
+        "the bar waited {took:?}"
+    );
+    let feed: Value = serde_json::from_str(&out.stdout).unwrap_or(Value::Null);
+    let codex = chip(&feed, "codex");
+    assert_eq!(
+        (codex["text"].as_str(), codex["tone"].as_str()),
+        (Some("?"), Some("muted")),
+        "{feed}"
+    );
+    assert!(
+        codex["tooltip"].to_string().contains("still being asked"),
+        "{feed}"
+    );
+    open(&gate);
+    let mut feed = Value::Null;
+    let landed = world::poll_until(|| {
+        feed = bar_document(&sandbox);
+        chip(&feed, "codex")["text"] == "40%"
+    });
+    assert!(landed, "{feed}");
+    assert_eq!(sandbox.calls(APP_SERVER).len(), 1, "one ask for every run");
 }
 
 #[test]
@@ -336,6 +403,31 @@ fn a_held_codex_with_no_other_backend_refuses_the_review_with_75() {
     );
     assert!(out.stderr.contains("held at 5h 93%"), "{out:?}");
     assert!(sandbox.calls("codex").is_empty(), "Codex was not run");
+}
+
+#[test]
+fn a_review_held_off_codex_by_a_stale_reading_asks_the_plan_again_first() {
+    let sandbox = Sandbox::new();
+    let skew = sandbox.path("clock-skew");
+    let sandbox = sandbox.env("FACTORY_CLOCK_SKEW_FILE", &skew);
+    let repo = sandbox.repo();
+    configure(&sandbox, "[[review.backend]]\ncli = \"codex\"\n");
+    answers(&sandbox, &reply(93.0, 20.0));
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+    assert_eq!(quota(&sandbox).code, 75, "the 5-hour window holds");
+
+    // Six minutes on, the reading is stale and the plan has room again, before the old reset.
+    std::fs::write(&skew, "360").unwrap();
+    answers(&sandbox, &reply(10.0, 20.0));
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1-r1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(sandbox.calls("codex").len(), 1, "Codex took the review");
+    assert_eq!(
+        sandbox.calls(APP_SERVER).len(),
+        2,
+        "the plan was asked again"
+    );
 }
 
 #[test]
@@ -399,7 +491,7 @@ fn a_review_waits_out_an_ask_that_a_look_gives_up_on() {
     let repo = sandbox.repo();
     configure(
         &sandbox,
-        "[codex]\ntimeout_seconds = 60\n\n[[review.backend]]\ncli = \"codex\"\n",
+        "[codex]\ntimeout_seconds = 20\n\n[[review.backend]]\ncli = \"codex\"\n",
     );
     // Codex answers only once the gate opens, after a look has given up on the ask.
     let gate = gate(&sandbox);
@@ -456,6 +548,40 @@ fn a_failed_ask_is_not_repeated_by_a_restart_within_five_minutes() {
         "{row}: Codex was not pressed again"
     );
     assert_eq!(sandbox.calls(APP_SERVER).len(), 1);
+}
+
+#[test]
+fn a_failed_ask_puts_no_pruned_reading_back_into_the_history() {
+    let sandbox = Sandbox::new();
+    let skew = sandbox.path("clock-skew");
+    let sandbox = sandbox.env("FACTORY_CLOCK_SKEW_FILE", &skew);
+    answers(&sandbox, &reply(18.0, 40.0));
+    assert_eq!(quota(&sandbox).code, 0);
+    let codex_rows = |sandbox: &Sandbox| -> Vec<Value> {
+        let out = sandbox.factory(&["quota", "history", "--json"]);
+        assert_eq!(out.code, 0, "{out:?}");
+        let document: Value = serde_json::from_str(&out.stdout).unwrap();
+        document["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["harness"] == "codex")
+            .cloned()
+            .collect()
+    };
+    assert_eq!(codex_rows(&sandbox).len(), 2, "one row per window");
+
+    // 91 days on, a new daemon prunes both rows; the next ask fails.
+    std::fs::write(&skew, (91 * 86_400).to_string()).unwrap();
+    crate::router::kill_daemon(&sandbox);
+    sandbox.fake(APP_SERVER, "exit 1");
+    assert!(
+        codex_row(&sandbox).starts_with("codex usage unreadable: "),
+        "the ask fails"
+    );
+
+    assert_eq!(codex_rows(&sandbox), Vec::<Value>::new());
+    assert_eq!(sandbox.calls(APP_SERVER).len(), 2);
 }
 
 /// `body`, with a child of its own beside it; it notes both pids in `codex-app-server.pids`.

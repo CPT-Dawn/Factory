@@ -91,6 +91,7 @@ fn snapshot(claude: Claude, leads: Vec<Lead>) -> Snapshot {
         claude,
         codex: Codex::default(),
         agy: Agy::default(),
+        agy_hold_at: factory_core::quota::AGY_HOLD_AT_PERCENT,
         waits: vec![Wait {
             pane: Some("w1:p1".to_owned()),
             lead: Some("lead-a".to_owned()),
@@ -142,6 +143,7 @@ fn busy_lab() -> Lab {
         max_emulators: 2,
         mem_available_mb: 8192,
         error: None,
+        usb_error: None,
     }
 }
 
@@ -658,6 +660,34 @@ fn the_agy_chip_shows_the_worst_window_across_its_quota_groups() {
     assert_eq!(chip_of(&document, "agy"), ("91%".into(), "critical".into()));
 }
 
+#[test]
+fn an_agy_pool_held_at_a_mark_below_ninety_is_a_critical_chip_that_says_so() {
+    // [agy] hold_at_percent = 40: the Claude and GPT pool's weekly 63% is held.
+    let held = Snapshot {
+        agy_hold_at: 40.0,
+        ..with_agy(agy_read())
+    };
+    let document = json(&feed(&held));
+    let chip = chip(&document, "agy");
+    assert_eq!(chip["text"], "63%", "{chip}");
+    assert_eq!(chip["tone"], "critical", "{chip}");
+    assert_eq!(
+        chip["tooltip"],
+        "agy: Gemini Models 5h 30%, weekly 7%; Claude and GPT models 5h 24%, weekly 63% \
+         · held from 40%"
+    );
+
+    // Below the mark the share tones it as usual.
+    let under = Snapshot {
+        agy_hold_at: 70.0,
+        ..with_agy(agy_read())
+    };
+    assert_eq!(
+        chip_of(&json(&feed(&under)), "agy"),
+        ("63%".into(), "ok".into())
+    );
+}
+
 fn chip_of(document: &Value, id: &str) -> (String, String) {
     let chip = chip(document, id);
     (
@@ -706,6 +736,38 @@ fn the_codex_chip_shows_the_worst_window_toned_by_its_share() {
     let chip = chip(&document, "codex");
     assert_eq!(chip["label"], glyph::CODEX.char.to_string());
     assert_eq!(chip["tooltip"], "Codex: 5h 18%, weekly 62%");
+}
+
+#[test]
+fn an_unreadable_codex_whose_standing_reading_still_holds_shows_the_hold_critical() {
+    let held = Codex {
+        verdict: ClaudeState::Hold,
+        until: Some(at("2026-11-23T07:00:00Z")),
+        hold: Some("5h 93%".to_owned()),
+        unreadable: Some("it did not answer within 20s".to_owned()),
+        ..codex(vec![five(93)])
+    };
+    assert_eq!(codex_chip(held.clone()), ("93%".into(), "critical".into()));
+
+    let mut shot = snapshot(Claude::default(), Vec::new());
+    shot.codex = held;
+    let document = json(&feed(&shot));
+    let tooltip = chip(&document, "codex")["tooltip"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        tooltip.contains("codex usage unreadable: it did not answer within 20s"),
+        "{tooltip}"
+    );
+    assert!(tooltip.contains("hold: 5h 93% until"), "{tooltip}");
+
+    // Unreadable with nothing holding stays a muted ?.
+    let open = Codex {
+        unreadable: Some("it did not answer within 20s".to_owned()),
+        ..codex(vec![five(18)])
+    };
+    assert_eq!(codex_chip(open), ("?".into(), "muted".into()));
 }
 
 #[test]
