@@ -1705,7 +1705,7 @@ fn many_quota_groups_are_a_summary_line_naming_a_file_with_a_row_each() {
 }
 
 #[test]
-fn a_listing_that_cannot_be_written_comes_under_the_summary_instead() {
+fn a_listing_that_cannot_be_written_is_an_error_while_json_still_has_every_group() {
     let sandbox = Sandbox::new();
     let bucket = |window: &str| json!({"window": window, "remaining_fraction": 0.5, "reset_time": "2099-01-01T00:00:00Z"});
     let groups: Vec<Value> = (1..=12)
@@ -1718,19 +1718,30 @@ fn a_listing_that_cannot_be_written_comes_under_the_summary_instead() {
 
     let out = quota_agy(&sandbox);
 
-    assert_eq!(out.code, 0, "{out:?}");
-    let lines = out.stdout_lines();
-    assert_eq!(lines.len(), 13, "{out:?}");
-    assert_eq!(lines[0], "agy: 12 quota groups, worst window 50%");
-    assert_eq!(
-        lines[1],
-        "  Quota group number 1 of the plan: 5h 50%, weekly 50%"
-    );
-    assert_eq!(out.stderr, "", "{out:?}");
+    assert_ne!(out.code, 0, "{out:?}");
+    assert_eq!(out.stdout, "", "{out:?}");
+    assert!(out.stderr.contains("cannot write"), "{out:?}");
+    assert!(out.stderr.contains("use --json"), "{out:?}");
     let json = sandbox.factory(&["quota", "agy", "--json"]);
     assert_eq!(json.code, 0, "{json:?}");
     assert_eq!(
         shown(&json.stdout)["groups"].as_array().map(Vec::len),
         Some(12)
+    );
+}
+
+#[test]
+fn a_group_name_with_a_line_break_is_still_one_line() {
+    let sandbox = Sandbox::new();
+    let answer = two_groups().replace("Gemini Models", "Gemini\\nModels");
+    sandbox.fake("agy", &agy_says(&answer));
+
+    let out = quota_agy(&sandbox);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(out.stdout_lines().len(), 1, "{out:?}");
+    assert!(
+        out.stdout.starts_with("agy: Gemini Models: 5h 30%"),
+        "{out:?}"
     );
 }
