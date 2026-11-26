@@ -121,6 +121,29 @@ fn a_window_whose_length_is_no_number_of_minutes_makes_the_answer_unreadable() {
 }
 
 #[test]
+fn a_window_that_names_no_length_or_is_no_window_makes_the_answer_unreadable() {
+    // Beside a good 5-hour window, a weekly one whose length is missing, null, or that is no
+    // object at all is torn, not absent: an absent one would erase a standing hold on the week.
+    let torn = |week: Value| {
+        codex::read_usage(&limits(window(10, 300, FIVE_RESETS), week), now())
+            .err()
+            .unwrap_or_default()
+    };
+    for week in [
+        json!({"usedPercent": 95, "resetsAt": WEEK_RESETS}),
+        json!({"usedPercent": 95, "windowDurationMins": null, "resetsAt": WEEK_RESETS}),
+        json!("weekly"),
+        json!(95),
+    ] {
+        assert_eq!(
+            torn(week.clone()),
+            "one of its windows has a length that could not be read",
+            "{week}"
+        );
+    }
+}
+
+#[test]
 fn reset_credits_count_only_the_available_ones() {
     let credits = |credits: Value, count: Value| {
         let mut answer: Value = serde_json::from_str(REPLY).unwrap_or_else(|e| panic!("{e:?}"));

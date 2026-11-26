@@ -273,7 +273,7 @@ fn codex_waits_for(gate: &std::path::Path, report: &str) -> String {
     )
 }
 
-fn gate(sandbox: &Sandbox) -> std::path::PathBuf {
+pub(crate) fn gate(sandbox: &Sandbox) -> std::path::PathBuf {
     let gate = sandbox.path("gate");
     let made = std::process::Command::new("mkfifo").arg(&gate).status();
     assert!(made.is_ok_and(|status| status.success()), "mkfifo {gate:?}");
@@ -282,7 +282,7 @@ fn gate(sandbox: &Sandbox) -> std::path::PathBuf {
 
 /// Lets one waiting fake through `gate`, blocking until one opens it. Open it again only
 /// once the next fake waits, as the last one may still hold it open.
-fn open(gate: &std::path::Path) {
+pub(crate) fn open(gate: &std::path::Path) {
     fs::write(gate, "go\n").unwrap_or_default();
 }
 

@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use crate::claude::{HOUR, now_secs};
 use crate::review::codex_writes;
-use crate::router::{CLEAN_REPORT, claude_writes, codex_out_of_quota, configure};
-use crate::support::{APP_SERVER, Run, Sandbox};
+use crate::router::{CLEAN_REPORT, claude_writes, codex_out_of_quota, configure, gate, open};
+use crate::support::{self, APP_SERVER, Run, Sandbox, world};
 
 /// The app-server's reply to `account/rateLimits/read`: a 5-hour window `five` percent spent
 /// and a weekly one `weekly` percent spent, on the plus plan with two reset credits.
@@ -35,6 +35,7 @@ fn answers(sandbox: &Sandbox, reply: &str) {
             "read a; read b; read c\n\
              echo '{{\"method\":\"remoteControl/status/changed\",\"params\":{{}}}}'\n\
              echo '{{\"id\":1,\"result\":{{}}}}'\n\
+             echo 'not json'\n\
              echo '{reply}'\n\
              exec sleep 60"
         ),
@@ -243,9 +244,14 @@ fn output_that_is_no_json_before_the_server_ends_is_unreadable_not_zero() {
 fn a_hung_codex_is_killed_at_its_timeout_and_the_looks_still_answer() {
     let sandbox = Sandbox::new();
     configure(&sandbox, "[codex]\ntimeout_seconds = 1\n");
-    sandbox.fake(APP_SERVER, "exec sleep 60");
+    sandbox.fake(APP_SERVER, &with_a_child("exec sleep 60"));
 
     unreadable(&sandbox, "it did not answer within 1s");
+    assert!(
+        world::poll_until(|| pids(&sandbox).iter().all(|&pid| gone(pid))),
+        "the hung server and its child were killed: {:?}",
+        pids(&sandbox)
+    );
     assert_eq!(
         sandbox.calls(APP_SERVER).len(),
         1,
@@ -388,25 +394,48 @@ fn a_review_that_claude_takes_never_asks_codex_about_its_plan() {
 }
 
 #[test]
-fn a_slow_first_answer_still_holds_the_review_it_was_asked_for() {
+fn a_review_waits_out_an_ask_that_a_look_gives_up_on() {
     let sandbox = Sandbox::new();
     let repo = sandbox.repo();
-    configure(&sandbox, "[[review.backend]]\ncli = \"codex\"\n");
-    // Slower than the display patience: the review waits for the plan, it does not guess.
+    configure(
+        &sandbox,
+        "[codex]\ntimeout_seconds = 60\n\n[[review.backend]]\ncli = \"codex\"\n",
+    );
+    // Codex answers only once the gate opens, after a look has given up on the ask.
+    let gate = gate(&sandbox);
     sandbox.fake(
         APP_SERVER,
         &format!(
-            "read a; read b; read c\nsleep 9\necho '{}'\nexec sleep 60",
+            "read a; read b; read c\nread go < '{}'\necho '{}'\nexec sleep 60",
+            gate.display(),
             reply(18.0, 92.0)
         ),
     );
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+    let mut cmd = sandbox.factory_command(&["review", "main", "t1-r1"]);
+    cmd.current_dir(&repo);
+    let mut review = support::spawn(cmd);
+    assert!(
+        world::poll_until(|| sandbox.calls(APP_SERVER).len() == 1),
+        "the review never asked about the plan"
+    );
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1-r1"]);
+    let row = codex_row(&sandbox);
 
+    assert!(
+        row.starts_with("codex usage unreadable: it is still being asked"),
+        "{row}"
+    );
+    assert!(
+        matches!(review.try_wait(), Ok(None)),
+        "the review did not wait for the answer"
+    );
+    open(&gate);
+    let out = support::finish(review);
     assert_eq!(out.code, 75, "{out:?}");
     assert!(out.stderr.contains("held at weekly 92%"), "{out:?}");
     assert!(sandbox.calls("codex").is_empty(), "Codex was not run");
+    assert_eq!(sandbox.calls(APP_SERVER).len(), 1, "one ask for both");
 }
 
 #[test]
@@ -427,4 +456,198 @@ fn a_failed_ask_is_not_repeated_by_a_restart_within_five_minutes() {
         "{row}: Codex was not pressed again"
     );
     assert_eq!(sandbox.calls(APP_SERVER).len(), 1);
+}
+
+/// `body`, with a child of its own beside it; it notes both pids in `codex-app-server.pids`.
+fn with_a_child(body: &str) -> String {
+    format!("sleep 60 &\necho $! $$ > \"$0.pids\"\n{body}")
+}
+
+/// The pids `with_a_child` noted.
+fn pids(sandbox: &Sandbox) -> Vec<u32> {
+    std::fs::read_to_string(sandbox.path(format!("bin/{APP_SERVER}.pids")))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|pid| pid.parse().ok())
+        .collect()
+}
+
+/// Whether process `pid` has ended: it is gone, or a zombie no one has reaped yet.
+fn gone(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z'))
+    })
+}
+
+#[test]
+fn the_exchange_is_three_messages_with_no_jsonrpc_field() {
+    let sandbox = Sandbox::new();
+    sandbox.fake(
+        APP_SERVER,
+        &format!(
+            "read -r a; read -r b; read -r c\n\
+             printf '%s\\n%s\\n%s\\n' \"$a\" \"$b\" \"$c\" > \"$0.received\"\n\
+             echo '{}'\nexec sleep 60",
+            reply(18.0, 40.0)
+        ),
+    );
+
+    assert_eq!(quota(&sandbox).code, 0);
+
+    let received = std::fs::read_to_string(sandbox.path(format!("bin/{APP_SERVER}.received")))
+        .unwrap_or_default();
+    let lines: Vec<&str> = received.lines().collect();
+    assert_eq!(lines.len(), 3, "{received}");
+    let first: Value = serde_json::from_str(lines[0]).unwrap_or(Value::Null);
+    assert_eq!(
+        (&first["id"], &first["method"]),
+        (&json!(1), &json!("initialize")),
+        "{received}"
+    );
+    assert_eq!(
+        first["params"]["clientInfo"]["name"], "factory",
+        "{received}"
+    );
+    assert_eq!(lines[1], r#"{"method":"initialized"}"#);
+    assert_eq!(lines[2], r#"{"id":2,"method":"account/rateLimits/read"}"#);
+    assert!(!received.contains("jsonrpc"), "{received}");
+    assert_eq!(sandbox.calls(APP_SERVER), [vec!["app-server".to_owned()]]);
+}
+
+#[test]
+fn the_server_and_its_children_are_killed_once_it_has_answered() {
+    let sandbox = Sandbox::new();
+    sandbox.fake(
+        APP_SERVER,
+        &with_a_child(&format!(
+            "read a; read b; read c\necho '{}'\nexec sleep 60",
+            reply(18.0, 40.0)
+        )),
+    );
+
+    let out = quota(&sandbox);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(pids(&sandbox).len(), 2, "the fake noted its pids");
+    assert!(
+        world::poll_until(|| pids(&sandbox).iter().all(|&pid| gone(pid))),
+        "the answered server and its child were killed: {:?}",
+        pids(&sandbox)
+    );
+}
+
+#[test]
+fn a_server_that_never_stops_chattering_is_killed_at_its_timeout() {
+    let sandbox = Sandbox::new();
+    configure(&sandbox, "[codex]\ntimeout_seconds = 1\n");
+    sandbox.fake(
+        APP_SERVER,
+        "read a; read b; read c\nwhile :; do echo '{\"method\":\"account/updated\"}'; done",
+    );
+
+    unreadable(&sandbox, "it did not answer within 1s");
+}
+
+#[test]
+fn a_request_of_the_servers_own_with_id_2_is_not_the_answer() {
+    let sandbox = Sandbox::new();
+    configure(&sandbox, "[codex]\ntimeout_seconds = 1\n");
+    sandbox.fake(
+        APP_SERVER,
+        "read a; read b; read c\necho '{\"id\":2,\"method\":\"item/tool/requestUserInput\"}'\nexec sleep 60",
+    );
+
+    unreadable(&sandbox, "it did not answer within 1s");
+}
+
+fn database(sandbox: &Sandbox) -> rusqlite::Connection {
+    rusqlite::Connection::open(sandbox.path("state/factory/factory.db")).unwrap_or_else(|e| {
+        panic!("open the daemon's database: {e}");
+    })
+}
+
+#[test]
+fn a_hold_that_a_failed_ask_leaves_standing_says_both() {
+    let sandbox = Sandbox::new();
+    answers(&sandbox, &reply(18.0, 92.0));
+    assert_eq!(quota(&sandbox).code, 75, "the first reading holds");
+    // Ten minutes on, as the database counts: the next look asks again, and Codex is down.
+    crate::router::kill_daemon(&sandbox);
+    let moved =
+        database(&sandbox).execute("UPDATE codex_quota SET asked_ms = asked_ms - 600000", []);
+    assert_eq!(moved, Ok(1));
+    sandbox.fake(APP_SERVER, "exit 1");
+
+    let out = quota(&sandbox);
+
+    assert_eq!(out.code, 75, "the week still holds: {out:?}");
+    assert!(
+        out.stderr
+            .starts_with("factory: codex: hold: weekly 92%; hold new reviews on codex until "),
+        "{out:?}"
+    );
+    assert!(
+        out.stderr
+            .contains("; codex usage unreadable: it exited with status 1 before it answered"),
+        "{out:?}"
+    );
+    let row = codex_row(&sandbox);
+    assert!(
+        row.starts_with(
+            "codex usage unreadable: it exited with status 1 before it answered; held: "
+        ),
+        "{row}"
+    );
+    assert_eq!(sandbox.calls(APP_SERVER).len(), 2);
+}
+
+#[test]
+fn a_reading_that_could_not_be_kept_says_so_and_the_next_look_keeps_it() {
+    let sandbox = Sandbox::new();
+    answers(&sandbox, &reply(18.0, 92.0));
+    assert_eq!(
+        sandbox.factory(&["monitor", "status"]).code,
+        0,
+        "wake the daemon"
+    );
+    // The table goes from under the running daemon, so its write of the reading fails.
+    let db = database(&sandbox);
+    let schema: Result<String, _> = db.query_row(
+        "SELECT sql FROM sqlite_master WHERE name = 'codex_quota'",
+        [],
+        |row| row.get(0),
+    );
+    let schema = schema.unwrap_or_else(|e| panic!("the daemon made codex_quota: {e}"));
+    assert_eq!(db.execute_batch("DROP TABLE codex_quota"), Ok(()));
+
+    let unkept = quota(&sandbox);
+
+    assert_eq!(
+        unkept.code, 75,
+        "the reading still holds this run: {unkept:?}"
+    );
+    assert!(
+        unkept
+            .stderr
+            .contains("codex usage unreadable: its reading could not be kept: "),
+        "{unkept:?}"
+    );
+    assert_eq!(db.execute_batch(&schema), Ok(()));
+    let kept = quota(&sandbox);
+    assert_eq!(kept.code, 75, "{kept:?}");
+    assert!(!kept.stderr.contains("unreadable"), "{kept:?}");
+    // What the next look wrote outlives a restart.
+    crate::router::kill_daemon(&sandbox);
+    sandbox.fake(APP_SERVER, "exit 1");
+    let restarted = quota(&sandbox);
+    assert_eq!(restarted.code, 75, "{restarted:?}");
+    assert!(
+        restarted
+            .stderr
+            .starts_with("factory: codex: hold: weekly 92%; "),
+        "{restarted:?}"
+    );
+    assert!(!restarted.stderr.contains("unreadable"), "{restarted:?}");
+    assert_eq!(sandbox.calls(APP_SERVER).len(), 1, "one ask for all of it");
 }
