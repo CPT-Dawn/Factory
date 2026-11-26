@@ -510,6 +510,17 @@ pub fn claude_hold_at(paths: &Paths) -> Result<f64, Failure> {
     )
 }
 
+/// The config's mark for holding a quota group of agy's: `[agy] hold_at_percent`.
+pub fn agy_hold_at(paths: &Paths) -> Result<f64, Failure> {
+    let (path, file) = load_config(paths)?;
+    hold_at(
+        &path,
+        "agy",
+        file.agy.hold_at_percent,
+        factory_core::quota::AGY_HOLD_AT_PERCENT,
+    )
+}
+
 /// A harness's `[<table>] hold_at_percent`, more than 0 and at most 100, or `default` unset.
 fn hold_at(path: &Path, table: &str, given: Option<f64>, default: f64) -> Result<f64, Failure> {
     match given {

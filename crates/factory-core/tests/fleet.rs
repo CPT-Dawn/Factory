@@ -102,6 +102,7 @@ fn snapshot(ci: Ci) -> Snapshot {
         claude: Claude::default(),
         codex: Default::default(),
         agy: Default::default(),
+        agy_hold_at: factory_core::quota::AGY_HOLD_AT_PERCENT,
         waits: Vec::new(),
         leads: no_leads(),
         ci,

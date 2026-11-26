@@ -1683,6 +1683,28 @@ fn a_slow_usage_query_is_asked_once_and_holds_no_bar_up() {
 }
 
 #[test]
+fn a_pool_held_at_the_configs_mark_is_a_critical_bar_chip() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", &agy_says(&two_groups()));
+    configure(&sandbox, "[agy]\nhold_at_percent = 40\n");
+    start(&sandbox);
+
+    // Claude and GPT's weekly 63% is past the 40% mark, where routing holds the pool.
+    assert!(
+        until_it(|| agy_chip(&bar_json(&sandbox))["text"] == "63%"),
+        "no reading landed"
+    );
+    let chip = agy_chip(&bar_json(&sandbox));
+    assert_eq!(chip["tone"], "critical", "{chip}");
+    assert!(
+        chip["tooltip"]
+            .as_str()
+            .is_some_and(|tip| tip.ends_with(" · held from 40%")),
+        "{chip}"
+    );
+}
+
+#[test]
 fn a_reading_is_shown_for_five_minutes_and_asked_again_after() {
     let skew = Sandbox::new();
     let clock = skew.path("clock-skew");

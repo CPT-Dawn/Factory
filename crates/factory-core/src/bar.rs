@@ -20,7 +20,7 @@ const WARN_AT: u32 = 75;
 const CRITICAL_AT: u32 = 90;
 
 /// What the daemon answers the bar's one request with.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     /// When it was taken, in milliseconds since the epoch.
     pub now: i64,
@@ -28,6 +28,9 @@ pub struct Snapshot {
     #[serde(default)]
     pub codex: status::Codex,
     pub agy: status::Agy,
+    /// The config's mark for holding a quota group of agy's, in percent of either window.
+    #[serde(default = "agy_hold_default")]
+    pub agy_hold_at: f64,
     pub waits: Vec<status::Wait>,
     pub leads: status::Leads,
     /// The watched repos' CI; none configured shows no CI chip or section.
@@ -36,6 +39,10 @@ pub struct Snapshot {
     /// The lab as the daemon last checked it.
     #[serde(default)]
     pub lab: lab::Lab,
+}
+
+fn agy_hold_default() -> f64 {
+    crate::quota::AGY_HOLD_AT_PERCENT
 }
 
 /// A cockpit v1 document.
@@ -597,8 +604,10 @@ fn codex_section(snapshot: &Snapshot) -> Section {
     }
 }
 
-/// The worst window across agy's quota groups, toned by its share; muted while agy's usage is
-/// unreadable or no window stands.
+/// The worst window across agy's quota groups, toned by its share, and critical once it is at
+/// the config's hold mark, where routing holds its pool; muted while agy's usage is unreadable
+/// or no window stands. Whole percents are rounded down, so a fractional mark counts as reached
+/// at the next whole percent.
 fn agy_chip(snapshot: &Snapshot) -> Chip {
     let agy = &snapshot.agy;
     let label = glyph::AGY.char.to_string();
@@ -611,11 +620,14 @@ fn agy_chip(snapshot: &Snapshot) -> Chip {
             tooltip: Some(problem),
         };
     }
-    let (text, tone) = match agy.worst(snapshot.now) {
+    let worst = agy.worst(snapshot.now);
+    let held = worst.is_some_and(|used| f64::from(used) >= snapshot.agy_hold_at);
+    let (text, tone) = match worst {
+        Some(used) if held => (format!("{used}%"), Tone::Critical),
         Some(used) => (format!("{used}%"), share_tone(used)),
         None => ("?".to_owned(), Tone::Muted),
     };
-    let tooltip = if agy.groups.is_empty() {
+    let mut tooltip = if agy.groups.is_empty() {
         "agy: no reading yet".to_owned()
     } else {
         let groups: Vec<String> = agy
@@ -625,6 +637,9 @@ fn agy_chip(snapshot: &Snapshot) -> Chip {
             .collect();
         format!("agy: {}", groups.join("; "))
     };
+    if held {
+        tooltip.push_str(&format!(" · held from {}%", snapshot.agy_hold_at));
+    }
     Chip {
         id: "agy".to_owned(),
         label,

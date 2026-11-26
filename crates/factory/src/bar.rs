@@ -60,11 +60,13 @@ fn request() -> Result<(Paths, BarParams), Failure> {
     let paths = Paths::from_env()?;
     let claude_hold_at = config::claude_hold_at(&paths)?;
     let codex = config::codex_params(&paths)?;
+    let agy_hold_at = config::agy_hold_at(&paths)?;
     Ok((
         paths,
         BarParams {
             claude_hold_at,
             codex,
+            agy_hold_at,
         },
     ))
 }
@@ -85,6 +87,7 @@ pub async fn snapshot(
         claude: quotas.claude(params.claude_hold_at),
         codex: quotas.codex_glance(&params.codex),
         agy: quotas.agy(Duration::ZERO).await,
+        agy_hold_at: params.agy_hold_at,
         waits: leads.registered(),
         leads: status::leads_seen(leads, steward),
         ci: fleet.snapshot(),

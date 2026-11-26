@@ -44,8 +44,9 @@ const PRUNE_LOOK: Duration = Duration::from_secs(5);
 /// its own, shorter freshness check: a dispatch wants the newest answer, a bar poll does not.
 pub const AGY_DISPLAY_FRESH_MS: i64 = 300_000;
 
-/// How long status and the bar wait for a usage query that is under way: past it they show the
-/// last reading and the query finishes on its own, so a slow agy never holds a poll up.
+/// How long `factory status` waits for a usage query that is under way: past it, it shows the
+/// last reading and the query finishes on its own, so a slow agy never holds a look up. The bar
+/// waits for none.
 pub const AGY_GLANCE: Duration = Duration::from_secs(4);
 
 /// How long `factory quota agy` waits for a usage query: agy's own limit for it, and a margin.
