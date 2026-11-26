@@ -296,3 +296,46 @@ fn a_lab_that_cannot_be_read_says_so_on_the_chip_the_card_and_the_line() {
     assert_eq!(card_json["rows"], json!([]));
     assert_eq!(line(&card), "lab ?");
 }
+
+#[test]
+fn a_usb_bus_that_cannot_be_read_never_says_no_phones_are_plugged_in() {
+    let unread = Lab {
+        usb_error: Some("/sys/bus/usb/devices: Permission denied".to_owned()),
+        ..lab(Vec::new())
+    };
+    let phones = row(&unread, "phones");
+    assert_eq!(
+        (&phones["text"], &phones["tone"]),
+        (&json!("unknown"), &json!("muted"))
+    );
+    let card = serde_json::to_value(section(&unread)).unwrap_or(Value::Null);
+    let error = card["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("the USB bus could not be read") && error.contains("Permission denied"),
+        "{card}"
+    );
+    assert!(
+        chip(&unread)
+            .tooltip
+            .is_some_and(|t| t.contains("the USB bus could not be read")),
+    );
+
+    // The phones last found stand, with the error beside them.
+    let stale = Lab {
+        usb_error: Some("gone".to_owned()),
+        ..lab(vec![phone("S1", "Samsung", Readiness::UsbDebuggingOff)])
+    };
+    assert_eq!(row(&stale, "phones"), Value::Null);
+    assert_eq!(row(&stale, "Samsung")["text"], "turn on USB debugging");
+    let card = serde_json::to_value(section(&stale)).unwrap_or(Value::Null);
+    assert!(
+        card["error"].as_str().is_some_and(|e| e.contains("gone")),
+        "{card}"
+    );
+
+    // A bus read again says nothing of it.
+    let read = lab(Vec::new());
+    assert_eq!(row(&read, "phones")["text"], "none plugged in");
+    let card = serde_json::to_value(section(&read)).unwrap_or(Value::Null);
+    assert_eq!(card["error"], Value::Null);
+}

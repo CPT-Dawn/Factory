@@ -39,12 +39,21 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 /// within this is said alone.
 const FOLD: Duration = Duration::from_secs(3);
 
-/// The phones with USB debugging off at the watcher's last sweep of the USB bus, and when it was
-/// made, in ms since the epoch.
+/// The phones with USB debugging off at the watcher's last sweep of the USB bus that could read
+/// it, and when it was made, in ms since the epoch; and why the last sweep could not read the
+/// bus, while it can't: the phones are then the last ones read, which may be out of date.
 #[derive(Default)]
 pub(super) struct Hidden {
     pub at: i64,
     pub phones: Vec<HiddenPhone>,
+    pub error: Option<String>,
+}
+
+/// What the bar is told of the phones with USB debugging off: [`Hidden`] as of a call.
+pub(super) struct HiddenNow {
+    pub at: i64,
+    pub phones: Vec<HiddenPhone>,
+    pub error: Option<String>,
 }
 
 /// What the watcher thread is asked to do.
@@ -98,7 +107,7 @@ impl Lab {
     /// and when; those `listed`, the list the caller shows beside them, are left out, so that
     /// no phone is said to be missing from a list that has it. Reads what is kept: it spawns
     /// nothing and reads no sysfs.
-    pub(super) fn hidden_phones(&self, listed: &[Attached]) -> (i64, Vec<HiddenPhone>) {
+    pub(super) fn hidden_phones(&self, listed: &[Attached]) -> HiddenNow {
         let hidden = lock_ignoring_poison(&self.hidden);
         let phones = hidden
             .phones
@@ -106,7 +115,11 @@ impl Lab {
             .filter(|h| !listed.iter().any(|a| a.serial == h.serial))
             .cloned()
             .collect();
-        (hidden.at, phones)
+        HiddenNow {
+            at: hidden.at,
+            phones,
+            error: hidden.error.clone(),
+        }
     }
 
     /// Tells the watcher what adb's stream showed; called before the list is told to anyone
@@ -272,10 +285,20 @@ impl Watcher {
     /// Android vendor whose serial adb doesn't list. It reads sysfs and spawns nothing. While
     /// adb's stream follows no list, what adb lists is not known: no phone is newly said to be
     /// missing from it, and the ones already said are kept only while the bus still shows them.
+    ///
+    /// A bus that can't be read changes no phone: the last ones found stand, and the error says
+    /// they may be out of date, until a sweep reads the bus again.
     fn sweep_usb(&mut self) {
+        let on_bus = match self.usb.devices() {
+            Ok(on_bus) => on_bus,
+            Err(why) => {
+                lock_ignoring_poison(&self.lab.hidden).error = Some(why);
+                return;
+            }
+        };
         if !self.following {
-            let on_bus = self.usb.devices();
             let mut hidden = lock_ignoring_poison(&self.lab.hidden);
+            hidden.error = None;
             // Still the same device: its serial and a vendor of the same maker.
             hidden.phones.retain(|h| {
                 on_bus
@@ -290,11 +313,12 @@ impl Watcher {
             .chain(&self.lost)
             .map(|a| a.serial.as_str())
             .collect();
-        let found = hidden_phones(&self.usb.devices(), &listed);
+        let found = hidden_phones(&on_bus, &listed);
         let mut hidden = lock_ignoring_poison(&self.lab.hidden);
         *hidden = Hidden {
             at: now_ms(),
             phones: found,
+            error: None,
         };
     }
 

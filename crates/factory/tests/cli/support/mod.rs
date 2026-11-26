@@ -97,6 +97,8 @@ impl Sandbox {
         for sub in ["home", "state", "config", "bin", "calls"] {
             fs::create_dir(sandbox.path(sub)).expect("create a sandbox subdir");
         }
+        // An empty USB bus, as a machine with nothing plugged in shows it.
+        fs::create_dir_all(sandbox.path("sysfs/bus/usb/devices")).expect("create the USB bus");
         fs::DirBuilder::new()
             .mode(0o700)
             .create(sandbox.path("run"))
@@ -183,7 +185,7 @@ impl Sandbox {
             .env("XDG_CONFIG_HOME", self.path("config"))
             .env("XDG_RUNTIME_DIR", self.path("run"))
             // The USB bus of the sandbox, empty unless a test lays one out: the machine's own is
-            // never read (#73).
+            // never read (#73). A test that removes it has a bus that can't be read.
             .env("FACTORY_SYSFS_ROOT", self.path("sysfs"))
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .current_dir(self.dir.path())

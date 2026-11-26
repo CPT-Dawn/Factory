@@ -12,8 +12,9 @@ use factory_core::lab::usb::UsbDevice;
 pub const ROOT_VAR: &str = "FACTORY_SYSFS_ROOT";
 
 pub trait Usb: Send + Sync {
-    /// Every USB device on the bus that has a vendor id and a serial.
-    fn devices(&self) -> Vec<UsbDevice>;
+    /// Every USB device on the bus that has a vendor id and a serial, or why the bus can't be
+    /// read: an unreadable bus is never an empty one.
+    fn devices(&self) -> Result<Vec<UsbDevice>, String>;
 }
 
 /// Sysfs under a root.
@@ -43,10 +44,9 @@ fn attribute(device: &Path, name: &str) -> Option<String> {
 }
 
 impl Usb for Sysfs {
-    fn devices(&self) -> Vec<UsbDevice> {
-        let Ok(entries) = std::fs::read_dir(self.root.join("bus/usb/devices")) else {
-            return Vec::new();
-        };
+    fn devices(&self) -> Result<Vec<UsbDevice>, String> {
+        let bus = self.root.join("bus/usb/devices");
+        let entries = std::fs::read_dir(&bus).map_err(|e| format!("{}: {e}", bus.display()))?;
         let mut found: Vec<(String, UsbDevice)> = entries
             .filter_map(Result::ok)
             .filter_map(|entry| {
@@ -60,15 +60,15 @@ impl Usb for Sysfs {
             })
             .collect();
         found.sort_by(|a, b| a.0.cmp(&b.0));
-        found.into_iter().map(|(_, device)| device).collect()
+        Ok(found.into_iter().map(|(_, device)| device).collect())
     }
 }
 
-/// A bus that shows what it is given.
-pub struct FakeUsb(pub Vec<UsbDevice>);
+/// A bus that shows what it is given, or fails with it.
+pub struct FakeUsb(pub Result<Vec<UsbDevice>, String>);
 
 impl Usb for FakeUsb {
-    fn devices(&self) -> Vec<UsbDevice> {
+    fn devices(&self) -> Result<Vec<UsbDevice>, String> {
         self.0.clone()
     }
 }
