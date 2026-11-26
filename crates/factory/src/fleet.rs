@@ -2,14 +2,16 @@
 //! self-hosted runners, its queued and running workflow jobs and the checks of its open
 //! `factory/*` pull requests, for the status screen and the bar.
 //!
-//! It reads only while something needs watching: a `factory wait ci` on one of the repos'
+//! It reads every repo once as the daemon starts, so the runner fleet shows even when nothing
+//! needs watching (#79). After that it reads only while something needs watching: a
+//! `factory wait ci` on one of the repos'
 //! pull requests wakes it, and it reads a repo every minute while the last answer shows an open
 //! factory pull request or a job not yet completed, or while the factory has live work in it: a
 //! lead herdr shows at work in a checkout of the repo (its `origin` on github.com), while one of
 //! the repo's worktrees is on a `factory/*` branch. Reviews and waits count through the lead
 //! they run under. Live work is looked at again on each change to the leads and every minute,
-//! with git and herdr's picture only, so an idle factory costs GitHub nothing. A read that fails keeps the last good answer, marked with
-//! why, and every answer is kept in the database, so a restarted daemon resumes the watch.
+//! with git and herdr's picture only, so an idle factory costs GitHub nothing past that first
+//! read. A read that fails keeps the last good answer, marked with why, and every answer is kept in the database, so a restarted daemon resumes the watch.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -124,7 +126,9 @@ impl<A: Actions> Fleet<A> {
             return;
         }
         let mut leads = Some(leads);
-        let mut asked = false;
+        // Every repo is read once as the daemon starts, so its runner fleet shows even on a
+        // night with nothing to watch (#79); after that, only what needs watching is read.
+        let mut asked = true;
         let mut last: Option<i64> = None;
         // The repos with live work, as last looked; looked at again once `look` is set.
         let mut busy: Vec<String> = Vec::new();

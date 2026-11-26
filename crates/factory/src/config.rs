@@ -36,7 +36,7 @@
 //! ```toml
 //! [ci]
 //! poll = "30s"             # a duration: 90s, 9m, 2h
-//! repos = ["owner/name"]   # on github.com; read every 60s, only while something needs watching
+//! repos = ["owner/name"]   # on github.com; read once at start, then every 60s while something needs watching
 //! expected = 7             # self-hosted runners the owner runs across those repos
 //!
 //! [monitor]
