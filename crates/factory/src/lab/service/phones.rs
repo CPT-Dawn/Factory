@@ -221,8 +221,8 @@ impl Watcher {
     }
 
     /// Probes each free phone adb can use. A leased phone is its holder's, whose run the
-    /// watcher leaves alone: no prep or probe of its own touches the phone while a lease holds
-    /// it (#72). Whether one does is read right before each probe, so a lease granted during
+    /// watcher leaves alone: no re-check probes it while a lease holds it (#72); only a replug
+    /// readies it again, as any phone is (#55). Whether one does is read right before each probe, so a lease granted during
     /// the round is seen by the next phone's.
     fn recheck(&mut self) {
         for phone in self.shown.clone() {

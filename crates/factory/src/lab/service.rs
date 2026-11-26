@@ -189,7 +189,7 @@ impl Lab {
     pub fn open(path: &Path, ledger: Arc<Ledger>) -> Result<Lab, String> {
         let store =
             Store::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        let looker = store::Reader::open(path)
+        let read_only = store::Reader::open(path)
             .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         // The ledger's thread, on its own connection: it appends what the lab's transactions
         // queued, when told to and at least every few seconds, so a backlog an earlier daemon
@@ -218,7 +218,7 @@ impl Lab {
         Ok(Lab {
             path: path.to_owned(),
             store: Mutex::new(store),
-            reader: Mutex::new(looker),
+            reader: Mutex::new(read_only),
             changed: watch::Sender::new(0),
             attached: watch::Sender::new(DeviceList::default()),
             tracking: Once::new(),
