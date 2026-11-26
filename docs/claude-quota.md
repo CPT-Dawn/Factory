@@ -34,7 +34,7 @@ agy has no hook: the daemon's quota keeper asks `agy -p /usage --output-format j
 
 - Each quota group (`Gemini Models`, `Claude and GPT models`) has a 5-hour and a weekly window. A bucket that agy reports with the Unix epoch as its reset has no clock running: with a remaining fraction of 1 it is an unused window, 0%; with a lower fraction it is unknown, and routing treats the answer as unreadable. It is never "a reset that passed".
 - An answer that is garbage, or a query that fails, shows `agy usage unreadable: <why>` in `factory status`, `factory quota agy` and the bar (a muted `?` chip, and the card's `error`), never 0% or 100%. It is asked again after five minutes like any reading.
-- `factory quota agy` prints `agy: Gemini Models: 5h 30%, weekly 7%; Claude and GPT models: 5h 24%, weekly 63%` and exits 0, reading or not: it reports, and does not gate. `--json` has `groups`, `error` and `seen`.
+- `factory quota agy` prints `agy: Gemini Models: 5h 30%, weekly 7%; Claude and GPT models: 5h 24%, weekly 63%` and exits 0, reading or not: it reports, and does not gate. Past 200 characters (many groups, or long names) the line becomes a summary naming `agy-quota.txt` in the state dir, which has a row for each group; if that file can't be written the command says so and exits non-zero (the state dir is the daemon's too, so it is broken anyway), and `--json`, which writes no file, has every group. `--json` has `groups`, `error` and `seen`.
 - The bar's agy chip shows the worst window across the groups, toned by its share. The card has one block per quota group: a text row naming it, then a meter per window.
 - The keeper holds the reading in memory: a restart asks again.
 
