@@ -408,3 +408,23 @@ fn a_slow_first_answer_still_holds_the_review_it_was_asked_for() {
     assert!(out.stderr.contains("held at weekly 92%"), "{out:?}");
     assert!(sandbox.calls("codex").is_empty(), "Codex was not run");
 }
+
+#[test]
+fn a_failed_ask_is_not_repeated_by_a_restart_within_five_minutes() {
+    let sandbox = Sandbox::new();
+    sandbox.fake(APP_SERVER, "exit 1");
+    assert!(
+        codex_row(&sandbox).starts_with("codex usage unreadable: "),
+        "the first ask fails"
+    );
+    crate::router::kill_daemon(&sandbox);
+    answers(&sandbox, &reply(18.0, 40.0));
+
+    let row = codex_row(&sandbox);
+
+    assert!(
+        !row.contains("5h 18%"),
+        "{row}: Codex was not pressed again"
+    );
+    assert_eq!(sandbox.calls(APP_SERVER).len(), 1);
+}

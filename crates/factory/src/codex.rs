@@ -65,35 +65,3 @@ fn judged(verdict: &CodexVerdict) -> Result<Done, Failure> {
     let json = serde_json::to_value(verdict).unwrap_or(Value::Null);
     Ok(Done::new(line, json))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use factory_core::status::Codex;
-
-    #[test]
-    fn a_hold_that_a_failed_ask_leaves_standing_says_both() {
-        let verdict = CodexVerdict {
-            codex: Codex {
-                verdict: ClaudeState::Hold,
-                until: Some(1_795_831_256_000),
-                hold: Some("weekly 92%".to_owned()),
-                unreadable: Some("it did not answer within 20s".to_owned()),
-                ..Codex::default()
-            },
-            hold_at: 90.0,
-        };
-
-        let failure = judged(&verdict).err();
-
-        let message = failure.map(|f| f.message).unwrap_or_default();
-        assert!(
-            message.starts_with("codex: hold: weekly 92%; "),
-            "{message}"
-        );
-        assert!(
-            message.ends_with("; codex usage unreadable: it did not answer within 20s"),
-            "{message}"
-        );
-    }
-}

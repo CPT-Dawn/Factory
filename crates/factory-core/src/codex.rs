@@ -84,12 +84,17 @@ pub fn read_usage(reply: &str, now: Timestamp) -> Result<Usage, String> {
 }
 
 /// A window: none when there is no window, or its length is neither the 5-hour nor the weekly
-/// one; an error when it is one of those and its share or reset can't be read.
+/// one; an error when it is one of those and its share or reset can't be read, or when it names
+/// a length that is no whole number of minutes (so it may be one of those, torn).
 fn read_window(window: &Value, now: Timestamp) -> Result<Option<UsageWindow>, String> {
-    let kind = match window.get("windowDurationMins").and_then(Value::as_i64) {
-        Some(FIVE_HOUR_MINUTES) => WindowKind::FiveHour,
-        Some(WEEKLY_MINUTES) => WindowKind::Weekly,
-        _ => return Ok(None),
+    let kind = match window.get("windowDurationMins") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(length) => match length.as_i64() {
+            Some(FIVE_HOUR_MINUTES) => WindowKind::FiveHour,
+            Some(WEEKLY_MINUTES) => WindowKind::Weekly,
+            Some(_) => return Ok(None),
+            None => return Err("one of its windows has a length that could not be read".to_owned()),
+        },
     };
     let read = (|| {
         let used = window.get("usedPercent")?.as_f64()?;
@@ -131,8 +136,8 @@ pub struct CodexQuota {
     pub reset_credits: u32,
     /// Why the last ask could not be read; none once one could. Kept in memory only.
     pub unreadable: Option<String>,
-    /// When Codex was last asked, read or not. Kept in memory only: a daemon that starts asks
-    /// again.
+    /// When Codex was last asked, read or not. Kept with the readings: a daemon that starts
+    /// within 5 minutes of an ask does not ask again.
     pub asked: Option<Timestamp>,
 }
 

@@ -237,7 +237,19 @@ mod tests {
 
     fn app_server(body: &str, timeout: Duration) -> Result<String, CodexError> {
         let dir = tempfile::tempdir().map_err(|e| CodexError::Spawn(e.to_string()))?;
-        AppServer::with(script(dir.path(), body)).rate_limits(timeout)
+        let server = AppServer::with(script(dir.path(), body));
+        // A script just written can be held open for a moment by a sibling test's fork
+        // ("Text file busy"): the start is tried again, a few times, before it counts.
+        let mut answer = server.rate_limits(timeout);
+        for _ in 0..5 {
+            match &answer {
+                Err(CodexError::Spawn(why)) if why.contains("Text file busy") => {
+                    answer = server.rate_limits(timeout);
+                }
+                _ => break,
+            }
+        }
+        answer
     }
 
     #[test]

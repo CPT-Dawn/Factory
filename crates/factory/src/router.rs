@@ -131,13 +131,16 @@ impl Router {
             .iter()
             .map(|backend| backend.cli.as_deref() == Some(CODEX))
             .collect();
+        // Set when the pick fell to Codex though the first look expected another backend: the
+        // plan is settled before it is granted.
+        let mut settle = false;
         loop {
             let mut changed = std::pin::pin!(self.changed.notified());
             changed.as_mut().enable();
             // A first look, from the quotas as stored: only a review that is about to take Codex
             // asks about its plan, and it waits for the answer, so none starts on a plan that
             // a reading on its way would have held.
-            let takes_codex = {
+            let takes_codex = settle || {
                 let state = lock(&self.state);
                 let candidates = candidates(&state, &wanted, &on_codex, None, clock::now());
                 matches!(
@@ -145,6 +148,7 @@ impl Router {
                     Pick::Take(index) if on_codex[index]
                 )
             };
+            settle = false;
             let hold = if takes_codex {
                 Hold::of(&keeper.codex_settled(&params.codex).await)
             } else {
@@ -156,6 +160,12 @@ impl Router {
                 let candidates = candidates(&state, &wanted, &on_codex, hold.as_ref(), now);
                 match quota::pick(&candidates, now) {
                     Pick::Take(index) => {
+                        if on_codex[index] && !takes_codex {
+                            // The slot the first look counted on went to another review: this
+                            // one falls to Codex, whose plan nobody has settled yet.
+                            settle = true;
+                            continue;
+                        }
                         let name = wanted[index].0.to_owned();
                         *state.running.entry(name.clone()).or_default() += 1;
                         if let Some(tier) = &params.tier {

@@ -121,7 +121,8 @@ impl Store {
                  weekly_resets_ms INTEGER,
                  weekly_seen_ms INTEGER,
                  plan TEXT,
-                 reset_credits INTEGER NOT NULL DEFAULT 0
+                 reset_credits INTEGER NOT NULL DEFAULT 0,
+                 asked_ms INTEGER
              );
              CREATE TABLE IF NOT EXISTS usage_history (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -318,18 +319,25 @@ impl Store {
             .db
             .query_row(
                 "SELECT used_percent, resets_ms, seen_ms, weekly_used_percent, weekly_resets_ms,
-                     weekly_seen_ms, plan, reset_credits
+                     weekly_seen_ms, plan, reset_credits, asked_ms
                  FROM codex_quota WHERE id = 1",
                 [],
                 |row| {
                     let five: Reading = (row.get(0)?, row.get(1)?, row.get(2)?);
                     let weekly: Reading = (row.get(3)?, row.get(4)?, row.get(5)?);
                     let credits: i64 = row.get(7)?;
-                    Ok((five, weekly, row.get::<_, Option<String>>(6)?, credits))
+                    let asked: Option<i64> = row.get(8)?;
+                    Ok((
+                        five,
+                        weekly,
+                        row.get::<_, Option<String>>(6)?,
+                        credits,
+                        asked,
+                    ))
                 },
             )
             .optional()?;
-        let Some((five, weekly, plan, credits)) = row else {
+        let Some((five, weekly, plan, credits, asked)) = row else {
             return Ok(CodexQuota::default());
         };
         let stamp = Timestamp::from_unix_millis;
@@ -347,9 +355,8 @@ impl Store {
             window(WindowKind::Weekly, weekly),
         );
         Ok(CodexQuota {
-            // The last answer was read when its windows were seen: a restart within 5 minutes
-            // of it does not ask again.
-            asked: five_hour.into_iter().chain(weekly).map(|w| w.seen).max(),
+            // A restart within 5 minutes of an ask, read or not, does not ask again.
+            asked: asked.map(stamp),
             five_hour,
             weekly,
             plan,
@@ -358,18 +365,18 @@ impl Store {
         })
     }
 
-    /// Records the Codex plan's windows, plan and reset credits. Whether the last ask could be
-    /// read is not kept, and when it was is the time its windows were seen: a daemon that starts
-    /// within 5 minutes of that does not ask again.
+    /// Records the Codex plan's windows, plan, reset credits and when it was last asked. Whether
+    /// the last ask could be read is not kept: a daemon that starts within 5 minutes of the ask
+    /// does not press a Codex that was down.
     pub fn set_codex_quota(&self, quota: &CodexQuota) -> rusqlite::Result<()> {
         let (five, weekly) = (quota.five_hour, quota.weekly);
         self.db.execute(
             "INSERT INTO codex_quota (id, used_percent, resets_ms, seen_ms, weekly_used_percent,
-                 weekly_resets_ms, weekly_seen_ms, plan, reset_credits)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 weekly_resets_ms, weekly_seen_ms, plan, reset_credits, asked_ms)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT (id) DO UPDATE SET used_percent = ?1, resets_ms = ?2, seen_ms = ?3,
                  weekly_used_percent = ?4, weekly_resets_ms = ?5, weekly_seen_ms = ?6,
-                 plan = ?7, reset_credits = ?8",
+                 plan = ?7, reset_credits = ?8, asked_ms = ?9",
             params![
                 five.map(|window| window.used_percent),
                 five.map(|window| window.resets.unix_millis()),
@@ -379,6 +386,7 @@ impl Store {
                 weekly.map(|window| window.seen.unix_millis()),
                 quota.plan,
                 i64::from(quota.reset_credits),
+                quota.asked.map(Timestamp::unix_millis),
             ],
         )?;
         Ok(())

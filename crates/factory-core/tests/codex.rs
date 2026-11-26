@@ -104,6 +104,23 @@ fn a_window_of_another_length_or_none_is_no_trouble() {
 }
 
 #[test]
+fn a_window_whose_length_is_no_number_of_minutes_makes_the_answer_unreadable() {
+    // A weekly window with its length as text must not read as absent beside a good 5-hour
+    // one: the standing hold on the week would go with it.
+    let usage = codex::read_usage(
+        &limits(
+            window(10, 300, FIVE_RESETS),
+            json!({"usedPercent": 95, "windowDurationMins": "10080", "resetsAt": WEEK_RESETS}),
+        ),
+        now(),
+    );
+    assert_eq!(
+        usage.err().unwrap_or_default(),
+        "one of its windows has a length that could not be read"
+    );
+}
+
+#[test]
 fn reset_credits_count_only_the_available_ones() {
     let credits = |credits: Value, count: Value| {
         let mut answer: Value = serde_json::from_str(REPLY).unwrap_or_else(|e| panic!("{e:?}"));
