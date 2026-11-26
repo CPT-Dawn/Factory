@@ -58,7 +58,7 @@ fn row(feed: &Value, label: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn feed_until(sandbox: &Sandbox, done: impl Fn(&Value) -> bool) -> (bool, Value) {
+fn feed_until(sandbox: &Sandbox, mut done: impl FnMut(&Value) -> bool) -> (bool, Value) {
     let mut last = Value::Null;
     let ok = poll_until(|| {
         last = feed(sandbox);
@@ -106,13 +106,29 @@ fn a_known_vendor_device_adb_does_not_list_shows_on_the_bar_and_in_status() {
         "{text}"
     );
 
-    // Turned on: adb lists it now, and it is a phone like any other.
-    unplug_usb(&sandbox, "1-2");
+    // Turned on: adb lists it now while it stays on the bus, and it is a phone like any other:
+    // never both the phone and its warning, not even in between.
     world
-        .apply("plug SAMSUNG0001 device usb:1-2 model:SM_S901")
+        .apply("plug SAMSUNG0001 device usb:1-2 model:Samsung")
         .unwrap();
-    let (cleared, last) = feed_until(&sandbox, |f| row(f, "Samsung")["text"].is_null());
+    let mut doubled = Vec::new();
+    let (cleared, last) = feed_until(&sandbox, |f| {
+        let samsungs = rows(f)
+            .into_iter()
+            .filter(|r| {
+                r["label"]
+                    .as_str()
+                    .is_some_and(|l| l.starts_with("Samsung"))
+            })
+            .count();
+        if samsungs > 1 {
+            doubled.push(f.clone());
+        }
+        row(f, "Samsung")["text"] == "ready"
+    });
     assert!(cleared, "{last}");
+    assert!(doubled.is_empty(), "{doubled:?}");
+    assert!(!status_text(&sandbox, &world).contains("turn on USB debugging"));
 }
 
 #[test]
@@ -123,6 +139,12 @@ fn devices_that_are_no_hidden_phone_are_left_out() {
     plug_usb(&sandbox, "1-1", "18d1", "FAKEPHONE01");
     plug_usb(&sandbox, "1-3", "046d", "KEYBOARD01");
     plug_usb(&sandbox, "1-4", "2717", "XIAOMI0001");
+    // Neither an interface, nor a device with no serial or a blank one, is a phone adb could list.
+    std::fs::create_dir_all(sandbox.path("sysfs/bus/usb/devices/1-4:1.0")).unwrap();
+    plug_usb(&sandbox, "1-6", "2d95", "");
+    let bare = sandbox.path("sysfs/bus/usb/devices/1-7");
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::write(bare.join("idVendor"), "22b8\n").unwrap();
 
     let (shown, last) = feed_until(&sandbox, |f| {
         row(f, "Xiaomi")["text"] == "turn on USB debugging"
@@ -131,7 +153,14 @@ fn devices_that_are_no_hidden_phone_are_left_out() {
     let (ready, last) = feed_until(&sandbox, |f| row(f, "Pixel 8")["text"] == "ready");
     assert!(ready, "{last}");
     let labels: Vec<Value> = rows(&last).iter().map(|r| r["label"].clone()).collect();
-    for absent in ["FAKEPHONE01", "KEYBOARD01", "Google", "Logitech"] {
+    for absent in [
+        "FAKEPHONE01",
+        "KEYBOARD01",
+        "Google",
+        "Logitech",
+        "vivo",
+        "Motorola",
+    ] {
         assert!(
             !labels.iter().any(|l| l == absent),
             "{absent} in {labels:?}"
@@ -158,6 +187,49 @@ fn a_phone_adb_lists_is_not_flagged_while_adb_s_stream_comes_back() {
     assert_eq!(row(&last, "Pixel 8")["text"], "ready", "{last}");
     assert!(row(&last, "Google")["text"].is_null(), "{last}");
     assert!(!status_text(&sandbox, &world).contains("turn on USB debugging"));
+}
+
+#[test]
+fn a_leased_phone_that_left_adb_but_not_the_bus_is_one_row_and_keeps_its_holder() {
+    let (sandbox, world) = watching();
+    world.apply(PIXEL).unwrap();
+    let (ready, last) = feed_until(&sandbox, |f| row(f, "Pixel 8")["text"] == "ready");
+    assert!(ready, "{last}");
+    let wt = world.worktree("plain-held");
+    let held = owned(&sandbox, &wt, &["acquire", "--phone"]);
+    assert_eq!(held.code, 0, "{held:?}");
+
+    // Its USB debugging goes off under the lease: adb loses it, the bus still has it.
+    plug_usb(&sandbox, "1-1", "18d1", "FAKEPHONE01");
+    world.apply("unplug FAKEPHONE01").unwrap();
+    assert!(poll_until(
+        || status_text(&sandbox, &world).contains("turn on USB debugging")
+    ));
+    let text = status_text(&sandbox, &world);
+    let lines: Vec<&str> = text.lines().filter(|l| l.contains("FAKEPHONE01")).collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    assert!(
+        lines[0].contains("turn on USB debugging") && lines[0].contains("lease 1 plain-held"),
+        "{text}"
+    );
+    let (shown, last) = feed_until(&sandbox, |f| {
+        row(f, "Google")["text"] == "leased to plain-held"
+    });
+    assert!(shown, "{last}");
+}
+
+#[test]
+fn a_phone_said_to_have_its_debugging_off_is_forgotten_when_unplugged_while_adb_is_away() {
+    let (sandbox, world) = watching();
+    plug_usb(&sandbox, "1-2", "04e8", "SAMSUNG0001");
+    let (shown, last) = feed_until(&sandbox, |f| {
+        row(f, "Samsung")["text"] == "turn on USB debugging"
+    });
+    assert!(shown, "{last}");
+
+    world.restart_trackers(|| unplug_usb(&sandbox, "1-2"));
+    let (gone, last) = feed_until(&sandbox, |f| row(f, "Samsung")["text"].is_null());
+    assert!(gone, "{last}");
 }
 
 #[test]

@@ -95,10 +95,18 @@ impl Lab {
     }
 
     /// The phones adb doesn't list that the USB bus shows (#73), as the watcher last found them,
-    /// and when. Reads what is kept: it spawns nothing and reads no sysfs.
-    pub(super) fn hidden_phones(&self) -> (i64, Vec<HiddenPhone>) {
+    /// and when; those `listed`, the list the caller shows beside them, are left out, so that
+    /// no phone is said to be missing from a list that has it. Reads what is kept: it spawns
+    /// nothing and reads no sysfs.
+    pub(super) fn hidden_phones(&self, listed: &[Attached]) -> (i64, Vec<HiddenPhone>) {
         let hidden = lock_ignoring_poison(&self.hidden);
-        (hidden.at, hidden.phones.clone())
+        let phones = hidden
+            .phones
+            .iter()
+            .filter(|h| !listed.iter().any(|a| a.serial == h.serial))
+            .cloned()
+            .collect();
+        (hidden.at, phones)
     }
 
     /// Tells the watcher what adb's stream showed; called before the list is told to anyone
@@ -262,9 +270,15 @@ impl Watcher {
 
     /// Looks at the USB bus for a phone with USB debugging off (#73): a device of a known
     /// Android vendor whose serial adb doesn't list. It reads sysfs and spawns nothing. While
-    /// adb's stream follows no list, what adb lists is not known, so the last sweep stands.
+    /// adb's stream follows no list, what adb lists is not known: no phone is newly said to be
+    /// missing from it, and the ones already said are kept only while the bus still shows them.
     fn sweep_usb(&mut self) {
         if !self.following {
+            let on_bus = self.usb.devices();
+            let mut hidden = lock_ignoring_poison(&self.lab.hidden);
+            hidden
+                .phones
+                .retain(|h| on_bus.iter().any(|d| d.serial == h.serial));
             return;
         }
         let listed: Vec<&str> = self

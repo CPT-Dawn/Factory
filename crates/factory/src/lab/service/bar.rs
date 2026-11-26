@@ -33,7 +33,7 @@ impl Lab {
         let cfg = context::machine_config().unwrap_or_default();
         let shown = self.attached.borrow().shown.clone();
         let stacks_seen = lock_ignoring_poison(&self.stacks).clone();
-        let (swept, hidden) = self.hidden_phones();
+        let (swept, hidden) = self.hidden_phones(shown.as_deref().unwrap_or_default());
         self.read(|c| {
             let leases = store::leases(c)?;
             let holder = |serial: &str| {
@@ -74,11 +74,12 @@ impl Lab {
                 .collect();
             // A phone adb doesn't list, but the USB bus shows: its USB debugging is off.
             phones.extend(hidden.into_iter().map(|h| Phone {
-                serial: h.serial,
                 model: h.vendor.to_owned(),
                 readiness: Some(Readiness::UsbDebuggingOff),
                 probed: Some(swept),
-                holder: None,
+                // A leased phone is its holder's, and says so whatever adb shows of it.
+                holder: holder(&h.serial),
+                serial: h.serial,
             }));
             let emulators = store::emulators(c)?
                 .into_iter()

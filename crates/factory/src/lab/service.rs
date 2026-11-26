@@ -823,30 +823,41 @@ fn status(lab: &Lab, seen: &[Attached]) -> Answer<Board> {
                 idle_since: e.idle_since,
             })
             .collect();
-        let (_, hidden) = lab.hidden_phones();
-        let devices = device_rows(seen, &held, &emulators, now)
+        let (_, hidden) = lab.hidden_phones(seen);
+        let usb_off = Readiness::UsbDebuggingOff.word();
+        let mut devices: Vec<DeviceLine> = device_rows(seen, &held, &emulators, now)
             .into_iter()
             .map(|r| DeviceLine {
-                readiness: (r.kind == "phone")
-                    .then(|| ready.iter().find(|(s, _)| *s == r.serial))
-                    .flatten()
-                    .map(|(_, word)| word.clone()),
+                // A leased phone that left adb's list but is on the USB bus is one with its
+                // USB debugging off: its row says so and keeps its holder (#73).
+                readiness: if hidden.iter().any(|h| h.serial == r.serial) {
+                    Some(usb_off.to_owned())
+                } else {
+                    (r.kind == "phone")
+                        .then(|| ready.iter().find(|(s, _)| *s == r.serial))
+                        .flatten()
+                        .map(|(_, word)| word.clone())
+                },
                 serial: r.serial,
                 kind: r.kind,
                 model: r.model,
                 state: r.state,
                 holder: r.holder,
             })
-            // Then each phone adb doesn't list but the USB bus shows (#73).
-            .chain(hidden.into_iter().map(|h| DeviceLine {
-                serial: h.serial,
-                kind: "phone".to_owned(),
-                model: h.vendor.to_owned(),
-                state: Readiness::UsbDebuggingOff.word().to_owned(),
-                holder: "-".to_owned(),
-                readiness: Some(Readiness::UsbDebuggingOff.word().to_owned()),
-            }))
             .collect();
+        // Then each other phone adb doesn't list but the USB bus shows.
+        for h in hidden {
+            if !devices.iter().any(|d| d.serial == h.serial) {
+                devices.push(DeviceLine {
+                    serial: h.serial,
+                    kind: "phone".to_owned(),
+                    model: h.vendor.to_owned(),
+                    state: usb_off.to_owned(),
+                    holder: "-".to_owned(),
+                    readiness: Some(usb_off.to_owned()),
+                });
+            }
+        }
         let running = activity::running(c, &host::alive)?
             .into_iter()
             .map(|(lease, command)| LeaseRunning { lease, command })
