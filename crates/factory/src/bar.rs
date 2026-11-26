@@ -67,6 +67,7 @@ pub async fn snapshot(
     leads: &Leads,
     steward: &Steward,
     quotas: &Arc<QuotaKeeper>,
+    lab: bar::lab::Lab,
 ) -> Snapshot {
     Snapshot {
         now: clock::now().unix_millis(),
@@ -74,5 +75,6 @@ pub async fn snapshot(
         agy: quotas.agy(AGY_GLANCE).await,
         waits: leads.registered(),
         leads: status::leads_seen(leads, steward),
+        lab,
     }
 }

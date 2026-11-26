@@ -3,8 +3,10 @@
 
 use std::collections::BTreeSet;
 
+use factory_core::bar::lab::{Emulator, Lab, Phone, Stack};
 use factory_core::bar::{Feed, Snapshot, daemon_down, feed, glyph, line};
 use factory_core::claude::ClaudeQuota;
+use factory_core::lab::ready::Readiness;
 use factory_core::status::{Agy, Claude, ClaudeState, Lead, Leads, Wait};
 use factory_core::timestamp::Timestamp;
 use factory_core::usage::{
@@ -89,6 +91,45 @@ fn snapshot(claude: Claude, leads: Vec<Lead>) -> Snapshot {
             monitor: true,
             leads,
         },
+        lab: Lab::default(),
+    }
+}
+
+/// A lab with a phone of each readiness, a leased one, a stale one, an emulator and stacks.
+fn busy_lab() -> Lab {
+    let phone = |serial: &str, readiness, probed: i64, holder: Option<&str>| Phone {
+        serial: serial.to_owned(),
+        model: format!("Pixel {serial}"),
+        readiness,
+        probed: Some(probed),
+        holder: holder.map(str::to_owned),
+    };
+    Lab {
+        now: now(),
+        phones: vec![
+            phone("1", Some(Readiness::Ready), now(), None),
+            phone("2", Some(Readiness::Locked), now(), None),
+            phone("3", Some(Readiness::Unauthorized), now(), None),
+            phone("4", Some(Readiness::Ready), now() - 10 * 60_000, None),
+            phone("5", Some(Readiness::Asleep), now(), Some("app-t1")),
+            phone("6", None, now(), None),
+        ],
+        emulators: vec![Emulator {
+            serial: "emulator-5580".to_owned(),
+            ready: true,
+            holder: Some("app-t2".to_owned()),
+        }],
+        stacks: vec![Stack {
+            project: "app".to_owned(),
+            slot: 0,
+            up: Some(true),
+            ours: false,
+            holder: None,
+        }],
+        queue: 1,
+        max_emulators: 2,
+        mem_available_mb: 8192,
+        error: None,
     }
 }
 
@@ -174,7 +215,10 @@ fn snapshots() -> Vec<Snapshot> {
             going(vec![five(12), weekly(40)]),
             vec![lead("lead-a", "working")],
         ),
-        snapshot(going(vec![five(80), weekly(40)]), Vec::new()),
+        Snapshot {
+            lab: busy_lab(),
+            ..snapshot(going(vec![five(80), weekly(40)]), Vec::new())
+        },
         snapshot(
             Claude {
                 verdict: ClaudeState::Hold,
@@ -518,11 +562,13 @@ fn the_factory_card_lists_leads_waits_and_the_steward() {
 #[test]
 fn the_line_names_both_windows_and_the_leads() {
     let all = snapshots();
-    assert_eq!(line(&all[0]), "claude 12/40 · agy ?/? · 1 lead");
+    assert_eq!(line(&all[0]), "claude 12/40 · agy ?/? · 1 lead · lab 0/0");
+    // Phones ready out of plugged in: a stale ready one isn't counted ready.
+    assert_eq!(line(&all[1]), "claude 80/40 · agy ?/? · 0 leads · lab 1/6");
     // A hold and the leads that need the owner are the chips' to show, not the line's.
-    assert_eq!(line(&all[2]), "claude 41/91 · agy ?/? · 2 leads");
-    assert_eq!(line(&all[3]), "claude ?/12 · agy ?/? · 0 leads");
-    assert_eq!(line(&all[4]), "claude ?/? · agy ?/? · ? leads");
+    assert_eq!(line(&all[2]), "claude 41/91 · agy ?/? · 2 leads · lab 0/0");
+    assert_eq!(line(&all[3]), "claude ?/12 · agy ?/? · 0 leads · lab 0/0");
+    assert_eq!(line(&all[4]), "claude ?/? · agy ?/? · ? leads · lab 0/0");
 }
 
 #[test]
@@ -666,12 +712,18 @@ fn an_agy_window_past_its_reset_is_unknown_with_the_age_of_the_reading() {
 #[test]
 fn the_bar_line_gives_agys_worst_share_of_each_window_after_claudes() {
     let line_of = |agy: Agy| line(&with_agy(agy));
-    assert_eq!(line_of(agy_read()), "claude 12/40 · agy 30/63 · 0 leads");
+    assert_eq!(
+        line_of(agy_read()),
+        "claude 12/40 · agy 30/63 · 0 leads · lab 0/0"
+    );
     assert_eq!(
         line_of(agy_unreadable()),
-        "claude 12/40 · agy unreadable · 0 leads"
+        "claude 12/40 · agy unreadable · 0 leads · lab 0/0"
     );
-    assert_eq!(line_of(Agy::default()), "claude 12/40 · agy ?/? · 0 leads");
+    assert_eq!(
+        line_of(Agy::default()),
+        "claude 12/40 · agy ?/? · 0 leads · lab 0/0"
+    );
 }
 
 #[test]
@@ -683,5 +735,5 @@ fn the_agy_chip_comes_after_claudes_and_before_the_factorys() {
         .flatten()
         .filter_map(|chip| chip["id"].as_str())
         .collect();
-    assert_eq!(ids, ["claude", "agy", "factory"]);
+    assert_eq!(ids, ["claude", "agy", "factory", "lab"]);
 }

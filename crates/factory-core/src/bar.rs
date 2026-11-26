@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod lab;
+
 use crate::status::{self, ClaudeState};
 use crate::timestamp::Timestamp;
 use crate::usage::{UsageReading, WindowKind, WindowState};
@@ -26,6 +28,9 @@ pub struct Snapshot {
     pub agy: status::Agy,
     pub waits: Vec<status::Wait>,
     pub leads: status::Leads,
+    /// The lab as the daemon last checked it.
+    #[serde(default)]
+    pub lab: lab::Lab,
 }
 
 /// A cockpit v1 document.
@@ -162,11 +167,13 @@ pub fn feed(snapshot: &Snapshot) -> Feed {
             claude_chip(snapshot),
             agy_chip(snapshot),
             factory_chip(snapshot),
+            lab::chip(&snapshot.lab),
         ],
         sections: vec![
             claude_section(snapshot),
             agy_section(snapshot),
             factory_section(snapshot),
+            lab::section(&snapshot.lab),
         ],
     }
 }
@@ -194,9 +201,9 @@ pub fn daemon_down(reason: &str, now: i64) -> Feed {
     }
 }
 
-/// `claude 12/40 · agy 30/63 · 2 leads`: each window's share (5-hour/weekly, `?` while
-/// unknown; agy's the worst of its quota groups, or `unreadable` while its usage is), then the live leads (`? leads` while herdr
-/// can't tell).
+/// `claude 12/40 · agy 30/63 · 2 leads · lab 2/2`: each window's share (5-hour/weekly, `?` while
+/// unknown; agy's the worst of its quota groups, or `unreadable` while its usage is), the live
+/// leads (`? leads` while herdr can't tell), then the phones ready out of plugged in.
 pub fn line(snapshot: &Snapshot) -> String {
     let claude = &snapshot.claude;
     let share = |kind| {
@@ -229,9 +236,10 @@ pub fn line(snapshot: &Snapshot) -> String {
         )
     };
     format!(
-        "claude {}/{} · agy {agy} · {leads}",
+        "claude {}/{} · agy {agy} · {leads} · {}",
         share(WindowKind::FiveHour),
         share(WindowKind::Weekly),
+        lab::line(&snapshot.lab),
     )
 }
 

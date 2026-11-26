@@ -94,14 +94,20 @@ impl World {
     /// - `stall <serial>`: the emulator never finishes booting,
     /// - `yank <serial>`: the phone is unplugged when it is next asked its ABI, as a grant of it
     ///   settles: between the grant and the prep,
+    /// - `container <name>`: docker runs it, as a stack started outside devlab is run,
     /// - `break <operation>` / `mend <operation>`: `supabase start`, `supabase stop` or `systemd-run` fails,
     ///   or works again.
     pub fn apply(&self, step: &str) -> Result<(), String> {
         let words: Vec<&str> = step.split_whitespace().collect();
         match words.as_slice() {
+            // A replug is one change: no fake sees the device gone in between.
             ["plug", serial, _state, ..] => {
-                self.remove("devices", |line| first_word(line) == *serial);
-                self.append("devices", &words[1..].join(" "));
+                self.rewrite("devices", |text| {
+                    let mut kept = without(text, |line| first_word(line) == *serial);
+                    kept.push_str(&words[1..].join(" "));
+                    kept.push('\n');
+                    kept
+                });
                 self.settle_trackers();
             }
             ["unplug", serial] => {
@@ -112,15 +118,17 @@ impl World {
             ["unlock", serial] => self.remove("locked", |line| line == *serial),
             ["asleep", serial] => self.append("asleep", serial),
             ["slow", serial] => self.append("slow", serial),
-            ["setting", serial, key, value] => {
-                self.remove("settings", |line| {
+            ["setting", serial, key, value] => self.rewrite("settings", |text| {
+                let mut kept = without(text, |line| {
                     line.split_whitespace().take(2).eq([*serial, *key])
                 });
-                self.append("settings", &format!("{serial} {key} {value}"));
-            }
+                kept.push_str(&format!("{serial} {key} {value}\n"));
+                kept
+            }),
             ["power", serial, source] => self.append("power", &format!("{serial} {source}")),
             ["stall", serial] => self.append("stalled", serial),
             ["yank", serial] => self.append("yanked", serial),
+            ["container", name] => self.append("containers", name),
             ["break", what @ ..] if !what.is_empty() => self.append("broken", &what.join(" ")),
             ["mend", what @ ..] if !what.is_empty() => {
                 let what = what.join(" ");
@@ -237,22 +245,27 @@ impl World {
     }
 
     fn append(&self, file: &str, line: &str) {
-        let path = self.dir.join(file);
-        let mut text = fs::read_to_string(&path).unwrap_or_default();
-        text.push_str(line);
-        text.push('\n');
-        fs::write(path, text).expect("write a world file");
+        self.rewrite(file, |text| format!("{text}{line}\n"));
     }
 
     fn remove(&self, file: &str, gone: impl Fn(&str) -> bool) {
+        self.rewrite(file, |text| without(text, gone));
+    }
+
+    /// Replaces world file `file` with what `change` makes of it, as one change: the new text
+    /// is renamed over the old, so a fake reading it meanwhile sees one or the other, never a
+    /// file cut short. It holds `<file>.lock`, as the fake adb's settings writes do, so that
+    /// neither loses the other's change.
+    fn rewrite(&self, file: &str, change: impl FnOnce(&str) -> String) {
+        use rustix::fs::{FlockOperation, flock};
         let path = self.dir.join(file);
+        let lock = fs::File::create(self.dir.join(format!("{file}.lock")))
+            .expect("open a world file's lock");
+        flock(&lock, FlockOperation::LockExclusive).expect("lock a world file");
         let text = fs::read_to_string(&path).unwrap_or_default();
-        let kept: String = text
-            .lines()
-            .filter(|line| !gone(line))
-            .map(|line| format!("{line}\n"))
-            .collect();
-        fs::write(path, kept).expect("write a world file");
+        let next = self.dir.join(format!("{file}.step"));
+        fs::write(&next, change(&text)).expect("write a world file");
+        fs::rename(&next, &path).expect("replace a world file");
     }
 }
 
@@ -318,6 +331,14 @@ fn process_runs(pid: &str) -> bool {
             .next()
             .is_some_and(|s| s.trim_start().starts_with('Z'))
     })
+}
+
+/// `text`'s lines but those `gone` names.
+fn without(text: &str, gone: impl Fn(&str) -> bool) -> String {
+    text.lines()
+        .filter(|line| !gone(line))
+        .map(|line| format!("{line}\n"))
+        .collect()
 }
 
 fn first_word(line: &str) -> &str {

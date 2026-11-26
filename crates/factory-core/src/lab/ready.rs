@@ -184,6 +184,20 @@ fn power_sources(battery: &str) -> u32 {
     if named { on } else { 2 }
 }
 
+/// The name a phone goes by, in notifications and on the bar: its `model`, else its serial;
+/// with the last 4 of its serial when `shared`, another phone being of its model.
+pub fn phone_name(model: &str, serial: &str, shared: bool) -> String {
+    if model.is_empty() {
+        return serial.to_owned();
+    }
+    if !shared {
+        return model.to_owned();
+    }
+    let chars: Vec<char> = serial.chars().collect();
+    let last: String = chars[chars.len().saturating_sub(4)..].iter().collect();
+    format!("{model} ({last})")
+}
+
 /// How loud a notification is: `notify-send -u`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Urgency {

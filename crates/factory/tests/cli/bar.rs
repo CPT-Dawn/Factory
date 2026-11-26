@@ -51,7 +51,7 @@ fn the_bar_prints_both_claude_windows_and_the_leads_in_one_line() {
     assert!(
         poll_until(|| {
             out = bar(&sandbox, false);
-            out.stdout == "claude 12/40 · agy unreadable · 2 leads\n"
+            out.stdout == "claude 12/40 · agy unreadable · 2 leads · lab 0/0\n"
         }),
         "{out:?}"
     );
@@ -66,7 +66,7 @@ fn the_bar_prints_both_claude_windows_and_the_leads_in_one_line() {
     );
     assert_eq!(
         bar(&sandbox, false).stdout,
-        "claude 12/40 · agy unreadable · 2 leads\n"
+        "claude 12/40 · agy unreadable · 2 leads · lab 0/0\n"
     );
 }
 
@@ -400,10 +400,27 @@ fn the_bar_runs_no_external_command_and_asks_herdr_nothing() {
         &["acquire", "--no-device"],
     ));
     assert_eq!(held.code, 0, "{held:?}");
-    // The daemon's first look at herdr is its own, at its start.
-    assert!(poll_until(|| bar(&sandbox, false)
-        .stdout
-        .ends_with("· 1 lead\n")));
+    world
+        .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
+        .unwrap();
+    // The daemon's first look at herdr is its own, at its start; its phone's probe and its
+    // stacks' sweep are its own too, as the phone shows up and at its start.
+    let mut last = Value::Null;
+    assert!(
+        poll_until(|| {
+            last = feed(&sandbox);
+            let slot = section(&last, "lab")["rows"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|row| row["label"] == "demo slot 0" && row["text"] != "unchecked, demo-a");
+            slot && bar(&sandbox, false)
+                .stdout
+                .ends_with("· 1 lead · lab 1/1\n")
+        }),
+        "{last} {:?}",
+        bar(&sandbox, false)
+    );
     let tools = [
         "adb",
         "docker",

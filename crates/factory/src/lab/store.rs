@@ -167,6 +167,35 @@ impl Store {
     }
 }
 
+/// A connection of the store's own that only reads: in WAL mode a read neither waits for a
+/// writer nor holds one up, and it drops no lease and takes back no reverse (#72).
+pub struct Reader {
+    conn: Connection,
+}
+
+impl Reader {
+    /// Opens the store `Store::open` made, for reading only.
+    pub fn open(path: &Path) -> rusqlite::Result<Reader> {
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(15))?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Reader { conn })
+    }
+
+    /// Runs `work` in one read transaction: what it reads is one moment of the store.
+    pub fn read<T>(
+        &mut self,
+        work: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let out = work(&tx)?;
+        tx.rollback()?;
+        Ok(out)
+    }
+}
+
 fn lease_row(row: &Row<'_>) -> rusqlite::Result<Lease> {
     Ok(Lease {
         id: row.get("id")?,

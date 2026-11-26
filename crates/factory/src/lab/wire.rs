@@ -435,6 +435,29 @@ pub struct SlotRow {
     pub stopping: bool,
 }
 
+/// Every slot of `slots`, and each one `reservations` holds that was never leased, which has no
+/// row of its own yet: by project, then slot.
+pub fn slot_inventory(slots: &[SlotRow], reservations: &[Reservation]) -> Vec<SlotRow> {
+    let mut rows = slots.to_vec();
+    for r in reservations {
+        if !rows
+            .iter()
+            .any(|s| s.project == r.project && s.slot == r.slot)
+        {
+            rows.push(SlotRow {
+                project: r.project.clone(),
+                slot: r.slot,
+                last_worktree: None,
+                stack_ours: false,
+                idle_since: None,
+                stopping: false,
+            });
+        }
+    }
+    rows.sort_by(|a, b| (&a.project, a.slot).cmp(&(&b.project, b.slot)));
+    rows
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Waiter {
     pub id: i64,
