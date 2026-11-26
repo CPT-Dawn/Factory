@@ -484,8 +484,9 @@ pub trait Actions: Send + Sync + 'static {
     fn runners(&self, repo: &str) -> Result<Vec<Runner>, GhError>;
     /// The ids of the workflow runs queued or in progress.
     fn active_runs(&self, repo: &str) -> Result<Vec<u64>, GhError>;
-    /// The ids of the workflow runs created at or after `since` (milliseconds since the
-    /// epoch), whatever their status: a run that queued and completed between two reads.
+    /// The ids of the latest workflow runs updated at or after `since` (milliseconds since the
+    /// epoch), whatever their status: a run that queued and completed between two reads, or
+    /// the re-run of an earlier one.
     fn runs_since(&self, repo: &str, since: i64) -> Result<Vec<u64>, GhError>;
     /// The latest attempt's jobs of the workflow run `run`.
     fn jobs(&self, repo: &str, run: u64) -> Result<Vec<Job>, GhError>;
@@ -496,14 +497,12 @@ pub trait Actions: Send + Sync + 'static {
     fn sweep(&self) {}
 }
 
-/// The Actions API through gh, each read conditional: it sends back the ETag of the last
-/// answer to the same path, and GitHub answers an unchanged one with a `304 Not Modified`
+/// The Actions API through gh, each read conditional: every page sends back the ETag of the
+/// last answer to the same path, and GitHub answers an unchanged one with a `304 Not Modified`
 /// that costs no rate limit.
 #[derive(Default)]
 pub struct GhActions {
-    lists: Cache<Vec<Value>>,
     pages: Cache<Value>,
-    checks: Cache<Vec<CheckRun>>,
 }
 
 /// The last answer to each path, with its ETag.
@@ -592,7 +591,11 @@ impl Actions for GhActions {
         let mut ids = Vec::new();
         for status in ["queued", "in_progress"] {
             let path = format!("repos/{repo}/actions/runs?status={status}&per_page={PAGE}");
-            ids.extend(self.run_ids(&path)?);
+            ids.extend(
+                self.list(&path, "workflow_runs")?
+                    .iter()
+                    .filter_map(|run| run["id"].as_u64()),
+            );
         }
         ids.sort_unstable();
         ids.dedup();
@@ -600,12 +603,19 @@ impl Actions for GhActions {
     }
 
     fn runs_since(&self, repo: &str, since: i64) -> Result<Vec<u64>, GhError> {
-        let since = Timestamp::from_unix_millis(since - since.rem_euclid(1000))
-            .to_string()
-            .replace(".000Z", "Z");
-        // created=>=<time>, its operator escaped for the URL.
-        let path = format!("repos/{repo}/actions/runs?created=%3E%3D{since}&per_page={PAGE}");
-        self.run_ids(&path)
+        // The latest page only: GitHub lists the newest runs first.
+        let path = format!("repos/{repo}/actions/runs?per_page={PAGE}");
+        let page = self.page(&path)?;
+        Ok(entries(&page, "workflow_runs")
+            .iter()
+            .filter(|run| {
+                run["updated_at"]
+                    .as_str()
+                    .and_then(Timestamp::parse)
+                    .is_some_and(|updated| updated.unix_millis() >= since)
+            })
+            .filter_map(|run| run["id"].as_u64())
+            .collect())
     }
 
     fn jobs(&self, repo: &str, run: u64) -> Result<Vec<Job>, GhError> {
@@ -618,66 +628,62 @@ impl Actions for GhActions {
     }
 
     fn open_pulls(&self, repo: &str) -> Result<Vec<OpenPull>, GhError> {
-        let mut pulls = Vec::new();
-        for number in 1.. {
-            let path = format!("repos/{repo}/pulls?state=open&per_page={PAGE}&page={number}");
-            let page = self
-                .pages
-                .read(&path, |etag| Gh.conditional(HOST, &path, etag))?;
-            let page = page.as_array().cloned().unwrap_or_default();
-            pulls.extend(page.iter().filter_map(open_pull));
-            if page.len() < PAGE {
-                break;
-            }
-        }
-        Ok(pulls)
+        let path = format!("repos/{repo}/pulls?state=open&per_page={PAGE}");
+        Ok(self.list(&path, "")?.iter().filter_map(open_pull).collect())
     }
 
     fn checks(&self, repo: &str, pull: &OpenPull) -> Result<Vec<CheckRun>, GhError> {
-        let (owner, name) = repo.split_once('/').ok_or_else(|| {
-            GhError(format!(
+        if !factory_core::fleet::is_repo(repo) {
+            return Err(GhError(format!(
                 "{repo:?} is not owner/name; fix [ci] repos in the config"
-            ))
-        })?;
-        let pr = PullRequest {
-            host: HOST.to_owned(),
-            owner: owner.to_owned(),
-            repo: name.to_owned(),
-            number: pull.number,
-        };
+            )));
+        }
         let head = &pull.head;
-        let mut runs = self
-            .checks
-            .read(&format!("{repo}@{head}/check-runs"), |etag| {
-                Gh.check_runs(&pr, head, etag)
-            })?;
-        runs.extend(self.checks.read(&format!("{repo}@{head}/status"), |etag| {
-            Gh.statuses(&pr, head, etag)
-        })?);
-        Ok(runs)
+        let runs = format!("repos/{repo}/commits/{head}/check-runs?per_page={PAGE}");
+        let statuses = format!("repos/{repo}/commits/{head}/status?per_page={PAGE}");
+        let mut checks: Vec<CheckRun> = self
+            .list(&runs, "check_runs")?
+            .iter()
+            .filter_map(check_run)
+            .collect();
+        checks.extend(self.list(&statuses, "statuses")?.iter().filter_map(status));
+        Ok(checks)
     }
 
     fn sweep(&self) {
-        self.lists.sweep();
         self.pages.sweep();
-        self.checks.sweep();
     }
 }
 
 impl GhActions {
-    /// Every entry of the paged list `list` at `path`.
+    /// Every entry of the list `list` in the pages at `path` (`?` and a query, without
+    /// `page`), each page read on its own ETag; `""` for a page that is the list.
     fn list(&self, path: &str, list: &str) -> Result<Vec<Value>, GhError> {
-        self.lists
-            .read(path, |etag| Gh.paged(HOST, path, list, etag))
+        let mut all = Vec::new();
+        for number in 1.. {
+            let page = if number == 1 {
+                self.page(path)?
+            } else {
+                self.page(&format!("{path}&page={number}"))?
+            };
+            let page = if list.is_empty() {
+                page.as_array().cloned().unwrap_or_default()
+            } else {
+                entries(&page, list)
+            };
+            let more = page.len() >= PAGE;
+            all.extend(page);
+            if !more {
+                break;
+            }
+        }
+        Ok(all)
     }
 
-    /// The ids of the workflow runs a `workflow_runs` list at `path` holds.
-    fn run_ids(&self, path: &str) -> Result<Vec<u64>, GhError> {
-        Ok(self
-            .list(path, "workflow_runs")?
-            .iter()
-            .filter_map(|run| run["id"].as_u64())
-            .collect())
+    /// The answer at `path`, or the last one while GitHub says it has not changed.
+    fn page(&self, path: &str) -> Result<Value, GhError> {
+        self.pages
+            .read(path, |etag| Gh.conditional(HOST, path, etag))
     }
 }
 

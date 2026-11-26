@@ -66,22 +66,27 @@ pub enum RunnerState {
 }
 
 impl RunnerState {
-    /// From GitHub's `status` (`online` or `offline`) and `busy`.
+    /// Each state with GitHub's `status` and `busy` for it.
+    const GITHUB: [(RunnerState, &'static str, bool); 3] = [
+        (RunnerState::Busy, "online", true),
+        (RunnerState::Idle, "online", false),
+        (RunnerState::Offline, "offline", false),
+    ];
+
+    /// From GitHub's `status` (`online` or `offline`) and `busy`: offline for any other.
     pub fn of(status: &str, busy: bool) -> RunnerState {
-        match (status, busy) {
-            ("online", true) => RunnerState::Busy,
-            ("online", false) => RunnerState::Idle,
-            _ => RunnerState::Offline,
-        }
+        Self::GITHUB
+            .into_iter()
+            .find(|&(_, s, b)| s == status && b == busy)
+            .map_or(RunnerState::Offline, |(state, _, _)| state)
     }
 
     /// GitHub's `status` and `busy` for this state: [`RunnerState::of`] reversed.
     pub fn github(self) -> (&'static str, bool) {
-        match self {
-            RunnerState::Busy => ("online", true),
-            RunnerState::Idle => ("online", false),
-            RunnerState::Offline => ("offline", false),
-        }
+        Self::GITHUB
+            .into_iter()
+            .find(|&(state, _, _)| state == self)
+            .map_or(("offline", false), |(_, status, busy)| (status, busy))
     }
 }
 

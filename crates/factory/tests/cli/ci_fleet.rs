@@ -86,6 +86,19 @@ fn status_shows_the_fleet_and_each_open_factory_prs_checks_once_a_wait_wakes_the
     );
 }
 
+/// What `factory status --json` shows of acme/shop once `what` holds of it.
+fn shop_when(sandbox: &Sandbox, what: impl Fn(&Value) -> bool) -> Value {
+    let mut seen = Value::Null;
+    assert!(
+        poll_until(|| {
+            seen = status(sandbox)["ci"]["repos"][0].clone();
+            what(&seen)
+        }),
+        "never so: {seen}"
+    );
+    seen
+}
+
 /// Moves the daemon's clock to `secs` seconds past the system's.
 fn move_clock(sandbox: &Sandbox, secs: u64) {
     std::fs::write(sandbox.path("clock-skew"), secs.to_string()).unwrap();
@@ -226,8 +239,7 @@ fn the_watcher_reads_each_minute_while_a_factory_pr_is_open_and_stops_once_none_
     stop_daemon(&sandbox);
     github.pulls(&[]);
     assert_eq!(status(&sandbox)["ci"]["repos"][0]["pulls"][0]["number"], 12);
-    await_reads(&github, &sandbox, 3);
-    assert_eq!(shop(&sandbox)["pulls"], json!([]));
+    shop_when(&sandbox, |shop| shop["pulls"] == json!([]));
 
     // Nothing is left to watch.
     idle(&sandbox);
@@ -236,6 +248,50 @@ fn the_watcher_reads_each_minute_while_a_factory_pr_is_open_and_stops_once_none_
         assert!(status(&sandbox)["ci"]["next"].is_null());
     }
     assert_eq!(pull_reads(&github, &sandbox), 3);
+}
+
+#[test]
+fn every_page_of_a_long_list_is_asked_again_with_its_own_etag() {
+    let sandbox = watching(2);
+    let github = FakeGitHub::install(&sandbox);
+    github.pulls(&[(12, "factory/s1-t2")]);
+    let names: Vec<String> = (1..=150).map(|id| format!("shard-{id}")).collect();
+    let runs: Vec<_> = names
+        .iter()
+        .zip(1..)
+        .map(|(name, id)| {
+            (
+                id,
+                name.as_str(),
+                "completed",
+                Some("success"),
+                "github-actions",
+            )
+        })
+        .collect();
+    github.runs(&runs);
+    let second_pages = || {
+        sandbox
+            .calls("gh")
+            .iter()
+            .filter(|call| {
+                call.iter()
+                    .any(|arg| arg.contains("/check-runs?per_page=100&page=2"))
+            })
+            .filter(|call| call.iter().any(|arg| arg.starts_with("If-None-Match: ")))
+            .count()
+    };
+
+    assert_eq!(sandbox.factory(&["wait", "ci", "12"]).code, 0);
+    awaits_next_read(&sandbox);
+    let before = second_pages();
+    move_clock(&sandbox, 61);
+    await_reads(&github, &sandbox, 2);
+    assert!(
+        poll_until(|| second_pages() > before),
+        "the second page went out with no ETag"
+    );
+    assert_eq!(shop(&sandbox)["pulls"][0]["state"], "passing");
 }
 
 #[test]
@@ -303,13 +359,12 @@ fn each_jobs_queued_started_and_finished_times_are_stored() {
         }],
     );
     move_clock(&sandbox, 122);
-    await_reads(&github, &sandbox, 3);
     let finished = json!([{
         "id": 70, "run_id": 7, "name": "test", "status": "completed", "conclusion": "success",
         "runner": "ci-1", "queued": 1_767_261_600_000_i64, "started": 1_767_261_720_000_i64,
         "finished": 1_767_262_020_000_i64,
     }]);
-    let shop = status(&sandbox)["ci"]["repos"][0].clone();
+    let shop = shop_when(&sandbox, |shop| shop["finished"] != json!([]));
     assert_eq!(shop["jobs"], json!([]), "{shop}");
     assert_eq!(shop["finished"], finished, "{shop}");
 
@@ -327,36 +382,40 @@ fn a_run_that_queued_and_completed_between_two_reads_keeps_its_jobs_times() {
     assert_eq!(sandbox.factory(&["wait", "ci", "12"]).code, 0);
     awaits_next_read(&sandbox);
 
-    // Never queued nor in progress at a read: only the runs created since the last one name it.
-    github.created_runs(&[8]);
-    github.jobs(
-        8,
-        &[Job {
-            id: 80,
-            name: "lint",
-            status: "completed",
-            conclusion: Some("failure"),
-            created: "2026-01-01T10:00:00Z",
-            started: Some("2026-01-01T10:00:30Z"),
-            completed: Some("2026-01-01T10:01:00Z"),
-            runner: Some("ci-2"),
-        }],
-    );
+    // Never queued nor in progress at a read: only the latest runs updated since the last one
+    // name it. An older run is not read again.
+    let lint = Job {
+        id: 80,
+        name: "lint",
+        status: "completed",
+        conclusion: Some("failure"),
+        created: "2026-01-01T10:00:00Z",
+        started: Some("2026-01-01T10:00:30Z"),
+        completed: Some("2026-01-01T10:01:00Z"),
+        runner: Some("ci-2"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let now = factory_core::timestamp::Timestamp::from_unix_millis(
+        i64::try_from(now.as_millis()).unwrap(),
+    )
+    .to_string();
+    github.latest_runs(&[(8, &now), (9, "2026-01-01T09:00:00Z")]);
+    github.jobs(9, &[Job { id: 90, ..lint }]);
+    github.jobs(8, &[lint]);
     move_clock(&sandbox, 61);
-    let mut shop = Value::Null;
+    let shop = shop_when(&sandbox, |shop| shop["finished"] != json!([]));
+    let reads = github.watcher_reads(&sandbox);
     assert!(
-        poll_until(|| {
-            shop = status(&sandbox)["ci"]["repos"][0].clone();
-            shop["finished"] != json!([])
-        }),
-        "never read: {shop}"
+        reads
+            .iter()
+            .any(|path| path.ends_with("/runs/8/jobs?filter=latest&per_page=100")),
+        "{reads:?}"
     );
     assert!(
-        github
-            .watcher_reads(&sandbox)
-            .iter()
-            .any(|path| path.contains("/actions/runs?created=%3E%3D")),
-        "asked for the runs created since"
+        !reads.iter().any(|path| path.contains("/runs/9/")),
+        "a run not updated since: {reads:?}"
     );
     assert_eq!(
         shop["finished"],

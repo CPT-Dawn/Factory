@@ -25,11 +25,10 @@ use crate::store::Store;
 const INTERVAL_MS: i64 = 60_000;
 /// How often a watcher with something to watch looks at the clock.
 const TICK: Duration = Duration::from_secs(1);
-/// How far before the last good answer a read looks for runs created since, for the clocks
-/// of GitHub and of this machine to disagree.
+/// How far before the last good answer a read looks for runs updated since, for the clocks of
+/// GitHub and of this machine to disagree.
 const OVERLAP_MS: i64 = 120_000;
-/// The furthest back a read looks for runs created since: a repo unread for a week needs only
-/// its recent runs.
+/// How far back the first read of a repo looks for runs updated since.
 const LOOKBACK_MS: i64 = 3_600_000;
 /// What a failed GitHub read tells the owner to do.
 const RETRY: &str = "the last good answer stays shown; check `gh auth status` and the [ci] repos";
@@ -119,8 +118,8 @@ impl<A: Actions> Fleet<A> {
                 let _ = tokio::task::spawn_blocking(move || fleet.read_all()).await;
                 let next = self
                     .needs_watching()
-                    .then(|| clock::lab_now_ms() + INTERVAL_MS);
-                self.ci().next = next;
+                    .then(|| last.map(|at| at + INTERVAL_MS));
+                self.ci().next = next.flatten();
                 continue;
             }
             let heard = if wanted {
@@ -164,6 +163,15 @@ impl<A: Actions> Fleet<A> {
                     match kept {
                         Ok(kept) => after.finished = kept.finished,
                         Err(e) => {
+                            // Until the database keeps their end, the jobs it kept as not
+                            // completed stay tracked: the next read reads their runs again.
+                            for job in &before.jobs {
+                                if after.jobs.iter().all(|read| read.id != job.id) {
+                                    after.jobs.push(job.clone());
+                                }
+                            }
+                            after.jobs.sort_by_key(|job| job.id);
+                            after.finished.clone_from(&before.finished);
                             after.error = Some(format!(
                                 "cannot keep GitHub's answer: {e}; check the disk and \
                                  FACTORY_STATE"
@@ -185,17 +193,20 @@ impl<A: Actions> Fleet<A> {
     }
 }
 
-/// One read of `before`'s repo: its runners, the jobs of its active runs, of the runs created
-/// since the last good answer (one that queued and completed between two reads among them)
-/// and of the runs whose jobs `before` still waited on, and its open factory pull requests'
-/// checks. Also every job read, completed ones too, for the times the database keeps.
+/// One read of `before`'s repo: its runners, the jobs of its active runs, of the latest runs
+/// updated since the last good answer (one that queued and completed between two reads, or a
+/// re-run, among them) and of the runs whose jobs `before` still waited on, and its open
+/// factory pull requests' checks. Also every job read, completed ones too, for the times the
+/// database keeps.
 fn read<A: Actions>(actions: &A, before: &RepoCi) -> Result<(RepoCi, Vec<Job>), GhError> {
     let repo = before.repo.as_str();
     let runners = actions.runners(repo)?;
     let now = clock::now().unix_millis();
-    let since = before.seen.unwrap_or(now).saturating_sub(OVERLAP_MS);
+    let since = before
+        .seen
+        .map_or(now - LOOKBACK_MS, |seen| seen - OVERLAP_MS);
     let mut runs = actions.active_runs(repo)?;
-    runs.extend(actions.runs_since(repo, since.max(now - LOOKBACK_MS))?);
+    runs.extend(actions.runs_since(repo, since)?);
     runs.extend(before.jobs.iter().map(|job| job.run_id));
     runs.sort_unstable();
     runs.dedup();
