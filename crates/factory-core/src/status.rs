@@ -362,17 +362,7 @@ fn claude(status: &Status, rows: &mut Vec<String>) {
             let windows: Vec<String> = claude
                 .windows
                 .iter()
-                .map(|window| {
-                    if window.current {
-                        format!(
-                            "{} resets {}",
-                            window.describe(now),
-                            moment(window.resets, now)
-                        )
-                    } else {
-                        window.describe(now)
-                    }
-                })
+                .map(|window| window.describe_with_reset(now, |resets| moment(resets, now)))
                 .collect();
             format!("claude: {}", windows.join(", "))
         }

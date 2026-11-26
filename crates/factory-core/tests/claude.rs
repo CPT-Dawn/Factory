@@ -241,6 +241,79 @@ fn a_window_with_room_seen_after_a_limit_lifts_it() {
 }
 
 #[test]
+fn only_both_windows_seen_with_room_after_a_limit_lift_it() {
+    let reading = |kind, used, resets, seen| UsageWindow {
+        kind,
+        used_percent: used,
+        resets: at(resets),
+        seen: at(seen),
+    };
+    let limited = || {
+        let mut quota = ClaudeQuota::default();
+        quota.see(
+            &[reading(WindowKind::Weekly, 100.0, NOW + 30 * HOUR, NOW - 1)],
+            at(NOW - 1),
+        );
+        quota.hit_limit(Some(at(NOW + 30 * HOUR)), at(NOW));
+        quota
+    };
+    // A 5-hour reading alone says nothing of the week the limit was hit on.
+    let mut quota = limited();
+    quota.see(
+        &[reading(WindowKind::FiveHour, 5.0, NOW + 4 * HOUR, NOW + 1)],
+        at(NOW + 1),
+    );
+    assert_eq!(quota.held_until(at(NOW + 2)), Some(at(NOW + 30 * HOUR)));
+    // Nor does a weekly reading of a week already over.
+    quota.see(
+        &[reading(WindowKind::Weekly, 3.0, NOW - HOUR, NOW + 1)],
+        at(NOW + 1),
+    );
+    assert_eq!(quota.held_until(at(NOW + 2)), Some(at(NOW + 30 * HOUR)));
+    // Both windows standing with room, read since the limit, do.
+    quota.see(
+        &[reading(WindowKind::Weekly, 60.0, NOW + 30 * HOUR, NOW + 1)],
+        at(NOW + 1),
+    );
+    assert_eq!(quota.held_until(at(NOW + 2)), None);
+}
+
+#[test]
+fn a_share_or_reset_out_of_range_is_no_reading() {
+    let input = |used: serde_json::Value, resets: serde_json::Value| json!({"rate_limits": {"five_hour": {"used_percentage": used, "resets_at": resets}}});
+    let resets = json!(1_795_420_000);
+    for used in [json!(-5), json!(100.5), json!(1e300)] {
+        assert_eq!(
+            statusline_windows(&input(used.clone(), resets.clone()), at(NOW)),
+            vec![],
+            "{used}"
+        );
+    }
+    for resets in [json!(-1), json!(1e15), json!(1e300)] {
+        assert_eq!(
+            statusline_windows(&input(json!(40), resets.clone()), at(NOW)),
+            vec![],
+            "{resets}"
+        );
+    }
+    assert_eq!(
+        statusline_windows(&input(json!(0), json!(0)), at(NOW)),
+        vec![window(WindowKind::FiveHour, 0.0, 0)]
+    );
+    assert_eq!(
+        statusline_windows(&input(json!(100), resets.clone()), at(NOW)),
+        vec![window(WindowKind::FiveHour, 100.0, 1_795_420_000_000)]
+    );
+    // The daemon reads the hook's request with the same rule.
+    let read = |used, resets| UsageWindow::read(WindowKind::Weekly, used, resets, at(NOW));
+    assert_eq!(read(-0.1, NOW), None);
+    assert_eq!(read(f64::NAN, NOW), None);
+    assert_eq!(read(40.0, -1), None);
+    assert_eq!(read(40.0, i64::MAX), None);
+    assert_eq!(read(40.0, NOW), Some(window(WindowKind::Weekly, 40.0, NOW)));
+}
+
+#[test]
 fn the_documented_limit_messages_give_their_reset_in_local_time() {
     // 05:00Z is 10:30 IST.
     let cases = [

@@ -144,6 +144,17 @@ fn the_hook_exits_0_in_silence_on_partial_empty_or_garbage_input() {
         "seven_day": {"used_percentage": 30.0, "resets_at": resets + 86_400}
     }});
     hook(&sandbox, &partial.to_string());
+    // A share or a reset out of range is garbled too.
+    for (used, at) in [
+        (json!(-5), json!(resets)),
+        (json!(250), json!(resets)),
+        (json!(10), json!(-1)),
+        (json!(10), json!(1e300)),
+    ] {
+        let input =
+            json!({"rate_limits": {"five_hour": {"used_percentage": used, "resets_at": at}}});
+        hook(&sandbox, &input.to_string());
+    }
     for input in [
         "",
         "not json at all",
@@ -214,7 +225,7 @@ fn a_spent_weekly_window_holds_until_the_week_resets_and_is_named() {
     assert_eq!(
         out.stderr,
         format!(
-            "factory: claude: hold: weekly 91%; hold new dispatches until {}; factory wait claude blocks until then\n",
+            "factory: claude: hold: weekly 91%; hold new dispatches until {}; 5h 41%, weekly 91%; factory wait claude blocks until then\n",
             stamp(weekly_resets)
         )
     );
@@ -253,6 +264,22 @@ fn a_reading_past_its_reset_shows_as_unknown_with_its_age() {
     let shown = quota_json(&sandbox);
     assert_eq!(shown["windows"][0]["current"], false, "{shown}");
     assert_eq!(shown["used_percent"], Value::Null, "{shown}");
+
+    // While the week holds, the line still names the stale window and its age.
+    hook(&sandbox, &statusline_input(97.0, reset, 95.0));
+    let held = quota(&sandbox);
+    assert_eq!(held.code, 75, "{held:?}");
+    assert!(
+        held.stderr
+            .contains("; 5h unknown (seen 0m ago), weekly 95%; "),
+        "{held:?}"
+    );
+    let row = claude_row(&sandbox);
+    // The screen may cut the row at its width; the stale window comes first.
+    assert!(
+        row.contains("; 5h unknown (seen 0m ago), weekly 9"),
+        "{row}"
+    );
 }
 
 #[test]
@@ -501,29 +528,20 @@ fn a_version_5_store_migrates_in_place_keeping_its_reading() {
         out.stdout,
         format!("claude: 5h 40% resets {}; dispatch\n", stamp(resets))
     );
+    // The weekly window the migrated store now keeps outlives a restart, and the migrated
+    // store opens again as it is.
     hook(&sandbox, &statusline_input(41.0, resets, 91.0));
     assert_eq!(quota(&sandbox).code, 75);
-    crate::router::kill_daemon(&sandbox);
-    let db = rusqlite::Connection::open(&path).unwrap();
-    let version: i64 = db
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .unwrap();
-    assert_eq!(version, 6);
-    let weekly: f64 = db
-        .query_row("SELECT weekly_used_percent FROM claude_quota", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert!((weekly - 91.0).abs() < f64::EPSILON, "{weekly}");
-    for table in ["usage_history", "ci_runner", "ci_job"] {
-        let found: i64 = db
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                [table],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(found, 1, "{table}");
+    for _ in 0..2 {
+        crate::router::kill_daemon(&sandbox);
+        let held = quota(&sandbox);
+        assert_eq!(held.code, 75, "{held:?}");
+        assert!(
+            held.stderr
+                .starts_with("factory: claude: hold: weekly 91%; hold new dispatches until "),
+            "{held:?}"
+        );
+        assert!(held.stderr.contains("; 5h 41%, weekly 91%; "), "{held:?}");
     }
 }
 

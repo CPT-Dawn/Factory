@@ -4,9 +4,10 @@
 use std::collections::BTreeSet;
 
 use factory_core::bar::{Feed, Snapshot, daemon_down, feed, glyph, line};
+use factory_core::claude::ClaudeQuota;
 use factory_core::status::{Claude, ClaudeState, Lead, Leads, Wait};
 use factory_core::timestamp::Timestamp;
-use factory_core::usage::{UsageReading, WindowKind};
+use factory_core::usage::{UsageReading, UsageWindow, WindowKind};
 use serde_json::Value;
 
 const FIXTURE: &str = include_str!("fixtures/cockpit-feed.json");
@@ -341,9 +342,60 @@ fn a_window_past_its_reset_is_unknown_and_marks_the_card_stale() {
     assert_eq!(
         card["rows"][0],
         serde_json::json!({"kind": "meter", "label": "5h", "value": 0.0,
-            "text": "unknown, 3h old", "tone": "muted"})
+            "text": "unknown, 3h old", "tone": "muted", "until": "2026-11-23T03:00:00.000Z"})
     );
     assert_eq!(chip(&document, "claude")["text"], "12%");
+}
+
+#[test]
+fn a_window_never_seen_still_has_its_meter() {
+    let rows = |claude: Claude| {
+        section(&json(&feed(&snapshot(claude, Vec::new()))), "claude")["rows"].clone()
+    };
+    let unseen = |label: &str| {
+        serde_json::json!({"kind": "meter", "label": label, "value": 0.0,
+            "text": "no reading yet", "tone": "muted"})
+    };
+    let partial = rows(going(vec![five(12)]));
+    assert_eq!(partial.as_array().map(Vec::len), Some(2), "{partial}");
+    assert_eq!(partial[0]["until"], "2026-11-23T07:00:00.000Z");
+    assert_eq!(partial[1], unseen("weekly"));
+    let weekly_only = rows(going(vec![weekly(40)]));
+    assert_eq!(weekly_only[0], unseen("5h"));
+    assert_eq!(weekly_only[1]["text"], "40%");
+    assert_eq!(
+        rows(Claude::default()),
+        serde_json::json!([unseen("5h"), unseen("weekly")])
+    );
+}
+
+#[test]
+fn the_chip_tones_a_share_by_what_was_spent_not_its_rounding() {
+    // From the quota keeper's own record, as the daemon's snapshot carries it.
+    let chip_of = |five_hour: f64| {
+        let mut quota = ClaudeQuota::default();
+        let now = Timestamp::from_unix_millis(now());
+        quota.see(
+            &[UsageWindow {
+                kind: WindowKind::FiveHour,
+                used_percent: five_hour,
+                resets: Timestamp::from_unix_millis(at("2026-11-23T07:00:00Z")),
+                seen: now,
+            }],
+            now,
+        );
+        let document = json(&feed(&snapshot(quota.record(now, 90.0), Vec::new())));
+        let chip = chip(&document, "claude").clone();
+        (
+            chip["text"].as_str().unwrap_or_default().to_owned(),
+            chip["tone"].as_str().unwrap_or_default().to_owned(),
+        )
+    };
+    assert_eq!(chip_of(74.6), ("74%".into(), "ok".into()));
+    assert_eq!(chip_of(75.0), ("75%".into(), "warn".into()));
+    assert_eq!(chip_of(89.6), ("89%".into(), "warn".into()));
+    assert_eq!(chip_of(90.0), ("90%".into(), "critical".into()));
+    assert_eq!(chip_of(99.9), ("99%".into(), "critical".into()));
 }
 
 #[test]
@@ -408,9 +460,10 @@ fn the_factory_card_lists_leads_waits_and_the_steward() {
 fn the_line_names_both_windows_and_the_leads() {
     let all = snapshots();
     assert_eq!(line(&all[0]), "claude 12/40 · 1 lead");
-    assert_eq!(line(&all[2]), "claude 41/91 hold · 2 need you");
+    // A hold and the leads that need the owner are the chips' to show, not the line's.
+    assert_eq!(line(&all[2]), "claude 41/91 · 2 leads");
     assert_eq!(line(&all[3]), "claude ?/12 · 0 leads");
-    assert_eq!(line(&all[4]), "claude ?/? · leads ?");
+    assert_eq!(line(&all[4]), "claude ?/? · ? leads");
 }
 
 #[test]

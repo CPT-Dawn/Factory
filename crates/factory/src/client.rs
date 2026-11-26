@@ -121,7 +121,7 @@ pub fn hold<P: Serialize, R: DeserializeOwned>(
                 &mut |row| heard = Some(row),
             ) {
                 Ok(answer) => return Ok(answer),
-                Err(Ended::Refused(failure)) => return Err(failure),
+                Err(Ended::Refused(failure) | Ended::Silent(failure)) => return Err(failure),
                 Err(Ended::Lost(failure)) => failure,
             },
             Err(failure) if !retry => return Err(failure),
@@ -204,12 +204,14 @@ pub fn call_queued_on<P: Serialize, R: DeserializeOwned>(
                         &mut |_| {},
                     ) {
                         Ok(_) => return Ok((answer, session)),
-                        Err(Ended::Refused(failure) | Ended::Lost(failure)) => {
+                        Err(
+                            Ended::Refused(failure) | Ended::Silent(failure) | Ended::Lost(failure),
+                        ) => {
                             asked = true;
                             failure
                         }
                     },
-                    Err(Ended::Refused(failure)) => return Err(failure),
+                    Err(Ended::Refused(failure) | Ended::Silent(failure)) => return Err(failure),
                     Err(Ended::Lost(failure)) => {
                         asked = true;
                         failure
@@ -250,7 +252,7 @@ pub fn reattach<P: Serialize>(paths: &Paths, method: &str, params: &P) -> Result
                 &mut |_| {},
             ) {
                 Ok(_) => return Ok(session),
-                Err(Ended::Refused(failure)) => return Err(failure),
+                Err(Ended::Refused(failure) | Ended::Silent(failure)) => return Err(failure),
                 Err(Ended::Lost(failure)) => failure,
             },
             Err(failure) => failure,
@@ -266,6 +268,8 @@ pub fn reattach<P: Serialize>(paths: &Paths, method: &str, params: &P) -> Result
 enum Ended {
     /// The daemon said no.
     Refused(Failure),
+    /// It said nothing within the patience.
+    Silent(Failure),
     /// The connection broke first.
     Lost(Failure),
 }
@@ -347,7 +351,7 @@ impl Session {
     ) -> Result<R, Failure> {
         self.exchange_raw(method, params, patience, impatient, on_note, &mut |_| {})
             .map_err(|ended| match ended {
-                Ended::Refused(failure) | Ended::Lost(failure) => failure,
+                Ended::Refused(failure) | Ended::Silent(failure) | Ended::Lost(failure) => failure,
             })
     }
 
@@ -392,7 +396,7 @@ impl Session {
                 Ok(0) => return Err(lost(&"it closed the connection without answering")),
                 Ok(_) => {}
                 Err(e) if is_timeout(&e) => {
-                    return Err(Ended::Refused(Failure::new(
+                    return Err(Ended::Silent(Failure::new(
                         impatient,
                         format!(
                             "the daemon did not answer within {}s; see {}",
@@ -426,6 +430,15 @@ fn is_timeout(e: &std::io::Error) -> bool {
     )
 }
 
+/// Why a daemon that was not started gave no answer.
+#[derive(Debug)]
+pub enum Unanswered {
+    /// Nothing answered: no daemon listens, it hung up, or it said nothing within the patience.
+    Down(Failure),
+    /// The daemon answered, refusing.
+    Refused(Failure),
+}
+
 /// Sends a request to a daemon that is already running, and never starts one, giving up with exit
 /// 3 after `patience`: for the callers that must stay fast and leave nothing behind, the
 /// status-line hook and the bar.
@@ -434,25 +447,31 @@ pub fn call_running<P: Serialize, R: DeserializeOwned>(
     method: &str,
     params: &P,
     patience: Duration,
-) -> Result<R, Failure> {
+) -> Result<R, Unanswered> {
     let stream = UnixStream::connect(paths.socket()).map_err(|e| {
-        Failure::precondition(format!(
+        Unanswered::Down(Failure::precondition(format!(
             "daemon unreachable at {}: {e}; factory status starts it",
             paths.socket().display()
-        ))
+        )))
     })?;
     let mut session = Session {
         reader: BufReader::new(stream),
         paths: paths.clone(),
         next_id: 1,
     };
-    session.exchange(
-        method,
-        params,
-        Some(patience),
-        Exit::Precondition,
-        &mut |_| {},
-    )
+    session
+        .exchange_raw(
+            method,
+            params,
+            Some(patience),
+            Exit::Precondition,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .map_err(|ended| match ended {
+            Ended::Refused(failure) => Unanswered::Refused(failure),
+            Ended::Silent(failure) | Ended::Lost(failure) => Unanswered::Down(failure),
+        })
 }
 
 /// Connects to the daemon, starting it first when nothing answers on the socket.

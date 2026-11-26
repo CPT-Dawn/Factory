@@ -9,7 +9,7 @@ use std::time::Duration;
 use factory_core::claude::{ClaudeQuota, Verdict};
 use factory_core::exit::Exit;
 use factory_core::timestamp::Timestamp;
-use factory_core::usage::{UsageWindow, WindowKind};
+use factory_core::usage::{self, UsageWindow, WindowKind};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
@@ -39,7 +39,8 @@ impl QuotaKeeper {
         })
     }
 
-    /// A status line saw Claude's windows.
+    /// A status line saw Claude's windows. A window whose share or reset is out of range keeps
+    /// its last reading.
     pub fn see_claude(&self, params: &ClaudeWindowParams) -> Result<(), Failure> {
         self.change(|quota, now| {
             let windows: Vec<UsageWindow> = [
@@ -48,21 +49,20 @@ impl QuotaKeeper {
             ]
             .into_iter()
             .filter_map(|(kind, reading)| {
-                reading.as_ref().map(|reading| UsageWindow {
-                    kind,
-                    used_percent: reading.used_percent,
-                    resets: Timestamp::from_unix_millis(reading.resets),
-                    seen: now,
-                })
+                let reading = reading.as_ref()?;
+                UsageWindow::read(kind, reading.used_percent, reading.resets, now)
             })
             .collect();
             quota.see(&windows, now);
         })
     }
 
-    /// A Claude turn ended on the plan's limit.
+    /// A Claude turn ended on the plan's limit. A reset out of range counts as none named.
     pub fn claude_limit(&self, params: &ClaudeLimitParams) -> Result<(), Failure> {
-        let reset = params.reset.map(Timestamp::from_unix_millis);
+        let reset = params
+            .reset
+            .filter(|reset| usage::representable(*reset))
+            .map(Timestamp::from_unix_millis);
         self.change(|quota, now| quota.hit_limit(reset, now))
     }
 
@@ -107,9 +107,13 @@ impl QuotaKeeper {
             let mut changed = std::pin::pin!(self.changed.notified());
             changed.as_mut().enable();
             let now = clock::now();
-            let verdict = lock(&self.claude).verdict(now, params.hold_at);
-            let Verdict::Hold { until, by } = verdict else {
-                return Ok(self.claude_verdict(params.hold_at));
+            // One look at the quota: the answer is the verdict that ended the wait.
+            let quota = *lock(&self.claude);
+            let Verdict::Hold { until, by } = quota.verdict(now, params.hold_at) else {
+                return Ok(ClaudeVerdict {
+                    claude: quota.record(now, params.hold_at),
+                    hold_at: params.hold_at,
+                });
             };
             if Instant::now() >= deadline {
                 return Err(Failure::new(

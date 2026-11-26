@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::status::{self, ClaudeState};
 use crate::timestamp::Timestamp;
-use crate::usage::UsageReading;
+use crate::usage::{UsageReading, WindowKind};
 
 /// The cockpit format's version.
 pub const VERSION: u32 = 1;
@@ -185,7 +185,7 @@ pub fn daemon_down(reason: &str, now: i64) -> Feed {
 }
 
 /// `claude 12/40 · 2 leads`: each window's share (5-hour/weekly, `?` while unknown), then
-/// the live leads, or how many need the owner.
+/// the live leads (`? leads` while herdr can't tell).
 pub fn line(snapshot: &Snapshot) -> String {
     let claude = &snapshot.claude;
     let share = |kind| {
@@ -196,20 +196,15 @@ pub fn line(snapshot: &Snapshot) -> String {
                 |reading| reading.used_percent.to_string(),
             )
     };
-    let hold = if claude.verdict == ClaudeState::Hold {
-        " hold"
-    } else {
-        ""
-    };
     let leads = if snapshot.leads.error.is_some() {
-        "leads ?".to_owned()
+        "? leads".to_owned()
     } else {
-        leads_text(snapshot)
+        plural(live(snapshot).count(), "lead")
     };
     format!(
-        "claude {}/{}{hold} · {leads}",
-        share(crate::usage::WindowKind::FiveHour),
-        share(crate::usage::WindowKind::Weekly),
+        "claude {}/{} · {leads}",
+        share(WindowKind::FiveHour),
+        share(WindowKind::Weekly),
     )
 }
 
@@ -221,6 +216,8 @@ fn current(claude: &status::Claude) -> impl Iterator<Item = &UsageReading> {
     claude.windows.iter().filter(|reading| reading.current)
 }
 
+/// The tone of a share in whole percent. Whole percents are rounded down, so a share reaches a
+/// whole-percent mark here exactly when it reaches it unrounded: 74.6% is still `ok`.
 fn share_tone(used: u32) -> Tone {
     if used >= CRITICAL_AT {
         Tone::Critical
@@ -277,44 +274,41 @@ fn claude_chip(snapshot: &Snapshot) -> Chip {
     }
 }
 
+/// A meter per window, 5-hour first, whether or not a reading of it was seen.
 fn claude_section(snapshot: &Snapshot) -> Section {
     let claude = &snapshot.claude;
-    let rows: Vec<Row> = if claude.windows.is_empty() {
-        vec![Row::Text {
-            label: "usage".to_owned(),
-            text: "no reading yet".to_owned(),
-            tone: Some(Tone::Muted),
-            url: None,
-        }]
-    } else {
-        claude
-            .windows
-            .iter()
-            .map(|reading| {
-                let label = reading.window.label().to_owned();
-                if reading.current {
-                    Row::Meter {
-                        label,
-                        value: f64::from(reading.used_percent) / 100.0,
-                        text: format!("{}%", reading.used_percent),
-                        tone: share_tone(reading.used_percent),
-                        until: Some(stamp(reading.resets)),
-                    }
-                } else {
-                    Row::Meter {
-                        label,
-                        value: 0.0,
-                        text: format!(
-                            "unknown, {} old",
-                            crate::lab::ago(snapshot.now / 1000, reading.seen / 1000)
-                        ),
-                        tone: Tone::Muted,
-                        until: None,
-                    }
-                }
-            })
-            .collect()
-    };
+    let rows: Vec<Row> = [WindowKind::FiveHour, WindowKind::Weekly]
+        .into_iter()
+        .map(|kind| {
+            let label = kind.label().to_owned();
+            match claude.windows.iter().find(|reading| reading.window == kind) {
+                Some(reading) if reading.current => Row::Meter {
+                    label,
+                    value: f64::from(reading.used_percent) / 100.0,
+                    text: format!("{}%", reading.used_percent),
+                    tone: share_tone(reading.used_percent),
+                    until: Some(stamp(reading.resets)),
+                },
+                Some(reading) => Row::Meter {
+                    label,
+                    value: 0.0,
+                    text: format!(
+                        "unknown, {} old",
+                        crate::lab::ago(snapshot.now / 1000, reading.seen / 1000)
+                    ),
+                    tone: Tone::Muted,
+                    until: Some(stamp(reading.resets)),
+                },
+                None => Row::Meter {
+                    label,
+                    value: 0.0,
+                    text: "no reading yet".to_owned(),
+                    tone: Tone::Muted,
+                    until: None,
+                },
+            }
+        })
+        .collect();
     let stale_since = claude
         .windows
         .iter()

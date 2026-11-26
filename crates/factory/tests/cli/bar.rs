@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::claude::{HOUR, hook, now_secs, statusline_input};
 use crate::lab::{Agent, for_owner, lab};
 use crate::monitor;
+use crate::router::configure;
 use crate::support::herdr::FakeHerdr;
 use crate::support::world::poll_until;
 use crate::support::{Run, Sandbox, run};
@@ -56,14 +57,14 @@ fn the_bar_prints_both_claude_windows_and_the_leads_in_one_line() {
     );
     assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
 
+    // A lead that needs the owner is the chip's to say; the line still counts the leads.
     herdr.status("w2:p1", "blocked");
     assert!(
-        poll_until(|| {
-            out = bar(&sandbox, false);
-            out.stdout == "claude 12/40 · 1 need you\n"
-        }),
-        "{out:?}"
+        poll_until(|| chip(&feed(&sandbox), "factory")["text"] == "1 need you"),
+        "{:?}",
+        bar(&sandbox, true)
     );
+    assert_eq!(bar(&sandbox, false).stdout, "claude 12/40 · 2 leads\n");
 }
 
 #[test]
@@ -146,7 +147,7 @@ fn a_held_claude_chip_is_critical_and_its_card_says_why() {
         "{document}"
     );
     let line = bar(&sandbox, false).stdout;
-    assert!(line.starts_with("claude 41/91 hold · "), "{line}");
+    assert!(line.starts_with("claude 41/91 · "), "{line}");
 }
 
 #[test]
@@ -203,6 +204,30 @@ fn with_the_daemon_down_the_json_feed_is_one_critical_chip_and_exits_0() {
         plain.stderr.starts_with("factory: factory daemon down: "),
         "{plain:?}"
     );
+}
+
+#[test]
+fn a_bad_config_is_no_daemon_down_and_keeps_the_exit_table() {
+    let sandbox = Sandbox::new();
+    assert_eq!(sandbox.factory(&["monitor", "status"]).code, 0);
+    configure(&sandbox, "[claude]\nhold_at_percent = 0\n");
+
+    let plain = bar(&sandbox, false);
+    assert_eq!((plain.code, plain.stdout.as_str()), (3, ""), "{plain:?}");
+    assert!(
+        plain.stderr.contains("config.toml") && !plain.stderr.contains("daemon down"),
+        "{plain:?}"
+    );
+    let out = bar(&sandbox, true);
+    assert_eq!((out.code, out.stderr.as_str()), (3, ""), "{out:?}");
+    let error: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(error["exit"], 3, "{error}");
+    let message = error["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("config.toml") && !message.contains("daemon down"),
+        "{error}"
+    );
+    assert!(error.get("glance").is_none(), "{error}");
 }
 
 #[test]

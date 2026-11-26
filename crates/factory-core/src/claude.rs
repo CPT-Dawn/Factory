@@ -81,21 +81,27 @@ impl ClaudeQuota {
     }
 
     /// A status line read `windows` at `now`; a window it doesn't mention keeps its last
-    /// reading. A reading in which every window has room, seen after a limit was hit, lifts the
-    /// limit: the 429 was not the plan's.
+    /// reading. Once a reading seen after a limit was hit leaves both windows standing with
+    /// room (under 100%), the limit lifts: the 429 was not the plan's. A window not read since
+    /// the limit, or read past its reset, is no evidence of room.
     pub fn see(&mut self, windows: &[UsageWindow], now: Timestamp) {
         if windows.is_empty() {
             return;
-        }
-        if self.limit.is_some_and(|limit| now > limit.at)
-            && windows.iter().all(|window| window.used_percent < 100.0)
-        {
-            self.limit = None;
         }
         for window in windows {
             match window.kind {
                 WindowKind::FiveHour => self.five_hour = Some(*window),
                 WindowKind::Weekly => self.weekly = Some(*window),
+            }
+        }
+        if let Some(limit) = self.limit {
+            let room = |window: Option<UsageWindow>| {
+                window.is_some_and(|window| {
+                    window.seen > limit.at && window.current(now) && window.used_percent < 100.0
+                })
+            };
+            if room(self.five_hour) && room(self.weekly) {
+                self.limit = None;
             }
         }
     }
@@ -171,7 +177,8 @@ impl ClaudeQuota {
 
 /// The windows in Claude Code's status-line input, read at `now`: `rate_limits.five_hour` and
 /// `rate_limits.seven_day`, present for Pro and Max plans once a session has had its first
-/// answer. A window that is missing or malformed is left out; any input at all is read.
+/// answer. A window that is missing or malformed, its share outside 0 to 100 or its reset outside
+/// the epoch to the year 9999, is left out; any input at all is read.
 pub fn statusline_windows(input: &Value, now: Timestamp) -> Vec<UsageWindow> {
     [
         ("/rate_limits/five_hour", WindowKind::FiveHour),
@@ -182,17 +189,13 @@ pub fn statusline_windows(input: &Value, now: Timestamp) -> Vec<UsageWindow> {
         let window = input.pointer(pointer)?;
         let used_percent = window.get("used_percentage")?.as_f64()?;
         let resets = window.get("resets_at")?.as_f64()?;
-        if !used_percent.is_finite() || !resets.is_finite() {
+        let resets = resets * 1000.0;
+        #[allow(clippy::cast_precision_loss)]
+        if !(0.0..=usage::LAST_RESET_MILLIS as f64).contains(&resets) {
             return None;
         }
         #[allow(clippy::cast_possible_truncation)]
-        let resets = Timestamp::from_unix_millis((resets * 1000.0) as i64);
-        Some(UsageWindow {
-            kind,
-            used_percent,
-            resets,
-            seen: now,
-        })
+        UsageWindow::read(kind, used_percent, resets as i64, now)
     })
     .collect()
 }

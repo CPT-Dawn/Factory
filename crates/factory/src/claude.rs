@@ -64,10 +64,21 @@ fn judged(verdict: &ClaudeVerdict) -> Result<Done, Failure> {
             Some("limit hit") | None => "hit its limit".to_owned(),
             Some(hold) => format!("hold: {hold}"),
         };
+        // Every window, a stale one with its age; resets left out to keep the line short.
+        let windows: Vec<String> = claude
+            .windows
+            .iter()
+            .map(|reading| reading.describe(now))
+            .collect();
+        let windows = if windows.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", windows.join(", "))
+        };
         return Err(Failure::new(
             Exit::Busy,
             format!(
-                "claude: {what}; hold new dispatches until {until}; factory wait claude blocks until then"
+                "claude: {what}; hold new dispatches until {until}{windows}; factory wait claude blocks until then"
             ),
         ));
     }
@@ -78,15 +89,9 @@ fn judged(verdict: &ClaudeVerdict) -> Result<Done, Failure> {
             .windows
             .iter()
             .map(|reading| {
-                if reading.current {
-                    format!(
-                        "{} resets {}",
-                        reading.describe(now),
-                        Timestamp::from_unix_millis(reading.resets)
-                    )
-                } else {
-                    reading.describe(now)
-                }
+                reading.describe_with_reset(now, |resets| {
+                    Timestamp::from_unix_millis(resets).to_string()
+                })
             })
             .collect();
         format!("claude: {}; dispatch", windows.join(", "))
@@ -121,7 +126,7 @@ pub fn statusline_hook() -> ExitCode {
         seven_day: reading(WindowKind::Weekly),
     };
     if let Ok(paths) = Paths::from_env() {
-        let _: Result<Value, Failure> =
+        let _: Result<Value, client::Unanswered> =
             client::call_running(&paths, CLAUDE_WINDOW, &params, HOOK_PATIENCE);
     }
     ExitCode::SUCCESS

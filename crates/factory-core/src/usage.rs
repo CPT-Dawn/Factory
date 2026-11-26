@@ -35,7 +35,35 @@ pub struct UsageWindow {
     pub seen: Timestamp,
 }
 
+/// The latest reset a reading may name: the last millisecond of the year 9999.
+pub const LAST_RESET_MILLIS: i64 = 253_402_300_799_999;
+
+/// Whether `millis`, a reset in milliseconds since the epoch, is one a reading may name: from
+/// the epoch to the year 9999.
+pub fn representable(millis: i64) -> bool {
+    (0..=LAST_RESET_MILLIS).contains(&millis)
+}
+
 impl UsageWindow {
+    /// A reading of `kind` seen at `seen`: `used_percent` spent, resetting at `resets_millis`.
+    /// None when the share is outside 0 to 100 or the reset isn't [`representable`]: a garbled
+    /// reading must not replace a good one.
+    pub fn read(
+        kind: WindowKind,
+        used_percent: f64,
+        resets_millis: i64,
+        seen: Timestamp,
+    ) -> Option<UsageWindow> {
+        ((0.0..=100.0).contains(&used_percent) && representable(resets_millis)).then(|| {
+            UsageWindow {
+                kind,
+                used_percent,
+                resets: Timestamp::from_unix_millis(resets_millis),
+                seen,
+            }
+        })
+    }
+
     /// Whether the reading still stands at `now`: its window has not reset since.
     pub fn current(&self, now: Timestamp) -> bool {
         self.resets > now
@@ -57,7 +85,8 @@ impl UsageWindow {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageReading {
     pub window: WindowKind,
-    /// The spent share, rounded.
+    /// The spent share, in whole percent rounded down, so a tone or a mark that a whole
+    /// percent crosses reads the same from it as from the share itself.
     pub used_percent: u32,
     /// When the window resets, in milliseconds since the epoch.
     pub resets: i64,
@@ -79,6 +108,16 @@ impl UsageReading {
                 "{label} unknown (seen {} ago)",
                 crate::lab::ago(now / 1000, self.seen / 1000)
             )
+        }
+    }
+
+    /// `5h 41% resets <reset>` while it stands, the reset written by `reset`; once its window
+    /// has reset, as [`UsageReading::describe`] says.
+    pub fn describe_with_reset(&self, now: i64, reset: impl FnOnce(i64) -> String) -> String {
+        if self.current {
+            format!("{} resets {}", self.describe(now), reset(self.resets))
+        } else {
+            self.describe(now)
         }
     }
 }
@@ -110,8 +149,8 @@ pub fn verdict(windows: &[UsageWindow], now: Timestamp, hold_at: f64) -> Verdict
     }
 }
 
-/// A share as a whole percent, 0 to 100.
+/// A share as a whole percent, 0 to 100, rounded down: 89.6% is 89%, under a mark of 90.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn whole_percent(used: f64) -> u32 {
-    used.round().clamp(0.0, 100.0) as u32
+    used.floor().clamp(0.0, 100.0) as u32
 }
