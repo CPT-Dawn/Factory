@@ -26,8 +26,10 @@
 //! and which repos' runner fleets, jobs and open `factory/*` pull requests the daemon watches
 //! for the status screen and the bar; its `[monitor]` table the context steward's thresholds.
 //! Its `[codex]` table sets `hold_at_percent` (default 90), the share of Codex's 5-hour or weekly
-//! window from which reviews hold off Codex, and `timeout_seconds` (default 20), how long its
-//! `app-server` may take to give the windows.
+//! window from which reviews hold off Codex, and `timeout_seconds` (default 20, at most 20), how
+//! long its `app-server` may take to give the windows. Its `[agy]` table sets `hold_at_percent`
+//! (default 90), the share of either bucket of an agy model group from which reviews hold off
+//! that group's pools.
 //! Its `[notify]` table is the switch for event delivery: whether `factory wait --notify` may
 //! post into the sessions that ask. It is off unless the owner switches it on.
 //!
@@ -174,6 +176,9 @@ pub struct ReviewSetup {
     pub trivial: Vec<Step>,
     /// The reviewer skill the prompt carries, as configured.
     pub skill: Option<PathBuf>,
+    /// `[agy] hold_at_percent`: the share of either bucket of agy's model group from which its
+    /// backends hold off, until that bucket resets.
+    pub agy_hold_at: f64,
 }
 
 impl ReviewSetup {
@@ -203,6 +208,14 @@ struct ConfigFile {
     claude: ClaudeSection,
     #[serde(default)]
     codex: CodexSection,
+    #[serde(default)]
+    agy: AgySection,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct AgySection {
+    hold_at_percent: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -489,11 +502,21 @@ fn load_config(paths: &Paths) -> Result<(PathBuf, ConfigFile), Failure> {
 /// dispatches: `[claude] hold_at_percent`, more than 0 and at most 100.
 pub fn claude_hold_at(paths: &Paths) -> Result<f64, Failure> {
     let (path, file) = load_config(paths)?;
-    match file.claude.hold_at_percent {
-        None => Ok(factory_core::claude::HOLD_AT_PERCENT),
+    hold_at(
+        &path,
+        "claude",
+        file.claude.hold_at_percent,
+        factory_core::claude::HOLD_AT_PERCENT,
+    )
+}
+
+/// A harness's `[<table>] hold_at_percent`, more than 0 and at most 100, or `default` unset.
+fn hold_at(path: &Path, table: &str, given: Option<f64>, default: f64) -> Result<f64, Failure> {
+    match given {
+        None => Ok(default),
         Some(at) if at > 0.0 && at <= 100.0 => Ok(at),
         Some(at) => Err(Failure::precondition(format!(
-            "{}: [claude] hold_at_percent is {at}; give it more than 0 and at most 100",
+            "{}: [{table}] hold_at_percent is {at}; give it more than 0 and at most 100",
             path.display()
         ))),
     }
@@ -509,16 +532,7 @@ const MAX_CODEX_TIMEOUT_SECS: u64 = 20;
 pub fn codex_params(paths: &Paths) -> Result<CodexParams, Failure> {
     let (path, file) = load_config(paths)?;
     let defaults = CodexParams::default();
-    let hold_at = match file.codex.hold_at_percent {
-        None => defaults.hold_at,
-        Some(at) if at > 0.0 && at <= 100.0 => at,
-        Some(at) => {
-            return Err(Failure::precondition(format!(
-                "{}: [codex] hold_at_percent is {at}; give it more than 0 and at most 100",
-                path.display()
-            )));
-        }
-    };
+    let hold_at = hold_at(&path, "codex", file.codex.hold_at_percent, defaults.hold_at)?;
     let timeout_secs = match file.codex.timeout_seconds {
         None => defaults.timeout_secs,
         Some(secs) if (1..=MAX_CODEX_TIMEOUT_SECS).contains(&secs) => secs,
@@ -539,6 +553,12 @@ pub fn codex_params(paths: &Paths) -> Result<CodexParams, Failure> {
 pub fn review_setup(paths: &Paths) -> Result<ReviewSetup, Failure> {
     let (path, file) = load_config(paths)?;
     let refuse = |what: String| Failure::precondition(format!("{}: {what}", path.display()));
+    let agy_hold_at = hold_at(
+        &path,
+        "agy",
+        file.agy.hold_at_percent,
+        factory_core::quota::AGY_HOLD_AT_PERCENT,
+    )?;
     let review = file.review;
     let configured = !review.backend.is_empty();
     let backends = if configured {
@@ -625,6 +645,7 @@ pub fn review_setup(paths: &Paths) -> Result<ReviewSetup, Failure> {
         trivial: chain(Tier::Trivial, chains.trivial)?,
         skill: review.skill.map(|skill| expand_home(&skill)),
         backends,
+        agy_hold_at,
     })
 }
 

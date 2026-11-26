@@ -322,6 +322,20 @@ impl QuotaKeeper {
         let reading = Agy::read(answer, clock::lab_now_ms());
         {
             let mut state = lock(&self.agy);
+            // Each group's windows join the history by the shared path, under agy's lock, so
+            // readings land in the order they were taken. A write that fails costs only those
+            // rows: the next reading, unlike the last row kept, is written in full.
+            let seen = Timestamp::from_unix_millis(reading.seen.unwrap_or_default());
+            for group in &reading.groups {
+                let readings = group.readings(seen);
+                if let Err(e) = self.store_readings("agy", Some(&group.name), &readings, |_| Ok(()))
+                {
+                    eprintln!(
+                        "factory: agy's {} reading could not join the usage history: {e}; check the disk and FACTORY_STATE",
+                        group.name
+                    );
+                }
+            }
             state.reading = Some(reading);
             state.asking = false;
         }
