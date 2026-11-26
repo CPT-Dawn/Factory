@@ -27,18 +27,21 @@ pub fn run() -> Result<Done, Failure> {
     let backends = config::review_backends(&paths)?
         .into_iter()
         .map(|backend| BackendSlots {
+            cli: Some(config::cli_name(backend.cli).to_owned()),
             name: backend.name,
             concurrency: backend.concurrency,
             when_busy: backend.when_busy.unwrap_or(WhenBusy::Queue).into(),
         })
         .collect();
     let claude_hold_at = config::claude_hold_at(&paths)?;
+    let codex = config::codex_params(&paths)?;
     let status: Status = client::call(
         &paths,
         STATUS,
         &StatusParams {
             backends,
             claude_hold_at,
+            codex,
         },
     )?;
     let mut rows = status::screen(&status).into_iter();
@@ -65,12 +68,15 @@ pub async fn gather(
         .overview()
         .await
         .map_err(|e| Failure::precondition(e.message))?;
+    // Both looks wait at once, so their patience together stays under the client's.
+    let (codex, agy) = tokio::join!(quotas.codex(&params.codex), quotas.agy(AGY_GLANCE));
     Ok(Status {
         now: now.unix_millis(),
         lab,
-        review: router.snapshot(&params.backends, now),
+        review: router.snapshot(&params.backends, now, &codex),
         claude: quotas.claude(params.claude_hold_at),
-        agy: quotas.agy(AGY_GLANCE).await,
+        codex,
+        agy,
         waits: leads.registered(),
         leads: leads_seen(leads, steward),
         ci: fleet.snapshot(),

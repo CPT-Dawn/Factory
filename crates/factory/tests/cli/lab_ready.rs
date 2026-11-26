@@ -509,3 +509,70 @@ fn a_daemon_on_a_machine_with_no_devlab_config_readies_phones_and_notifies_by_de
         world.read("settings")
     );
 }
+
+/// The probes of phone `serial`'s screen.
+fn probes_of(sandbox: &Sandbox, serial: &str) -> usize {
+    sandbox
+        .calls("adb")
+        .iter()
+        .filter(|c| c.iter().any(|a| a == serial))
+        .filter(|c| c.last().is_some_and(|cmd| cmd.contains("dumpsys power")))
+        .count()
+}
+
+#[test]
+fn a_leased_phone_back_from_offline_with_no_replug_is_neither_prepped_nor_probed() {
+    let (sandbox, world, wt) = watching();
+    world.apply(PIXEL).unwrap();
+    assert!(
+        poll_until(|| summaries(&sandbox).len() == 1),
+        "{:?}",
+        summaries(&sandbox)
+    );
+    let acquired = run(devlab(
+        &sandbox,
+        &wt,
+        &["acquire", "--phone", "--wait", "0"],
+    ));
+    assert_eq!(acquired.code, 0, "{acquired:?}");
+    // The holder turned stay-awake off on purpose.
+    world
+        .apply("setting FAKEPHONE01 stay_on_while_plugged_in 0")
+        .unwrap();
+    let probed = probes_of(&sandbox, "FAKEPHONE01");
+
+    // adb drops it to offline and back, as it does on its own: no replug.
+    world.apply("plug FAKEPHONE01 offline usb:1-1").unwrap();
+    world.apply(PIXEL).unwrap();
+    // A phone plugged in after it is readied once the watcher has been through both lists.
+    world
+        .apply("plug FAKEPHONE02 device usb:1-2 model:Pixel_7")
+        .unwrap();
+    assert!(
+        poll_until(|| summaries(&sandbox).iter().any(|s| s == "Pixel 7 ready")),
+        "{:?}",
+        summaries(&sandbox)
+    );
+    assert!(
+        world
+            .read("settings")
+            .contains("FAKEPHONE01 stay_on_while_plugged_in 0")
+            && !world
+                .read("settings")
+                .contains("FAKEPHONE01 stay_on_while_plugged_in 7"),
+        "{}",
+        world.read("settings")
+    );
+    assert_eq!(probes_of(&sandbox, "FAKEPHONE01"), probed);
+
+    // A real replug readies it again, leased or not (#55).
+    world.apply("unplug FAKEPHONE01").unwrap();
+    world.apply(PIXEL).unwrap();
+    assert!(
+        poll_until(|| world
+            .read("settings")
+            .contains("FAKEPHONE01 stay_on_while_plugged_in 7")),
+        "{}",
+        world.read("settings")
+    );
+}

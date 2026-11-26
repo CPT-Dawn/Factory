@@ -1,5 +1,5 @@
 //! The daemon's SQLite database, `<state>/factory.db`, in WAL mode: what a daemon restart must
-//! not lose: each review backend's quota, the Claude plan's quota, the leads spawned whose end is not yet in the
+//! not lose: each review backend's quota, the Claude and Codex plans' quotas, the leads spawned whose end is not yet in the
 //! ledger, whether the context steward runs and what it has done to each session, each wait
 //! that outlives its CLI (`--notify`), each blocking `factory wait` the daemon holds, and the
 //! watched repos' CI as GitHub last answered it, with every job's queued, started and finished
@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use factory_core::claude::{ClaudeQuota, Limit};
+use factory_core::codex::CodexQuota;
 use factory_core::fleet::{Job, Pull, PullState, RepoCi, Runner, RunnerState};
 use factory_core::history::{self, HistoryRow};
 use factory_core::quota::Quota;
@@ -115,6 +116,18 @@ impl Store {
                  weekly_resets_ms INTEGER,
                  weekly_seen_ms INTEGER
              );
+             CREATE TABLE IF NOT EXISTS codex_quota (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 used_percent REAL,
+                 resets_ms INTEGER,
+                 seen_ms INTEGER,
+                 weekly_used_percent REAL,
+                 weekly_resets_ms INTEGER,
+                 weekly_seen_ms INTEGER,
+                 plan TEXT,
+                 reset_credits INTEGER NOT NULL DEFAULT 0,
+                 asked_ms INTEGER
+             );
              CREATE TABLE IF NOT EXISTS usage_history (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  harness TEXT NOT NULL,
@@ -176,6 +189,7 @@ impl Store {
              ",
             )
             .map_err(cannot)?;
+        add_codex_asked_column(&migration).map_err(cannot)?;
         if version < VERSION {
             add_weekly_columns(&migration).map_err(cannot)?;
             migration
@@ -317,6 +331,87 @@ impl Store {
 }
 
 impl Store {
+    /// The Codex plan's windows, plan and reset credits as last read; nothing recorded is
+    /// nothing known.
+    pub fn codex_quota(&self) -> rusqlite::Result<CodexQuota> {
+        type Reading = (Option<f64>, Option<i64>, Option<i64>);
+        let row = self
+            .db
+            .query_row(
+                "SELECT used_percent, resets_ms, seen_ms, weekly_used_percent, weekly_resets_ms,
+                     weekly_seen_ms, plan, reset_credits, asked_ms
+                 FROM codex_quota WHERE id = 1",
+                [],
+                |row| {
+                    let five: Reading = (row.get(0)?, row.get(1)?, row.get(2)?);
+                    let weekly: Reading = (row.get(3)?, row.get(4)?, row.get(5)?);
+                    let credits: i64 = row.get(7)?;
+                    let asked: Option<i64> = row.get(8)?;
+                    Ok((
+                        five,
+                        weekly,
+                        row.get::<_, Option<String>>(6)?,
+                        credits,
+                        asked,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((five, weekly, plan, credits, asked)) = row else {
+            return Ok(CodexQuota::default());
+        };
+        let stamp = Timestamp::from_unix_millis;
+        let window = |kind, (used, resets, seen): Reading| match (used, resets, seen) {
+            (Some(used_percent), Some(resets), Some(seen)) => Some(UsageWindow {
+                kind,
+                used_percent,
+                resets: stamp(resets),
+                seen: stamp(seen),
+            }),
+            _ => None,
+        };
+        let (five_hour, weekly) = (
+            window(WindowKind::FiveHour, five),
+            window(WindowKind::Weekly, weekly),
+        );
+        Ok(CodexQuota {
+            // A restart within 5 minutes of an ask, read or not, does not ask again.
+            asked: asked.map(stamp),
+            five_hour,
+            weekly,
+            plan,
+            reset_credits: u32::try_from(credits).unwrap_or(0),
+            ..CodexQuota::default()
+        })
+    }
+
+    /// Records the Codex plan's windows, plan, reset credits and when it was last asked. Whether
+    /// the last ask could be read is not kept: a daemon that starts within 5 minutes of the ask
+    /// does not press a Codex that was down.
+    pub fn set_codex_quota(&self, quota: &CodexQuota) -> rusqlite::Result<()> {
+        let (five, weekly) = (quota.five_hour, quota.weekly);
+        self.db.execute(
+            "INSERT INTO codex_quota (id, used_percent, resets_ms, seen_ms, weekly_used_percent,
+                 weekly_resets_ms, weekly_seen_ms, plan, reset_credits, asked_ms)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT (id) DO UPDATE SET used_percent = ?1, resets_ms = ?2, seen_ms = ?3,
+                 weekly_used_percent = ?4, weekly_resets_ms = ?5, weekly_seen_ms = ?6,
+                 plan = ?7, reset_credits = ?8, asked_ms = ?9",
+            params![
+                five.map(|window| window.used_percent),
+                five.map(|window| window.resets.unix_millis()),
+                five.map(|window| window.seen.unix_millis()),
+                weekly.map(|window| window.used_percent),
+                weekly.map(|window| window.resets.unix_millis()),
+                weekly.map(|window| window.seen.unix_millis()),
+                quota.plan,
+                i64::from(quota.reset_credits),
+                quota.asked.map(Timestamp::unix_millis),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Runs `write` in one transaction: all of what it writes lands, or none of it does.
     pub fn atomically<T>(
         &self,
@@ -404,7 +499,6 @@ impl Store {
             params![before],
         )
     }
-
     /// Records a repo's CI as GitHub just answered it: its runners and open factory pull
     /// requests replace the last ones, and every job read keeps the times it had.
     pub fn record_ci(&mut self, ci: &RepoCi, read: &[Job]) -> rusqlite::Result<()> {
@@ -570,6 +664,24 @@ fn add_weekly_columns(db: &Connection) -> rusqlite::Result<()> {
                 "ALTER TABLE claude_quota ADD COLUMN {name} {kind};"
             ))?;
         }
+    }
+    Ok(())
+}
+
+/// `codex_quota.asked_ms`, on a table an earlier build made without it (at this same schema):
+/// the last ask is taken to be the last window it saw, so a restart soon after it asks nothing.
+fn add_codex_asked_column(db: &Connection) -> rusqlite::Result<()> {
+    let present: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('codex_quota') WHERE name = 'asked_ms'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        db.execute_batch(
+            "ALTER TABLE codex_quota ADD COLUMN asked_ms INTEGER;
+             UPDATE codex_quota
+                 SET asked_ms = NULLIF(MAX(COALESCE(seen_ms, 0), COALESCE(weekly_seen_ms, 0)), 0);",
+        )?;
     }
     Ok(())
 }

@@ -117,6 +117,25 @@ impl GitRepo {
         self
     }
 
+    /// The URL of the remote `origin`; none when there is no such remote.
+    pub fn origin_url(&self) -> Option<String> {
+        self.git(&["remote", "get-url", "origin"])
+            .ok()
+            .map(|url| url.trim().to_owned())
+            .filter(|url| !url.is_empty())
+    }
+
+    /// The branch each worktree of the repository has checked out (none for a detached one),
+    /// this one among them.
+    pub fn worktree_branches(&self) -> Result<Vec<String>, GitError> {
+        Ok(self
+            .git(&["worktree", "list", "--porcelain"])?
+            .lines()
+            .filter_map(|line| line.strip_prefix("branch refs/heads/"))
+            .map(str::to_owned)
+            .collect())
+    }
+
     /// Runs git to its end, whatever its exit status.
     fn output(&self, args: &[&str]) -> Result<Output, GitError> {
         let mut cmd = Command::new("git");

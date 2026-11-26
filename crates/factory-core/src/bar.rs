@@ -20,13 +20,17 @@ const WARN_AT: u32 = 75;
 const CRITICAL_AT: u32 = 90;
 
 /// What the daemon answers the bar's one request with.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     /// When it was taken, in milliseconds since the epoch.
     pub now: i64,
     pub claude: status::Claude,
     #[serde(default)]
+    pub codex: status::Codex,
     pub agy: status::Agy,
+    /// The config's mark for holding a quota group of agy's, in percent of either window.
+    #[serde(default = "agy_hold_default")]
+    pub agy_hold_at: f64,
     pub waits: Vec<status::Wait>,
     pub leads: status::Leads,
     /// The watched repos' CI; none configured shows no CI chip or section.
@@ -35,6 +39,10 @@ pub struct Snapshot {
     /// The lab as the daemon last checked it.
     #[serde(default)]
     pub lab: lab::Lab,
+}
+
+fn agy_hold_default() -> f64 {
+    crate::quota::AGY_HOLD_AT_PERCENT
 }
 
 /// A cockpit v1 document.
@@ -169,6 +177,7 @@ pub fn feed(snapshot: &Snapshot) -> Feed {
         generated: stamp(snapshot.now),
         glance: [
             Some(claude_chip(snapshot)),
+            Some(codex_chip(snapshot)),
             Some(agy_chip(snapshot)),
             Some(factory_chip(snapshot)),
             Some(lab::chip(&snapshot.lab)),
@@ -179,6 +188,7 @@ pub fn feed(snapshot: &Snapshot) -> Feed {
         .collect(),
         sections: [
             Some(claude_section(snapshot)),
+            Some(codex_section(snapshot)),
             Some(agy_section(snapshot)),
             Some(factory_section(snapshot)),
             Some(lab::section(&snapshot.lab)),
@@ -311,19 +321,32 @@ pub fn daemon_down(reason: &str, now: i64) -> Feed {
     }
 }
 
-/// `claude 12/40 · agy 30/63 · 2 leads · lab 2/2 · CI ✓`: each window's share (5-hour/weekly, `?` while
-/// unknown; agy's the worst of its quota groups, or `unreadable` while its usage is), the live
-/// leads (`? leads` while herdr can't tell), the phones ready out of plugged in, then CI's mark
-/// when repos are watched.
+/// `claude 12/40 · codex 8/30 · agy 30/63 · 2 leads · lab 2/2 · CI ✓`: each plan's windows'
+/// shares (5-hour/weekly, `?` while unknown; agy's the worst of its quota groups, or
+/// `unreadable` while its usage is), the live leads (`? leads` while herdr can't tell), the
+/// phones ready out of plugged in, then CI's mark when repos are watched.
 pub fn line(snapshot: &Snapshot) -> String {
-    let claude = &snapshot.claude;
-    let share = |kind| {
-        current(claude)
-            .find(|reading| reading.window == kind)
-            .map_or_else(
-                || "?".to_owned(),
-                |reading| reading.used_percent.to_string(),
-            )
+    let shares = |windows: &[UsageReading]| {
+        let share = |kind| {
+            windows
+                .iter()
+                .filter(|reading| reading.current)
+                .find(|reading| reading.window == kind)
+                .map_or_else(
+                    || "?".to_owned(),
+                    |reading| reading.used_percent.to_string(),
+                )
+        };
+        format!(
+            "{}/{}",
+            share(WindowKind::FiveHour),
+            share(WindowKind::Weekly)
+        )
+    };
+    // A plan that can't be read shows no shares, however old its last reading.
+    let codex = match snapshot.codex.unreadable {
+        Some(_) => "?/?".to_owned(),
+        None => shares(&snapshot.codex.windows),
     };
     let leads = if snapshot.leads.error.is_some() {
         "? leads".to_owned()
@@ -352,9 +375,8 @@ pub fn line(snapshot: &Snapshot) -> String {
         )
     };
     format!(
-        "claude {}/{} · agy {agy} · {leads} · {}{ci}",
-        share(WindowKind::FiveHour),
-        share(WindowKind::Weekly),
+        "claude {} · codex {codex} · agy {agy} · {leads} · {}{ci}",
+        shares(&snapshot.claude.windows),
         lab::line(&snapshot.lab),
     )
 }
@@ -426,13 +448,12 @@ fn claude_chip(snapshot: &Snapshot) -> Chip {
 }
 
 /// A meter per window, 5-hour first, whether or not a reading of it was seen.
-fn claude_section(snapshot: &Snapshot) -> Section {
-    let claude = &snapshot.claude;
-    let rows: Vec<Row> = [WindowKind::FiveHour, WindowKind::Weekly]
+fn meter_rows(windows: &[UsageReading], now: i64) -> Vec<Row> {
+    [WindowKind::FiveHour, WindowKind::Weekly]
         .into_iter()
         .map(|kind| {
             let label = kind.label().to_owned();
-            match claude.windows.iter().find(|reading| reading.window == kind) {
+            match windows.iter().find(|reading| reading.window == kind) {
                 Some(reading) if reading.current => Row::Meter {
                     label,
                     value: f64::from(reading.used_percent) / 100.0,
@@ -445,7 +466,7 @@ fn claude_section(snapshot: &Snapshot) -> Section {
                     value: 0.0,
                     text: format!(
                         "unknown, {} old",
-                        crate::lab::ago(snapshot.now / 1000, reading.seen / 1000)
+                        crate::lab::ago(now / 1000, reading.seen / 1000)
                     ),
                     tone: Tone::Muted,
                     until: Some(stamp(reading.resets)),
@@ -459,26 +480,134 @@ fn claude_section(snapshot: &Snapshot) -> Section {
                 },
             }
         })
-        .collect();
-    let stale_since = claude
-        .windows
+        .collect()
+}
+
+/// Since when the readings that no longer stand have been old.
+fn stale_since(windows: &[UsageReading]) -> Option<String> {
+    windows
         .iter()
         .filter(|reading| !reading.current)
         .map(|reading| reading.seen)
         .min()
-        .map(stamp);
+        .map(stamp)
+}
+
+fn claude_section(snapshot: &Snapshot) -> Section {
+    let claude = &snapshot.claude;
     Section {
         id: "claude".to_owned(),
         title: "Claude".to_owned(),
         note: hold_note(snapshot),
         error: None,
-        stale_since,
+        stale_since: stale_since(&claude.windows),
+        rows: meter_rows(&claude.windows, snapshot.now),
+    }
+}
+
+/// `hold: weekly 91% until 11-30 02:00Z`, while Codex reviews are held.
+fn codex_hold_note(snapshot: &Snapshot) -> Option<String> {
+    let codex = &snapshot.codex;
+    if codex.verdict != ClaudeState::Hold {
+        return None;
+    }
+    let what = codex.hold.as_deref().unwrap_or("limit hit");
+    Some(match codex.until {
+        Some(until) => format!("hold: {what} until {}", status::moment(until, snapshot.now)),
+        None => format!("hold: {what}"),
+    })
+}
+
+/// The worst window's share, as Claude's chip does; muted `?` while Codex can't be read, so an
+/// unreadable source is never a calm 0%, unless a reading that still stands holds dispatch:
+/// then the hold is shown, critical, with why the plan could not be read again beside it.
+fn codex_chip(snapshot: &Snapshot) -> Chip {
+    let codex = &snapshot.codex;
+    let note = codex_hold_note(snapshot);
+    let held = codex.verdict == ClaudeState::Hold;
+    if let Some(line) = codex.unreadable_line().filter(|_| !held) {
+        let tooltip = match &note {
+            Some(note) => format!("Codex: {line} · {note}"),
+            None => format!("Codex: {line}"),
+        };
+        return Chip {
+            id: "codex".to_owned(),
+            label: glyph::CODEX.char.to_string(),
+            text: "?".to_owned(),
+            tone: Tone::Muted,
+            tooltip: Some(tooltip),
+        };
+    }
+    let worst = codex
+        .windows
+        .iter()
+        .filter(|reading| reading.current)
+        .map(|reading| reading.used_percent)
+        .max();
+    let (text, tone) = match (worst, held) {
+        (Some(used), true) => (format!("{used}%"), Tone::Critical),
+        (Some(used), false) => (format!("{used}%"), share_tone(used)),
+        (None, true) => ("hold".to_owned(), Tone::Critical),
+        (None, false) => ("?".to_owned(), Tone::Muted),
+    };
+    let mut tooltip = if codex.windows.is_empty() {
+        "Codex: no reading yet".to_owned()
+    } else {
+        let windows: Vec<String> = codex
+            .windows
+            .iter()
+            .map(|reading| reading.describe(snapshot.now))
+            .collect();
+        format!("Codex: {}", windows.join(", "))
+    };
+    if let Some(line) = codex.unreadable_line() {
+        tooltip.push_str(" · ");
+        tooltip.push_str(&line);
+    }
+    if let Some(note) = note {
+        tooltip.push_str(" · ");
+        tooltip.push_str(&note);
+    }
+    Chip {
+        id: "codex".to_owned(),
+        label: glyph::CODEX.char.to_string(),
+        text,
+        tone,
+        tooltip: Some(tooltip),
+    }
+}
+
+/// A meter per window, then the plan and the reset credits available. A Codex that can't be
+/// read puts the reason in `error` and shows no meters: a reading it could not take is not 0%.
+fn codex_section(snapshot: &Snapshot) -> Section {
+    let codex = &snapshot.codex;
+    let mut rows = Vec::new();
+    if codex.unreadable.is_none() {
+        rows = meter_rows(&codex.windows, snapshot.now);
+        if let Some(plan) = &codex.plan {
+            rows.push(text("plan", plan.clone(), Tone::Muted));
+        }
+        let credits = match codex.reset_credits {
+            0 => "none".to_owned(),
+            1 => "1 available".to_owned(),
+            n => format!("{n} available"),
+        };
+        rows.push(text("reset credits", credits, Tone::Muted));
+    }
+    Section {
+        id: "codex".to_owned(),
+        title: "Codex".to_owned(),
+        note: codex_hold_note(snapshot),
+        error: codex.unreadable_line(),
+        stale_since: stale_since(&codex.windows),
         rows,
     }
 }
 
-/// The worst window across agy's quota groups, toned by its share; muted while agy's usage is
-/// unreadable or no window stands.
+/// The worst window across agy's quota groups, toned by its share, and critical once it is at
+/// the config's hold mark, where routing holds its pool; muted while agy's usage is unreadable
+/// or no window stands. Whole percents are rounded down, so a fractional mark counts as reached
+/// at the next whole percent.
 fn agy_chip(snapshot: &Snapshot) -> Chip {
     let agy = &snapshot.agy;
     let label = glyph::AGY.char.to_string();
@@ -491,11 +620,14 @@ fn agy_chip(snapshot: &Snapshot) -> Chip {
             tooltip: Some(problem),
         };
     }
-    let (text, tone) = match agy.worst(snapshot.now) {
+    let worst = agy.worst(snapshot.now);
+    let held = worst.is_some_and(|used| f64::from(used) >= snapshot.agy_hold_at);
+    let (text, tone) = match worst {
+        Some(used) if held => (format!("{used}%"), Tone::Critical),
         Some(used) => (format!("{used}%"), share_tone(used)),
         None => ("?".to_owned(), Tone::Muted),
     };
-    let tooltip = if agy.groups.is_empty() {
+    let mut tooltip = if agy.groups.is_empty() {
         "agy: no reading yet".to_owned()
     } else {
         let groups: Vec<String> = agy
@@ -505,6 +637,9 @@ fn agy_chip(snapshot: &Snapshot) -> Chip {
             .collect();
         format!("agy: {}", groups.join("; "))
     };
+    if held {
+        tooltip.push_str(&format!(" · held from {}%", snapshot.agy_hold_at));
+    }
     Chip {
         id: "agy".to_owned(),
         label,

@@ -1436,6 +1436,64 @@ fn quota_agy_lists_each_quota_groups_windows() {
     assert_eq!(shown["error"], Value::Null, "{shown}");
 }
 
+/// The usage history's agy rows, as `group window used`.
+fn agy_history(sandbox: &Sandbox) -> Vec<String> {
+    let out = sandbox.factory(&["quota", "history", "--json"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    let document = shown(&out.stdout);
+    document["rows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter(|row| row["harness"] == "agy")
+        .map(|row| {
+            format!(
+                "{} {} {}",
+                row["group"].as_str().unwrap_or("-"),
+                row["window"],
+                row["used_percent"]
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn each_agy_reading_joins_the_usage_history_by_group_and_window_once() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", &agy_says(&two_groups()));
+
+    assert_eq!(quota_agy(&sandbox).code, 0);
+    assert_eq!(
+        quota_agy(&sandbox).code,
+        0,
+        "a second look reads the same reading"
+    );
+
+    let mut rows = agy_history(&sandbox);
+    rows.sort();
+    assert_eq!(
+        rows,
+        [
+            "Claude and GPT models \"five_hour\" 24.0",
+            "Claude and GPT models \"weekly\" 63.0",
+            "Gemini Models \"five_hour\" 30.0",
+            "Gemini Models \"weekly\" 7.0",
+        ],
+        "one row per group and window"
+    );
+}
+
+#[test]
+fn a_failed_usage_query_adds_nothing_to_the_history() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", "exit 1");
+
+    let _ = quota_agy(&sandbox);
+
+    assert_eq!(agy_history(&sandbox), Vec::<String>::new());
+}
+
 #[test]
 fn the_bar_shows_the_worst_window_and_a_block_per_quota_group() {
     let sandbox = Sandbox::new();
@@ -1481,7 +1539,7 @@ fn the_bar_shows_the_worst_window_and_a_block_per_quota_group() {
     assert_eq!(groups, ["Gemini Models", "Claude and GPT models"]);
     assert_eq!(
         sandbox.factory(&["bar"]).stdout,
-        "claude ?/? · agy 30/63 · ? leads · lab 0/0\n"
+        "claude ?/? · codex ?/? · agy 30/63 · ? leads · lab 0/0\n"
     );
 }
 
@@ -1501,7 +1559,7 @@ fn assert_unreadable(sandbox: &Sandbox, why: &str) {
     assert!(!agy_card(&feed).to_string().contains('%'), "{feed}");
     assert_eq!(
         sandbox.factory(&["bar"]).stdout,
-        "claude ?/? · agy unreadable · ? leads · lab 0/0\n"
+        "claude ?/? · codex ?/? · agy unreadable · ? leads · lab 0/0\n"
     );
 
     let status = sandbox.factory(&["status"]);
@@ -1622,6 +1680,28 @@ fn a_slow_usage_query_is_asked_once_and_holds_no_bar_up() {
         "the late answer never landed"
     );
     assert_eq!(usage_queries(&sandbox), 1, "{:?}", sandbox.calls("agy"));
+}
+
+#[test]
+fn a_pool_held_at_the_configs_mark_is_a_critical_bar_chip() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", &agy_says(&two_groups()));
+    configure(&sandbox, "[agy]\nhold_at_percent = 40\n");
+    start(&sandbox);
+
+    // Claude and GPT's weekly 63% is past the 40% mark, where routing holds the pool.
+    assert!(
+        until_it(|| agy_chip(&bar_json(&sandbox))["text"] == "63%"),
+        "no reading landed"
+    );
+    let chip = agy_chip(&bar_json(&sandbox));
+    assert_eq!(chip["tone"], "critical", "{chip}");
+    assert!(
+        chip["tooltip"]
+            .as_str()
+            .is_some_and(|tip| tip.ends_with(" · held from 40%")),
+        "{chip}"
+    );
 }
 
 #[test]

@@ -49,6 +49,11 @@ pub const FAKED_TOOLS: &[&str] = &[
     "xdg-dbus-proxy",
 ];
 
+/// The fake that `codex app-server` is handed on to: the daemon's read of Codex's usage windows.
+/// A test scripts it with `sandbox.fake(APP_SERVER, body)`; `calls(APP_SERVER)` counts the asks.
+/// It refuses with exit 127 until then.
+pub const APP_SERVER: &str = "codex-app-server";
+
 /// A fake `bwrap` that puts up no guard: it runs the command after its `--` as it is.
 pub const BWRAP_PASSES: &str =
     "while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"";
@@ -92,11 +97,13 @@ impl Sandbox {
         for sub in ["home", "state", "config", "bin", "calls"] {
             fs::create_dir(sandbox.path(sub)).expect("create a sandbox subdir");
         }
+        // An empty USB bus, as a machine with nothing plugged in shows it.
+        fs::create_dir_all(sandbox.path("sysfs/bus/usb/devices")).expect("create the USB bus");
         fs::DirBuilder::new()
             .mode(0o700)
             .create(sandbox.path("run"))
             .expect("create the runtime dir");
-        for tool in FAKED_TOOLS {
+        for tool in FAKED_TOOLS.iter().chain(&[APP_SERVER]) {
             sandbox.fake(
                 tool,
                 &format!("echo \"fake {tool}: no script for: $*\" >&2\nexit 127"),
@@ -130,10 +137,22 @@ impl Sandbox {
 
     /// Scripts the fake `tool`: `body` is shell that runs after the call is recorded, with the
     /// call's arguments in `$@`.
+    ///
+    /// The fake `codex` hands `codex app-server` (the daemon's reading of the plan's windows) on
+    /// to the fake [`APP_SERVER`], so what a test scripts for reviews never sees it.
     pub fn fake(&self, tool: &str, body: &str) {
         let calls = self.path("calls").join(tool);
+        let hand_on = if tool == "codex" {
+            format!(
+                "if [ \"$1\" = app-server ]; then exec '{}' \"$@\"; fi\n",
+                self.path("bin").join(APP_SERVER).display()
+            )
+        } else {
+            String::new()
+        };
         let script = format!(
             "#!/bin/sh\n# Fake {tool}, written by the factory test harness.\n\
+             {hand_on}\
              us=$(printf '\\037'); call=''; for a in \"$@\"; do call=\"$call$a$us\"; done\n\
              printf '%s\\036' \"$call\" >> '{calls}'\n\
              {body}\n",
@@ -166,7 +185,7 @@ impl Sandbox {
             .env("XDG_CONFIG_HOME", self.path("config"))
             .env("XDG_RUNTIME_DIR", self.path("run"))
             // The USB bus of the sandbox, empty unless a test lays one out: the machine's own is
-            // never read (#73).
+            // never read (#73). A test that removes it has a bus that can't be read.
             .env("FACTORY_SYSFS_ROOT", self.path("sysfs"))
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .current_dir(self.dir.path())

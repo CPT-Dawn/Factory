@@ -85,6 +85,10 @@ impl FakeGitHub {
         github.latest_runs(&[]);
         github.pulls(&[]);
         github.put("no-jobs.json", &json!({"total_count": 0, "jobs": []}));
+        github.put(
+            "no-runs.json",
+            &json!({"total_count": 0, "workflow_runs": []}),
+        );
         sandbox.fake("gh", &script(&github.dir));
         github
     }
@@ -116,16 +120,28 @@ impl FakeGitHub {
         );
     }
 
-    /// Sets the repo's latest workflow runs, whatever their status, each `(id, updated_at)`.
+    /// Sets the repo's latest workflow runs, whatever their status, each `(id, updated_at)`
+    /// and created then too.
     pub fn latest_runs(&self, runs: &[(u64, &str)]) {
+        self.latest_runs_page(1, runs);
+    }
+
+    /// Sets page `page` of the repo's latest workflow runs, as [`FakeGitHub::latest_runs`].
+    pub fn latest_runs_page(&self, page: u32, runs: &[(u64, &str)]) {
         let runs: Vec<Value> = runs
             .iter()
             .map(|(id, updated)| {
-                json!({"id": id, "status": "completed", "name": "CI", "updated_at": updated})
+                json!({"id": id, "status": "completed", "name": "CI", "updated_at": updated,
+                       "created_at": updated})
             })
             .collect();
+        let file = if page == 1 {
+            "runs-latest.json".to_owned()
+        } else {
+            format!("runs-latest-{page}.json")
+        };
         self.put(
-            "runs-latest.json",
+            &file,
             &json!({"total_count": runs.len(), "workflow_runs": runs}),
         );
     }
@@ -349,6 +365,8 @@ api)
     repos/acme/shop/actions/runners\?*) file="$G/runners.json" ;;
     repos/acme/shop/actions/runs\?status=queued*) file="$G/runs-queued.json" ;;
     repos/acme/shop/actions/runs\?status=in_progress*) file="$G/runs-in_progress.json" ;;
+    repos/acme/shop/actions/runs\?per_page=*'&page='*)
+        file="$G/runs-latest-${{path##*&page=}}.json"; [ -f "$file" ] || file="$G/no-runs.json" ;;
     repos/acme/shop/actions/runs\?per_page=*) file="$G/runs-latest.json" ;;
     repos/acme/shop/actions/runs/*/jobs*)
         id="${{path#repos/acme/shop/actions/runs/}}"; id="${{id%%/*}}"

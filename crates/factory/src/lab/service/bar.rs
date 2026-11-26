@@ -33,7 +33,8 @@ impl Lab {
         let cfg = context::machine_config().unwrap_or_default();
         let shown = self.attached.borrow().shown.clone();
         let stacks_seen = lock_ignoring_poison(&self.stacks).clone();
-        let (swept, hidden) = self.hidden_phones(shown.as_deref().unwrap_or_default());
+        let hidden = self.hidden_phones(shown.as_deref().unwrap_or_default());
+        let (swept, usb_error) = (hidden.at, hidden.error);
         self.read(|c| {
             let leases = store::leases(c)?;
             let holder = |serial: &str| {
@@ -73,7 +74,7 @@ impl Lab {
                 })
                 .collect();
             // A phone adb doesn't list, but the USB bus shows: its USB debugging is off.
-            phones.extend(hidden.into_iter().map(|h| Phone {
+            phones.extend(hidden.phones.into_iter().map(|h| Phone {
                 model: h.vendor.to_owned(),
                 readiness: Some(Readiness::UsbDebuggingOff),
                 probed: Some(swept),
@@ -131,6 +132,7 @@ impl Lab {
                 max_emulators: cfg.max_emulators,
                 mem_available_mb: host::mem_available_mb(),
                 error: None,
+                usb_error,
             })
         })
     }

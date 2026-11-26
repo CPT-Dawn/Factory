@@ -175,6 +175,22 @@ pub struct QuotaGroup {
 }
 
 impl QuotaGroup {
+    /// Its windows with some spent, as readings taken at `seen`, for the usage history. A
+    /// window nobody has touched has no clock running and no reset to stamp, and one that can't
+    /// be placed says nothing: neither is a reading.
+    pub fn readings(&self, seen: Timestamp) -> Vec<UsageWindow> {
+        self.windows
+            .iter()
+            .filter_map(|window| match window.state {
+                WindowState::Used {
+                    used_percent,
+                    resets,
+                } => UsageWindow::read(window.window, f64::from(used_percent), resets, seen),
+                WindowState::Unused | WindowState::Unknown => None,
+            })
+            .collect()
+    }
+
     /// Its windows as `describe` says each, joined by `separator`: `5h 30%, weekly 7%`.
     pub fn describe(&self, now: i64, separator: &str) -> String {
         let windows: Vec<String> = self.windows.iter().map(|w| w.describe(now)).collect();

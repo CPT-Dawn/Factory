@@ -166,8 +166,14 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
 }
 
 /// The adapter that runs a chain's step on its backend, keeping the backend's reserve unless
-/// the review is hard or spec.
-fn reviewer(backend: &Backend, step: &Step, tier: Tier, paths: &Paths) -> Box<dyn Reviewer> {
+/// the review is hard or spec, and agy's hold at `agy_hold_at` percent of either bucket.
+fn reviewer(
+    backend: &Backend,
+    step: &Step,
+    tier: Tier,
+    paths: &Paths,
+    agy_hold_at: f64,
+) -> Box<dyn Reviewer> {
     let model = step.model.clone().or_else(|| backend.model.clone());
     let effort = step.effort.clone().or_else(|| backend.effort.clone());
     match backend.cli {
@@ -183,7 +189,8 @@ fn reviewer(backend: &Backend, step: &Step, tier: Tier, paths: &Paths) -> Box<dy
                 backend
                     .reserve
                     .filter(|_| !matches!(tier, Tier::Hard | Tier::Spec)),
-            ),
+            )
+            .holding_at(agy_hold_at),
         ),
         Cli::Codex => Box::new(Codex::new(model, effort, &home_of("CODEX_HOME", ".codex"))),
         Cli::Claude => Box::new(Claude::new(
@@ -279,6 +286,7 @@ fn review(
     let mut spent = vec![false; chain.len()];
     // The daemon holds the backend's slot for as long as this session lives.
     let mut daemon = client::Session::open(paths)?;
+    let codex = config::codex_params(paths)?;
     let text = loop {
         let pools = candidates(&setup.backends, chain, &spent, run);
         if pools.is_empty() && !run.skipped.is_empty() {
@@ -294,6 +302,7 @@ fn review(
         }
         let last = pools.len().saturating_sub(1);
         let slots = AcquireParams {
+            codex,
             tier: Some(tier.as_str().to_owned()),
             review: Some(ReviewRef {
                 repo: run.repo.clone(),
@@ -311,6 +320,7 @@ fn review(
                         WhenBusy::Next
                     };
                     BackendSlots {
+                        cli: Some(config::cli_name(backend.cli).to_owned()),
                         name: backend.name.clone(),
                         concurrency: backend.concurrency,
                         when_busy: backend.when_busy.unwrap_or(chained).into(),
@@ -354,7 +364,7 @@ fn review(
             model: None,
             effort: None,
         });
-        let reviewer = reviewer(backend, &step, tier, paths);
+        let reviewer = reviewer(backend, &step, tier, paths, setup.agy_hold_at);
         run.chosen = Some(Chosen {
             pool: backend.name.clone(),
             cli: backend.cli,
