@@ -14,8 +14,9 @@ const MILLIS_PER_DAY: i64 = 86_400_000;
 /// How long a row is kept.
 pub const RETENTION_DAYS: i64 = 90;
 
-/// The longest the history goes without a prune.
-pub const PRUNE_EVERY_MS: i64 = MILLIS_PER_DAY;
+/// How long after a prune the history is due the next: an hour short of a day, so a daemon
+/// that looks a little late still prunes at least daily.
+pub const PRUNE_EVERY_MS: i64 = MILLIS_PER_DAY - 3_600_000;
 
 /// One reading of one usage window, as history keeps it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -74,9 +75,16 @@ pub fn cutoff(now: Timestamp) -> Timestamp {
     Timestamp::from_unix_millis(now.unix_millis() - RETENTION_DAYS * MILLIS_PER_DAY)
 }
 
-/// Whether the history is due a prune at `now`, the last one having run at `last`.
+/// Whether the history is due a prune at `now` by the wall clock, the last one having run at
+/// `last`; never pruned is due.
 pub fn prune_due(last: Option<Timestamp>, now: Timestamp) -> bool {
     last.is_none_or(|last| now.unix_millis() - last.unix_millis() >= PRUNE_EVERY_MS)
+}
+
+/// Whether `elapsed`, the time that has passed since the last prune by a clock that never
+/// steps back, makes the history due one: the wall clock stepped back doesn't hold a prune off.
+pub fn overdue(elapsed: Duration) -> bool {
+    i128::try_from(elapsed.as_millis()).is_ok_and(|elapsed| elapsed >= i128::from(PRUNE_EVERY_MS))
 }
 
 /// The moment `--since` names at `now`: a UTC time (`2026-11-20T00:00:00Z`), a UTC date
@@ -112,24 +120,19 @@ pub fn parse_since(text: &str, now: Timestamp) -> Result<Timestamp, String> {
         .ok_or_else(bad)
 }
 
-/// Each window and its name in the database, which is its serde name.
-const WINDOWS: [(WindowKind, &str); 2] = [
-    (WindowKind::FiveHour, "five_hour"),
-    (WindowKind::Weekly, "weekly"),
-];
-
-/// What a window's name is in the database: `five_hour` or `weekly`.
+/// What a window's name is in the database, its serde name. A new window kind fails to
+/// compile until it has one.
 pub fn window_key(kind: WindowKind) -> &'static str {
-    WINDOWS
-        .iter()
-        .find(|(window, _)| *window == kind)
-        .map_or("unknown", |(_, key)| key)
+    match kind {
+        WindowKind::FiveHour => "five_hour",
+        WindowKind::Weekly => "weekly",
+    }
 }
 
-/// The window a database name is of.
+/// The window a database name is of: the windows `window_key` names, found by their key, so
+/// the key is written once.
 pub fn window_of(key: &str) -> Option<WindowKind> {
-    WINDOWS
-        .iter()
-        .find(|(_, name)| *name == key)
-        .map(|(window, _)| *window)
+    [WindowKind::FiveHour, WindowKind::Weekly]
+        .into_iter()
+        .find(|kind| window_key(*kind) == key)
 }

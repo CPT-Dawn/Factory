@@ -1,6 +1,10 @@
 //! Usage-window history: which readings add a row, when rows are pruned, and `--since`.
 
-use factory_core::history::{HistoryRow, cutoff, parse_since, prune_due, window_key, window_of};
+use std::time::Duration;
+
+use factory_core::history::{
+    HistoryRow, cutoff, overdue, parse_since, prune_due, window_key, window_of,
+};
 use factory_core::timestamp::Timestamp;
 use factory_core::usage::WindowKind;
 
@@ -49,8 +53,15 @@ fn rows_are_kept_for_90_days() {
 fn the_history_is_pruned_at_least_daily() {
     let last = at("2026-11-26T00:00:00Z");
     assert!(prune_due(None, last));
-    assert!(!prune_due(Some(last), at("2026-11-26T23:59:59Z")));
-    assert!(prune_due(Some(last), at("2026-11-27T00:00:00Z")));
+    assert!(!prune_due(Some(last), at("2026-11-26T22:59:59Z")));
+    // An hour short of a day: a look that comes a little late still prunes within the day.
+    assert!(prune_due(Some(last), at("2026-11-26T23:00:00Z")));
+}
+
+#[test]
+fn a_day_of_elapsed_time_makes_a_prune_due_whatever_the_wall_clock_says() {
+    assert!(!overdue(Duration::from_secs(22 * 3600)));
+    assert!(overdue(Duration::from_secs(23 * 3600)));
 }
 
 #[test]

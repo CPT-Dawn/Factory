@@ -28,8 +28,9 @@ const PRUNE_LOOK: Duration = Duration::from_secs(5);
 pub struct QuotaKeeper {
     store: Mutex<Store>,
     claude: Mutex<ClaudeQuota>,
-    /// When the usage history was last pruned; none until this daemon has.
-    pruned: Mutex<Option<Timestamp>>,
+    /// When the usage history was last pruned, by the wall clock and by one that never steps
+    /// back; none until this daemon has.
+    pruned: Mutex<Option<(Timestamp, Instant)>>,
     /// Woken when Claude's quota changes, so a waiting lead looks again.
     changed: Notify,
 }
@@ -139,7 +140,10 @@ impl QuotaKeeper {
     /// Drops the history past its 90 days, when a day or more has passed since it last did.
     fn prune_if_due(&self, now: Timestamp) -> Result<(), Failure> {
         let mut pruned = lock(&self.pruned);
-        if !history::prune_due(*pruned, now) {
+        let due = pruned.is_none_or(|(at, since)| {
+            history::prune_due(Some(at), now) || history::overdue(since.elapsed())
+        });
+        if !due {
             return Ok(());
         }
         lock(&self.store)
@@ -149,18 +153,22 @@ impl QuotaKeeper {
                     "cannot prune the usage history: {e}; check the disk and FACTORY_STATE"
                 ))
             })?;
-        *pruned = Some(now);
+        *pruned = Some((now, Instant::now()));
         Ok(())
     }
 
     /// Keeps the history to its 90 days for as long as the daemon runs, idle or not: it looks
     /// every few seconds whether a day has passed since the last prune (a start prunes too).
     pub async fn keep(self: Arc<Self>) {
+        let mut failing = false;
         loop {
             tokio::time::sleep(PRUNE_LOOK).await;
-            if let Err(failure) = self.prune_if_due(clock::now()) {
+            // The daemon's log hears of a failure once, not at every look until it is mended.
+            let pruned = self.prune_if_due(clock::now());
+            if let (Err(failure), false) = (&pruned, failing) {
                 eprintln!("factory: {}", failure.message);
             }
+            failing = pruned.is_err();
         }
     }
 

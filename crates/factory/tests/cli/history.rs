@@ -2,6 +2,7 @@
 //! `factory quota history` prints it, and rows past 90 days are pruned. The test clock's skew
 //! file moves the daemon's clock a day at a time, so the 90 days pass without a wait.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -278,20 +279,25 @@ fn each_result_gets_a_file_of_its_own() {
 }
 
 #[test]
-fn json_prints_the_rows_and_writes_no_file() {
+fn json_prints_the_rows_though_no_file_could_be_written() {
     let (sandbox, _) = skewed();
     many_readings(&sandbox, 6);
+    let state = sandbox.path("state/factory");
+    let mode =
+        |mode| std::fs::set_permissions(&state, std::fs::Permissions::from_mode(mode)).unwrap();
 
-    assert_eq!(rows(&sandbox, &[]).len(), 12);
+    // A state dir nothing can be created in: the daemon holds its database open.
+    mode(0o555);
+    let plain = sandbox.factory(&["quota", "history"]);
+    let json = sandbox.factory(&["quota", "history", "--json"]);
+    mode(0o755);
 
-    let exported = std::fs::read_dir(sandbox.path("state/factory"))
-        .unwrap()
-        .filter_map(Result::ok)
-        .any(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("quota-history")
-        });
-    assert!(!exported, "--json wrote a file");
+    assert_eq!(plain.code, 3, "{plain:?}");
+    assert!(
+        plain.stderr.starts_with("factory: cannot write "),
+        "{plain:?}"
+    );
+    assert_eq!((json.code, json.stderr.as_str()), (0, ""), "{json:?}");
+    let document: Value = serde_json::from_str(&json.stdout).unwrap();
+    assert_eq!(document["rows"].as_array().unwrap().len(), 12);
 }

@@ -4,6 +4,7 @@
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
+use std::time::Duration;
 
 use factory_core::history::{self, HistoryRow};
 use factory_core::timestamp::Timestamp;
@@ -14,6 +15,9 @@ use crate::clock;
 use crate::output::{Done, Failure, LINE_LIMIT};
 use crate::paths::Paths;
 use crate::protocol::{HistoryParams, HistoryRows, QUOTA_HISTORY};
+
+/// How long an export file stays after it was written.
+const EXPORT_LIFE: Duration = Duration::from_secs(24 * 3600);
 
 pub fn run(since: Option<&str>, json: bool) -> Result<Done, Failure> {
     let since = since
@@ -73,5 +77,29 @@ fn export(state: &Path, content: &str) -> Result<std::path::PathBuf, Failure> {
         let _ = fs::remove_file(&partial);
         cannot(e)
     })?;
+    forget_old_exports(state, &file);
     Ok(file)
+}
+
+/// Removes the exports of earlier results that nobody has written to for a day, `keep` aside:
+/// a file lives as long as the line that named it is likely to be read.
+fn forget_old_exports(state: &Path, keep: &Path) {
+    let Ok(entries) = fs::read_dir(state) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let old = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age > EXPORT_LIFE));
+        if name.starts_with("quota-history-")
+            && name.ends_with(".json")
+            && old
+            && entry.path() != keep
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
