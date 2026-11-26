@@ -94,6 +94,7 @@ impl World {
     /// - `stall <serial>`: the emulator never finishes booting,
     /// - `yank <serial>`: the phone is unplugged when it is next asked its ABI, as a grant of it
     ///   settles: between the grant and the prep,
+    /// - `container <name>`: docker runs it, as a stack started outside devlab is run,
     /// - `break <operation>` / `mend <operation>`: `supabase start`, `supabase stop` or `systemd-run` fails,
     ///   or works again.
     pub fn apply(&self, step: &str) -> Result<(), String> {
@@ -127,6 +128,7 @@ impl World {
             ["power", serial, source] => self.append("power", &format!("{serial} {source}")),
             ["stall", serial] => self.append("stalled", serial),
             ["yank", serial] => self.append("yanked", serial),
+            ["container", name] => self.append("containers", name),
             ["break", what @ ..] if !what.is_empty() => self.append("broken", &what.join(" ")),
             ["mend", what @ ..] if !what.is_empty() => {
                 let what = what.join(" ");

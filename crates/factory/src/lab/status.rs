@@ -6,7 +6,6 @@ use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{DeviceRow, device_line};
 use factory_core::lab::queue::{Holding, held_by, live_queue, owner_slot_counts, waiter_capped};
 use factory_core::lab::reserve::lapses_at;
-use factory_core::lab::slots::slot_project_id;
 use factory_core::lab::{ago, js_round};
 use serde::Serialize;
 
@@ -214,16 +213,7 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
                 .reservations
                 .iter()
                 .find(|r| r.project == s.project && r.slot == s.slot);
-            let id = s
-                .last_worktree
-                .as_deref()
-                .and_then(|wt| {
-                    let p = project_config(wt).ok().flatten()?;
-                    stack::info(&p, wt, s.slot).ok().flatten()
-                })
-                .map(|info| info.project_id)
-                .filter(|id| !id.is_empty())
-                .unwrap_or_else(|| slot_project_id(&s.project, s.slot));
+            let id = stack::slot_stack_id(&s.project, s.slot, s.last_worktree.as_deref());
             SlotLine {
                 project: s.project.clone(),
                 slot: s.slot,

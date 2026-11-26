@@ -3,8 +3,10 @@
 
 use std::collections::BTreeSet;
 
+use factory_core::bar::lab::{Emulator, Lab, Phone, Stack};
 use factory_core::bar::{Feed, Snapshot, daemon_down, feed, glyph, line};
 use factory_core::claude::ClaudeQuota;
+use factory_core::lab::ready::Readiness;
 use factory_core::status::{Claude, ClaudeState, Lead, Leads, Wait};
 use factory_core::timestamp::Timestamp;
 use factory_core::usage::{UsageReading, UsageWindow, WindowKind};
@@ -86,6 +88,45 @@ fn snapshot(claude: Claude, leads: Vec<Lead>) -> Snapshot {
             monitor: true,
             leads,
         },
+        lab: Lab::default(),
+    }
+}
+
+/// A lab with a phone of each readiness, a leased one, a stale one, an emulator and stacks.
+fn busy_lab() -> Lab {
+    let phone = |serial: &str, readiness, probed: i64, holder: Option<&str>| Phone {
+        serial: serial.to_owned(),
+        model: format!("Pixel {serial}"),
+        readiness,
+        probed: Some(probed),
+        holder: holder.map(str::to_owned),
+    };
+    Lab {
+        now: now(),
+        phones: vec![
+            phone("1", Some(Readiness::Ready), now(), None),
+            phone("2", Some(Readiness::Locked), now(), None),
+            phone("3", Some(Readiness::Unauthorized), now(), None),
+            phone("4", Some(Readiness::Ready), now() - 10 * 60_000, None),
+            phone("5", Some(Readiness::Asleep), now(), Some("app-t1")),
+            phone("6", None, now(), None),
+        ],
+        emulators: vec![Emulator {
+            serial: "emulator-5580".to_owned(),
+            ready: true,
+            holder: Some("app-t2".to_owned()),
+        }],
+        stacks: vec![Stack {
+            project: "app".to_owned(),
+            slot: 0,
+            up: Some(true),
+            ours: false,
+            holder: None,
+        }],
+        queue: 1,
+        max_emulators: 2,
+        mem_available_mb: 8192,
+        error: None,
     }
 }
 
@@ -118,7 +159,10 @@ fn snapshots() -> Vec<Snapshot> {
             going(vec![five(12), weekly(40)]),
             vec![lead("lead-a", "working")],
         ),
-        snapshot(going(vec![five(80), weekly(40)]), Vec::new()),
+        Snapshot {
+            lab: busy_lab(),
+            ..snapshot(going(vec![five(80), weekly(40)]), Vec::new())
+        },
         snapshot(
             Claude {
                 verdict: ClaudeState::Hold,
@@ -459,11 +503,13 @@ fn the_factory_card_lists_leads_waits_and_the_steward() {
 #[test]
 fn the_line_names_both_windows_and_the_leads() {
     let all = snapshots();
-    assert_eq!(line(&all[0]), "claude 12/40 · 1 lead");
+    assert_eq!(line(&all[0]), "claude 12/40 · 1 lead · lab 0/0");
+    // Phones ready out of plugged in: a stale ready one isn't counted ready.
+    assert_eq!(line(&all[1]), "claude 80/40 · 0 leads · lab 1/6");
     // A hold and the leads that need the owner are the chips' to show, not the line's.
-    assert_eq!(line(&all[2]), "claude 41/91 · 2 leads");
-    assert_eq!(line(&all[3]), "claude ?/12 · 0 leads");
-    assert_eq!(line(&all[4]), "claude ?/? · ? leads");
+    assert_eq!(line(&all[2]), "claude 41/91 · 2 leads · lab 0/0");
+    assert_eq!(line(&all[3]), "claude ?/12 · 0 leads · lab 0/0");
+    assert_eq!(line(&all[4]), "claude ?/? · ? leads · lab 0/0");
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! The daemon's watch over phones (#55): a phone is prepped when adb's stream first shows it as
-//! `device` and after every replug, every attached phone is probed every `readinessCheckSec`,
-//! and its readiness is kept in the store. Each change of it posts one desktop notification
-//! saying what to do: one per change of a phone, told by its serial and named the same way each
+//! `device` and after every replug, every free phone is probed every `readinessCheckSec` (two
+//! minutes unless set, #72; a leased one is its holder's and isn't), and its readiness is kept
+//! in the store. Each change of it posts one desktop notification saying what to do: one per change of a phone, told by its serial and named the same way each
 //! time, and an offline that its unplug soon follows is said as the unplug alone (#63). One
 //! thread does it all, so the probes, the store's rows and the notifications follow the stream's
 //! order; `devlab check` is answered on it too.
@@ -18,12 +18,13 @@ use factory_core::lab::devices::{Attached, LOCK_PROBE, prep_command};
 use factory_core::lab::events as event;
 use factory_core::lab::ready::{
     AUTH_TIMEOUT_PROBE, BATTERY_PROBE, EpochMs, Known, Notice, POWER_PROBE, Probe, Readiness,
-    STAY_ON_PROBE, after, auth_timeout_warning, judge, notice, refresh_again, unplugged,
+    STAY_ON_PROBE, after, auth_timeout_warning, judge, notice, phone_name, refresh_again,
+    unplugged,
 };
 
 use super::super::check::PhoneCheck;
 use super::super::readiness::{self, ReadyRow};
-use super::super::{context, events};
+use super::super::{context, events, store};
 use super::{Answer, Lab, Mark, failed, lock_ignoring_poison, now_ms};
 
 /// How old a probe `devlab check` answers from may be.
@@ -168,21 +169,7 @@ fn config() -> MachineConfig {
 }
 
 fn every(cfg: &MachineConfig) -> Duration {
-    Duration::try_from_secs_f64(cfg.readiness_check_sec).unwrap_or(Duration::from_secs(60))
-}
-
-/// The name a notification gives phone `serial`: its `model`, else its serial; with the last 4
-/// of its serial when `shared`, another attached phone being of its model.
-fn name(model: &str, serial: &str, shared: bool) -> String {
-    if model.is_empty() {
-        return serial.to_owned();
-    }
-    if !shared {
-        return model.to_owned();
-    }
-    let chars: Vec<char> = serial.chars().collect();
-    let last: String = chars[chars.len().saturating_sub(4)..].iter().collect();
-    format!("{model} ({last})")
+    Duration::try_from_secs_f64(cfg.readiness_check_sec).unwrap_or(Duration::from_secs(120))
 }
 
 impl Watcher {
@@ -216,8 +203,14 @@ impl Watcher {
                 Err(RecvTimeoutError::Timeout) if Instant::now() < next => self.say_held(),
                 Err(RecvTimeoutError::Timeout) => {
                     self.say_held();
+                    // A leased phone is its holder's: a probe would wake its screen mid-run.
+                    let leased: HashSet<String> = self
+                        .lab
+                        .write(|c, _| store::taken(c))
+                        .map(|serials| serials.into_iter().collect())
+                        .unwrap_or_default();
                     for phone in self.shown.clone() {
-                        if phone.state == "device" {
+                        if phone.state == "device" && !leased.contains(&phone.serial) {
                             self.probe(&phone);
                         }
                     }
@@ -297,7 +290,7 @@ impl Watcher {
                 .models
                 .iter()
                 .any(|(other, m)| other != serial && m == model);
-        name(model, serial, shared)
+        phone_name(model, serial, shared)
     }
 
     /// Says `n`: phone `serial` is now `what`, unless that was the last thing said of it. An

@@ -112,6 +112,11 @@ pub struct Lab {
     watched: Mutex<HashSet<String>>,
     /// What the keeper is stopping because it idled; no grant hands it out meanwhile.
     stopping: Mutex<keeper::Stopping>,
+    /// Whether each slot's stack ran at the stack sweep's last look, by project and slot
+    /// ([`Lab::sweep_stacks`]): what the bar says of the stacks.
+    stacks: Mutex<BTreeMap<(String, u32), bool>>,
+    /// Wakes the stack sweep, once it runs: a change to the lab may have made or ended a slot.
+    sweep: OnceLock<mpsc::Sender<()>>,
     /// Tells the ledger's thread that events are queued: it alone appends them, so no lab
     /// call waits on the ledger (#62).
     wake: mpsc::Sender<()>,
@@ -173,6 +178,7 @@ fn lock_ignoring_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+mod bar;
 mod overview;
 
 type Answer<T> = Result<T, ErrorBody>;
@@ -217,6 +223,8 @@ impl Lab {
             list_gate: Mutex::new(()),
             watched: Mutex::new(HashSet::new()),
             stopping: Mutex::new(keeper::Stopping::default()),
+            stacks: Mutex::new(BTreeMap::new()),
+            sweep: OnceLock::new(),
             callers: Mutex::new(HashSet::new()),
             wake,
         })
@@ -443,6 +451,9 @@ impl Lab {
 
     fn notify(&self) {
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
+        if let Some(sweep) = self.sweep.get() {
+            let _ = sweep.send(());
+        }
     }
 
     /// Gives lease `lease` back whole, its devices as they are now, and ends request `waiter`:
