@@ -169,6 +169,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
         notifier.resume();
         lab.keep();
         lab.watch_phones();
+        lab.sweep_stacks();
         let daemon = Daemon {
             ledger,
             leads,
@@ -476,12 +477,16 @@ async fn respond(
             Err(refused) => refused,
         },
         BAR => match params::<BarParams>(BAR, request.params) {
-            Ok(params) => answered(Ok::<_, Failure>(crate::bar::snapshot(
-                &params,
-                &daemon.leads,
-                &daemon.steward,
-                &daemon.quotas,
-            ))),
+            Ok(params) => {
+                let lab = daemon.lab.bar().await;
+                answered(Ok::<_, Failure>(crate::bar::snapshot(
+                    &params,
+                    &daemon.leads,
+                    &daemon.steward,
+                    &daemon.quotas,
+                    lab,
+                )))
+            }
             Err(refused) => refused,
         },
         LOG => {
