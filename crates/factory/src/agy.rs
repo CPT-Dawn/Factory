@@ -31,14 +31,7 @@ fn said(agy: &Agy, now: i64, json: Value) -> Done {
     let groups: Vec<String> = agy
         .groups
         .iter()
-        .map(|group| {
-            let windows: Vec<String> = group
-                .windows
-                .iter()
-                .map(|window| window.describe(now))
-                .collect();
-            format!("{}: {}", group.name, windows.join(", "))
-        })
+        .map(|group| format!("{}: {}", group.name, group.describe(now, ", ")))
         .collect();
     if groups.is_empty() {
         return Done::new("agy: no reading yet; try again", json);

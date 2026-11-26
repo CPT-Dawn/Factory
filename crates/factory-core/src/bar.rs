@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::status::{self, ClaudeState};
 use crate::timestamp::Timestamp;
-use crate::usage::{QuotaGroup, UsageReading, WindowKind, WindowState};
+use crate::usage::{UsageReading, WindowKind, WindowState};
 
 /// The cockpit format's version.
 pub const VERSION: u32 = 1;
@@ -353,16 +353,6 @@ fn claude_section(snapshot: &Snapshot) -> Section {
     }
 }
 
-/// `5h 30%, weekly 7%`.
-fn group_windows(group: &QuotaGroup, now: i64, separator: &str) -> String {
-    let windows: Vec<String> = group
-        .windows
-        .iter()
-        .map(|window| window.describe(now))
-        .collect();
-    windows.join(separator)
-}
-
 /// The worst window across agy's quota groups, toned by its share; muted while agy's usage is
 /// unreadable or no window stands.
 fn agy_chip(snapshot: &Snapshot) -> Chip {
@@ -387,13 +377,7 @@ fn agy_chip(snapshot: &Snapshot) -> Chip {
         let groups: Vec<String> = agy
             .groups
             .iter()
-            .map(|group| {
-                format!(
-                    "{} {}",
-                    group.name,
-                    group_windows(group, snapshot.now, ", ")
-                )
-            })
+            .map(|group| format!("{} {}", group.name, group.describe(snapshot.now, ", ")))
             .collect();
         format!("agy: {}", groups.join("; "))
     };
@@ -412,11 +396,7 @@ fn agy_section(snapshot: &Snapshot) -> Section {
     let now = snapshot.now;
     let mut rows = Vec::new();
     for group in &agy.groups {
-        rows.push(text(
-            &group.name,
-            group_windows(group, now, " · "),
-            Tone::Muted,
-        ));
+        rows.push(text(&group.name, group.describe(now, " · "), Tone::Muted));
         for window in &group.windows {
             let label = window.window.label().to_owned();
             rows.push(match window.state {

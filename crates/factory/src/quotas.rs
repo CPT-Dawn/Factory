@@ -1,5 +1,6 @@
-//! The quota keeper: the daemon's one owner of every harness's latest usage readings, kept in
-//! its database so a restart forgets no hold. Status, the bar and a dispatch all ask it; nothing
+//! The quota keeper: the daemon's one owner of every harness's latest usage readings. Claude's
+//! are kept in its database so a restart forgets no hold; agy's are held in memory and asked
+//! again after a restart. Status, the bar and a dispatch all ask it; nothing
 //! else reads or records a quota. Claude's two windows come in through `factory hook
 //! statusline`, and its limit through the `StopFailure` hook. agy's come from its usage query,
 //! which the keeper asks for itself, at most once in [`AGY_DISPLAY_FRESH_MS`]: what status, the

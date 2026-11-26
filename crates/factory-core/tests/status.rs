@@ -634,7 +634,7 @@ fn used(percent: u32, resets: &str) -> WindowState {
 }
 
 #[test]
-fn agys_row_lists_each_quota_groups_windows() {
+fn agys_row_names_each_quota_group_and_its_worst_window() {
     let mut status = idle();
     status.agy = Agy {
         groups: vec![
@@ -654,14 +654,14 @@ fn agys_row_lists_each_quota_groups_windows() {
     let shown = rows(&status);
 
     assert!(
-        shown.contains(&"agy Gemini Models: 5h 30%, weekly 7%".to_owned()),
+        shown.contains(&"agy: Gemini Models 30%; Claude and GPT models 0%".to_owned()),
         "{}",
         shown.join("\n")
     );
-    assert!(
-        shown.contains(&"agy Claude and GPT models: 5h 0%, weekly unknown".to_owned()),
-        "{}",
-        shown.join("\n")
+    assert_eq!(
+        shown.iter().filter(|row| row.starts_with("agy")).count(),
+        1,
+        "one row, whatever the groups"
     );
 }
 

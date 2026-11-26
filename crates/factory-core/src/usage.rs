@@ -174,6 +174,22 @@ pub struct QuotaGroup {
     pub windows: Vec<GroupWindow>,
 }
 
+impl QuotaGroup {
+    /// Its windows as `describe` says each, joined by `separator`: `5h 30%, weekly 7%`.
+    pub fn describe(&self, now: i64, separator: &str) -> String {
+        let windows: Vec<String> = self.windows.iter().map(|w| w.describe(now)).collect();
+        windows.join(separator)
+    }
+
+    /// The most spent of its windows' shares at `now`; none when none stands.
+    pub fn worst(&self, now: i64) -> Option<u32> {
+        self.windows
+            .iter()
+            .filter_map(|w| w.used_percent(now))
+            .max()
+    }
+}
+
 /// What a harness's windows say of dispatching now.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Verdict {

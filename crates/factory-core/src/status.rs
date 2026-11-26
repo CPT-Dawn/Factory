@@ -281,7 +281,8 @@ pub const COLUMNS: usize = 80;
 
 /// The most rows each section lists before it says how many it left out. The lab the ticket
 /// names (three slots, three backends, five leads) takes at most 23 rows with every section at
-/// its cap, the Claude plan's row included.
+/// its cap, the Claude plan's row included, and agy's quota is one row more at most: the screen
+/// holds each group's worst window, and `factory quota agy` and the bar hold the rest.
 const LAB_ROWS: usize = 5;
 const QUEUE_ROWS: usize = 2;
 const WAIT_ROWS: usize = 3;
@@ -457,13 +458,18 @@ fn agy(status: &Status, rows: &mut Vec<String>) {
     } else if agy.groups.is_empty() {
         rows.push("agy: no reading yet".to_owned());
     }
-    for group in &agy.groups {
-        let windows: Vec<String> = group
-            .windows
+    // One row, whatever the groups: the screen is full at 24 rows, and `factory quota agy` and
+    // the bar's card hold each window.
+    if !agy.groups.is_empty() {
+        let groups: Vec<String> = agy
+            .groups
             .iter()
-            .map(|window| window.describe(status.now))
+            .map(|group| match group.worst(status.now) {
+                Some(used) => format!("{} {used}%", group.name),
+                None => format!("{} unknown", group.name),
+            })
             .collect();
-        rows.push(format!("agy {}: {}", group.name, windows.join(", ")));
+        rows.push(format!("agy: {}", groups.join("; ")));
     }
 }
 
