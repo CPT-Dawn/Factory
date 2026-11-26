@@ -134,30 +134,26 @@ impl Router {
         loop {
             let mut changed = std::pin::pin!(self.changed.notified());
             changed.as_mut().enable();
-            let hold = if on_codex.contains(&true) {
-                Hold::of(&keeper.codex(&params.codex).await)
+            // A first look, from the quotas as stored: only a review that is about to take Codex
+            // asks about its plan, and it waits for the answer, so none starts on a plan that
+            // a reading on its way would have held.
+            let takes_codex = {
+                let state = lock(&self.state);
+                let candidates = candidates(&state, &wanted, &on_codex, None, clock::now());
+                matches!(
+                    quota::pick(&candidates, clock::now()),
+                    Pick::Take(index) if on_codex[index]
+                )
+            };
+            let hold = if takes_codex {
+                Hold::of(&keeper.codex_settled(&params.codex).await)
             } else {
                 None
             };
             let now = clock::now();
             let next_reset = {
                 let mut state = lock(&self.state);
-                let candidates: Vec<Candidate> = wanted
-                    .iter()
-                    .zip(&on_codex)
-                    .map(|(&(name, concurrency, when_busy), &codex)| Candidate {
-                        quota: {
-                            let stored = state.quotas.get(name).copied().unwrap_or(Quota::Unknown);
-                            match (&hold, codex) {
-                                (Some(hold), true) => hold.over(stored, now),
-                                _ => stored,
-                            }
-                        },
-                        running: state.running.get(name).copied().unwrap_or(0),
-                        concurrency,
-                        when_busy,
-                    })
-                    .collect();
+                let candidates = candidates(&state, &wanted, &on_codex, hold.as_ref(), now);
                 match quota::pick(&candidates, now) {
                     Pick::Take(index) => {
                         let name = wanted[index].0.to_owned();
@@ -319,6 +315,33 @@ impl Router {
         self.changed.notify_waiters();
         Outcome::Result(serde_json::to_value(params).unwrap_or(Value::Null))
     }
+}
+
+/// The candidates for a pick at `now`: each backend's quota, with a Codex hold laid over those
+/// that run on Codex, and its load.
+fn candidates(
+    state: &State,
+    wanted: &[(&str, u32, WhenBusy)],
+    on_codex: &[bool],
+    hold: Option<&Hold>,
+    now: Timestamp,
+) -> Vec<Candidate> {
+    wanted
+        .iter()
+        .zip(on_codex)
+        .map(|(&(name, concurrency, when_busy), &codex)| {
+            let stored = state.quotas.get(name).copied().unwrap_or(Quota::Unknown);
+            Candidate {
+                quota: match hold {
+                    Some(hold) if codex => hold.over(stored, now),
+                    _ => stored,
+                },
+                running: state.running.get(name).copied().unwrap_or(0),
+                concurrency,
+                when_busy,
+            }
+        })
+        .collect()
 }
 
 /// Every backend is cooling down: exit 75, naming when each resets and the first reset.

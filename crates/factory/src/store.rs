@@ -342,9 +342,16 @@ impl Store {
             }),
             _ => None,
         };
+        let (five_hour, weekly) = (
+            window(WindowKind::FiveHour, five),
+            window(WindowKind::Weekly, weekly),
+        );
         Ok(CodexQuota {
-            five_hour: window(WindowKind::FiveHour, five),
-            weekly: window(WindowKind::Weekly, weekly),
+            // The last answer was read when its windows were seen: a restart within 5 minutes
+            // of it does not ask again.
+            asked: five_hour.into_iter().chain(weekly).map(|w| w.seen).max(),
+            five_hour,
+            weekly,
             plan,
             reset_credits: u32::try_from(credits).unwrap_or(0),
             ..CodexQuota::default()
@@ -352,7 +359,8 @@ impl Store {
     }
 
     /// Records the Codex plan's windows, plan and reset credits. Whether the last ask could be
-    /// read, and when it was, are not kept: a daemon that starts asks again.
+    /// read is not kept, and when it was is the time its windows were seen: a daemon that starts
+    /// within 5 minutes of that does not ask again.
     pub fn set_codex_quota(&self, quota: &CodexQuota) -> rusqlite::Result<()> {
         let (five, weekly) = (quota.five_hour, quota.weekly);
         self.db.execute(

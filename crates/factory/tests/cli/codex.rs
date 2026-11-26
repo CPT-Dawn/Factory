@@ -345,21 +345,66 @@ fn an_unreadable_codex_does_not_stop_a_review() {
     assert_eq!(out.code, 0, "{out:?}");
     assert_eq!(sandbox.calls("codex").len(), 1);
 }
+
 #[test]
-fn a_reading_outlives_a_daemon_restart_and_a_hold_survives_a_codex_that_then_fails() {
+fn a_reading_outlives_a_daemon_restart_and_is_not_asked_for_again() {
     let sandbox = Sandbox::new();
     answers(&sandbox, &reply(18.0, 92.0));
-    assert!(codex_row(&sandbox).starts_with("codex: hold: weekly 92% until "));
+    let before = codex_row(&sandbox);
+    assert!(
+        before.starts_with("codex: hold: weekly 92% until "),
+        "{before}"
+    );
     crate::router::kill_daemon(&sandbox);
     sandbox.fake(APP_SERVER, "exit 1");
 
     let row = codex_row(&sandbox);
 
-    assert!(
-        row.starts_with(
-            "codex usage unreadable: it exited with status 1 before it answered; held: "
-        ),
-        "{row}"
-    );
+    // The reading is five minutes old at most, restart or not: no new ask, so no new failure.
+    assert_eq!(row, before);
     assert_eq!(quota(&sandbox).code, 75, "the stored windows still hold");
+    assert_eq!(
+        sandbox.calls(APP_SERVER).len(),
+        1,
+        "only the first daemon asked"
+    );
+}
+
+#[test]
+fn a_review_that_claude_takes_never_asks_codex_about_its_plan() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    configure(
+        &sandbox,
+        "[[review.backend]]\ncli = \"claude\"\nmodel = \"opus\"\neffort = \"high\"\n\n[[review.backend]]\ncli = \"codex\"\n",
+    );
+    answers(&sandbox, &reply(18.0, 92.0));
+    sandbox.fake("claude", &claude_writes(CLEAN_REPORT));
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1-r1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(sandbox.calls(APP_SERVER).is_empty(), "Codex was not asked");
+}
+
+#[test]
+fn a_slow_first_answer_still_holds_the_review_it_was_asked_for() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    configure(&sandbox, "[[review.backend]]\ncli = \"codex\"\n");
+    // Slower than the display patience: the review waits for the plan, it does not guess.
+    sandbox.fake(
+        APP_SERVER,
+        &format!(
+            "read a; read b; read c\nsleep 9\necho '{}'\nexec sleep 60",
+            reply(18.0, 92.0)
+        ),
+    );
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1-r1"]);
+
+    assert_eq!(out.code, 75, "{out:?}");
+    assert!(out.stderr.contains("held at weekly 92%"), "{out:?}");
+    assert!(sandbox.calls("codex").is_empty(), "Codex was not run");
 }

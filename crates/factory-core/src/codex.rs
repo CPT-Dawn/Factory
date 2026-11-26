@@ -37,9 +37,10 @@ pub struct Usage {
 
 /// Reads `reply`, the app-server's answer to `account/rateLimits/read`, seen at `now`. A
 /// window is the 5-hour one at 300 minutes and the weekly one at 10080, whichever of
-/// `primary` and `secondary` carries it; one of another length, or one whose share or reset
-/// can't be read, is left out. The reason an answer is no usage, for the line
-/// `codex usage unreadable: <reason>`.
+/// `primary` and `secondary` carries it; one of another length, or none, is left out. A window
+/// of those two lengths whose share or reset can't be read makes the whole answer unreadable: it
+/// must not pass for an absent window, which the keeper forgets. The reason an answer is no
+/// usage, for the line `codex usage unreadable: <reason>`.
 pub fn read_usage(reply: &str, now: Timestamp) -> Result<Usage, String> {
     let reply: Value =
         serde_json::from_str(reply).map_err(|_| "its answer is not JSON".to_owned())?;
@@ -56,7 +57,12 @@ pub fn read_usage(reply: &str, now: Timestamp) -> Result<Usage, String> {
         .ok_or_else(|| "its answer has no rate limits".to_owned())?;
     let mut windows: Vec<UsageWindow> = Vec::new();
     for slot in ["primary", "secondary"] {
-        let Some(read) = limits.get(slot).and_then(|window| read_window(window, now)) else {
+        let Some(read) = limits
+            .get(slot)
+            .map(|window| read_window(window, now))
+            .transpose()?
+            .flatten()
+        else {
             continue;
         };
         if windows.iter().all(|seen| seen.kind != read.kind) {
@@ -77,15 +83,21 @@ pub fn read_usage(reply: &str, now: Timestamp) -> Result<Usage, String> {
     })
 }
 
-fn read_window(window: &Value, now: Timestamp) -> Option<UsageWindow> {
-    let kind = match window.get("windowDurationMins")?.as_i64()? {
-        FIVE_HOUR_MINUTES => WindowKind::FiveHour,
-        WEEKLY_MINUTES => WindowKind::Weekly,
-        _ => return None,
+/// A window: none when there is no window, or its length is neither the 5-hour nor the weekly
+/// one; an error when it is one of those and its share or reset can't be read.
+fn read_window(window: &Value, now: Timestamp) -> Result<Option<UsageWindow>, String> {
+    let kind = match window.get("windowDurationMins").and_then(Value::as_i64) {
+        Some(FIVE_HOUR_MINUTES) => WindowKind::FiveHour,
+        Some(WEEKLY_MINUTES) => WindowKind::Weekly,
+        _ => return Ok(None),
     };
-    let used = window.get("usedPercent")?.as_f64()?;
-    let resets = window.get("resetsAt")?.as_i64()?.checked_mul(1000)?;
-    UsageWindow::read(kind, used, resets, now)
+    let read = (|| {
+        let used = window.get("usedPercent")?.as_f64()?;
+        let resets = window.get("resetsAt")?.as_i64()?.checked_mul(1000)?;
+        UsageWindow::read(kind, used, resets, now)
+    })();
+    read.map(Some)
+        .ok_or_else(|| format!("its {} window could not be read", kind.label()))
 }
 
 /// The available reset credits: the detail rows marked `available`, or the count the answer

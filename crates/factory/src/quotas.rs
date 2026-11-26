@@ -26,6 +26,9 @@ use crate::protocol::{
 };
 use crate::store::Store;
 
+/// How long past its own timeout a dispatch waits for an ask of Codex to end.
+const SETTLE_MARGIN: Duration = Duration::from_secs(10);
+
 /// How long a look waits for Codex's answer before it goes on with what it has. Under the
 /// client's own 10 seconds, so a slow Codex never reads as a daemon that is down.
 const PATIENCE: Duration = Duration::from_secs(8);
@@ -71,7 +74,7 @@ impl QuotaKeeper {
     /// failed ask counts as an ask, so a Codex that is down is not pressed again within 5 minutes.
     pub async fn codex(self: &Arc<Self>, params: &CodexParams) -> factory_core::status::Codex {
         if self.start_codex_ask(params) {
-            self.await_codex_ask().await;
+            self.await_codex_ask(Instant::now() + PATIENCE).await;
         }
         let quota = lock(&self.codex).clone();
         let mut record = quota.record(clock::now(), params.hold_at);
@@ -79,6 +82,23 @@ impl QuotaKeeper {
             record.unreadable = Some("it is still being asked; look again shortly".to_owned());
         }
         record
+    }
+
+    /// Codex's quota once its ask has ended, however long that takes: an ask ends by itself,
+    /// killed at its timeout. A dispatch waits for this where a look does not, so a review never
+    /// starts on a plan that a reading on its way would have held.
+    pub async fn codex_settled(
+        self: &Arc<Self>,
+        params: &CodexParams,
+    ) -> factory_core::status::Codex {
+        if self.start_codex_ask(params) {
+            // The ask's own time, with a margin for it to be killed and its answer taken in.
+            let wait = Duration::from_secs(params.timeout_secs).saturating_add(SETTLE_MARGIN);
+            self.await_codex_ask(Instant::now() + wait).await;
+        }
+        lock(&self.codex)
+            .clone()
+            .record(clock::now(), params.hold_at)
     }
 
     /// Whether a review may dispatch on Codex now: `codex` with the mark it held to.
@@ -106,8 +126,7 @@ impl QuotaKeeper {
     }
 
     /// Waits for the ask that is out, for as long as a look is patient.
-    async fn await_codex_ask(&self) {
-        let patience = Instant::now() + PATIENCE;
+    async fn await_codex_ask(&self, patience: Instant) {
         loop {
             let mut ended = pin!(self.codex_asked.notified());
             ended.as_mut().enable();
@@ -135,9 +154,13 @@ impl QuotaKeeper {
             Ok(Err(why)) => next.fail(why.to_string(), now),
             Err(why) => next.fail(format!("its reader stopped: {why}"), now),
         }
-        // The store only carries a reading over a restart: one it cannot keep still serves
-        // this run.
-        let _ = lock(&self.store).set_codex_quota(&next);
+        // A reading that could not be kept still holds this run, and says so beside it: the
+        // next ask, 5 minutes on, keeps it again.
+        if let Err(e) = lock(&self.store).set_codex_quota(&next) {
+            next.unreadable = Some(format!(
+                "its reading could not be kept: {e}; check the disk and FACTORY_STATE"
+            ));
+        }
         *lock(&self.codex) = next;
         *lock(&self.codex_asking) = false;
         self.codex_asked.notify_waiters();

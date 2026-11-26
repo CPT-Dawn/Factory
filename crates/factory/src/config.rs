@@ -465,9 +465,13 @@ pub fn claude_hold_at(paths: &Paths) -> Result<f64, Failure> {
     }
 }
 
+/// The longest `[codex] timeout_seconds` may be, an hour: past it the keeper's ask would outlast
+/// every wait on it.
+const MAX_CODEX_TIMEOUT_SECS: u64 = 3600;
+
 /// What `[codex]` says: `hold_at_percent` (more than 0 and at most 100, default 90), the share of
 /// either window from which reviews hold off Codex, and `timeout_seconds` (at least 1, default
-/// 20), how long its app-server may take before it is killed.
+/// 20, at most 3600), how long its app-server may take before it is killed.
 pub fn codex_params(paths: &Paths) -> Result<CodexParams, Failure> {
     let (path, file) = load_config(paths)?;
     let defaults = CodexParams::default();
@@ -483,10 +487,10 @@ pub fn codex_params(paths: &Paths) -> Result<CodexParams, Failure> {
     };
     let timeout_secs = match file.codex.timeout_seconds {
         None => defaults.timeout_secs,
-        Some(secs) if secs >= 1 => secs,
+        Some(secs) if (1..=MAX_CODEX_TIMEOUT_SECS).contains(&secs) => secs,
         Some(secs) => {
             return Err(Failure::precondition(format!(
-                "{}: [codex] timeout_seconds is {secs}; give it at least 1",
+                "{}: [codex] timeout_seconds is {secs}; give it from 1 to {MAX_CODEX_TIMEOUT_SECS}",
                 path.display()
             )));
         }

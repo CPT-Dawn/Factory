@@ -69,18 +69,38 @@ fn a_window_is_named_by_its_length_not_its_place() {
 }
 
 #[test]
-fn a_window_that_cannot_be_read_is_left_out_not_read_as_zero() {
-    let usage = codex::read_usage(
+fn a_window_that_cannot_be_read_makes_the_answer_unreadable_not_zero_and_not_absent() {
+    // A weekly window with no reset beside a good 5-hour one must not read as an absent
+    // weekly window: the keeper forgets those, and a hold on the week would go with it.
+    let torn_week = codex::read_usage(
         &limits(
-            window(140, 300, FIVE_RESETS),
+            window(10, 300, FIVE_RESETS),
             json!({"usedPercent": 30, "windowDurationMins": 10_080}),
         ),
         now(),
     );
+    let past_the_end =
+        codex::read_usage(&limits(window(140, 300, FIVE_RESETS), json!(null)), now());
     assert_eq!(
-        usage.err().unwrap_or_default(),
-        "its answer names no 5-hour or weekly window it can read"
+        torn_week.err().unwrap_or_default(),
+        "its weekly window could not be read"
     );
+    assert_eq!(
+        past_the_end.err().unwrap_or_default(),
+        "its 5h window could not be read"
+    );
+}
+
+#[test]
+fn a_window_of_another_length_or_none_is_no_trouble() {
+    let usage = codex::read_usage(
+        &limits(
+            window(10, 300, FIVE_RESETS),
+            json!({"usedPercent": 30, "windowDurationMins": 60}),
+        ),
+        now(),
+    );
+    assert_eq!(usage.map(|usage| usage.windows.len()), Ok(1));
 }
 
 #[test]

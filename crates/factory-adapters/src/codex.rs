@@ -106,6 +106,10 @@ fn is_reply_2(line: &str) -> bool {
 
 impl CodexUsage for AppServer {
     fn rate_limits(&self, timeout: Duration) -> Result<String, CodexError> {
+        // A time too long to count is refused before there is a child to strand.
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| CodexError::Spawn("its time is too long to count".to_owned()))?;
         let mut cmd = Command::new(&self.program);
         cmd.arg("app-server")
             .stdin(Stdio::piped())
@@ -117,7 +121,6 @@ impl CodexUsage for AppServer {
             _ => CodexError::Spawn(e.to_string()),
         })?;
         let group = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
-        let deadline = Instant::now() + timeout;
         let outcome = (|| {
             let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
                 return (Err(CodexError::Spawn("no pipes".to_owned())), None);
@@ -142,7 +145,12 @@ impl CodexUsage for AppServer {
                 }
             }
             let answer = loop {
+                // The time is up whatever is still buffered: a server that never stops
+                // chattering must not outlast it.
                 let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break Err(CodexError::TimedOut(timeout));
+                }
                 match rx.recv_timeout(left) {
                     Ok(Ok(line)) if is_reply_2(&line) => break Ok(line),
                     Ok(Ok(_)) => {}
@@ -290,6 +298,25 @@ mod tests {
             CodexError::TimedOut(Duration::from_secs(20)).to_string(),
             "it did not answer within 20s"
         );
+    }
+
+    #[test]
+    fn a_server_that_never_stops_chattering_is_killed_at_its_time() {
+        let started = Instant::now();
+
+        let answer = app_server(
+            "while :; do echo '{\"method\":\"account/updated\"}'; done",
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(answer, Err(CodexError::TimedOut(Duration::from_secs(1))));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_time_too_long_to_count_is_refused_before_a_child_starts() {
+        let answer = AppServer::with("/nonexistent/codex").rate_limits(Duration::MAX);
+        assert!(matches!(answer, Err(CodexError::Spawn(_))), "{answer:?}");
     }
 
     #[test]
