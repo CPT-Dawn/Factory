@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use factory_adapters::gh::Gh;
+use factory_adapters::gh::{Gh, GhActions};
 use factory_core::duration;
 use factory_core::event::Event;
 use factory_core::exit::Exit;
@@ -35,6 +35,7 @@ use factory_adapters::inbox::Inbox;
 use listenfd::ListenFd;
 
 use crate::clock;
+use crate::fleet::Fleet;
 use crate::lab::service::{self, Lab};
 use crate::lab::wire::{ACQUIRE, RESERVE, RUN_RESUME};
 use crate::leads::{Leads, Registered};
@@ -72,6 +73,7 @@ struct Daemon {
     steward: Arc<Steward>,
     notifier: Arc<Notifier>,
     quotas: Arc<QuotaKeeper>,
+    fleet: Arc<Fleet>,
 }
 
 /// How long a stopping daemon gives the connections it holds to finish their requests.
@@ -104,6 +106,11 @@ pub fn run(json: bool) -> Result<(), Failure> {
     let pollers = Arc::new(Pollers::new(paths.clone(), Gh));
     let router = Arc::new(Router::open(Store::open(&paths.database())?)?);
     let quotas = Arc::new(QuotaKeeper::open(Store::open(&paths.database())?)?);
+    let fleet = Arc::new(Fleet::open(
+        crate::config::ci_watch(&paths),
+        Store::open(&paths.database())?,
+        GhActions::default(),
+    ));
     let steward = Steward::new(
         paths.clone(),
         Arc::clone(&leads),
@@ -164,6 +171,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
         );
         tokio::spawn(Arc::clone(&leads).start());
         tokio::spawn(Arc::clone(&steward).resume());
+        tokio::spawn(Arc::clone(&fleet).run(pollers.watched()));
         let lab = Arc::new(lab);
         lab.recover();
         notifier.resume();
@@ -180,6 +188,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
             steward,
             notifier,
             quotas,
+            fleet,
         };
         serve([listener, live], Arc::new(daemon), stop).await;
         Ok(())
@@ -471,6 +480,7 @@ async fn respond(
                     &daemon.leads,
                     &daemon.steward,
                     &daemon.quotas,
+                    &daemon.fleet,
                 )
                 .await,
             ),
@@ -484,6 +494,7 @@ async fn respond(
                     &daemon.leads,
                     &daemon.steward,
                     &daemon.quotas,
+                    &daemon.fleet,
                     lab,
                 )))
             }

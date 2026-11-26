@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use crate::client::{self, ANSWER_TIMEOUT, Unanswered};
 use crate::clock;
 use crate::config;
+use crate::fleet::Fleet;
 use crate::leads::Leads;
 use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
@@ -65,6 +66,7 @@ pub fn snapshot(
     leads: &Leads,
     steward: &Steward,
     quotas: &QuotaKeeper,
+    fleet: &Fleet,
     lab: bar::lab::Lab,
 ) -> Snapshot {
     Snapshot {
@@ -72,6 +74,7 @@ pub fn snapshot(
         claude: quotas.claude(params.claude_hold_at),
         waits: leads.registered(),
         leads: status::leads_seen(leads, steward),
+        ci: fleet.snapshot(),
         lab,
     }
 }

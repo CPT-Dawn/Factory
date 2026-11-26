@@ -88,6 +88,7 @@ fn snapshot(claude: Claude, leads: Vec<Lead>) -> Snapshot {
             monitor: true,
             leads,
         },
+        ci: factory_core::fleet::Ci::default(),
         lab: Lab::default(),
     }
 }

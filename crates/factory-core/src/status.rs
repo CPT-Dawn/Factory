@@ -24,6 +24,9 @@ pub struct Status {
     pub claude: Claude,
     pub waits: Vec<Wait>,
     pub leads: Leads,
+    /// The watched repos' runner fleets, queued jobs and open factory pull requests.
+    #[serde(default)]
+    pub ci: crate::fleet::Ci,
 }
 
 /// The lab's leases, slots and queue.
@@ -208,8 +211,8 @@ pub const ROWS: usize = 24;
 pub const COLUMNS: usize = 80;
 
 /// The most rows each section lists before it says how many it left out. The lab the ticket
-/// names (three slots, three backends, five leads) takes at most 23 rows with every section at
-/// its cap, the Claude plan's row included.
+/// names (three slots, three backends, five leads) takes at most 24 rows with every section at
+/// its cap, the Claude plan's row and the CI row included.
 const LAB_ROWS: usize = 5;
 const QUEUE_ROWS: usize = 2;
 const WAIT_ROWS: usize = 3;
@@ -221,9 +224,17 @@ pub fn screen(status: &Status) -> Vec<String> {
     lab(status, &mut rows);
     review(status, &mut rows);
     claude(status, &mut rows);
+    ci(status, &mut rows);
     waits(status, &mut rows);
     leads(status, &mut rows);
     rows.iter().map(|row| fit(row)).collect()
+}
+
+/// One line, only when the owner watches repos' CI.
+fn ci(status: &Status, rows: &mut Vec<String>) {
+    if status.ci.shown() {
+        rows.push(format!("ci: {}", status.ci.summary(status.now)));
+    }
 }
 
 fn lab(status: &Status, rows: &mut Vec<String>) {

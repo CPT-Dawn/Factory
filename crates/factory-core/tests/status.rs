@@ -1,6 +1,7 @@
 //! The status screen's layout: what each section shows, what it cuts, and that the lab the
 //! ticket names (three slots, three backends, five leads) fits one terminal screen.
 
+use factory_core::fleet::Ci;
 use factory_core::status::{
     Backend, COLUMNS, Claude, ClaudeState, Lab, Lead, Leads, Lease, Queued, QuotaState, ROWS,
     Reservation, Slot, Status, Subagent, Wait, screen,
@@ -25,6 +26,7 @@ fn idle() -> Status {
             monitor: false,
             leads: Vec::new(),
         },
+        ci: Ci::default(),
     }
 }
 

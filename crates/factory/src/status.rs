@@ -9,6 +9,7 @@ use serde_json::json;
 
 use crate::client;
 use crate::config;
+use crate::fleet::Fleet;
 use crate::lab::service::Lab;
 use crate::leads::Leads;
 use crate::output::{Done, Failure};
@@ -55,6 +56,7 @@ pub async fn gather(
     leads: &Leads,
     steward: &Steward,
     quotas: &QuotaKeeper,
+    fleet: &Fleet,
 ) -> Result<Status, Failure> {
     let now = crate::clock::now();
     let lab = lab
@@ -68,6 +70,7 @@ pub async fn gather(
         claude: quotas.claude(params.claude_hold_at),
         waits: leads.registered(),
         leads: leads_seen(leads, steward),
+        ci: fleet.snapshot(),
     })
 }
 

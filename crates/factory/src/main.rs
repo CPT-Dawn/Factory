@@ -9,6 +9,7 @@ mod clock;
 mod config;
 mod cutover;
 mod daemon;
+mod fleet;
 mod hook;
 mod install;
 mod lab;
