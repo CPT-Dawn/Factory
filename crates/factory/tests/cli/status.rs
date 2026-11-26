@@ -54,11 +54,20 @@ fn an_idle_factory_says_so_in_every_section() {
         .collect();
     assert_eq!(
         sections,
-        ["factory", "lab", "review", "claude", "waits", "leads"],
+        [
+            "factory", "lab", "review", "claude", "codex", "waits", "leads"
+        ],
         "{out:?}"
     );
     assert!(lines.contains(&"lab: idle"), "{out:?}");
     assert!(lines.contains(&"waits: none"), "{out:?}");
+    // No Codex to ask is no 0%: the row says it could not read.
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("codex usage unreadable: ")),
+        "{out:?}"
+    );
 }
 
 #[test]
@@ -74,7 +83,7 @@ fn json_gives_every_field_of_every_section() {
     };
     assert_eq!(
         keys(&shown),
-        ["claude", "lab", "leads", "now", "review", "waits"]
+        ["claude", "codex", "lab", "leads", "now", "review", "waits"]
     );
     assert_eq!(
         keys(&shown["claude"]),

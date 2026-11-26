@@ -64,27 +64,26 @@ impl fmt::Display for CodexError {
 impl std::error::Error for CodexError {}
 
 pub trait CodexUsage: Send + Sync {
-    /// The app-server's reply to `account/rateLimits/read`: the one line whose id is 2.
-    fn rate_limits(&self) -> Result<String, CodexError>;
+    /// The app-server's reply to `account/rateLimits/read`: the one line whose id is 2. The
+    /// server is killed, with its process group, once it has answered or `timeout` has passed.
+    fn rate_limits(&self, timeout: Duration) -> Result<String, CodexError>;
 }
 
 /// `codex app-server` from PATH, or the program named.
 pub struct AppServer {
     program: String,
-    timeout: Duration,
 }
 
 impl AppServer {
-    /// `codex` from PATH, bounded by [`TIMEOUT`].
+    /// `codex` from PATH.
     pub fn new() -> Self {
-        Self::with("codex", TIMEOUT)
+        Self::with("codex")
     }
 
-    /// `program app-server`, killed after `timeout`.
-    pub fn with(program: impl Into<String>, timeout: Duration) -> Self {
+    /// `program app-server`.
+    pub fn with(program: impl Into<String>) -> Self {
         Self {
             program: program.into(),
-            timeout,
         }
     }
 }
@@ -106,7 +105,7 @@ fn is_reply_2(line: &str) -> bool {
 }
 
 impl CodexUsage for AppServer {
-    fn rate_limits(&self) -> Result<String, CodexError> {
+    fn rate_limits(&self, timeout: Duration) -> Result<String, CodexError> {
         let mut cmd = Command::new(&self.program);
         cmd.arg("app-server")
             .stdin(Stdio::piped())
@@ -118,7 +117,7 @@ impl CodexUsage for AppServer {
             _ => CodexError::Spawn(e.to_string()),
         })?;
         let group = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + timeout;
         let outcome = (|| {
             let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
                 return (Err(CodexError::Spawn("no pipes".to_owned())), None);
@@ -149,7 +148,7 @@ impl CodexUsage for AppServer {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => break Err(CodexError::Read(e.to_string())),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        break Err(CodexError::TimedOut(self.timeout));
+                        break Err(CodexError::TimedOut(timeout));
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         break Err(CodexError::Closed(None));
@@ -195,7 +194,7 @@ impl FakeCodex {
 }
 
 impl CodexUsage for FakeCodex {
-    fn rate_limits(&self) -> Result<String, CodexError> {
+    fn rate_limits(&self, _timeout: Duration) -> Result<String, CodexError> {
         if let Ok(mut asked) = self.asked.lock() {
             *asked += 1;
         }
@@ -230,7 +229,7 @@ mod tests {
 
     fn app_server(body: &str, timeout: Duration) -> Result<String, CodexError> {
         let dir = tempfile::tempdir().map_err(|e| CodexError::Spawn(e.to_string()))?;
-        AppServer::with(script(dir.path(), body), timeout).rate_limits()
+        AppServer::with(script(dir.path(), body)).rate_limits(timeout)
     }
 
     #[test]
@@ -267,7 +266,7 @@ mod tests {
         );
         let program = script(dir.path(), &body);
 
-        let answer = AppServer::with(program, Duration::from_secs(10)).rate_limits();
+        let answer = AppServer::with(program).rate_limits(Duration::from_secs(10));
 
         assert_eq!(answer, Ok(REPLY.to_owned()));
         let received = std::fs::read_to_string(&log).unwrap_or_default();
@@ -316,16 +315,16 @@ mod tests {
 
     #[test]
     fn no_codex_is_missing() {
-        let answer = AppServer::with("/nonexistent/codex", Duration::from_secs(1)).rate_limits();
+        let answer = AppServer::with("/nonexistent/codex").rate_limits(Duration::from_secs(1));
         assert_eq!(answer, Err(CodexError::Missing));
     }
 
     #[test]
     fn the_fake_answers_in_turn_and_counts_the_asks() {
         let fake = FakeCodex::new([Ok("a".to_owned()), Err(CodexError::Missing)]);
-        assert_eq!(fake.rate_limits(), Ok("a".to_owned()));
-        assert_eq!(fake.rate_limits(), Err(CodexError::Missing));
-        assert_eq!(fake.rate_limits(), Err(CodexError::Missing));
+        assert_eq!(fake.rate_limits(TIMEOUT), Ok("a".to_owned()));
+        assert_eq!(fake.rate_limits(TIMEOUT), Err(CodexError::Missing));
+        assert_eq!(fake.rate_limits(TIMEOUT), Err(CodexError::Missing));
         assert_eq!(fake.asked(), 3);
     }
 }

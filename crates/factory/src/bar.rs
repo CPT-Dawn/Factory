@@ -8,6 +8,7 @@
 //! failure (a bad config, a daemon that refuses), it follows the exit-code table.
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use factory_core::bar::{self, Snapshot};
 use serde_json::{Value, json};
@@ -56,19 +57,28 @@ pub fn run(json: bool) -> ExitCode {
 fn request() -> Result<(Paths, BarParams), Failure> {
     let paths = Paths::from_env()?;
     let claude_hold_at = config::claude_hold_at(&paths)?;
-    Ok((paths, BarParams { claude_hold_at }))
+    let codex = config::codex_params(&paths)?;
+    Ok((
+        paths,
+        BarParams {
+            claude_hold_at,
+            codex,
+        },
+    ))
 }
 
-/// The daemon's side: everything the bar shows, from memory.
-pub fn snapshot(
+/// The daemon's side: everything the bar shows, from memory but for a Codex reading older than
+/// 5 minutes, which is asked of Codex first.
+pub async fn snapshot(
     params: &BarParams,
     leads: &Leads,
     steward: &Steward,
-    quotas: &QuotaKeeper,
+    quotas: &Arc<QuotaKeeper>,
 ) -> Snapshot {
     Snapshot {
         now: clock::now().unix_millis(),
         claude: quotas.claude(params.claude_hold_at),
+        codex: quotas.codex(&params.codex).await,
         waits: leads.registered(),
         leads: status::leads_seen(leads, steward),
     }

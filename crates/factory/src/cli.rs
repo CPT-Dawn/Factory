@@ -79,7 +79,7 @@ pub enum Command {
         #[command(subcommand)]
         command: HookCommand,
     },
-    /// Whether a lead may dispatch on the Claude plan now: exit 0, or 75 naming the reset
+    /// Whether a lead may dispatch on the Claude or Codex plan now: exit 0, or 75 naming the reset
     Quota {
         #[command(subcommand)]
         command: QuotaCommand,
@@ -131,6 +131,8 @@ pub enum HookCommand {
 pub enum QuotaCommand {
     /// The Claude plan's 5-hour and weekly windows: dispatch (exit 0) or hold until the holding one resets (exit 75)
     Claude,
+    /// The Codex plan's 5-hour and weekly windows: dispatch (exit 0) or hold reviews until the holding one resets (exit 75)
+    Codex,
 }
 
 #[derive(Subcommand, Debug)]

@@ -171,6 +171,29 @@ fn a_slot_whose_stack_is_being_stopped_says_so_instead_of_free() {
 }
 
 #[test]
+fn a_backend_held_by_a_plan_says_why_under_its_row() {
+    let mut status = idle();
+    let mut held = backend(
+        "codex",
+        QuotaState::Cooling,
+        Some("2026-11-23T06:13:00Z"),
+        0,
+        2,
+    );
+    held.reason = Some("held at weekly 92%".to_owned());
+    status.review = vec![held];
+
+    assert_eq!(
+        &rows(&status)[2..5],
+        [
+            "review quota",
+            "  codex  cooling, resets 06:13Z (in 2h), 0/2 running",
+            "    held at weekly 92%"
+        ]
+    );
+}
+
+#[test]
 fn a_backend_shows_its_quota_its_reset_and_its_load() {
     let mut status = idle();
     status.review = vec![

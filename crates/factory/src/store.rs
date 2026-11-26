@@ -1,5 +1,5 @@
 //! The daemon's SQLite database, `<state>/factory.db`, in WAL mode: what a daemon restart must
-//! not lose: each review backend's quota, the Claude plan's quota, the leads spawned whose end is not yet in the
+//! not lose: each review backend's quota, the Claude and Codex plans' quotas, the leads spawned whose end is not yet in the
 //! ledger, whether the context steward runs and what it has done to each session, each wait
 //! that outlives its CLI (`--notify`), and each blocking `factory wait` the daemon holds.
 
@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use factory_core::claude::{ClaudeQuota, Limit};
+use factory_core::codex::CodexQuota;
 use factory_core::quota::Quota;
 use factory_core::timestamp::Timestamp;
 use factory_core::usage::{UsageWindow, WindowKind};
@@ -110,6 +111,17 @@ impl Store {
                  weekly_used_percent REAL,
                  weekly_resets_ms INTEGER,
                  weekly_seen_ms INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS codex_quota (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 used_percent REAL,
+                 resets_ms INTEGER,
+                 seen_ms INTEGER,
+                 weekly_used_percent REAL,
+                 weekly_resets_ms INTEGER,
+                 weekly_seen_ms INTEGER,
+                 plan TEXT,
+                 reset_credits INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS usage_history (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -291,6 +303,74 @@ impl Store {
                 weekly.map(|window| window.used_percent),
                 weekly.map(|window| window.resets.unix_millis()),
                 weekly.map(|window| window.seen.unix_millis()),
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+impl Store {
+    /// The Codex plan's windows, plan and reset credits as last read; nothing recorded is
+    /// nothing known.
+    pub fn codex_quota(&self) -> rusqlite::Result<CodexQuota> {
+        type Reading = (Option<f64>, Option<i64>, Option<i64>);
+        let row = self
+            .db
+            .query_row(
+                "SELECT used_percent, resets_ms, seen_ms, weekly_used_percent, weekly_resets_ms,
+                     weekly_seen_ms, plan, reset_credits
+                 FROM codex_quota WHERE id = 1",
+                [],
+                |row| {
+                    let five: Reading = (row.get(0)?, row.get(1)?, row.get(2)?);
+                    let weekly: Reading = (row.get(3)?, row.get(4)?, row.get(5)?);
+                    let credits: i64 = row.get(7)?;
+                    Ok((five, weekly, row.get::<_, Option<String>>(6)?, credits))
+                },
+            )
+            .optional()?;
+        let Some((five, weekly, plan, credits)) = row else {
+            return Ok(CodexQuota::default());
+        };
+        let stamp = Timestamp::from_unix_millis;
+        let window = |kind, (used, resets, seen): Reading| match (used, resets, seen) {
+            (Some(used_percent), Some(resets), Some(seen)) => Some(UsageWindow {
+                kind,
+                used_percent,
+                resets: stamp(resets),
+                seen: stamp(seen),
+            }),
+            _ => None,
+        };
+        Ok(CodexQuota {
+            five_hour: window(WindowKind::FiveHour, five),
+            weekly: window(WindowKind::Weekly, weekly),
+            plan,
+            reset_credits: u32::try_from(credits).unwrap_or(0),
+            ..CodexQuota::default()
+        })
+    }
+
+    /// Records the Codex plan's windows, plan and reset credits. Whether the last ask could be
+    /// read, and when it was, are not kept: a daemon that starts asks again.
+    pub fn set_codex_quota(&self, quota: &CodexQuota) -> rusqlite::Result<()> {
+        let (five, weekly) = (quota.five_hour, quota.weekly);
+        self.db.execute(
+            "INSERT INTO codex_quota (id, used_percent, resets_ms, seen_ms, weekly_used_percent,
+                 weekly_resets_ms, weekly_seen_ms, plan, reset_credits)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (id) DO UPDATE SET used_percent = ?1, resets_ms = ?2, seen_ms = ?3,
+                 weekly_used_percent = ?4, weekly_resets_ms = ?5, weekly_seen_ms = ?6,
+                 plan = ?7, reset_credits = ?8",
+            params![
+                five.map(|window| window.used_percent),
+                five.map(|window| window.resets.unix_millis()),
+                five.map(|window| window.seen.unix_millis()),
+                weekly.map(|window| window.used_percent),
+                weekly.map(|window| window.resets.unix_millis()),
+                weekly.map(|window| window.seen.unix_millis()),
+                quota.plan,
+                i64::from(quota.reset_credits),
             ],
         )?;
         Ok(())

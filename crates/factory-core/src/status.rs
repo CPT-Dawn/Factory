@@ -369,8 +369,11 @@ fn review(status: &Status, rows: &mut Vec<String>) {
             "  {:<width$}  {quota}, {}/{} running{tiers}",
             backend.name, backend.running, backend.concurrency
         ));
-        // Why it is unknown, under it: a row of its own keeps the reason within the columns.
-        if let (QuotaState::Unknown, Some(why)) = (backend.quota, &backend.reason) {
+        // Why it is unknown, or held (Codex's plan), under it: a row of its own keeps the reason
+        // within the columns.
+        if let (QuotaState::Unknown | QuotaState::Cooling, Some(why)) =
+            (backend.quota, &backend.reason)
+        {
             rows.push(format!("    {why}"));
         }
     }

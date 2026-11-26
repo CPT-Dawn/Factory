@@ -51,7 +51,7 @@ fn the_bar_prints_both_claude_windows_and_the_leads_in_one_line() {
     assert!(
         poll_until(|| {
             out = bar(&sandbox, false);
-            out.stdout == "claude 12/40 · 2 leads\n"
+            out.stdout == "claude 12/40 · codex ?/? · 2 leads\n"
         }),
         "{out:?}"
     );
@@ -64,7 +64,10 @@ fn the_bar_prints_both_claude_windows_and_the_leads_in_one_line() {
         "{:?}",
         bar(&sandbox, true)
     );
-    assert_eq!(bar(&sandbox, false).stdout, "claude 12/40 · 2 leads\n");
+    assert_eq!(
+        bar(&sandbox, false).stdout,
+        "claude 12/40 · codex ?/? · 2 leads\n"
+    );
 }
 
 #[test]

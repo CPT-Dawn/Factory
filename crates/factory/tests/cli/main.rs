@@ -16,6 +16,9 @@ mod ci;
 mod claude;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
+mod codex;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
 mod cutover;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]

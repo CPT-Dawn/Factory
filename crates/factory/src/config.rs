@@ -24,6 +24,9 @@
 //!
 //! Its `[ci]` table sets how often a wait on CI polls GitHub when it can't listen for events,
 //! and its `[monitor]` table the context steward's thresholds.
+//! Its `[codex]` table sets `hold_at_percent` (default 90), the share of Codex's 5-hour or weekly
+//! window from which reviews hold off Codex, and `timeout_seconds` (default 20), how long its
+//! `app-server` may take to give the windows.
 //! Its `[notify]` table is the switch for event delivery: whether `factory wait --notify` may
 //! post into the sessions that ask. It is off unless the owner switches it on.
 //!
@@ -110,6 +113,7 @@ use serde::Deserialize;
 
 use crate::output::Failure;
 use crate::paths::Paths;
+use crate::protocol::CodexParams;
 
 const DEFAULT_TIMEOUT_S: u64 = 1800;
 const DEFAULT_CONCURRENCY: u32 = 2;
@@ -194,6 +198,15 @@ struct ConfigFile {
     notify: NotifySection,
     #[serde(default)]
     claude: ClaudeSection,
+    #[serde(default)]
+    codex: CodexSection,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct CodexSection {
+    hold_at_percent: Option<f64>,
+    timeout_seconds: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -450,6 +463,38 @@ pub fn claude_hold_at(paths: &Paths) -> Result<f64, Failure> {
             path.display()
         ))),
     }
+}
+
+/// What `[codex]` says: `hold_at_percent` (more than 0 and at most 100, default 90), the share of
+/// either window from which reviews hold off Codex, and `timeout_seconds` (at least 1, default
+/// 20), how long its app-server may take before it is killed.
+pub fn codex_params(paths: &Paths) -> Result<CodexParams, Failure> {
+    let (path, file) = load_config(paths)?;
+    let defaults = CodexParams::default();
+    let hold_at = match file.codex.hold_at_percent {
+        None => defaults.hold_at,
+        Some(at) if at > 0.0 && at <= 100.0 => at,
+        Some(at) => {
+            return Err(Failure::precondition(format!(
+                "{}: [codex] hold_at_percent is {at}; give it more than 0 and at most 100",
+                path.display()
+            )));
+        }
+    };
+    let timeout_secs = match file.codex.timeout_seconds {
+        None => defaults.timeout_secs,
+        Some(secs) if secs >= 1 => secs,
+        Some(secs) => {
+            return Err(Failure::precondition(format!(
+                "{}: [codex] timeout_seconds is {secs}; give it at least 1",
+                path.display()
+            )));
+        }
+    };
+    Ok(CodexParams {
+        hold_at,
+        timeout_secs,
+    })
 }
 
 /// The review backends, each tier's chain over them, and the reviewer skill.

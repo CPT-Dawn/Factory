@@ -18,24 +18,28 @@ use crate::quotas::QuotaKeeper;
 use crate::router::Router;
 use crate::steward::Steward;
 use factory_core::quota::WhenBusy;
+use std::sync::Arc;
 
 pub fn run() -> Result<Done, Failure> {
     let paths = Paths::from_env()?;
     let backends = config::review_backends(&paths)?
         .into_iter()
         .map(|backend| BackendSlots {
+            cli: Some(config::cli_name(backend.cli).to_owned()),
             name: backend.name,
             concurrency: backend.concurrency,
             when_busy: backend.when_busy.unwrap_or(WhenBusy::Queue).into(),
         })
         .collect();
     let claude_hold_at = config::claude_hold_at(&paths)?;
+    let codex = config::codex_params(&paths)?;
     let status: Status = client::call(
         &paths,
         STATUS,
         &StatusParams {
             backends,
             claude_hold_at,
+            codex,
         },
     )?;
     let mut rows = status::screen(&status).into_iter();
@@ -54,18 +58,20 @@ pub async fn gather(
     lab: &std::sync::Arc<Lab>,
     leads: &Leads,
     steward: &Steward,
-    quotas: &QuotaKeeper,
+    quotas: &Arc<QuotaKeeper>,
 ) -> Result<Status, Failure> {
     let now = crate::clock::now();
     let lab = lab
         .overview()
         .await
         .map_err(|e| Failure::precondition(e.message))?;
+    let codex = quotas.codex(&params.codex).await;
     Ok(Status {
         now: now.unix_millis(),
         lab,
-        review: router.snapshot(&params.backends, now),
+        review: router.snapshot(&params.backends, now, &codex),
         claude: quotas.claude(params.claude_hold_at),
+        codex,
         waits: leads.registered(),
         leads: leads_seen(leads, steward),
     })

@@ -279,6 +279,7 @@ fn review(
     let mut spent = vec![false; chain.len()];
     // The daemon holds the backend's slot for as long as this session lives.
     let mut daemon = client::Session::open(paths)?;
+    let codex = config::codex_params(paths)?;
     let text = loop {
         let pools = candidates(&setup.backends, chain, &spent, run);
         if pools.is_empty() && !run.skipped.is_empty() {
@@ -294,6 +295,7 @@ fn review(
         }
         let last = pools.len().saturating_sub(1);
         let slots = AcquireParams {
+            codex,
             tier: Some(tier.as_str().to_owned()),
             review: Some(ReviewRef {
                 repo: run.repo.clone(),
@@ -311,6 +313,7 @@ fn review(
                         WhenBusy::Next
                     };
                     BackendSlots {
+                        cli: Some(config::cli_name(backend.cli).to_owned()),
                         name: backend.name.clone(),
                         concurrency: backend.concurrency,
                         when_busy: backend.when_busy.unwrap_or(chained).into(),

@@ -61,6 +61,9 @@ pub const CLAUDE_WINDOW: &str = "claude.window";
 pub const CLAUDE_LIMIT: &str = "claude.limit";
 /// Whether a lead may dispatch now: [`ClaudeQuotaParams`] in, [`ClaudeVerdict`] out.
 pub const CLAUDE_QUOTA: &str = "claude.quota";
+/// Whether a review may dispatch on Codex now, asking `codex app-server` when its reading is
+/// older than 5 minutes: [`CodexQuotaParams`] in, [`CodexVerdict`] out.
+pub const CODEX_QUOTA: &str = "codex.quota";
 /// Answered once a lead may dispatch: [`WaitClaudeParams`] in, [`ClaudeVerdict`] out; an error
 /// with exit 124 when the time runs out first.
 pub const WAIT_CLAUDE: &str = "wait.claude";
@@ -141,6 +144,9 @@ pub struct StatusParams {
     /// The config's mark for holding Claude dispatches, in percent of either window.
     #[serde(default = "hold_at_default")]
     pub claude_hold_at: f64,
+    /// The config's say on Codex: its hold mark, and how long its app-server may take.
+    #[serde(default)]
+    pub codex: CodexParams,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,10 +154,42 @@ pub struct BarParams {
     /// The config's mark for holding Claude dispatches, in percent of either window.
     #[serde(default = "hold_at_default")]
     pub claude_hold_at: f64,
+    /// The config's say on Codex: its hold mark, and how long its app-server may take.
+    #[serde(default)]
+    pub codex: CodexParams,
 }
 
 fn hold_at_default() -> f64 {
     factory_core::claude::HOLD_AT_PERCENT
+}
+
+/// What the config says of Codex (`[codex]`): the daemon holds the quota, the config holds the
+/// marks.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CodexParams {
+    /// Hold reviews once this share of either window is spent, in percent.
+    #[serde(default = "codex_hold_at_default")]
+    pub hold_at: f64,
+    /// How long `codex app-server` may take to answer, in seconds, before it is killed.
+    #[serde(default = "codex_timeout_default")]
+    pub timeout_secs: u64,
+}
+
+impl Default for CodexParams {
+    fn default() -> Self {
+        CodexParams {
+            hold_at: codex_hold_at_default(),
+            timeout_secs: codex_timeout_default(),
+        }
+    }
+}
+
+fn codex_hold_at_default() -> f64 {
+    factory_core::codex::HOLD_AT_PERCENT
+}
+
+fn codex_timeout_default() -> u64 {
+    factory_adapters::codex::TIMEOUT.as_secs()
 }
 
 /// The windows a status line reported; one it left out keeps its last reading.
@@ -175,6 +213,21 @@ pub struct ClaudeLimitParams {
     /// The reset the limit's message names, in milliseconds since the epoch; none when it names
     /// none.
     pub reset: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CodexQuotaParams {
+    #[serde(default)]
+    pub codex: CodexParams,
+}
+
+/// Whether a review may dispatch on Codex: `unknown`, `go` or `hold`, with the windows, the plan
+/// and what holds.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CodexVerdict {
+    #[serde(flatten)]
+    pub codex: factory_core::status::Codex,
+    pub hold_at: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -213,6 +266,9 @@ pub struct AcquireParams {
     /// The review's tier, which `factory status` names while it holds a slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+    /// The config's say on Codex, which holds the backends that run on it.
+    #[serde(default)]
+    pub codex: CodexParams,
 }
 
 /// A review by the repo it runs in and its label.
@@ -225,6 +281,10 @@ pub struct ReviewRef {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BackendSlots {
     pub name: String,
+    /// The CLI it runs on (`agy`, `codex`, `claude`); a backend of the CLI Codex is held by
+    /// the Codex plan's windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli: Option<String>,
     pub concurrency: u32,
     pub when_busy: WhenBusyParam,
 }
