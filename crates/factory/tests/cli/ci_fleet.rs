@@ -593,20 +593,13 @@ fn a_repo_that_never_answered_shows_why_and_no_numbers() {
     assert_eq!(bar_ci(&sandbox).0["text"], "?");
 }
 
-/// A git checkout at `dir` on `branch`, its origin `origin`.
-fn checkout(dir: &std::path::Path, branch: &str, origin: &str) {
+/// A git checkout at `dir` on `branch`, its origin `origin`. The sandbox's git runs with a
+/// clean environment, so a `GIT_DIR` the caller has (a pre-push hook's) never points it at
+/// the repository under test.
+fn checkout(sandbox: &Sandbox, dir: &std::path::Path, branch: &str, origin: &str) {
     std::fs::create_dir_all(dir).unwrap();
-    for args in [
-        vec!["init", "-q", "-b", branch],
-        vec!["remote", "add", "origin", origin],
-    ] {
-        let out = std::process::Command::new("git")
-            .args(&args)
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?}: {out:?}");
-    }
+    sandbox.git(dir, &["init", "-q", "-b", branch]);
+    sandbox.git(dir, &["remote", "add", "origin", origin]);
 }
 
 /// A herdr with the lead `lead-<slug>` in workspace `w<n>`, at work in `cwd`.
@@ -624,7 +617,12 @@ fn a_live_lead_on_a_factory_branch_of_the_repo_wakes_the_watcher_with_no_wait() 
     github.pulls(&[(12, "factory/s1-t2")]);
     github.checks(&[(1, "test", "completed", Some("success"))]);
     let shop = sandbox.path("work/shop");
-    checkout(&shop, "factory/s1", "git@github.com:acme/shop.git");
+    checkout(
+        &sandbox,
+        &shop,
+        "factory/s1",
+        "git@github.com:acme/shop.git",
+    );
     let herdr = FakeHerdr::start(&sandbox);
     lead_in(&herdr, 1, "s1", &shop);
 
@@ -640,9 +638,19 @@ fn a_lead_on_another_repo_or_off_the_factory_branches_costs_github_nothing() {
     let github = FakeGitHub::install(&sandbox);
     github.pulls(&[(12, "factory/s1-t2")]);
     let blog = sandbox.path("work/blog");
-    checkout(&blog, "factory/b1", "git@github.com:acme/blog.git");
+    checkout(
+        &sandbox,
+        &blog,
+        "factory/b1",
+        "git@github.com:acme/blog.git",
+    );
     let by_hand = sandbox.path("work/shop");
-    checkout(&by_hand, "main", "https://github.com/acme/shop.git");
+    checkout(
+        &sandbox,
+        &by_hand,
+        "main",
+        "https://github.com/acme/shop.git",
+    );
     let herdr = FakeHerdr::start(&sandbox);
     lead_in(&herdr, 1, "blog", &blog);
     lead_in(&herdr, 2, "shop", &by_hand);
