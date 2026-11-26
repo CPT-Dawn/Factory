@@ -2,6 +2,9 @@
 //! as the daemon's quota keeper read them from agy's usage query, or says why they can't be
 //! read. Whether agy may review is the router's to say, from its own, fresher look.
 
+use std::fs;
+use std::path::Path;
+
 use factory_core::status::Agy;
 use serde_json::{Value, json};
 
@@ -13,7 +16,7 @@ use crate::protocol::AGY_QUOTA;
 use crate::quotas::AGY_QUERY;
 
 /// `factory quota agy`: each quota group's windows, `Gemini Models: 5h 30%, weekly 7%`, on one
-/// line, or under a summary line when they are too long for one; or
+/// line, or a summary line naming a file with a row for each when they are too long for one; or
 /// `agy usage unreadable: <why>`, never a share it did not read. It exits 0 either way: it
 /// reports, and does not gate (`factory quota claude` does).
 pub fn quota() -> Result<Done, Failure> {
@@ -21,12 +24,12 @@ pub fn quota() -> Result<Done, Failure> {
     let agy: Agy =
         client::call_streaming(&paths, AGY_QUOTA, &json!({}), Some(AGY_QUERY), &mut |_| {})?;
     let json = serde_json::to_value(&agy).unwrap_or(Value::Null);
-    Ok(said(&agy, clock::now().unix_millis(), json))
+    said(&agy, clock::now().unix_millis(), json, &paths.agy_quota())
 }
 
-fn said(agy: &Agy, now: i64, json: Value) -> Done {
+fn said(agy: &Agy, now: i64, json: Value, listing: &Path) -> Result<Done, Failure> {
     if let Some(problem) = agy.problem() {
-        return Done::new(problem, json);
+        return Ok(Done::new(problem, json));
     }
     let groups: Vec<String> = agy
         .groups
@@ -34,23 +37,29 @@ fn said(agy: &Agy, now: i64, json: Value) -> Done {
         .map(|group| format!("{}: {}", group.name, group.describe(now, ", ")))
         .collect();
     if groups.is_empty() {
-        return Done::new("agy: no reading yet; try again", json);
+        return Ok(Done::new("agy: no reading yet; try again", json));
     }
     let line = format!("agy: {}", groups.join("; "));
     if line.chars().count() <= LINE_LIMIT {
-        return Done::new(line, json);
+        return Ok(Done::new(line, json));
     }
-    // Too many groups, or names too long, for one line: a summary, and a row for each group.
+    // Too many groups, or names too long, for one line: a summary naming the file that has a
+    // row for each.
     let worst = agy
         .worst(now)
         .map_or_else(|| "unknown".to_owned(), |used| format!("{used}%"));
-    let mut done = Done::new(
-        format!("agy: {} quota groups, worst window {worst}", groups.len()),
+    fs::write(listing, groups.join("\n") + "\n").map_err(|e| {
+        Failure::precondition(format!(
+            "cannot write {}: {e}; check the disk and FACTORY_STATE",
+            listing.display()
+        ))
+    })?;
+    Ok(Done::new(
+        format!(
+            "agy: {} quota groups, worst window {worst}; listing in {}",
+            groups.len(),
+            listing.display()
+        ),
         json,
-    );
-    done.more = groups
-        .into_iter()
-        .map(|group| format!("  {group}"))
-        .collect();
-    done
+    ))
 }

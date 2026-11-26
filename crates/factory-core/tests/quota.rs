@@ -504,7 +504,7 @@ fn an_epoch_reset_leaves_the_group_available_only_when_the_whole_quota_is_left()
     assert_eq!(quota::agy_usage(&untouched, CLAUDE_GPT), AgyUsage::Left);
 
     // Any less is a reading it cannot place: never "the reset has passed, so quota is back".
-    for left in [0.0, 0.4, 0.999] {
+    for left in [0.0, 0.4, 0.999, 0.999_999_9] {
         let usage = agy_usage_with("3p-5h", left, EPOCH);
         assert!(
             matches!(
@@ -728,4 +728,26 @@ fn an_answer_with_no_quota_group_to_read_says_why_it_is_unreadable() {
     ] {
         assert_eq!(quota::agy_groups(usage), Err(why.to_owned()), "{case}");
     }
+}
+
+#[test]
+fn an_answer_whose_every_reset_is_out_of_range_is_unreadable_not_a_row_of_unknowns() {
+    let before_the_epoch = r#"{"command":{"data":{"groups":[{"name":"G","buckets":[
+        {"window":"5h","remaining_fraction":0.4,"reset_time":"1960-01-01T00:00:00Z"},
+        {"window":"weekly","remaining_fraction":0.4,"reset_time":"1960-01-02T00:00:00Z"}]}]}}}"#;
+    assert_eq!(
+        quota::agy_groups(before_the_epoch),
+        Err("its answer has no bucket it can read".to_owned())
+    );
+}
+
+#[test]
+fn a_fraction_just_below_one_at_the_epoch_is_no_untouched_window() {
+    let almost = r#"{"command":{"data":{"groups":[{"name":"G","buckets":[
+        {"window":"5h","remaining_fraction":0.9999999,"reset_time":"1970-01-01T00:00:00Z"}]}]}}}"#;
+    let groups = quota::agy_groups(almost).expect("it reads");
+    assert_eq!(
+        groups[0].windows[0],
+        window(WindowKind::FiveHour, WindowState::Unknown)
+    );
 }

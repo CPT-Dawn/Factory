@@ -1668,7 +1668,7 @@ fn a_failed_usage_query_is_not_repeated_for_five_minutes_either() {
 }
 
 #[test]
-fn many_quota_groups_are_a_summary_line_and_a_row_each() {
+fn many_quota_groups_are_a_summary_line_naming_a_file_with_a_row_each() {
     let sandbox = Sandbox::new();
     let bucket = |window: &str, left: f64| json!({"window": window, "remaining_fraction": left, "reset_time": "2099-01-01T00:00:00Z"});
     let groups: Vec<Value> = (1..=12)
@@ -1680,14 +1680,23 @@ fn many_quota_groups_are_a_summary_line_and_a_row_each() {
     let out = quota_agy(&sandbox);
 
     assert_eq!(out.code, 0, "{out:?}");
-    let lines = out.stdout_lines();
-    assert_eq!(lines.len(), 13, "{out:?}");
-    assert_eq!(lines[0], "agy: 12 quota groups, worst window 50%");
+    let listing = sandbox.path("state/factory/agy-quota.txt");
     assert_eq!(
-        lines[1],
-        "  Quota group number 1 of the plan: 5h 50%, weekly 10%"
+        out.stdout,
+        format!(
+            "agy: 12 quota groups, worst window 50%; listing in {}\n",
+            listing.display()
+        ),
+        "{out:?}"
     );
-    assert!(lines.iter().all(|line| line.chars().count() <= 200));
+    assert!(out.stdout.chars().count() <= 200, "{out:?}");
+    let rows = fs::read_to_string(&listing).expect("the listing");
+    let rows: Vec<&str> = rows.lines().collect();
+    assert_eq!(rows.len(), 12, "{rows:?}");
+    assert_eq!(
+        rows[0],
+        "Quota group number 1 of the plan: 5h 50%, weekly 10%"
+    );
     let json = sandbox.factory(&["quota", "agy", "--json"]);
     assert_eq!(
         shown(&json.stdout)["groups"].as_array().map(Vec::len),

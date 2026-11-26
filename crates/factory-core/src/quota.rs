@@ -227,11 +227,8 @@ pub fn agy_usage(usage: &str, group: &str) -> AgyUsage {
     }
     let mut until = None;
     for bucket in buckets {
-        let left = bucket.get("remaining_fraction").and_then(Value::as_f64);
-        let reset = bucket
-            .get("reset_time")
-            .and_then(Value::as_str)
-            .and_then(Timestamp::parse);
+        let left = bucket_left(bucket);
+        let reset = bucket_reset(bucket);
         match (left, reset) {
             // The epoch is no reset: the bucket has been used, or it has not. Only a whole
             // quota left says it has not.
@@ -313,21 +310,33 @@ pub fn agy_groups(usage: &str) -> Result<Vec<QuotaGroup>, String> {
 
 /// Whether a bucket with the epoch as its reset, which has no clock running, is untouched: only
 /// when the whole quota is left.
+#[allow(clippy::float_cmp)]
 fn epoch_means_unused(left: f64) -> bool {
-    (left - 1.0).abs() < f64::EPSILON
+    left == 1.0
 }
 
-/// A bucket as agy printed it: the share left, 0 to 1, and when it resets.
-fn read_bucket(bucket: &Value) -> Option<(f64, i64)> {
-    let left = bucket
+/// The share of a bucket left, 0 to 1, as agy printed it.
+fn bucket_left(bucket: &Value) -> Option<f64> {
+    bucket
         .get("remaining_fraction")
         .and_then(Value::as_f64)
-        .filter(|left| (0.0..=1.0).contains(left))?;
-    let resets = bucket
+        .filter(|left| (0.0..=1.0).contains(left))
+}
+
+/// When a bucket resets, as agy printed it.
+fn bucket_reset(bucket: &Value) -> Option<Timestamp> {
+    bucket
         .get("reset_time")
         .and_then(Value::as_str)
-        .and_then(Timestamp::parse)?;
-    Some((left, resets.unix_millis()))
+        .and_then(Timestamp::parse)
+}
+
+/// A bucket as agy printed it, for the display: the share left and when it resets, the reset
+/// a time that can stand (or the epoch, which says none).
+fn read_bucket(bucket: &Value) -> Option<(f64, i64)> {
+    let left = bucket_left(bucket)?;
+    let resets = bucket_reset(bucket)?.unix_millis();
+    (resets == AGY_EPOCH_MILLIS || usage::representable(resets)).then_some((left, resets))
 }
 
 /// Which window a bucket is: its `window` (`5h`, `weekly`), else what its id or name says.

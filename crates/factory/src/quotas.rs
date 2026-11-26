@@ -1,7 +1,7 @@
 //! The quota keeper: the daemon's one owner of every harness's latest usage readings. Claude's
 //! are kept in its database so a restart forgets no hold; agy's are held in memory and asked
-//! again after a restart. Status, the bar and a dispatch all ask it; nothing
-//! else reads or records a quota. Claude's two windows come in through `factory hook
+//! again after a restart. Status, the bar and a dispatch's Claude hold all ask it;
+//! nothing else reads or records a quota, but agy's routing, which keeps its own 120 s look. Claude's two windows come in through `factory hook
 //! statusline`, and its limit through the `StopFailure` hook. agy's come from its usage query,
 //! which the keeper asks for itself, at most once in [`AGY_DISPLAY_FRESH_MS`]: what status, the
 //! bar and `factory quota agy` show is one reading, however often they look.
@@ -77,10 +77,12 @@ impl QuotaKeeper {
     /// the query goes on and lands for the next caller. An answer that can't be read is the
     /// reading too, with its reason: it is shown, and asked again after the same time.
     pub async fn agy(self: &Arc<Self>, patience: Duration) -> Agy {
-        let now = clock::lab_now_ms();
         let mut asked = std::pin::pin!(self.agy_asked.notified());
         {
             let mut state = lock(&self.agy);
+            // Looked at under the lock: a query that lands first stamps a time the look after
+            // it must not find in its future.
+            let now = clock::lab_now_ms();
             if let Some(reading) = state
                 .reading
                 .as_ref()
