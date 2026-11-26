@@ -2,7 +2,7 @@
 //! bundle, a run on the first step of the tier's chain the daemon's router grants a slot, and
 //! one line back.
 //!
-//! The tier picks the chain (spec review hard; small or docs-only diff trivial; else the
+//! The tier picks the chain (spec review spec, on a chain of its own; small or docs-only diff trivial; else the
 //! caller's, or standard), and each step names a pool, a model and an effort. The daemon holds
 //! each pool's slots and cooldown. A pool's preflight runs before the review is prepared for
 //! it: one out of quota is cooled down until its reset, and one that can't review now (agy
@@ -166,7 +166,7 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
 }
 
 /// The adapter that runs a chain's step on its backend, keeping the backend's reserve unless
-/// the review is hard.
+/// the review is hard or spec.
 fn reviewer(backend: &Backend, step: &Step, tier: Tier, paths: &Paths) -> Box<dyn Reviewer> {
     let model = step.model.clone().or_else(|| backend.model.clone());
     let effort = step.effort.clone().or_else(|| backend.effort.clone());
@@ -179,7 +179,11 @@ fn reviewer(backend: &Backend, step: &Step, tier: Tier, paths: &Paths) -> Box<dy
                 paths.state.join("agy-usage.json"),
                 paths.state.join("checkouts"),
             )
-            .reserving(backend.reserve.filter(|_| tier != Tier::Hard)),
+            .reserving(
+                backend
+                    .reserve
+                    .filter(|_| !matches!(tier, Tier::Hard | Tier::Spec)),
+            ),
         ),
         Cli::Codex => Box::new(Codex::new(model, effort, &home_of("CODEX_HOME", ".codex"))),
         Cli::Claude => Box::new(Claude::new(
@@ -290,6 +294,7 @@ fn review(
         }
         let last = pools.len().saturating_sub(1);
         let slots = AcquireParams {
+            tier: Some(tier.as_str().to_owned()),
             review: Some(ReviewRef {
                 repo: run.repo.clone(),
                 label: args.label.clone(),

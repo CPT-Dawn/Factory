@@ -38,6 +38,15 @@ struct State {
     /// memory only: the next review that tries the backend says again.
     unknown: HashMap<String, String>,
     running: HashMap<String, u32>,
+    /// The tier of each review running on a backend, for `factory status`.
+    tiers: HashMap<String, Vec<String>>,
+}
+
+/// The review slot a connection holds: its backend, and the tier of the review in it.
+#[derive(Debug)]
+pub struct Held {
+    backend: String,
+    tier: Option<String>,
 }
 
 impl Router {
@@ -53,13 +62,14 @@ impl Router {
                 quotas: quotas.into_iter().collect(),
                 unknown: HashMap::new(),
                 running: HashMap::new(),
+                tiers: HashMap::new(),
             }),
             changed: Notify::new(),
         })
     }
 
     /// Takes a slot for the connection that `held` belongs to, first freeing the one it holds.
-    pub async fn acquire(&self, params: Value, held: &mut Option<String>) -> Outcome {
+    pub async fn acquire(&self, params: Value, held: &mut Option<Held>) -> Outcome {
         self.release(held);
         let params: AcquireParams = match serde_json::from_value(params) {
             Ok(params) => params,
@@ -92,7 +102,17 @@ impl Router {
                     Pick::Take(index) => {
                         let name = wanted[index].0.to_owned();
                         *state.running.entry(name.clone()).or_default() += 1;
-                        *held = Some(name.clone());
+                        if let Some(tier) = &params.tier {
+                            state
+                                .tiers
+                                .entry(name.clone())
+                                .or_default()
+                                .push(tier.clone());
+                        }
+                        *held = Some(Held {
+                            backend: name.clone(),
+                            tier: params.tier.clone(),
+                        });
                         let result = AcquireResult { backend: name };
                         return Outcome::Result(
                             serde_json::to_value(result).unwrap_or(Value::Null),
@@ -147,6 +167,11 @@ impl Router {
                     resets,
                     reason,
                     running: state.running.get(&backend.name).copied().unwrap_or(0),
+                    tiers: {
+                        let mut tiers = state.tiers.get(&backend.name).cloned().unwrap_or_default();
+                        tiers.sort();
+                        tiers
+                    },
                     concurrency: backend.concurrency,
                     when_busy: match WhenBusy::from(backend.when_busy) {
                         WhenBusy::Queue => "queue",
@@ -159,13 +184,20 @@ impl Router {
     }
 
     /// Frees the slot `held` names, if any, and wakes the reviews waiting for one.
-    pub fn release(&self, held: &mut Option<String>) {
-        let Some(name) = held.take() else {
+    pub fn release(&self, held: &mut Option<Held>) {
+        let Some(Held { backend, tier }) = held.take() else {
             return;
         };
-        if let Some(running) = lock(&self.state).running.get_mut(&name) {
+        let mut state = lock(&self.state);
+        if let Some(running) = state.running.get_mut(&backend) {
             *running = running.saturating_sub(1);
         }
+        if let Some(tiers) = state.tiers.get_mut(&backend)
+            && let Some(at) = tier.and_then(|tier| tiers.iter().position(|t| *t == tier))
+        {
+            tiers.remove(at);
+        }
+        drop(state);
         self.changed.notify_waiters();
     }
 

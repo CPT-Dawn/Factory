@@ -210,6 +210,9 @@ pub struct AcquireParams {
     /// The review asking, so the daemon can tell a wait on its label that it is still running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewRef>,
+    /// The review's tier, which `factory status` names while it holds a slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
 }
 
 /// A review by the repo it runs in and its label.

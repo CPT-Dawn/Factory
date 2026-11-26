@@ -1,6 +1,7 @@
 //! Review tiers: how hard a diff is reviewed, and which chain of reviewers runs it. The caller
-//! tags a ticket `hard`, `standard` or `trivial`; a spec's own review (`spec-*`) is always
-//! hard, and a small or docs-only diff is trivial whatever else it was tagged, but hard.
+//! tags a ticket `hard`, `standard` or `trivial`; a spec's own review (`spec-*`) is the
+//! `spec` tier whatever the caller names, with a chain of its own. A small or docs-only diff is
+//! trivial whatever else it was tagged, but hard or spec.
 
 use std::fmt;
 
@@ -14,22 +15,29 @@ pub enum Tier {
     Hard,
     Standard,
     Trivial,
+    /// A spec's own review: as hard as `Hard`, on its own chain. No caller names it.
+    Spec,
 }
 
 impl Tier {
-    pub const ALL: [Tier; 3] = [Tier::Hard, Tier::Standard, Tier::Trivial];
+    /// The tiers a caller may name; `Spec` is read from the label.
+    pub const NAMED: [Tier; 3] = [Tier::Hard, Tier::Standard, Tier::Trivial];
+
+    /// Every tier, each with a chain of its own.
+    pub const ALL: [Tier; 4] = [Tier::Hard, Tier::Standard, Tier::Trivial, Tier::Spec];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Tier::Hard => "hard",
             Tier::Standard => "standard",
             Tier::Trivial => "trivial",
+            Tier::Spec => "spec",
         }
     }
 
     /// The tier a caller names, or none for a word that is no tier.
     pub fn parse(word: &str) -> Option<Tier> {
-        Tier::ALL.into_iter().find(|tier| tier.as_str() == word)
+        Tier::NAMED.into_iter().find(|tier| tier.as_str() == word)
     }
 }
 
@@ -42,7 +50,7 @@ impl fmt::Display for Tier {
 /// Where a review's tier came from, as its event's `tier_source` records it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
-    /// A spec review (`spec-*`), which is hard.
+    /// A spec review (`spec-*`), which has its own tier.
     Spec,
     /// The caller's `--tier`.
     Caller,
@@ -87,11 +95,11 @@ pub fn numstat(text: &str) -> Vec<Change> {
         .collect()
 }
 
-/// The tier a review runs at: a spec review is hard; a caller's `hard` or `trivial` stands;
-/// a trivial diff is trivial; else the caller's tier, or standard.
+/// The tier a review runs at: a spec review is spec, whatever the diff or the caller; a
+/// caller's `hard` or `trivial` stands; a trivial diff is trivial; else the caller's tier, or standard.
 pub fn tier(label: &str, caller: Option<Tier>, diff: &[Change]) -> (Tier, Source) {
     match caller {
-        _ if label.starts_with("spec-") => (Tier::Hard, Source::Spec),
+        _ if label.starts_with("spec-") => (Tier::Spec, Source::Spec),
         Some(tier @ (Tier::Hard | Tier::Trivial)) => (tier, Source::Caller),
         _ if is_trivial(diff) => (Tier::Trivial, Source::Detected),
         Some(tier) => (tier, Source::Caller),
@@ -202,6 +210,12 @@ mod tests {
     }
 
     #[test]
+    fn a_caller_cannot_name_the_spec_tier() {
+        assert_eq!(Tier::parse("spec"), None);
+        assert_eq!(Tier::parse("hard"), Some(Tier::Hard));
+    }
+
+    #[test]
     fn steering_and_tests_are_never_light() {
         for path in [
             "SKILL.md",
@@ -229,13 +243,22 @@ mod tests {
     }
 
     #[test]
-    fn a_spec_review_is_hard_and_a_callers_hard_or_trivial_stands() {
+    fn a_spec_review_is_its_own_tier_and_a_callers_hard_or_trivial_stands() {
         let code = diff(&[(40, "src/a.ts")]);
         let tiny = diff(&[(5, "src.ts")]);
-        assert_eq!(
-            tier("spec-r1", Some(Tier::Trivial), &tiny),
-            (Tier::Hard, Source::Spec)
-        );
+        for caller in [
+            None,
+            Some(Tier::Hard),
+            Some(Tier::Standard),
+            Some(Tier::Trivial),
+        ] {
+            assert_eq!(
+                tier("spec-r1", caller, &tiny),
+                (Tier::Spec, Source::Spec),
+                "{caller:?}"
+            );
+        }
+        assert_eq!(Tier::Spec.as_str(), "spec");
         assert_eq!(
             tier("t7-r1", Some(Tier::Hard), &tiny),
             (Tier::Hard, Source::Caller)

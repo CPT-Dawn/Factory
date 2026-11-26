@@ -8,7 +8,9 @@
 //!
 //! - pools `agy-gemini` (with a 20% reserve) and `agy-claude` (agy's two usage groups: every
 //!   Gemini model, Argon too, draws on the first), `codex` and `claude`, each with 2 slots;
-//! - hard: Gemini 4 Neon high, agy's Opus high, Codex high, Claude Opus high;
+//! - hard: Codex high, Gemini 4 Neon high, agy's Opus high, Claude Opus high;
+//! - spec (reviews labelled `spec-*`): Gemini 4 Neon high, agy's Opus high, Codex high, Claude
+//!   Opus high;
 //! - standard: Codex medium, Neon medium, agy's Opus high, agy's Sonnet high, Claude Sonnet
 //!   high;
 //! - trivial: Flash high, Neon low, Codex low, Claude Sonnet medium.
@@ -55,13 +57,16 @@
 //! auth = "subscription"    # agy only: its "subscription" login, or an "api-key" in
 //!                          # GEMINI_API_KEY (default: subscription)
 //! reserve = 0.2            # agy only: below this share of its group's 5-hour bucket, only
-//!                          # hard reviews may take it
+//!                          # hard and spec reviews may take it
 //!
 //! [review]
 //! skill = "~/.agents/skills/code-review/SKILL.md"  # the reviewer skill every prompt carries
 //!
 //! [review.chains]          # per tier: "pool:model:effort", model and effort optional
 //! hard = ["agy:gemini-4-neon-high:high", "codex:gpt-6.2-sol:high"]
+//! spec = ["agy:gemini-4-neon-high:high"]   # reviews labelled spec-*; default: hard's chain when
+//!                                          # set, else Neon high first (the old hard chain), or
+//!                                          # the backends in their order when you list them
 //! standard = ["codex:gpt-6.2-sol:medium", "agy"]
 //! trivial = ["codex::low"]
 //! ```
@@ -157,6 +162,7 @@ pub struct Step {
 pub struct ReviewSetup {
     pub backends: Vec<Backend>,
     pub hard: Vec<Step>,
+    pub spec: Vec<Step>,
     pub standard: Vec<Step>,
     pub trivial: Vec<Step>,
     /// The reviewer skill the prompt carries, as configured.
@@ -169,6 +175,7 @@ impl ReviewSetup {
             Tier::Hard => &self.hard,
             Tier::Standard => &self.standard,
             Tier::Trivial => &self.trivial,
+            Tier::Spec => &self.spec,
         }
     }
 }
@@ -344,6 +351,7 @@ struct Review {
 #[serde(deny_unknown_fields)]
 struct Chains {
     hard: Option<Vec<String>>,
+    spec: Option<Vec<String>>,
     standard: Option<Vec<String>>,
     trivial: Option<Vec<String>>,
 }
@@ -526,7 +534,10 @@ pub fn review_setup(paths: &Paths) -> Result<ReviewSetup, Failure> {
     };
     let chains = review.chains;
     Ok(ReviewSetup {
-        hard: chain(Tier::Hard, chains.hard)?,
+        hard: chain(Tier::Hard, chains.hard.clone())?,
+        // A config that sets `hard` and not `spec` keeps its spec reviews on that chain, as before
+        // the tier existed.
+        spec: chain(Tier::Spec, chains.spec.or_else(|| chains.hard.clone()))?,
         standard: chain(Tier::Standard, chains.standard)?,
         trivial: chain(Tier::Trivial, chains.trivial)?,
         skill: review.skill.map(|skill| expand_home(&skill)),
@@ -668,10 +679,20 @@ const FOLDED: (&str, &str) = ("agy-argon", "agy-gemini");
 /// review.sh's chains, over [`default_backends`]. Argon left them (owner, 2026-11-24): it
 /// shares the Gemini quota, and the replays' known findings went to the models kept. Config can
 /// still name it.
-const DEFAULT_HARD: [&str; 4] = [
+///
+/// A spec's own review keeps what hard was: Gemini Neon leads.
+const DEFAULT_SPEC: [&str; 4] = [
     "agy-gemini:gemini-4-neon-high:high",
     "agy-claude:claude-opus-5-5-high:high",
     "codex:gpt-6.2-sol:high",
+    "claude:opus:high",
+];
+/// A ticket's hard review leads with Codex (spec #67, story 23): 16 agy hard reviews used 16M
+/// tokens, against 3M for 8 Codex ones.
+const DEFAULT_HARD: [&str; 4] = [
+    "codex:gpt-6.2-sol:high",
+    "agy-gemini:gemini-4-neon-high:high",
+    "agy-claude:claude-opus-5-5-high:high",
     "claude:opus:high",
 ];
 /// Standard (owner, 2026-11-23): Codex medium leads, because Neon medium and Argon high missed
@@ -693,6 +714,7 @@ const DEFAULT_TRIVIAL: [&str; 4] = [
 fn default_chain(tier: Tier, backends: &[Backend]) -> Vec<Step> {
     let steps: &[&str] = match tier {
         Tier::Hard => &DEFAULT_HARD,
+        Tier::Spec => &DEFAULT_SPEC,
         Tier::Standard => &DEFAULT_STANDARD,
         Tier::Trivial => &DEFAULT_TRIVIAL,
     };

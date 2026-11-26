@@ -117,6 +117,7 @@ fn json_gives_every_field_of_every_section() {
             "reason",
             "resets",
             "running",
+            "tiers",
             "when_busy"
         ]
     );

@@ -63,6 +63,7 @@ fn backend(name: &str, quota: QuotaState, resets: Option<&str>, running: u32, of
             .map(Timestamp::unix_millis),
         reason: None,
         running,
+        tiers: Vec::new(),
         concurrency: of,
         when_busy: "queue".to_owned(),
     }
@@ -197,6 +198,30 @@ fn a_backend_shows_its_quota_its_reset_and_its_load() {
             "  claude  available, 1/2 running",
             "  agy     unknown, 0/1 running",
             "  old     cooling, resets 11-24 01:00Z (in 20.8h), 0/1 running",
+        ]
+    );
+}
+
+#[test]
+fn a_backend_names_the_tiers_of_the_reviews_running_on_it() {
+    let mut status = idle();
+    let mut busy = backend("codex", QuotaState::Available, None, 2, 2);
+    busy.tiers = vec!["hard".to_owned(), "spec".to_owned()];
+    let mut one = backend("agy", QuotaState::Available, None, 1, 2);
+    one.tiers = vec!["spec".to_owned()];
+    status.review = vec![
+        busy,
+        one,
+        backend("claude", QuotaState::Available, None, 0, 2),
+    ];
+
+    assert_eq!(
+        &rows(&status)[2..6],
+        [
+            "review quota",
+            "  codex   available, 2/2 running (hard, spec)",
+            "  agy     available, 1/2 running (spec)",
+            "  claude  available, 0/2 running",
         ]
     );
 }
