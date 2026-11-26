@@ -65,7 +65,8 @@
 //! [review.chains]          # per tier: "pool:model:effort", model and effort optional
 //! hard = ["agy:gemini-4-neon-high:high", "codex:gpt-6.2-sol:high"]
 //! spec = ["agy:gemini-4-neon-high:high"]   # reviews labelled spec-*; default: hard's chain when
-//!                                          # set, else Neon high first (the old hard chain)
+//!                                          # set, else Neon high first (the old hard chain), or
+//!                                          # the backends in their order when you list them
 //! standard = ["codex:gpt-6.2-sol:medium", "agy"]
 //! trivial = ["codex::low"]
 //! ```

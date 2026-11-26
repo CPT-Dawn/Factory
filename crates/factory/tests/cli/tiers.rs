@@ -299,9 +299,17 @@ fn status_names_the_tier_of_each_review_running_on_a_pool() {
     );
     assert_eq!(finish(spec).code, 0);
     assert_eq!(finish(ticket).code, 0);
-    let after: Value =
-        serde_json::from_str(&lab.sandbox.factory(&["status", "--json"]).stdout).unwrap();
-    assert_eq!(after["review"][0]["tiers"], json!([]), "{after}");
+    // The daemon frees a slot when it sees the review's connection close, a moment after the
+    // review exits.
+    assert!(
+        world::poll_until(|| {
+            let after: Value =
+                serde_json::from_str(&lab.sandbox.factory(&["status", "--json"]).stdout)
+                    .unwrap_or_default();
+            after["review"][0]["running"] == 0 && after["review"][0]["tiers"] == json!([])
+        }),
+        "the slots went back"
+    );
 }
 
 #[test]
