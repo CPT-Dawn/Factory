@@ -11,7 +11,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use factory_adapters::gh::{Actions, Gh, GhError, HOST};
+use factory_adapters::gh::{Actions, GhActions, GhError, HOST};
 use factory_core::ci::PullRequest;
 use factory_core::fleet::{Ci, Job, Pull, PullState, RepoCi, is_factory_branch};
 use tokio::sync::watch;
@@ -25,8 +25,16 @@ use crate::store::Store;
 const INTERVAL_MS: i64 = 60_000;
 /// How often a watcher with something to watch looks at the clock.
 const TICK: Duration = Duration::from_secs(1);
+/// How far before the last good answer a read looks for runs created since, for the clocks
+/// of GitHub and of this machine to disagree.
+const OVERLAP_MS: i64 = 120_000;
+/// The furthest back a read looks for runs created since: a repo unread for a week needs only
+/// its recent runs.
+const LOOKBACK_MS: i64 = 3_600_000;
+/// What a failed GitHub read tells the owner to do.
+const RETRY: &str = "the last good answer stays shown; check `gh auth status` and the [ci] repos";
 
-pub struct Fleet<A: Actions = Gh> {
+pub struct Fleet<A: Actions = GhActions> {
     actions: Arc<A>,
     store: Mutex<Store>,
     ci: Mutex<Ci>,
@@ -37,27 +45,25 @@ impl<A: Actions> Fleet<A> {
     /// can't be read (`watch` is that failure), one that watches nothing and says why.
     pub fn open(watch: Result<CiWatch, Failure>, store: Store, actions: A) -> Fleet<A> {
         let ci = match watch {
-            Ok(watch) => {
-                let mut error = None;
-                let repos = watch
+            Ok(watch) => Ci {
+                expected: watch.expected,
+                repos: watch
                     .repos
                     .iter()
                     .map(|repo| {
-                        store.ci(repo).unwrap_or_else(|e| {
-                            error = Some(format!("cannot read the CI the database keeps: {e}"));
-                            RepoCi {
-                                repo: repo.clone(),
-                                ..RepoCi::default()
-                            }
+                        // The next good read replaces what couldn't be read.
+                        store.ci(repo).unwrap_or_else(|e| RepoCi {
+                            repo: repo.clone(),
+                            error: Some(format!(
+                                "cannot read the CI the database keeps: {e}; check \
+                                 FACTORY_STATE, or move factory.db aside"
+                            )),
+                            ..RepoCi::default()
                         })
                     })
-                    .collect();
-                Ci {
-                    expected: watch.expected,
-                    error,
-                    repos,
-                }
-            }
+                    .collect(),
+                ..Ci::default()
+            },
             Err(failure) => Ci {
                 error: Some(failure.message),
                 ..Ci::default()
@@ -111,6 +117,10 @@ impl<A: Actions> Fleet<A> {
                 last = Some(clock::lab_now_ms());
                 let fleet = Arc::clone(&self);
                 let _ = tokio::task::spawn_blocking(move || fleet.read_all()).await;
+                let next = self
+                    .needs_watching()
+                    .then(|| clock::lab_now_ms() + INTERVAL_MS);
+                self.ci().next = next;
                 continue;
             }
             let heard = if wanted {
@@ -144,18 +154,26 @@ impl<A: Actions> Fleet<A> {
             let after = match read {
                 Ok((mut after, jobs)) => {
                     after.seen = Some(clock::now().unix_millis());
-                    let store = self
+                    let mut store = self
                         .store
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .record_ci(&after, &jobs);
-                    if let Err(e) = store {
-                        after.error = Some(format!("cannot keep GitHub's answer: {e}"));
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let kept = store
+                        .record_ci(&after, &jobs)
+                        .and_then(|()| store.ci(&after.repo));
+                    match kept {
+                        Ok(kept) => after.finished = kept.finished,
+                        Err(e) => {
+                            after.error = Some(format!(
+                                "cannot keep GitHub's answer: {e}; check the disk and \
+                                 FACTORY_STATE"
+                            ));
+                        }
                     }
                     after
                 }
                 Err(GhError(why)) => RepoCi {
-                    error: Some(why),
+                    error: Some(format!("{why}; {RETRY}")),
                     ..before
                 },
             };
@@ -163,16 +181,21 @@ impl<A: Actions> Fleet<A> {
                 *slot = after;
             }
         }
+        self.actions.sweep();
     }
 }
 
-/// One read of `before`'s repo: its runners, the jobs of its active runs and of the runs
-/// whose jobs `before` still waited on, and its open factory pull requests' checks. Also
-/// every job read, completed ones too, for the times the database keeps.
+/// One read of `before`'s repo: its runners, the jobs of its active runs, of the runs created
+/// since the last good answer (one that queued and completed between two reads among them)
+/// and of the runs whose jobs `before` still waited on, and its open factory pull requests'
+/// checks. Also every job read, completed ones too, for the times the database keeps.
 fn read<A: Actions>(actions: &A, before: &RepoCi) -> Result<(RepoCi, Vec<Job>), GhError> {
     let repo = before.repo.as_str();
     let runners = actions.runners(repo)?;
+    let now = clock::now().unix_millis();
+    let since = before.seen.unwrap_or(now).saturating_sub(OVERLAP_MS);
     let mut runs = actions.active_runs(repo)?;
+    runs.extend(actions.runs_since(repo, since.max(now - LOOKBACK_MS))?);
     runs.extend(before.jobs.iter().map(|job| job.run_id));
     runs.sort_unstable();
     runs.dedup();
@@ -208,115 +231,8 @@ fn read<A: Actions>(actions: &A, before: &RepoCi) -> Result<(RepoCi, Vec<Job>), 
             runners,
             jobs,
             pulls,
+            finished: Vec::new(),
         },
         read,
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use factory_adapters::gh::{FakeActions, OpenPull};
-    use factory_core::ci::CheckRun;
-    use factory_core::fleet::{Runner, RunnerState};
-
-    use super::*;
-
-    fn job(status: &str) -> Job {
-        Job {
-            id: 70,
-            run_id: 7,
-            name: "test".to_owned(),
-            status: status.to_owned(),
-            conclusion: (status == "completed").then(|| "success".to_owned()),
-            runner: Some("ci-1".to_owned()),
-            queued: Some(1_000),
-            started: Some(2_000),
-            finished: (status == "completed").then_some(3_000),
-        }
-    }
-
-    fn open(dir: &tempfile::TempDir, fake: FakeActions) -> Fleet<FakeActions> {
-        let watch = CiWatch {
-            repos: vec!["acme/shop".to_owned()],
-            expected: 2,
-        };
-        let store = Store::open(&dir.path().join("factory.db")).expect("open the store");
-        Fleet::open(Ok(watch), store, fake)
-    }
-
-    fn fake() -> FakeActions {
-        let fake = FakeActions::default();
-        {
-            let mut state = fake.state.lock().expect("the fake");
-            state.runners = vec![Runner {
-                id: 1,
-                name: "ci-1".to_owned(),
-                state: RunnerState::Busy,
-            }];
-            state.runs = vec![(7, vec![job("in_progress")])];
-            state.pulls = vec![(
-                OpenPull {
-                    number: 12,
-                    branch: "factory/s1-t2".to_owned(),
-                    head: "c0ffee".to_owned(),
-                    url: "https://github.com/acme/shop/pull/12".to_owned(),
-                },
-                vec![CheckRun {
-                    id: 1,
-                    name: "test".to_owned(),
-                    status: "in_progress".to_owned(),
-                    conclusion: None,
-                    url: String::new(),
-                    app: Some("github-actions".to_owned()),
-                }],
-            )];
-        }
-        fake
-    }
-
-    #[test]
-    fn a_failed_read_keeps_the_last_good_answer_marked_with_why() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let fleet = open(&dir, fake());
-        fleet.read_all();
-        let good = fleet.snapshot().repos[0].clone();
-        assert_eq!(good.error, None);
-        assert_eq!(good.jobs, vec![job("in_progress")]);
-
-        fleet.actions.state.lock().expect("the fake").failing = Some("gh: HTTP 502".to_owned());
-        fleet.read_all();
-        let stale = fleet.snapshot().repos[0].clone();
-        assert_eq!(stale.error.as_deref(), Some("gh: HTTP 502"));
-        assert_eq!(
-            RepoCi {
-                error: None,
-                ..stale
-            },
-            good
-        );
-    }
-
-    #[test]
-    fn a_restarted_watcher_resumes_from_what_it_kept_and_reads_a_tracked_jobs_end() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        open(&dir, fake()).read_all();
-
-        // The run finished while no daemon ran: it is no longer active, but its job was.
-        let finished = fake();
-        finished.state.lock().expect("the fake").runs = vec![(7, vec![job("completed")])];
-        let fleet = open(&dir, finished);
-        let kept = fleet.snapshot().repos[0].clone();
-        assert!(kept.needs_watching(), "{kept:?}");
-        assert_eq!(kept.pulls[0].number, 12);
-
-        fleet.read_all();
-        let read = fleet.snapshot().repos[0].clone();
-        assert_eq!(read.jobs, Vec::new());
-        let reopened = open(&dir, FakeActions::default());
-        assert_eq!(
-            reopened.snapshot().repos[0].jobs,
-            Vec::new(),
-            "the end was kept"
-        );
-    }
 }

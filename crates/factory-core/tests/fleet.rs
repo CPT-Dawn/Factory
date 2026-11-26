@@ -74,6 +74,7 @@ fn shop() -> RepoCi {
         ],
         jobs: Vec::new(),
         pulls: Vec::new(),
+        finished: Vec::new(),
     }
 }
 
@@ -82,6 +83,7 @@ fn ci(repo: RepoCi) -> Ci {
         expected: 4,
         error: None,
         repos: vec![repo],
+        next: None,
     }
 }
 
@@ -177,7 +179,7 @@ fn the_card_counts_busy_runners_against_the_expected_ones_and_the_queue_by_its_o
         json!([
             {"kind": "meter", "label": "runners", "value": 0.5,
              "text": "2/4 busy, 1 offline, 1 missing", "tone": "warn"},
-            {"kind": "text", "label": "queued", "text": "2 jobs, oldest 12m", "tone": "busy"},
+            {"kind": "text", "label": "queue", "text": "2 queued, oldest 12m", "tone": "busy"},
             {"kind": "text", "label": "shop#12", "text": "pending", "tone": "busy",
              "url": "https://github.com/acme/shop/pull/12"},
         ]),
@@ -266,12 +268,14 @@ fn the_status_screen_sums_the_ci_in_one_line() {
         .iter()
         .position(|row| row.starts_with("ci: "))
         .unwrap_or(0);
-    assert_eq!(
-        screen[at..at + 2],
-        [
-            "ci: 2/4 runners busy, 1 offline, 1 missing, 1 queued (oldest 12m)",
-            "  PRs 1 failing, 1 passing, stale 1m",
-        ],
-        "{screen:#?}"
+    let row = &screen[at];
+    assert!(
+        row.starts_with("ci: stale 1m · PRs 1 failing, 1 passing · 2/4 busy, 1 offline, 1 missing"),
+        "the failing pull request before the queue the screen cuts: {screen:#?}"
+    );
+    assert!(row.chars().count() <= 80, "{row}");
+    assert!(
+        !screen[at + 1..].iter().any(|row| row.starts_with("  ")),
+        "one row: {screen:#?}"
     );
 }

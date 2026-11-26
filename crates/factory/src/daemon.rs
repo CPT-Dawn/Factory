@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use factory_adapters::gh::Gh;
+use factory_adapters::gh::{Gh, GhActions};
 use factory_core::duration;
 use factory_core::event::Event;
 use factory_core::exit::Exit;
@@ -109,7 +109,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
     let fleet = Arc::new(Fleet::open(
         crate::config::ci_watch(&paths),
         Store::open(&paths.database())?,
-        Gh,
+        GhActions::default(),
     ));
     let steward = Steward::new(
         paths.clone(),

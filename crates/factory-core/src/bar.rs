@@ -179,11 +179,6 @@ pub fn feed(snapshot: &Snapshot) -> Feed {
     }
 }
 
-/// Whether the owner configured repos to watch, or tried to: the CI chip and card show then.
-fn ci_shown(ci: &Ci) -> bool {
-    !ci.repos.is_empty() || ci.error.is_some()
-}
-
 /// `✓`, `✗`, `busy`, or `?` before GitHub answered.
 fn ci_mark_text(ci: &Ci) -> &'static str {
     match ci.mark() {
@@ -196,7 +191,7 @@ fn ci_mark_text(ci: &Ci) -> &'static str {
 
 fn ci_chip(snapshot: &Snapshot) -> Option<Chip> {
     let ci = &snapshot.ci;
-    if !ci_shown(ci) {
+    if !ci.shown() {
         return None;
     }
     let mark = ci.mark();
@@ -219,19 +214,12 @@ fn ci_chip(snapshot: &Snapshot) -> Option<Chip> {
 /// request with its link. A failed read keeps the last good numbers, marked stale.
 fn ci_section(snapshot: &Snapshot) -> Option<Section> {
     let ci = &snapshot.ci;
-    if !ci_shown(ci) {
+    if !ci.shown() {
         return None;
     }
     let mut rows = Vec::new();
     if ci.answered() {
         let tally = ci.tally();
-        let mut runners = format!("{}/{} busy", tally.busy, tally.total);
-        if tally.offline > 0 {
-            runners.push_str(&format!(", {} offline", tally.offline));
-        }
-        if tally.missing > 0 {
-            runners.push_str(&format!(", {} missing", tally.missing));
-        }
         #[allow(clippy::cast_precision_loss)]
         let value = if tally.total == 0 {
             0.0
@@ -241,7 +229,7 @@ fn ci_section(snapshot: &Snapshot) -> Option<Section> {
         rows.push(Row::Meter {
             label: "runners".to_owned(),
             value,
-            text: runners,
+            text: tally.runners_text(),
             tone: if tally.offline + tally.missing > 0 {
                 Tone::Warn
             } else if tally.busy > 0 {
@@ -251,18 +239,11 @@ fn ci_section(snapshot: &Snapshot) -> Option<Section> {
             },
             until: None,
         });
-        rows.push(match (tally.queued, tally.oldest) {
-            (0, _) => text("queued", "none".to_owned(), Tone::Muted),
-            (queued, oldest) => {
-                let mut jobs = plural(queued, "job");
-                if let Some(oldest) = oldest {
-                    jobs.push_str(&format!(
-                        ", oldest {}",
-                        crate::lab::ago(snapshot.now / 1000, oldest / 1000)
-                    ));
-                }
-                text("queued", jobs, Tone::Busy)
-            }
+        let queue = tally.queue_text(snapshot.now);
+        rows.push(if tally.queued == 0 {
+            text("queue", queue, Tone::Muted)
+        } else {
+            text("queue", queue, Tone::Busy)
         });
         let pulls: Vec<Row> = ci
             .repos
@@ -336,7 +317,7 @@ pub fn line(snapshot: &Snapshot) -> String {
     } else {
         plural(live(snapshot).count(), "lead")
     };
-    let ci = if ci_shown(&snapshot.ci) {
+    let ci = if snapshot.ci.shown() {
         format!(" · CI {}", ci_mark_text(&snapshot.ci))
     } else {
         String::new()

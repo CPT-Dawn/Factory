@@ -321,11 +321,7 @@ impl Store {
         let tx = self.db.transaction()?;
         tx.execute("DELETE FROM ci_runner WHERE repo = ?1", params![ci.repo])?;
         for runner in &ci.runners {
-            let (status, busy) = match runner.state {
-                RunnerState::Busy => ("online", true),
-                RunnerState::Idle => ("online", false),
-                RunnerState::Offline => ("offline", false),
-            };
+            let (status, busy) = runner.state.github();
             tx.execute(
                 "INSERT INTO ci_runner (repo, id, name, status, busy, seen_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -378,8 +374,9 @@ impl Store {
         tx.commit()
     }
 
-    /// A repo's CI as last recorded: its runners, its jobs not yet completed and its open
-    /// factory pull requests; nothing, and never seen, before the first answer.
+    /// A repo's CI as last recorded: its runners, its jobs not yet completed, its open factory
+    /// pull requests and its latest completed jobs; nothing, and never seen, before the first
+    /// answer.
     pub fn ci(&self, repo: &str) -> rusqlite::Result<RepoCi> {
         let seen = self
             .db
@@ -402,26 +399,12 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
-        let mut jobs = self.db.prepare(
-            "SELECT id, run_id, name, status, conclusion, runner, queued_ms, started_ms,
-                 finished_ms
-             FROM ci_job WHERE repo = ?1 AND status != 'completed' ORDER BY id",
+        let jobs = self.ci_jobs(repo, "status != 'completed' ORDER BY id", u32::MAX)?;
+        let finished = self.ci_jobs(
+            repo,
+            "status = 'completed' ORDER BY finished_ms DESC, id DESC",
+            FINISHED_KEPT,
         )?;
-        let jobs = jobs
-            .query_map(params![repo], |row| {
-                Ok(Job {
-                    id: unsql(row.get(0)?),
-                    run_id: unsql(row.get(1)?),
-                    name: row.get(2)?,
-                    status: row.get(3)?,
-                    conclusion: row.get(4)?,
-                    runner: row.get(5)?,
-                    queued: row.get(6)?,
-                    started: row.get(7)?,
-                    finished: row.get(8)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
         let mut pulls = self.db.prepare(
             "SELECT number, branch, url, state FROM ci_pull WHERE repo = ?1 ORDER BY number",
         )?;
@@ -432,11 +415,7 @@ impl Store {
                     number: unsql(row.get(0)?),
                     branch: row.get(1)?,
                     url: row.get(2)?,
-                    state: match state.as_str() {
-                        "passing" => PullState::Passing,
-                        "failing" => PullState::Failing,
-                        _ => PullState::Pending,
-                    },
+                    state: PullState::parse(&state),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -447,9 +426,36 @@ impl Store {
             runners,
             jobs,
             pulls,
+            finished,
         })
     }
+
+    /// At most `limit` of `repo`'s jobs, those `filter` (a SQL condition and order) picks.
+    fn ci_jobs(&self, repo: &str, filter: &str, limit: u32) -> rusqlite::Result<Vec<Job>> {
+        let mut jobs = self.db.prepare(&format!(
+            "SELECT id, run_id, name, status, conclusion, runner, queued_ms, started_ms,
+                 finished_ms
+             FROM ci_job WHERE repo = ?1 AND {filter} LIMIT ?2"
+        ))?;
+        jobs.query_map(params![repo, limit], |row| {
+            Ok(Job {
+                id: unsql(row.get(0)?),
+                run_id: unsql(row.get(1)?),
+                name: row.get(2)?,
+                status: row.get(3)?,
+                conclusion: row.get(4)?,
+                runner: row.get(5)?,
+                queued: row.get(6)?,
+                started: row.get(7)?,
+                finished: row.get(8)?,
+            })
+        })?
+        .collect()
+    }
 }
+
+/// How many of a repo's latest completed jobs `factory status --json` shows.
+const FINISHED_KEPT: u32 = 10;
 
 /// A GitHub id as SQLite keeps it.
 fn sql(id: u64) -> i64 {

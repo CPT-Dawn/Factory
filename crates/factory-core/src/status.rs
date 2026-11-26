@@ -211,8 +211,8 @@ pub const ROWS: usize = 24;
 pub const COLUMNS: usize = 80;
 
 /// The most rows each section lists before it says how many it left out. The lab the ticket
-/// names (three slots, three backends, five leads) takes at most 23 rows with every section at
-/// its cap, the Claude plan's row included.
+/// names (three slots, three backends, five leads) takes at most 24 rows with every section at
+/// its cap, the Claude plan's row and the CI row included.
 const LAB_ROWS: usize = 5;
 const QUEUE_ROWS: usize = 2;
 const WAIT_ROWS: usize = 3;
@@ -232,11 +232,8 @@ pub fn screen(status: &Status) -> Vec<String> {
 
 /// One line, only when the owner watches repos' CI.
 fn ci(status: &Status, rows: &mut Vec<String>) {
-    let ci = &status.ci;
-    if !ci.repos.is_empty() || ci.error.is_some() {
-        let (fleet, pulls) = ci.summary_lines(status.now);
-        rows.push(format!("ci: {fleet}"));
-        rows.extend(pulls.map(|pulls| format!("  {pulls}")));
+    if status.ci.shown() {
+        rows.push(format!("ci: {}", status.ci.summary(status.now)));
     }
 }
 

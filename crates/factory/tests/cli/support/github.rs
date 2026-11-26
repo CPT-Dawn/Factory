@@ -82,6 +82,7 @@ impl FakeGitHub {
         github.runners(&[]);
         github.workflow_runs("queued", &[]);
         github.workflow_runs("in_progress", &[]);
+        github.created_runs(&[]);
         github.pulls(&[]);
         github.put("no-jobs.json", &json!({"total_count": 0, "jobs": []}));
         sandbox.fake("gh", &script(&github.dir));
@@ -111,6 +112,19 @@ impl FakeGitHub {
             .collect();
         self.put(
             &format!("runs-{status}.json"),
+            &json!({"total_count": runs.len(), "workflow_runs": runs}),
+        );
+    }
+
+    /// Sets the ids of the repo's workflow runs created since the time a read asks about,
+    /// whatever their status.
+    pub fn created_runs(&self, ids: &[u64]) {
+        let runs: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({"id": id, "status": "completed", "name": "CI"}))
+            .collect();
+        self.put(
+            "runs-created.json",
             &json!({"total_count": runs.len(), "workflow_runs": runs}),
         );
     }
@@ -334,6 +348,7 @@ api)
     repos/acme/shop/actions/runners\?*) file="$G/runners.json" ;;
     repos/acme/shop/actions/runs\?status=queued*) file="$G/runs-queued.json" ;;
     repos/acme/shop/actions/runs\?status=in_progress*) file="$G/runs-in_progress.json" ;;
+    repos/acme/shop/actions/runs\?created=*) file="$G/runs-created.json" ;;
     repos/acme/shop/actions/runs/*/jobs*)
         id="${{path#repos/acme/shop/actions/runs/}}"; id="${{id%%/*}}"
         file="$G/jobs-$id.json"; [ -f "$file" ] || file="$G/no-jobs.json" ;;

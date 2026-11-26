@@ -23,6 +23,10 @@ pub struct Ci {
     pub error: Option<String>,
     /// In the config's order.
     pub repos: Vec<RepoCi>,
+    /// When the watcher reads next, in milliseconds since the epoch; none while nothing needs
+    /// watching, when only a `factory wait ci` on a watched repo wakes it.
+    #[serde(default)]
+    pub next: Option<i64>,
 }
 
 /// One repo's CI, as its last good answer showed it.
@@ -40,6 +44,9 @@ pub struct RepoCi {
     pub jobs: Vec<Job>,
     /// The open pull requests from `factory/*` branches.
     pub pulls: Vec<Pull>,
+    /// The latest completed jobs, newest first, with the times the database keeps.
+    #[serde(default)]
+    pub finished: Vec<Job>,
 }
 
 /// One self-hosted runner.
@@ -65,6 +72,15 @@ impl RunnerState {
             ("online", true) => RunnerState::Busy,
             ("online", false) => RunnerState::Idle,
             _ => RunnerState::Offline,
+        }
+    }
+
+    /// GitHub's `status` and `busy` for this state: [`RunnerState::of`] reversed.
+    pub fn github(self) -> (&'static str, bool) {
+        match self {
+            RunnerState::Busy => ("online", true),
+            RunnerState::Idle => ("online", false),
+            RunnerState::Offline => ("offline", false),
         }
     }
 }
@@ -138,6 +154,14 @@ impl PullState {
             PullState::Pending => "pending",
         }
     }
+
+    /// The state [`PullState::word`] names; pending for a word it never gives.
+    pub fn parse(word: &str) -> PullState {
+        [PullState::Passing, PullState::Failing]
+            .into_iter()
+            .find(|state| state.word() == word)
+            .unwrap_or(PullState::Pending)
+    }
 }
 
 /// Whether `branch` is one the factory works on.
@@ -197,6 +221,32 @@ pub enum Mark {
     Passing,
 }
 
+impl Tally {
+    /// `2/7 busy, 1 offline, 2 missing`.
+    pub fn runners_text(&self) -> String {
+        let mut text = format!("{}/{} busy", self.busy, self.total);
+        if self.offline > 0 {
+            text.push_str(&format!(", {} offline", self.offline));
+        }
+        if self.missing > 0 {
+            text.push_str(&format!(", {} missing", self.missing));
+        }
+        text
+    }
+
+    /// `3 queued, oldest 12m` at `now`, or `none queued`.
+    pub fn queue_text(&self, now: i64) -> String {
+        match (self.queued, self.oldest) {
+            (0, _) => "none queued".to_owned(),
+            (queued, Some(oldest)) => format!(
+                "{queued} queued, oldest {}",
+                crate::lab::ago(now / 1000, oldest / 1000)
+            ),
+            (queued, None) => format!("{queued} queued"),
+        }
+    }
+}
+
 impl Ci {
     /// Whether any repo has answered.
     pub fn answered(&self) -> bool {
@@ -239,69 +289,49 @@ impl Ci {
         (!why.is_empty()).then(|| why.join("; "))
     }
 
-    /// `2/7 runners busy, 1 offline, 3 queued (oldest 12m), PRs 1 failing, 1 pending`, and how
-    /// old the numbers are while a read fails.
-    pub fn summary(&self, now: i64) -> String {
-        let (fleet, pulls) = self.summary_lines(now);
-        match pulls {
-            Some(pulls) => format!("{fleet}, {pulls}"),
-            None => fleet,
-        }
+    /// Whether the owner watches repos, or tried to: the bar's CI chip and card and the status
+    /// screen's CI row show then.
+    pub fn shown(&self) -> bool {
+        !self.repos.is_empty() || self.error.is_some()
     }
 
-    /// The summary in two: the runners and the queue, then the pull requests and how old the
-    /// numbers are; only the first before any repo answered.
-    pub fn summary_lines(&self, now: i64) -> (String, Option<String>) {
+    /// `stale 4m · PRs 1 failing, 1 pending · 2/7 busy, 1 offline · 3 queued, oldest 12m`:
+    /// how old the numbers are while a read fails, then the open factory pull requests, the
+    /// runners and the queue, the least needed last where a screen cuts it.
+    pub fn summary(&self, now: i64) -> String {
         if !self.answered() {
-            let first = match self.error() {
+            return match self.error() {
                 Some(why) => format!("unread: {why}"),
                 None => "not read yet".to_owned(),
             };
-            return (first, None);
         }
         let tally = self.tally();
-        let mut parts = vec![format!("{}/{} runners busy", tally.busy, tally.total)];
-        if tally.offline > 0 {
-            parts.push(format!("{} offline", tally.offline));
-        }
-        if tally.missing > 0 {
-            parts.push(format!("{} missing", tally.missing));
-        }
-        parts.push(match (tally.queued, tally.oldest) {
-            (0, _) => "none queued".to_owned(),
-            (queued, Some(oldest)) => {
-                format!(
-                    "{queued} queued (oldest {})",
-                    crate::lab::ago(now / 1000, oldest / 1000)
-                )
-            }
-            (queued, None) => format!("{queued} queued"),
-        });
-        let fleet = parts.join(", ");
         let mut parts = Vec::new();
-        let pulls: usize = self.repos.iter().map(|repo| repo.pulls.len()).sum();
-        let passing = pulls - tally.failing - tally.pending;
-        let states: Vec<String> = [
-            (tally.failing, "failing"),
-            (tally.pending, "pending"),
-            (passing, "passing"),
-        ]
-        .into_iter()
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, word)| format!("{count} {word}"))
-        .collect();
-        parts.push(if states.is_empty() {
-            "no open PRs".to_owned()
-        } else {
-            format!("PRs {}", states.join(", "))
-        });
         if let Some(since) = self.stale_since() {
             parts.push(format!(
                 "stale {}",
                 crate::lab::ago(now / 1000, since / 1000)
             ));
         }
-        (fleet, Some(parts.join(", ")))
+        let pulls: usize = self.repos.iter().map(|repo| repo.pulls.len()).sum();
+        let passing = pulls - tally.failing - tally.pending;
+        let states: Vec<String> = [
+            (tally.failing, PullState::Failing),
+            (tally.pending, PullState::Pending),
+            (passing, PullState::Passing),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, state)| format!("{count} {}", state.word()))
+        .collect();
+        parts.push(if states.is_empty() {
+            "no open PRs".to_owned()
+        } else {
+            format!("PRs {}", states.join(", "))
+        });
+        parts.push(tally.runners_text());
+        parts.push(tally.queue_text(now));
+        parts.join(" · ")
     }
 
     pub fn tally(&self) -> Tally {

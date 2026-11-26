@@ -2,17 +2,11 @@
 //! and running jobs and its open `factory/*` pull requests' checks, against a fake GitHub behind
 //! the fake `gh`, and only while something needs watching.
 
-use std::thread;
-use std::time::Duration;
-
 use serde_json::{Value, json};
 
 use crate::support::github::{FORBIDDEN, FakeGitHub, Job, RATE_LIMITED, TIMED_OUT};
 use crate::support::world::poll_until;
 use crate::support::{Sandbox, stop_daemon};
-
-/// Longer than the watcher's tick, so a read it would make has been made.
-const SETTLE: Duration = Duration::from_secs(3);
 
 /// A sandbox whose config watches acme/shop's CI, with `expected` runners, on a clock a test
 /// moves with [`move_clock`].
@@ -106,6 +100,43 @@ fn pull_reads(github: &FakeGitHub, sandbox: &Sandbox) -> usize {
         .count()
 }
 
+/// What `factory status --json` shows of the CI once the watcher has read acme/shop and found
+/// nothing left to watch: it reads next when nothing is due, only when a wait wakes it.
+fn idle(sandbox: &Sandbox) -> Value {
+    let mut ci = Value::Null;
+    assert!(
+        poll_until(|| {
+            ci = status(sandbox)["ci"].clone();
+            !ci["repos"][0]["seen"].is_null() && ci["next"].is_null()
+        }),
+        "never idle: {ci}"
+    );
+    ci
+}
+
+/// Waits until the watcher has read acme/shop and set when it reads next.
+fn awaits_next_read(sandbox: &Sandbox) -> Value {
+    let mut ci = Value::Null;
+    assert!(
+        poll_until(|| {
+            ci = status(sandbox)["ci"].clone();
+            !ci["next"].is_null()
+        }),
+        "no next read: {ci}"
+    );
+    ci
+}
+
+/// The watcher's reads of acme/shop's runners that sent the ETag of the last answer.
+fn conditional_runner_reads(sandbox: &Sandbox) -> usize {
+    sandbox
+        .calls("gh")
+        .iter()
+        .filter(|call| call.iter().any(|arg| arg.contains("/actions/runners?")))
+        .filter(|call| call.iter().any(|arg| arg.starts_with("If-None-Match: ")))
+        .count()
+}
+
 /// Waits until the watcher has listed the open pull requests `count` times.
 fn await_reads(github: &FakeGitHub, sandbox: &Sandbox, count: usize) {
     assert!(
@@ -139,18 +170,28 @@ fn bar_ci(sandbox: &Sandbox) -> (Value, Value) {
 #[test]
 fn an_idle_factory_costs_github_nothing_across_minutes_of_daemon_time() {
     let sandbox = watching(2);
-    let _github = FakeGitHub::install(&sandbox);
+    let github = FakeGitHub::install(&sandbox);
 
-    // The daemon runs, with no wait, no open factory pull request and no job.
-    assert!(status(&sandbox)["ci"]["repos"][0]["seen"].is_null());
+    // The daemon runs, with no wait, no open factory pull request and no job: no read is due.
     for minutes in [1, 3, 10] {
         move_clock(&sandbox, minutes * 60);
-        thread::sleep(SETTLE);
+        let ci = status(&sandbox)["ci"].clone();
+        assert!(ci["next"].is_null(), "{ci}");
+        assert!(ci["repos"][0]["seen"].is_null(), "{ci}");
     }
-
     assert_eq!(sandbox.calls("gh"), Vec::<Vec<String>>::new());
-    let ci = status(&sandbox)["ci"].clone();
-    assert!(ci["repos"][0]["seen"].is_null(), "{ci}");
+
+    // A wait on a pull request no longer open wakes one read, which finds nothing to watch.
+    github.checks(&[(1, "test", "completed", Some("success"))]);
+    assert_eq!(sandbox.factory(&["wait", "ci", "12"]).code, 0);
+    idle(&sandbox);
+    let reads = github.watcher_reads(&sandbox);
+    assert!(!reads.is_empty());
+    for minutes in [13, 20, 60] {
+        move_clock(&sandbox, minutes * 60);
+        assert!(status(&sandbox)["ci"]["next"].is_null());
+    }
+    assert_eq!(github.watcher_reads(&sandbox), reads);
 }
 
 #[test]
@@ -161,12 +202,25 @@ fn the_watcher_reads_each_minute_while_a_factory_pr_is_open_and_stops_once_none_
     github.checks(&[(1, "test", "completed", Some("success"))]);
 
     assert_eq!(sandbox.factory(&["wait", "ci", "12"]).code, 0);
-    await_reads(&github, &sandbox, 1);
-    thread::sleep(SETTLE);
-    assert_eq!(pull_reads(&github, &sandbox), 1, "a minute has not passed");
+    let ci = awaits_next_read(&sandbox);
+    assert_eq!(
+        pull_reads(&github, &sandbox),
+        1,
+        "a minute has not passed: {ci}"
+    );
+    assert_eq!(
+        conditional_runner_reads(&sandbox),
+        0,
+        "nothing to send back yet"
+    );
 
     move_clock(&sandbox, 61);
     await_reads(&github, &sandbox, 2);
+    assert_eq!(
+        conditional_runner_reads(&sandbox),
+        1,
+        "the second read sends back the first answer's ETag"
+    );
 
     // A restarted daemon resumes the watch from what it kept, with no wait to wake it.
     stop_daemon(&sandbox);
@@ -176,9 +230,10 @@ fn the_watcher_reads_each_minute_while_a_factory_pr_is_open_and_stops_once_none_
     assert_eq!(shop(&sandbox)["pulls"], json!([]));
 
     // Nothing is left to watch.
+    idle(&sandbox);
     for minutes in [3, 10] {
         move_clock(&sandbox, minutes * 60);
-        thread::sleep(SETTLE);
+        assert!(status(&sandbox)["ci"]["next"].is_null());
     }
     assert_eq!(pull_reads(&github, &sandbox), 3);
 }
@@ -215,9 +270,12 @@ fn each_jobs_queued_started_and_finished_times_are_stored() {
     let (chip, card) = bar_ci(&sandbox);
     assert_eq!(chip["text"], "busy", "{chip}");
     let row = &card["rows"][1];
-    assert_eq!(row["label"], "queued", "{card}");
+    assert_eq!(row["label"], "queue", "{card}");
     assert!(
-        row["text"].as_str().unwrap().starts_with("1 job, oldest "),
+        row["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("1 queued, oldest "),
         "{card}"
     );
 
@@ -246,36 +304,68 @@ fn each_jobs_queued_started_and_finished_times_are_stored() {
     );
     move_clock(&sandbox, 122);
     await_reads(&github, &sandbox, 3);
-    assert_eq!(status(&sandbox)["ci"]["repos"][0]["jobs"], json!([]));
+    let finished = json!([{
+        "id": 70, "run_id": 7, "name": "test", "status": "completed", "conclusion": "success",
+        "runner": "ci-1", "queued": 1_767_261_600_000_i64, "started": 1_767_261_720_000_i64,
+        "finished": 1_767_262_020_000_i64,
+    }]);
+    let shop = status(&sandbox)["ci"]["repos"][0].clone();
+    assert_eq!(shop["jobs"], json!([]), "{shop}");
+    assert_eq!(shop["finished"], finished, "{shop}");
 
-    let db = rusqlite::Connection::open(sandbox.path("state/factory/factory.db")).unwrap();
-    let stored: (i64, i64, i64, String, String, String) = db
-        .query_row(
-            "SELECT queued_ms, started_ms, finished_ms, runner, status, conclusion
-             FROM ci_job WHERE repo = 'acme/shop' AND id = 70",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
-        )
-        .unwrap();
+    // The times are kept across a restart.
+    stop_daemon(&sandbox);
+    assert_eq!(status(&sandbox)["ci"]["repos"][0]["finished"], finished);
+}
+
+#[test]
+fn a_run_that_queued_and_completed_between_two_reads_keeps_its_jobs_times() {
+    let sandbox = watching(2);
+    let github = FakeGitHub::install(&sandbox);
+    github.pulls(&[(12, "factory/s1-t2")]);
+    github.checks(&[(1, "test", "completed", Some("success"))]);
+    assert_eq!(sandbox.factory(&["wait", "ci", "12"]).code, 0);
+    awaits_next_read(&sandbox);
+
+    // Never queued nor in progress at a read: only the runs created since the last one name it.
+    github.created_runs(&[8]);
+    github.jobs(
+        8,
+        &[Job {
+            id: 80,
+            name: "lint",
+            status: "completed",
+            conclusion: Some("failure"),
+            created: "2026-01-01T10:00:00Z",
+            started: Some("2026-01-01T10:00:30Z"),
+            completed: Some("2026-01-01T10:01:00Z"),
+            runner: Some("ci-2"),
+        }],
+    );
+    move_clock(&sandbox, 61);
+    let mut shop = Value::Null;
+    assert!(
+        poll_until(|| {
+            shop = status(&sandbox)["ci"]["repos"][0].clone();
+            shop["finished"] != json!([])
+        }),
+        "never read: {shop}"
+    );
+    assert!(
+        github
+            .watcher_reads(&sandbox)
+            .iter()
+            .any(|path| path.contains("/actions/runs?created=%3E%3D")),
+        "asked for the runs created since"
+    );
     assert_eq!(
-        stored,
-        (
-            1_767_261_600_000,
-            1_767_261_720_000,
-            1_767_262_020_000,
-            "ci-1".to_owned(),
-            "completed".to_owned(),
-            "success".to_owned()
-        )
+        shop["finished"],
+        json!([{
+            "id": 80, "run_id": 8, "name": "lint", "status": "completed",
+            "conclusion": "failure", "runner": "ci-2", "queued": 1_767_261_600_000_i64,
+            "started": 1_767_261_630_000_i64, "finished": 1_767_261_660_000_i64,
+        }]),
+        "{shop}"
     );
 }
 
@@ -296,7 +386,7 @@ fn the_card_counts_busy_runners_against_the_expected_and_links_each_factory_pr()
     assert_eq!(card["title"], "CI");
     assert_eq!(card["rows"][0]["kind"], "meter", "{card}");
     assert_eq!(card["rows"][0]["text"], "1/4 busy, 2 missing", "{card}");
-    assert_eq!(card["rows"][1]["text"], "none", "{card}");
+    assert_eq!(card["rows"][1]["text"], "none queued", "{card}");
     assert_eq!(
         card["rows"][2],
         json!({
@@ -330,7 +420,12 @@ fn stale_after(body: &str, why: &str) {
         }),
         "the failure never showed: {seen}"
     );
-    assert!(seen["error"].as_str().unwrap().contains(why), "{seen}");
+    let error = seen["error"].as_str().unwrap();
+    assert!(error.contains(why), "{seen}");
+    assert!(
+        error.contains("gh auth status"),
+        "names a next step: {seen}"
+    );
     assert_eq!(seen["seen"], good["seen"]);
     assert_eq!(seen["runners"], good["runners"], "never no runners");
     assert_eq!(seen["pulls"], good["pulls"]);

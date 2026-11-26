@@ -1,5 +1,6 @@
 //! GitHub issues, pull requests and their checks, through `gh`.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -483,17 +484,105 @@ pub trait Actions: Send + Sync + 'static {
     fn runners(&self, repo: &str) -> Result<Vec<Runner>, GhError>;
     /// The ids of the workflow runs queued or in progress.
     fn active_runs(&self, repo: &str) -> Result<Vec<u64>, GhError>;
+    /// The ids of the workflow runs created at or after `since` (milliseconds since the
+    /// epoch), whatever their status: a run that queued and completed between two reads.
+    fn runs_since(&self, repo: &str, since: i64) -> Result<Vec<u64>, GhError>;
     /// The latest attempt's jobs of the workflow run `run`.
     fn jobs(&self, repo: &str, run: u64) -> Result<Vec<Job>, GhError>;
     fn open_pulls(&self, repo: &str) -> Result<Vec<OpenPull>, GhError>;
     /// The check runs and commit statuses on the pull request's head.
     fn checks(&self, repo: &str, pull: &OpenPull) -> Result<Vec<CheckRun>, GhError>;
+    /// Called after each round of reads: forgets what that round didn't read again.
+    fn sweep(&self) {}
 }
 
-impl Actions for Gh {
+/// The Actions API through gh, each read conditional: it sends back the ETag of the last
+/// answer to the same path, and GitHub answers an unchanged one with a `304 Not Modified`
+/// that costs no rate limit.
+#[derive(Default)]
+pub struct GhActions {
+    lists: Cache<Vec<Value>>,
+    pages: Cache<Value>,
+    checks: Cache<Vec<CheckRun>>,
+}
+
+/// The last answer to each path, with its ETag.
+struct Cache<T> {
+    entries: Mutex<HashMap<String, Cached<T>>>,
+}
+
+struct Cached<T> {
+    etag: String,
+    value: T,
+    /// Read since the last sweep.
+    used: bool,
+}
+
+impl<T> Default for Cache<T> {
+    fn default() -> Self {
+        Cache {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<T: Clone> Cache<T> {
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<String, Cached<T>>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `fetch` called with the ETag of the last answer at `path`; a 304 answers that again.
+    fn read(
+        &self,
+        path: &str,
+        fetch: impl FnOnce(Option<&str>) -> Result<Fetched<T>, GhError>,
+    ) -> Result<T, GhError> {
+        let etag = self.entries().get(path).map(|cached| cached.etag.clone());
+        match fetch(etag.as_deref())? {
+            Fetched::Fresh {
+                etag: Some(etag),
+                value,
+            } => {
+                let cached = Cached {
+                    etag,
+                    value: value.clone(),
+                    used: true,
+                };
+                self.entries().insert(path.to_owned(), cached);
+                Ok(value)
+            }
+            Fetched::Fresh { etag: None, value } => {
+                self.entries().remove(path);
+                Ok(value)
+            }
+            Fetched::NotModified => self
+                .entries()
+                .get_mut(path)
+                .map(|cached| {
+                    cached.used = true;
+                    cached.value.clone()
+                })
+                .ok_or_else(|| {
+                    GhError(format!(
+                        "GitHub answered {path} 304 Not Modified to a read without an ETag; retry"
+                    ))
+                }),
+        }
+    }
+
+    fn sweep(&self) {
+        self.entries()
+            .retain(|_, cached| std::mem::take(&mut cached.used));
+    }
+}
+
+impl Actions for GhActions {
     fn runners(&self, repo: &str) -> Result<Vec<Runner>, GhError> {
         let path = format!("repos/{repo}/actions/runners?per_page={PAGE}");
-        Ok(fresh_list(self.paged(HOST, &path, "runners", None)?)
+        Ok(self
+            .list(&path, "runners")?
             .iter()
             .filter_map(runner)
             .collect())
@@ -503,17 +592,26 @@ impl Actions for Gh {
         let mut ids = Vec::new();
         for status in ["queued", "in_progress"] {
             let path = format!("repos/{repo}/actions/runs?status={status}&per_page={PAGE}");
-            let runs = fresh_list(self.paged(HOST, &path, "workflow_runs", None)?);
-            ids.extend(runs.iter().filter_map(|run| run["id"].as_u64()));
+            ids.extend(self.run_ids(&path)?);
         }
         ids.sort_unstable();
         ids.dedup();
         Ok(ids)
     }
 
+    fn runs_since(&self, repo: &str, since: i64) -> Result<Vec<u64>, GhError> {
+        let since = Timestamp::from_unix_millis(since - since.rem_euclid(1000))
+            .to_string()
+            .replace(".000Z", "Z");
+        // created=>=<time>, its operator escaped for the URL.
+        let path = format!("repos/{repo}/actions/runs?created=%3E%3D{since}&per_page={PAGE}");
+        self.run_ids(&path)
+    }
+
     fn jobs(&self, repo: &str, run: u64) -> Result<Vec<Job>, GhError> {
         let path = format!("repos/{repo}/actions/runs/{run}/jobs?filter=latest&per_page={PAGE}");
-        Ok(fresh_list(self.paged(HOST, &path, "jobs", None)?)
+        Ok(self
+            .list(&path, "jobs")?
             .iter()
             .filter_map(|value| job(value, run))
             .collect())
@@ -523,10 +621,10 @@ impl Actions for Gh {
         let mut pulls = Vec::new();
         for number in 1.. {
             let path = format!("repos/{repo}/pulls?state=open&per_page={PAGE}&page={number}");
-            let page = match self.conditional(HOST, &path, None)? {
-                Fetched::Fresh { value, .. } => value.as_array().cloned().unwrap_or_default(),
-                Fetched::NotModified => Vec::new(),
-            };
+            let page = self
+                .pages
+                .read(&path, |etag| Gh.conditional(HOST, &path, etag))?;
+            let page = page.as_array().cloned().unwrap_or_default();
             pulls.extend(page.iter().filter_map(open_pull));
             if page.len() < PAGE {
                 break;
@@ -536,26 +634,50 @@ impl Actions for Gh {
     }
 
     fn checks(&self, repo: &str, pull: &OpenPull) -> Result<Vec<CheckRun>, GhError> {
-        let (owner, name) = repo
-            .split_once('/')
-            .ok_or_else(|| GhError(format!("{repo:?} is not owner/name")))?;
+        let (owner, name) = repo.split_once('/').ok_or_else(|| {
+            GhError(format!(
+                "{repo:?} is not owner/name; fix [ci] repos in the config"
+            ))
+        })?;
         let pr = PullRequest {
             host: HOST.to_owned(),
             owner: owner.to_owned(),
             repo: name.to_owned(),
             number: pull.number,
         };
-        let mut runs = fresh_list(self.check_runs(&pr, &pull.head, None)?);
-        runs.extend(fresh_list(self.statuses(&pr, &pull.head, None)?));
+        let head = &pull.head;
+        let mut runs = self
+            .checks
+            .read(&format!("{repo}@{head}/check-runs"), |etag| {
+                Gh.check_runs(&pr, head, etag)
+            })?;
+        runs.extend(self.checks.read(&format!("{repo}@{head}/status"), |etag| {
+            Gh.statuses(&pr, head, etag)
+        })?);
         Ok(runs)
+    }
+
+    fn sweep(&self) {
+        self.lists.sweep();
+        self.pages.sweep();
+        self.checks.sweep();
     }
 }
 
-/// What a read sent without an ETag answered: a 304 can't come back, and counts as nothing.
-fn fresh_list<T>(fetched: Fetched<Vec<T>>) -> Vec<T> {
-    match fetched {
-        Fetched::Fresh { value, .. } => value,
-        Fetched::NotModified => Vec::new(),
+impl GhActions {
+    /// Every entry of the paged list `list` at `path`.
+    fn list(&self, path: &str, list: &str) -> Result<Vec<Value>, GhError> {
+        self.lists
+            .read(path, |etag| Gh.paged(HOST, path, list, etag))
+    }
+
+    /// The ids of the workflow runs a `workflow_runs` list at `path` holds.
+    fn run_ids(&self, path: &str) -> Result<Vec<u64>, GhError> {
+        Ok(self
+            .list(path, "workflow_runs")?
+            .iter()
+            .filter_map(|run| run["id"].as_u64())
+            .collect())
     }
 }
 
@@ -656,6 +778,16 @@ impl Actions for FakeActions {
             .runs
             .iter()
             .filter(|(_, jobs)| jobs.iter().any(|job| !job.completed()))
+            .map(|(id, _)| *id)
+            .collect())
+    }
+
+    fn runs_since(&self, _repo: &str, since: i64) -> Result<Vec<u64>, GhError> {
+        Ok(self
+            .read()?
+            .runs
+            .iter()
+            .filter(|(_, jobs)| jobs.iter().any(|job| job.queued >= Some(since)))
             .map(|(id, _)| *id)
             .collect())
     }
