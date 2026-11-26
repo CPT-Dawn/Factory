@@ -11,6 +11,7 @@ mod config;
 mod cutover;
 mod daemon;
 mod fleet;
+mod history;
 mod hook;
 mod install;
 mod lab;
@@ -113,6 +114,9 @@ fn run(command: Command, json: bool) -> ExitCode {
         Command::Quota {
             command: QuotaCommand::Claude,
         } => claude::quota(),
+        Command::Quota {
+            command: QuotaCommand::History { since },
+        } => history::run(since.as_deref(), json),
         Command::Quota {
             command: QuotaCommand::Agy,
         } => agy::quota(json),

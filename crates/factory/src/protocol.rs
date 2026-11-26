@@ -61,6 +61,8 @@ pub const CLAUDE_WINDOW: &str = "claude.window";
 pub const CLAUDE_LIMIT: &str = "claude.limit";
 /// Whether a lead may dispatch now: [`ClaudeQuotaParams`] in, [`ClaudeVerdict`] out.
 pub const CLAUDE_QUOTA: &str = "claude.quota";
+/// The usage-window history, oldest first: [`HistoryParams`] in, [`HistoryRows`] out.
+pub const QUOTA_HISTORY: &str = "quota.history";
 /// agy's quota groups and their windows, from the keeper's reading of its usage query: no
 /// params in, [`factory_core::status::Agy`] out. It waits for a query that is under way.
 pub const AGY_QUOTA: &str = "agy.quota";
@@ -145,6 +147,18 @@ pub struct StatusParams {
     /// The config's mark for holding Claude dispatches, in percent of either window.
     #[serde(default = "hold_at_default")]
     pub claude_hold_at: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HistoryParams {
+    /// The oldest reading wanted, in milliseconds since the epoch; none asks for all.
+    #[serde(default)]
+    pub since: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HistoryRows {
+    pub rows: Vec<factory_core::history::HistoryRow>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
