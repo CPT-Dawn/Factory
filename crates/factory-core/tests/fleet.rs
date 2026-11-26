@@ -102,6 +102,7 @@ fn snapshot(ci: Ci) -> Snapshot {
         waits: Vec::new(),
         leads: no_leads(),
         ci,
+        lab: Default::default(),
     }
 }
 
@@ -206,9 +207,17 @@ fn the_chip_is_a_cross_while_any_factory_pr_fails_and_a_tick_once_all_pass() {
     let mut passing = shop();
     passing.pulls = vec![pull(12, PullState::Passing)];
     let snapshot = snapshot(ci(passing));
-    let chip = serde_json::to_value(&bar::feed(&snapshot).glance[2]).unwrap_or(Value::Null);
+    let chip = find(
+        &serde_json::to_value(bar::feed(&snapshot)).unwrap_or(Value::Null),
+        "glance",
+        "ci",
+    )
+    .clone();
     assert_eq!((&chip["text"], &chip["tone"]), (&json!("✓"), &json!("ok")));
-    assert_eq!(bar::line(&snapshot), "claude ?/? · 0 leads · CI ✓");
+    assert_eq!(
+        bar::line(&snapshot),
+        "claude ?/? · 0 leads · lab 0/0 · CI ✓"
+    );
 }
 
 #[test]
@@ -217,7 +226,7 @@ fn without_watched_repos_the_bar_has_no_ci_chip_card_or_line_mark() {
     let feed = bar::feed(&snapshot);
     assert!(feed.glance.iter().all(|chip| chip.id != "ci"));
     assert!(feed.sections.iter().all(|section| section.id != "ci"));
-    assert_eq!(bar::line(&snapshot), "claude ?/? · 0 leads");
+    assert_eq!(bar::line(&snapshot), "claude ?/? · 0 leads · lab 0/0");
 }
 
 #[test]

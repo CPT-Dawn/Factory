@@ -354,3 +354,13 @@ pub fn lines_of(path: &Path) -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
+
+/// Sets its flag when dropped, as a test unwinds too: a scoped helper thread that loops until
+/// the flag is set always stops, whatever ended the test's own part.
+pub struct SetOnDrop<'a>(pub &'a std::sync::atomic::AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}

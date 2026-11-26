@@ -67,6 +67,7 @@ pub fn snapshot(
     steward: &Steward,
     quotas: &QuotaKeeper,
     fleet: &Fleet,
+    lab: bar::lab::Lab,
 ) -> Snapshot {
     Snapshot {
         now: clock::now().unix_millis(),
@@ -74,5 +75,6 @@ pub fn snapshot(
         waits: leads.registered(),
         leads: status::leads_seen(leads, steward),
         ci: fleet.snapshot(),
+        lab,
     }
 }

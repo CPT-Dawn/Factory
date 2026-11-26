@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod lab;
+
 use crate::fleet::{Ci, Mark, PullState};
 use crate::status::{self, ClaudeState};
 use crate::timestamp::Timestamp;
@@ -28,6 +30,9 @@ pub struct Snapshot {
     /// The watched repos' CI; none configured shows no CI chip or section.
     #[serde(default)]
     pub ci: crate::fleet::Ci,
+    /// The lab as the daemon last checked it.
+    #[serde(default)]
+    pub lab: lab::Lab,
 }
 
 /// A cockpit v1 document.
@@ -163,6 +168,7 @@ pub fn feed(snapshot: &Snapshot) -> Feed {
         glance: [
             Some(claude_chip(snapshot)),
             Some(factory_chip(snapshot)),
+            Some(lab::chip(&snapshot.lab)),
             ci_chip(snapshot),
         ]
         .into_iter()
@@ -171,6 +177,7 @@ pub fn feed(snapshot: &Snapshot) -> Feed {
         sections: [
             Some(claude_section(snapshot)),
             Some(factory_section(snapshot)),
+            Some(lab::section(&snapshot.lab)),
             ci_section(snapshot),
         ]
         .into_iter()
@@ -300,8 +307,9 @@ pub fn daemon_down(reason: &str, now: i64) -> Feed {
     }
 }
 
-/// `claude 12/40 · 2 leads · CI ✓`: each window's share (5-hour/weekly, `?` while unknown),
-/// the live leads (`? leads` while herdr can't tell), then CI's mark when repos are watched.
+/// `claude 12/40 · 2 leads · lab 2/2 · CI ✓`: each window's share (5-hour/weekly, `?` while
+/// unknown), the live leads (`? leads` while herdr can't tell), the phones ready out of
+/// plugged in, then CI's mark when repos are watched.
 pub fn line(snapshot: &Snapshot) -> String {
     let claude = &snapshot.claude;
     let share = |kind| {
@@ -323,9 +331,10 @@ pub fn line(snapshot: &Snapshot) -> String {
         String::new()
     };
     format!(
-        "claude {}/{} · {leads}{ci}",
+        "claude {}/{} · {leads} · {}{ci}",
         share(WindowKind::FiveHour),
         share(WindowKind::Weekly),
+        lab::line(&snapshot.lab),
     )
 }
 

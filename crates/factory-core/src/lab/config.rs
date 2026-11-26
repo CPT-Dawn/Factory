@@ -52,7 +52,7 @@ pub struct MachineConfig {
     pub device_idle_min: f64,
     /// Post a desktop notification when a phone's readiness changes.
     pub notify: bool,
-    /// Seconds between two probes of every attached phone's readiness.
+    /// Seconds between two probes of each free phone's readiness: two minutes (#72).
     pub readiness_check_sec: f64,
 }
 
@@ -77,7 +77,7 @@ impl Default for MachineConfig {
             stack_idle_min: 45.0,
             device_idle_min: 10.0,
             notify: true,
-            readiness_check_sec: 60.0,
+            readiness_check_sec: 120.0,
         }
     }
 }
@@ -584,7 +584,7 @@ mod tests {
     fn notifications_are_on_and_phones_probed_every_minute_unless_the_config_says_otherwise() {
         let cfg = machine_config("m", "{}").unwrap();
         assert!(cfg.notify);
-        assert_eq!(cfg.readiness_check_sec, 60.0);
+        assert_eq!(cfg.readiness_check_sec, 120.0);
         let cfg = machine_config("m", r#"{"notify":false,"readinessCheckSec":0.5}"#).unwrap();
         assert!(!cfg.notify);
         assert_eq!(cfg.readiness_check_sec, 0.5);

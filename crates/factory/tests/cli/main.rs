@@ -10,6 +10,9 @@ mod agy;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
 mod bar;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
+mod bar_lab;
 mod ci;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
