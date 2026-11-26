@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use factory_core::claude::{ClaudeQuota, Limit};
+use factory_core::history::{self, HistoryRow};
 use factory_core::quota::Quota;
 use factory_core::timestamp::Timestamp;
 use factory_core::usage::{UsageWindow, WindowKind};
@@ -121,6 +122,8 @@ impl Store {
                  seen_ms INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS usage_history_seen ON usage_history (seen_ms);
+             CREATE INDEX IF NOT EXISTS usage_history_key
+                 ON usage_history (harness, quota_group, window, id);
              CREATE TABLE IF NOT EXISTS ci_runner (
                  repo TEXT NOT NULL,
                  id INTEGER NOT NULL,
@@ -294,6 +297,85 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+}
+
+impl Store {
+    /// Appends `row` to the usage history unless it is the reading its harness, group and
+    /// window last had: the latest row of that key stands for it. Whether it appended.
+    pub fn append_history(&self, row: &HistoryRow) -> rusqlite::Result<bool> {
+        let last = self
+            .db
+            .query_row(
+                "SELECT used_percent, resets_ms, seen_ms FROM usage_history
+                 WHERE harness = ?1 AND quota_group IS ?2 AND window = ?3
+                 ORDER BY id DESC LIMIT 1",
+                params![row.harness, row.group, history::window_key(row.window)],
+                |last| {
+                    Ok(HistoryRow {
+                        used_percent: last.get::<_, Option<f64>>(0)?.unwrap_or(f64::NAN),
+                        resets: last.get::<_, Option<i64>>(1)?.unwrap_or(i64::MIN),
+                        seen: last.get(2)?,
+                        ..row.clone()
+                    })
+                },
+            )
+            .optional()?;
+        if !row.adds_to(last.as_ref()) {
+            return Ok(false);
+        }
+        self.db.execute(
+            "INSERT INTO usage_history (harness, quota_group, window, used_percent, resets_ms, seen_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                row.harness,
+                row.group,
+                history::window_key(row.window),
+                row.used_percent,
+                row.resets,
+                row.seen
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// The usage history from `since` (in milliseconds since the epoch) on, oldest first.
+    pub fn usage_history(&self, since: Option<i64>) -> rusqlite::Result<Vec<HistoryRow>> {
+        let mut rows = self.db.prepare(
+            "SELECT harness, quota_group, window, used_percent, resets_ms, seen_ms
+             FROM usage_history WHERE seen_ms >= ?1 ORDER BY seen_ms, id",
+        )?;
+        let rows = rows.query_map(params![since.unwrap_or(i64::MIN)], |row| {
+            let window: String = row.get(2)?;
+            Ok((
+                window,
+                HistoryRow {
+                    harness: row.get(0)?,
+                    group: row.get(1)?,
+                    window: WindowKind::FiveHour,
+                    used_percent: row.get::<_, Option<f64>>(3)?.unwrap_or(f64::NAN),
+                    resets: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    seen: row.get(5)?,
+                },
+            ))
+        })?;
+        // A row of a window this factory doesn't know (a newer one wrote it) is left out.
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(window, row)| {
+                history::window_of(&window).map(|window| HistoryRow { window, ..row })
+            })
+            .collect())
+    }
+
+    /// Drops the usage history seen before `before` (in milliseconds since the epoch); how many
+    /// rows went.
+    pub fn prune_history(&self, before: i64) -> rusqlite::Result<usize> {
+        self.db.execute(
+            "DELETE FROM usage_history WHERE seen_ms < ?1",
+            params![before],
+        )
     }
 }
 

@@ -40,3 +40,9 @@ The statusline is the only documented signal that gives both the share spent and
 glowline pipes the JSON it reads to `factory hook statusline` and draws the line itself.
 
 implement-spec runs `factory quota claude` before each dispatch. On exit 75 it runs `factory wait claude` until that exits 0, then dispatches.
+
+## Usage history
+
+Every reading the quota keeper stores is also kept in the `usage_history` table when it differs from the window's last row (harness, quota group, window, share used, reset, time seen); a reading that only came later adds nothing. Rows are kept 90 days: the keeper prunes when it starts and, from then on, whenever a reading arrives or the history is read and a day has passed since the last prune. A harness whose readings go through `QuotaKeeper::remember` is covered with no code of its own.
+
+`factory quota history [--since <time>]` reads it, oldest first. `--since` takes a UTC time (`2026-11-20T00:00:00Z`), a date (`2026-11-20`) or an age (`6h`, `7d`). `--json` prints `{"rows": [{"harness", "group", "window", "used_percent", "resets", "seen"}, …]}`, times in milliseconds since the epoch. Without it, a few rows print on the one line, and more are written to `quota-history.json` in the state dir, which the line names.

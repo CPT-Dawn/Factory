@@ -24,6 +24,9 @@ mod devlab_golden;
 mod durations;
 mod harness;
 mod help;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
+mod history;
 mod install;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]

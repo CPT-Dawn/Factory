@@ -79,7 +79,7 @@ pub enum Command {
         #[command(subcommand)]
         command: HookCommand,
     },
-    /// Whether a lead may dispatch on the Claude plan now: exit 0, or 75 naming the reset
+    /// The harness quotas: whether a lead may dispatch on Claude (exit 0, or 75 naming the reset), and the usage-window history
     Quota {
         #[command(subcommand)]
         command: QuotaCommand,
@@ -131,6 +131,12 @@ pub enum HookCommand {
 pub enum QuotaCommand {
     /// The Claude plan's 5-hour and weekly windows: dispatch (exit 0) or hold until the holding one resets (exit 75)
     Claude,
+    /// Every usage-window reading kept (90 days), oldest first; --json for the rows
+    History {
+        /// Only readings from this moment on: a UTC time (2026-11-20T00:00:00Z), a date (2026-11-20) or an age (6h, 7d)
+        #[arg(long, value_name = "TIME")]
+        since: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

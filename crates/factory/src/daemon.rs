@@ -45,12 +45,12 @@ use crate::paths::Paths;
 use crate::pollers::Pollers;
 use crate::protocol::{
     BAR, BarParams, CLAUDE_LIMIT, CLAUDE_QUOTA, CLAUDE_WINDOW, ClaudeLimitParams,
-    ClaudeQuotaParams, ClaudeWindowParams, ErrorBody, LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LOG,
-    LeadParams, LogParams, LogResult, MISMATCH, MONITOR_START, MONITOR_STATUS, MONITOR_STOP,
-    NotifyParams, Outcome, REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, ReviewRef, STATUS,
-    SpawnParams, StatusParams, WAIT_CI, WAIT_CLAUDE, WAIT_LEAD, WAIT_LEASE, WAIT_NOTIFY,
-    WAIT_REVIEW, WaitCiParams, WaitCiResult, WaitClaudeParams, WaitLeadParams, WaitLeaseParams,
-    WaitReviewParams,
+    ClaudeQuotaParams, ClaudeWindowParams, ErrorBody, HistoryParams, LEAD_LIST, LEAD_SPAWN,
+    LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH, MONITOR_START, MONITOR_STATUS,
+    MONITOR_STOP, NotifyParams, Outcome, QUOTA_HISTORY, REVIEW_ACQUIRE, REVIEW_QUOTA, Request,
+    Response, ReviewRef, STATUS, SpawnParams, StatusParams, WAIT_CI, WAIT_CLAUDE, WAIT_LEAD,
+    WAIT_LEASE, WAIT_NOTIFY, WAIT_REVIEW, WaitCiParams, WaitCiResult, WaitClaudeParams,
+    WaitLeadParams, WaitLeaseParams, WaitReviewParams,
 };
 use crate::quotas::QuotaKeeper;
 use crate::reviews::Reviews;
@@ -447,6 +447,10 @@ async fn respond(
             Ok(params) => answered(Ok::<_, Failure>(
                 daemon.quotas.claude_verdict(params.hold_at),
             )),
+            Err(refused) => refused,
+        },
+        QUOTA_HISTORY => match params::<HistoryParams>(QUOTA_HISTORY, request.params) {
+            Ok(params) => answered(daemon.quotas.history(&params)),
             Err(refused) => refused,
         },
         WAIT_NOTIFY => match params::<NotifyParams>(WAIT_NOTIFY, request.params) {
