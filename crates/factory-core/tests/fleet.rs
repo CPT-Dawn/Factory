@@ -99,6 +99,7 @@ fn snapshot(ci: Ci) -> Snapshot {
     Snapshot {
         now: now(),
         claude: Claude::default(),
+        codex: Default::default(),
         agy: Default::default(),
         waits: Vec::new(),
         leads: no_leads(),
@@ -217,7 +218,7 @@ fn the_chip_is_a_cross_while_any_factory_pr_fails_and_a_tick_once_all_pass() {
     assert_eq!((&chip["text"], &chip["tone"]), (&json!("✓"), &json!("ok")));
     assert_eq!(
         bar::line(&snapshot),
-        "claude ?/? · agy ?/? · 0 leads · lab 0/0 · CI ✓"
+        "claude ?/? · codex ?/? · agy ?/? · 0 leads · lab 0/0 · CI ✓"
     );
 }
 
@@ -229,7 +230,7 @@ fn without_watched_repos_the_bar_has_no_ci_chip_card_or_line_mark() {
     assert!(feed.sections.iter().all(|section| section.id != "ci"));
     assert_eq!(
         bar::line(&snapshot),
-        "claude ?/? · agy ?/? · 0 leads · lab 0/0"
+        "claude ?/? · codex ?/? · agy ?/? · 0 leads · lab 0/0"
     );
 }
 
@@ -272,6 +273,7 @@ fn the_status_screen_sums_the_ci_in_one_line() {
         lab: status::Lab::default(),
         review: Vec::new(),
         claude: Claude::default(),
+        codex: Default::default(),
         agy: Default::default(),
         waits: Vec::new(),
         leads: no_leads(),

@@ -58,11 +58,19 @@ pub fn run(json: bool) -> ExitCode {
 fn request() -> Result<(Paths, BarParams), Failure> {
     let paths = Paths::from_env()?;
     let claude_hold_at = config::claude_hold_at(&paths)?;
-    Ok((paths, BarParams { claude_hold_at }))
+    let codex = config::codex_params(&paths)?;
+    Ok((
+        paths,
+        BarParams {
+            claude_hold_at,
+            codex,
+        },
+    ))
 }
 
-/// The daemon's side: everything the bar shows, from memory, and agy's last reading (its usage
-/// is asked at most every five minutes, and never waited on for long).
+/// The daemon's side: everything the bar shows, from memory but for a Codex reading older than
+/// 5 minutes, which is asked of Codex first, and agy's last reading (its usage is asked at most
+/// every five minutes). Neither is waited on for long, and both are waited on at once.
 pub async fn snapshot(
     params: &BarParams,
     leads: &Leads,
@@ -71,10 +79,12 @@ pub async fn snapshot(
     fleet: &Fleet,
     lab: bar::lab::Lab,
 ) -> Snapshot {
+    let (codex, agy) = tokio::join!(quotas.codex(&params.codex), quotas.agy(AGY_GLANCE));
     Snapshot {
         now: clock::now().unix_millis(),
         claude: quotas.claude(params.claude_hold_at),
-        agy: quotas.agy(AGY_GLANCE).await,
+        codex,
+        agy,
         waits: leads.registered(),
         leads: status::leads_seen(leads, steward),
         ci: fleet.snapshot(),

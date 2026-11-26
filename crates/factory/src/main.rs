@@ -7,6 +7,7 @@ mod claude;
 mod cli;
 mod client;
 mod clock;
+mod codex;
 mod config;
 mod cutover;
 mod daemon;
@@ -114,6 +115,9 @@ fn run(command: Command, json: bool) -> ExitCode {
         Command::Quota {
             command: QuotaCommand::Claude,
         } => claude::quota(),
+        Command::Quota {
+            command: QuotaCommand::Codex,
+        } => codex::quota(),
         Command::Quota {
             command: QuotaCommand::History { since },
         } => history::run(since.as_deref(), json),

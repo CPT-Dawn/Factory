@@ -7,6 +7,7 @@ pub mod agy;
 pub mod bar;
 pub mod ci;
 pub mod claude;
+pub mod codex;
 pub mod cutover;
 pub mod duration;
 pub mod event;

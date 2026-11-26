@@ -1,16 +1,22 @@
 //! The quota keeper: the daemon's one owner of every harness's latest usage readings. Claude's
-//! are kept in its database so a restart forgets no hold; agy's are held in memory and asked
-//! again after a restart. Status, the bar and a dispatch's Claude hold all ask it;
-//! nothing else reads or records a quota, but agy's routing, which keeps its own 120 s look. Claude's two windows come in through `factory hook
-//! statusline`, and its limit through the `StopFailure` hook. agy's come from its usage query,
-//! which the keeper asks for itself, at most once in [`AGY_DISPLAY_FRESH_MS`]: what status, the
-//! bar and `factory quota agy` show is one reading, however often they look.
+//! and Codex's are kept in its database so a restart forgets no hold; agy's are held in memory
+//! and asked again after a restart. Status, the bar and a dispatch all ask it; nothing else
+//! reads or records a quota, but agy's routing, which keeps its own 120 s look. Claude's two
+//! windows come in through `factory hook statusline`, and its limit through the `StopFailure`
+//! hook. Codex's are asked of its `app-server`, at most once in 5 minutes, by whichever look
+//! finds the reading stale: one ask at a time, on a thread of its own, so a hung server holds up
+//! no look beyond its patience. agy's come from its usage query, which the keeper asks for
+//! itself, at most once in [`AGY_DISPLAY_FRESH_MS`]: what status, the bar and `factory quota
+//! agy` show is one reading, however often they look.
 
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use factory_adapters::codex::CodexUsage;
 use factory_adapters::reviewer::AgyUsage;
 use factory_core::claude::{ClaudeQuota, Verdict};
+use factory_core::codex::{self, CodexQuota};
 use factory_core::exit::Exit;
 use factory_core::history::{self, HistoryRow};
 use factory_core::status::Agy;
@@ -22,10 +28,14 @@ use tokio::time::Instant;
 use crate::clock;
 use crate::output::Failure;
 use crate::protocol::{
-    ClaudeLimitParams, ClaudeVerdict, ClaudeWindowParams, HistoryParams, HistoryRows,
-    WaitClaudeParams,
+    ClaudeLimitParams, ClaudeVerdict, ClaudeWindowParams, CodexParams, CodexVerdict, HistoryParams,
+    HistoryRows, WaitClaudeParams,
 };
 use crate::store::Store;
+
+/// How long a look waits for Codex's answer before it goes on with what it has. Under the
+/// client's own 10 seconds, so a slow Codex never reads as a daemon that is down.
+const PATIENCE: Duration = Duration::from_secs(8);
 
 /// How often the keeper looks whether the history is due a prune.
 const PRUNE_LOOK: Duration = Duration::from_secs(5);
@@ -57,6 +67,15 @@ pub struct QuotaKeeper {
     pruned: Mutex<Option<(Timestamp, Instant)>>,
     /// Woken when Claude's quota changes, so a waiting lead looks again.
     changed: Notify,
+    codex: Mutex<CodexQuota>,
+    codex_usage: Arc<dyn CodexUsage>,
+    /// Whether an ask of Codex is out, so a second look waits for it instead of making its own.
+    codex_asking: Mutex<bool>,
+    /// Woken when an ask of Codex ends.
+    codex_asked: Notify,
+    /// Set while the last reading could not be written: what its `unreadable` was, to put back
+    /// once a look has written it.
+    codex_unsaved: Mutex<Option<Option<String>>>,
     agy: Mutex<AgyState>,
     /// Woken when agy's usage query ends.
     agy_asked: Notify,
@@ -64,11 +83,21 @@ pub struct QuotaKeeper {
 }
 
 impl QuotaKeeper {
-    /// The keeper over `store`, asking agy's usage through `usage`.
-    pub fn open(store: Store, usage: Arc<dyn AgyUsage>) -> Result<QuotaKeeper, Failure> {
+    /// The keeper over `store`, asking Codex's usage through `codex_usage` and agy's through
+    /// `usage`.
+    pub fn open(
+        store: Store,
+        codex_usage: Arc<dyn CodexUsage>,
+        usage: Arc<dyn AgyUsage>,
+    ) -> Result<QuotaKeeper, Failure> {
         let claude = store.claude_quota().map_err(|e| {
             Failure::precondition(format!(
                 "cannot read the Claude quota: {e}; move the database aside and restart"
+            ))
+        })?;
+        let codex = store.codex_quota().map_err(|e| {
+            Failure::precondition(format!(
+                "cannot read the Codex quota: {e}; move the database aside and restart"
             ))
         })?;
         let keeper = QuotaKeeper {
@@ -76,12 +105,149 @@ impl QuotaKeeper {
             claude: Mutex::new(claude),
             pruned: Mutex::new(None),
             changed: Notify::new(),
+            codex: Mutex::new(codex),
+            codex_usage,
+            codex_asking: Mutex::new(false),
+            codex_asked: Notify::new(),
+            codex_unsaved: Mutex::new(None),
             agy: Mutex::new(AgyState::default()),
             agy_asked: Notify::new(),
             usage,
         };
         keeper.prune_if_due(clock::now())?;
         Ok(keeper)
+    }
+
+    /// Codex's quota as `factory status`, the bar and `factory quota codex` record it. A reading
+    /// older than 5 minutes is asked of Codex first, once however many look at the same time; a
+    /// failed ask counts as an ask, so a Codex that is down is not pressed again within 5 minutes.
+    pub async fn codex(self: &Arc<Self>, params: &CodexParams) -> factory_core::status::Codex {
+        self.keep_codex();
+        if self.start_codex_ask(params) {
+            self.await_codex_ask(Some(Instant::now() + PATIENCE)).await;
+        }
+        let quota = lock(&self.codex).clone();
+        let mut record = quota.record(clock::now(), params.hold_at);
+        if *lock(&self.codex_asking) && quota.asked.is_none() && record.windows.is_empty() {
+            record.unreadable = Some("it is still being asked; look again shortly".to_owned());
+        }
+        record
+    }
+
+    /// Codex's quota as it stands, asking nothing: what a dispatch lays over each pick.
+    pub fn codex_standing(&self, params: &CodexParams) -> factory_core::status::Codex {
+        self.keep_codex();
+        lock(&self.codex)
+            .clone()
+            .record(clock::now(), params.hold_at)
+    }
+
+    /// For a dispatch whose pick has just fallen to Codex, under the lock it picked with: starts
+    /// an ask when the reading is stale and none is out. Whether an ask is out, for
+    /// [`QuotaKeeper::codex_asked`] to wait on.
+    pub fn ask_codex_for_dispatch(self: &Arc<Self>, params: &CodexParams) -> bool {
+        self.start_codex_ask(params)
+    }
+
+    /// Waits for the ask that is out to end, however long that takes: an ask ends by itself,
+    /// killed at its own timeout, whoever started it. A dispatch waits for this where a look does
+    /// not, so a review never starts on a plan that a reading on its way would have held.
+    pub async fn codex_asked(&self) {
+        self.await_codex_ask(None).await;
+    }
+
+    /// Whether a review may dispatch on Codex now: `codex` with the mark it held to.
+    pub async fn codex_verdict(self: &Arc<Self>, params: &CodexParams) -> CodexVerdict {
+        CodexVerdict {
+            codex: self.codex(params).await,
+            hold_at: params.hold_at,
+        }
+    }
+
+    /// Starts an ask of Codex when the reading is stale and none is out. Whether a look should
+    /// wait for the ask that is out.
+    fn start_codex_ask(self: &Arc<Self>, params: &CodexParams) -> bool {
+        let mut asking = lock(&self.codex_asking);
+        if !lock(&self.codex).stale(clock::now()) {
+            return false;
+        }
+        if !*asking {
+            *asking = true;
+            let keeper = Arc::clone(self);
+            let timeout = Duration::from_secs(params.timeout_secs);
+            tokio::spawn(async move { keeper.ask_codex(timeout).await });
+        }
+        true
+    }
+
+    /// Waits for the ask that is out: until `patience`, or without end (it ends itself) for none.
+    async fn await_codex_ask(&self, patience: Option<Instant>) {
+        loop {
+            let mut ended = pin!(self.codex_asked.notified());
+            ended.as_mut().enable();
+            if !*lock(&self.codex_asking) {
+                return;
+            }
+            match patience {
+                Some(patience) => {
+                    if tokio::time::timeout_at(patience, ended).await.is_err() {
+                        return;
+                    }
+                }
+                None => ended.await,
+            }
+        }
+    }
+
+    /// Tries again to write a reading that could not be written; the reading it says so beside
+    /// stands as it was once it has been.
+    fn keep_codex(&self) {
+        let mut unsaved = lock(&self.codex_unsaved);
+        let Some(unreadable) = unsaved.take() else {
+            return;
+        };
+        let mut quota = lock(&self.codex);
+        if self.store_codex(&quota).is_ok() {
+            quota.unreadable = unreadable;
+        } else {
+            *unsaved = Some(unreadable);
+        }
+    }
+
+    /// One ask of Codex, on a thread of its own: its answer, or why there was none, is the new
+    /// reading.
+    async fn ask_codex(self: Arc<Self>, timeout: Duration) {
+        let usage = Arc::clone(&self.codex_usage);
+        let answer = tokio::task::spawn_blocking(move || usage.rate_limits(timeout)).await;
+        let now = clock::now();
+        {
+            // The marker, the reading and its write are taken in the order `keep_codex` takes
+            // them, and held until the new reading is out: no look can write an older reading
+            // over it, or take the marker that says it is still to be written.
+            let mut unsaved = lock(&self.codex_unsaved);
+            let mut quota = lock(&self.codex);
+            let mut next = quota.clone();
+            match answer {
+                Ok(Ok(reply)) => match codex::read_usage(&reply, now) {
+                    Ok(read) => next.see(read, now),
+                    Err(why) => next.fail(why, now),
+                },
+                Ok(Err(why)) => next.fail(why.to_string(), now),
+                Err(why) => next.fail(format!("its reader stopped: {why}"), now),
+            }
+            // A reading that could not be kept still holds this run, and says so beside it: the
+            // next look writes it again.
+            *unsaved = None;
+            if let Err(e) = self.store_codex(&next) {
+                *unsaved = Some(next.unreadable.take());
+                next.unreadable = Some(format!(
+                    "its reading could not be kept: {e}; check the disk and FACTORY_STATE"
+                ));
+            }
+            *quota = next;
+        }
+        *lock(&self.codex_asking) = false;
+        self.codex_asked.notify_waiters();
     }
 
     /// agy's quota groups and their windows as of `AGY_DISPLAY_FRESH_MS`: the reading while it is
@@ -200,6 +366,18 @@ impl QuotaKeeper {
                 store.append_history(&HistoryRow::of(harness, group, window))?;
             }
             Ok(())
+        })
+    }
+
+    /// Stores Codex's reading, its windows joining the history, by the shared path. The caller
+    /// holds the Codex lock.
+    fn store_codex(&self, quota: &CodexQuota) -> rusqlite::Result<()> {
+        let windows: Vec<UsageWindow> = [quota.five_hour, quota.weekly]
+            .into_iter()
+            .flatten()
+            .collect();
+        self.store_readings("codex", None, &windows, |store| {
+            store.set_codex_quota(quota)
         })
     }
 

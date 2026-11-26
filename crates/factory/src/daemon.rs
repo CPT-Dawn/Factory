@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use factory_adapters::codex::AppServer;
 use factory_adapters::gh::{Gh, GhActions};
 use factory_core::duration;
 use factory_core::event::Event;
@@ -46,13 +47,13 @@ use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::pollers::Pollers;
 use crate::protocol::{
-    AGY_QUOTA, BAR, BarParams, CLAUDE_LIMIT, CLAUDE_QUOTA, CLAUDE_WINDOW, ClaudeLimitParams,
-    ClaudeQuotaParams, ClaudeWindowParams, ErrorBody, HistoryParams, LEAD_LIST, LEAD_SPAWN,
-    LEAD_STATUS, LOG, LeadParams, LogParams, LogResult, MISMATCH, MONITOR_START, MONITOR_STATUS,
-    MONITOR_STOP, NotifyParams, Outcome, QUOTA_HISTORY, REVIEW_ACQUIRE, REVIEW_QUOTA, Request,
-    Response, ReviewRef, STATUS, SpawnParams, StatusParams, WAIT_CI, WAIT_CLAUDE, WAIT_LEAD,
-    WAIT_LEASE, WAIT_NOTIFY, WAIT_REVIEW, WaitCiParams, WaitCiResult, WaitClaudeParams,
-    WaitLeadParams, WaitLeaseParams, WaitReviewParams,
+    AGY_QUOTA, BAR, BarParams, CLAUDE_LIMIT, CLAUDE_QUOTA, CLAUDE_WINDOW, CODEX_QUOTA,
+    ClaudeLimitParams, ClaudeQuotaParams, ClaudeWindowParams, CodexQuotaParams, ErrorBody,
+    HistoryParams, LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult,
+    MISMATCH, MONITOR_START, MONITOR_STATUS, MONITOR_STOP, NotifyParams, Outcome, QUOTA_HISTORY,
+    REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, ReviewRef, STATUS, SpawnParams, StatusParams,
+    WAIT_CI, WAIT_CLAUDE, WAIT_LEAD, WAIT_LEASE, WAIT_NOTIFY, WAIT_REVIEW, WaitCiParams,
+    WaitCiResult, WaitClaudeParams, WaitLeadParams, WaitLeaseParams, WaitReviewParams,
 };
 use crate::quotas::QuotaKeeper;
 use crate::reviews::Reviews;
@@ -108,6 +109,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
     let router = Arc::new(Router::open(Store::open(&paths.database())?)?);
     let quotas = Arc::new(QuotaKeeper::open(
         Store::open(&paths.database())?,
+        Arc::new(AppServer::new()),
         Arc::new(AgyUsageCli(AgyAuth::Subscription)),
     )?);
     let fleet = Arc::new(Fleet::open(
@@ -458,6 +460,12 @@ async fn respond(
             Ok(params) => answered(daemon.quotas.claude_limit(&params)),
             Err(refused) => refused,
         },
+        CODEX_QUOTA => match params::<CodexQuotaParams>(CODEX_QUOTA, request.params) {
+            Ok(params) => answered(Ok::<_, Failure>(
+                daemon.quotas.codex_verdict(&params.codex).await,
+            )),
+            Err(refused) => refused,
+        },
         CLAUDE_QUOTA => match params::<ClaudeQuotaParams>(CLAUDE_QUOTA, request.params) {
             Ok(params) => answered(Ok::<_, Failure>(
                 daemon.quotas.claude_verdict(params.hold_at),
@@ -544,7 +552,7 @@ async fn respond(
             let granted = tokio::select! {
                 biased;
                 () = stop.clone().stopping() => None,
-                granted = daemon.router.acquire(request.params, held) => Some(granted),
+                granted = daemon.router.acquire(&daemon.quotas, request.params, held) => Some(granted),
             };
             match granted {
                 // Checked again after the grant: a connection the stop hung up may have freed

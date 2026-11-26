@@ -1481,7 +1481,7 @@ fn the_bar_shows_the_worst_window_and_a_block_per_quota_group() {
     assert_eq!(groups, ["Gemini Models", "Claude and GPT models"]);
     assert_eq!(
         sandbox.factory(&["bar"]).stdout,
-        "claude ?/? · agy 30/63 · ? leads · lab 0/0\n"
+        "claude ?/? · codex ?/? · agy 30/63 · ? leads · lab 0/0\n"
     );
 }
 
@@ -1501,7 +1501,7 @@ fn assert_unreadable(sandbox: &Sandbox, why: &str) {
     assert!(!agy_card(&feed).to_string().contains('%'), "{feed}");
     assert_eq!(
         sandbox.factory(&["bar"]).stdout,
-        "claude ?/? · agy unreadable · ? leads · lab 0/0\n"
+        "claude ?/? · codex ?/? · agy unreadable · ? leads · lab 0/0\n"
     );
 
     let status = sandbox.factory(&["status"]);

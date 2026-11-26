@@ -7,7 +7,7 @@ use factory_core::bar::lab::{Emulator, Lab, Phone, Stack};
 use factory_core::bar::{Feed, Snapshot, daemon_down, feed, glyph, line};
 use factory_core::claude::ClaudeQuota;
 use factory_core::lab::ready::Readiness;
-use factory_core::status::{Agy, Claude, ClaudeState, Lead, Leads, Wait};
+use factory_core::status::{Agy, Claude, ClaudeState, Codex, Lead, Leads, Wait};
 use factory_core::timestamp::Timestamp;
 use factory_core::usage::{
     GroupWindow, QuotaGroup, UsageReading, UsageWindow, WindowKind, WindowState,
@@ -60,6 +60,16 @@ fn going(windows: Vec<UsageReading>) -> Claude {
     }
 }
 
+fn codex(windows: Vec<UsageReading>) -> Codex {
+    Codex {
+        verdict: ClaudeState::Go,
+        windows,
+        plan: Some("plus".to_owned()),
+        reset_credits: 2,
+        ..Codex::default()
+    }
+}
+
 fn lead(name: &str, state: &str) -> Lead {
     Lead {
         name: name.to_owned(),
@@ -79,6 +89,7 @@ fn snapshot(claude: Claude, leads: Vec<Lead>) -> Snapshot {
     Snapshot {
         now: now(),
         claude,
+        codex: Codex::default(),
         agy: Agy::default(),
         waits: vec![Wait {
             pane: Some("w1:p1".to_owned()),
@@ -211,6 +222,13 @@ fn snapshots() -> Vec<Snapshot> {
     let mut unreachable = snapshot(Claude::default(), Vec::new());
     unreachable.leads.error = Some("herdr is not running".to_owned());
     unreachable.leads.monitor = false;
+    let mut readable = snapshot(going(vec![five(12), weekly(40)]), Vec::new());
+    readable.codex = codex(vec![five(18), weekly(62)]);
+    let mut unreadable = snapshot(Claude::default(), Vec::new());
+    unreadable.codex = Codex {
+        unreadable: Some("it did not answer within 20s".to_owned()),
+        ..Codex::default()
+    };
     vec![
         snapshot(
             going(vec![five(12), weekly(40)]),
@@ -242,6 +260,8 @@ fn snapshots() -> Vec<Snapshot> {
             vec![lead("lead-c", "finished"), lead("lead-d", "dead")],
         ),
         unreachable,
+        readable,
+        unreadable,
         with_agy(Agy::default()),
         with_agy(agy_read()),
         with_agy(agy_unreadable()),
@@ -563,13 +583,28 @@ fn the_factory_card_lists_leads_waits_and_the_steward() {
 #[test]
 fn the_line_names_both_windows_and_the_leads() {
     let all = snapshots();
-    assert_eq!(line(&all[0]), "claude 12/40 · agy ?/? · 1 lead · lab 0/0");
+    assert_eq!(
+        line(&all[0]),
+        "claude 12/40 · codex ?/? · agy ?/? · 1 lead · lab 0/0"
+    );
     // Phones ready out of plugged in: a stale ready one isn't counted ready.
-    assert_eq!(line(&all[1]), "claude 80/40 · agy ?/? · 0 leads · lab 1/6");
+    assert_eq!(
+        line(&all[1]),
+        "claude 80/40 · codex ?/? · agy ?/? · 0 leads · lab 1/6"
+    );
     // A hold and the leads that need the owner are the chips' to show, not the line's.
-    assert_eq!(line(&all[2]), "claude 41/91 · agy ?/? · 2 leads · lab 0/0");
-    assert_eq!(line(&all[3]), "claude ?/12 · agy ?/? · 0 leads · lab 0/0");
-    assert_eq!(line(&all[4]), "claude ?/? · agy ?/? · ? leads · lab 0/0");
+    assert_eq!(
+        line(&all[2]),
+        "claude 41/91 · codex ?/? · agy ?/? · 2 leads · lab 0/0"
+    );
+    assert_eq!(
+        line(&all[3]),
+        "claude ?/12 · codex ?/? · agy ?/? · 0 leads · lab 0/0"
+    );
+    assert_eq!(
+        line(&all[4]),
+        "claude ?/? · codex ?/? · agy ?/? · ? leads · lab 0/0"
+    );
 }
 
 #[test]
@@ -599,6 +634,12 @@ fn the_glyph_table_holds_one_codepoint_per_name() {
     assert_eq!(glyph::FACTORY.char, '\u{f020f}');
 }
 
+fn codex_chip(codex: Codex) -> (String, String) {
+    let mut shot = snapshot(Claude::default(), Vec::new());
+    shot.codex = codex;
+    chip_of(&json(&feed(&shot)), "codex")
+}
+
 #[test]
 fn the_agy_chip_shows_the_worst_window_across_its_quota_groups() {
     let document = json(&feed(&with_agy(agy_read())));
@@ -623,6 +664,48 @@ fn chip_of(document: &Value, id: &str) -> (String, String) {
         chip["text"].as_str().unwrap_or_default().to_owned(),
         chip["tone"].as_str().unwrap_or_default().to_owned(),
     )
+}
+
+#[test]
+fn the_codex_chip_shows_the_worst_window_toned_by_its_share() {
+    assert_eq!(
+        codex_chip(codex(vec![five(18), weekly(62)])),
+        ("62%".into(), "ok".into())
+    );
+    assert_eq!(
+        codex_chip(codex(vec![five(80), weekly(62)])),
+        ("80%".into(), "warn".into())
+    );
+    assert_eq!(
+        codex_chip(codex(vec![five(18), weekly(90)])),
+        ("90%".into(), "critical".into())
+    );
+    // A window past its reset is not a reading.
+    let past = reading(
+        WindowKind::FiveHour,
+        95,
+        "2026-11-23T03:00:00Z",
+        "2026-11-23T01:13:00Z",
+    );
+    assert_eq!(
+        codex_chip(codex(vec![past, weekly(12)])),
+        ("12%".into(), "ok".into())
+    );
+    assert_eq!(codex_chip(Codex::default()), ("?".into(), "muted".into()));
+    let held = Codex {
+        verdict: ClaudeState::Hold,
+        until: Some(at("2026-11-23T07:00:00Z")),
+        hold: Some("5h 93%".to_owned()),
+        ..codex(vec![five(93)])
+    };
+    assert_eq!(codex_chip(held), ("93%".into(), "critical".into()));
+
+    let mut shot = snapshot(Claude::default(), Vec::new());
+    shot.codex = codex(vec![five(18), weekly(62)]);
+    let document = json(&feed(&shot));
+    let chip = chip(&document, "codex");
+    assert_eq!(chip["label"], glyph::CODEX.char.to_string());
+    assert_eq!(chip["tooltip"], "Codex: 5h 18%, weekly 62%");
 }
 
 #[test]
@@ -715,15 +798,15 @@ fn the_bar_line_gives_agys_worst_share_of_each_window_after_claudes() {
     let line_of = |agy: Agy| line(&with_agy(agy));
     assert_eq!(
         line_of(agy_read()),
-        "claude 12/40 · agy 30/63 · 0 leads · lab 0/0"
+        "claude 12/40 · codex ?/? · agy 30/63 · 0 leads · lab 0/0"
     );
     assert_eq!(
         line_of(agy_unreadable()),
-        "claude 12/40 · agy unreadable · 0 leads · lab 0/0"
+        "claude 12/40 · codex ?/? · agy unreadable · 0 leads · lab 0/0"
     );
     assert_eq!(
         line_of(Agy::default()),
-        "claude 12/40 · agy ?/? · 0 leads · lab 0/0"
+        "claude 12/40 · codex ?/? · agy ?/? · 0 leads · lab 0/0"
     );
 }
 
@@ -736,5 +819,101 @@ fn the_agy_chip_comes_after_claudes_and_before_the_factorys() {
         .flatten()
         .filter_map(|chip| chip["id"].as_str())
         .collect();
-    assert_eq!(ids, ["claude", "agy", "factory", "lab"]);
+    assert_eq!(ids, ["claude", "codex", "agy", "factory", "lab"]);
+    let ids: Vec<&str> = document["sections"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|section| section["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["claude", "codex", "agy", "factory", "lab"]);
+}
+
+#[test]
+fn the_codex_card_has_a_meter_per_window_the_plan_and_the_reset_credits() {
+    let mut shot = snapshot(Claude::default(), Vec::new());
+    shot.codex = codex(vec![five(18), weekly(62)]);
+    let document = json(&feed(&shot));
+    let card = section(&document, "codex");
+    assert_eq!(card["title"], "Codex");
+    assert_eq!(
+        card["rows"],
+        serde_json::json!([
+            {"kind": "meter", "label": "5h", "value": 0.18, "text": "18%", "tone": "ok",
+             "until": "2026-11-23T07:00:00.000Z"},
+            {"kind": "meter", "label": "weekly", "value": 0.62, "text": "62%", "tone": "ok",
+             "until": "2026-11-30T02:00:00.000Z"},
+            {"kind": "text", "label": "plan", "text": "plus", "tone": "muted"},
+            {"kind": "text", "label": "reset credits", "text": "2 available", "tone": "muted"},
+        ])
+    );
+    assert!(card.get("error").is_none());
+
+    shot.codex.reset_credits = 0;
+    let document = json(&feed(&shot));
+    let rows = section(&document, "codex")["rows"].clone();
+    assert_eq!(
+        rows[3],
+        serde_json::json!({"kind": "text", "label": "reset credits", "text": "none", "tone": "muted"})
+    );
+}
+
+#[test]
+fn a_codex_hold_is_noted_on_its_card() {
+    let mut shot = snapshot(Claude::default(), Vec::new());
+    shot.codex = Codex {
+        verdict: ClaudeState::Hold,
+        until: Some(at("2026-11-30T02:00:00Z")),
+        hold: Some("weekly 92%".to_owned()),
+        ..codex(vec![five(18), weekly(92)])
+    };
+    let document = json(&feed(&shot));
+    assert_eq!(
+        section(&document, "codex")["note"],
+        "hold: weekly 92% until 11-30 02:00Z"
+    );
+    assert_eq!(
+        chip(&document, "codex")["tooltip"],
+        "Codex: 5h 18%, weekly 92% · hold: weekly 92% until 11-30 02:00Z"
+    );
+}
+
+#[test]
+fn an_unreadable_codex_is_a_muted_chip_and_an_error_card_never_zero() {
+    let mut shot = snapshot(Claude::default(), Vec::new());
+    shot.codex = Codex {
+        unreadable: Some("it did not answer within 20s".to_owned()),
+        ..codex(vec![five(18), weekly(62)])
+    };
+    let document = json(&feed(&shot));
+
+    let chip = chip(&document, "codex");
+    assert_eq!(chip["text"], "?");
+    assert_eq!(chip["tone"], "muted");
+    assert_eq!(
+        chip["tooltip"],
+        "Codex: codex usage unreadable: it did not answer within 20s"
+    );
+    let card = section(&document, "codex");
+    assert_eq!(
+        card["error"],
+        "codex usage unreadable: it did not answer within 20s"
+    );
+    assert_eq!(card["rows"], serde_json::json!([]));
+}
+
+#[test]
+fn the_line_names_codexs_windows_and_hides_them_while_unreadable() {
+    let mut shot = snapshot(Claude::default(), Vec::new());
+    shot.codex = codex(vec![five(8), weekly(30)]);
+    assert_eq!(
+        line(&shot),
+        "claude ?/? · codex 8/30 · agy ?/? · 0 leads · lab 0/0"
+    );
+
+    shot.codex.unreadable = Some("it is not there".to_owned());
+    assert_eq!(
+        line(&shot),
+        "claude ?/? · codex ?/? · agy ?/? · 0 leads · lab 0/0"
+    );
 }

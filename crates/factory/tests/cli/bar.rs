@@ -51,7 +51,7 @@ fn the_bar_prints_both_claude_windows_and_the_leads_in_one_line() {
     assert!(
         poll_until(|| {
             out = bar(&sandbox, false);
-            out.stdout == "claude 12/40 · agy unreadable · 2 leads · lab 0/0\n"
+            out.stdout == "claude 12/40 · codex ?/? · agy unreadable · 2 leads · lab 0/0\n"
         }),
         "{out:?}"
     );
@@ -66,7 +66,7 @@ fn the_bar_prints_both_claude_windows_and_the_leads_in_one_line() {
     );
     assert_eq!(
         bar(&sandbox, false).stdout,
-        "claude 12/40 · agy unreadable · 2 leads · lab 0/0\n"
+        "claude 12/40 · codex ?/? · agy unreadable · 2 leads · lab 0/0\n"
     );
 }
 
