@@ -27,3 +27,4 @@ pub mod process;
 pub mod reviewer;
 pub mod supabase;
 pub mod systemd;
+pub mod usb;

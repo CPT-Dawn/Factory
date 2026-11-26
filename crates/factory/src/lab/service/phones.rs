@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use factory_adapters::adb::{Adb, AdbCli};
 use factory_adapters::desktop::{Desktop, NotifySend, PostError};
+use factory_adapters::usb::{Sysfs, Usb};
 use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{Attached, LOCK_PROBE, prep_command};
 use factory_core::lab::events as event;
@@ -21,6 +22,7 @@ use factory_core::lab::ready::{
     STAY_ON_PROBE, after, auth_timeout_warning, judge, notice, phone_name, refresh_again,
     unplugged,
 };
+use factory_core::lab::usb::{HiddenPhone, hidden_phones, vendor_name};
 
 use super::super::check::PhoneCheck;
 use super::super::readiness::{self, ReadyRow};
@@ -36,6 +38,14 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long an offline is held back: a phone being unplugged goes offline first, and its unplug
 /// within this is said alone.
 const FOLD: Duration = Duration::from_secs(3);
+
+/// The phones with USB debugging off at the watcher's last sweep of the USB bus, and when it was
+/// made, in ms since the epoch.
+#[derive(Default)]
+pub(super) struct Hidden {
+    pub at: i64,
+    pub phones: Vec<HiddenPhone>,
+}
 
 /// What the watcher thread is asked to do.
 pub enum Job {
@@ -66,6 +76,8 @@ impl Lab {
                     lab,
                     adb: Box::new(AdbCli),
                     desktop: Box::new(NotifySend),
+                    usb: Box::new(Sysfs::from_env()),
+                    following: false,
                     shown: Vec::new(),
                     lost: Vec::new(),
                     since: BTreeMap::new(),
@@ -80,6 +92,21 @@ impl Lab {
         if spawned.is_ok() && self.phones.set(tx).is_ok() {
             self.track();
         }
+    }
+
+    /// The phones adb doesn't list that the USB bus shows (#73), as the watcher last found them,
+    /// and when; those `listed`, the list the caller shows beside them, are left out, so that
+    /// no phone is said to be missing from a list that has it. Reads what is kept: it spawns
+    /// nothing and reads no sysfs.
+    pub(super) fn hidden_phones(&self, listed: &[Attached]) -> (i64, Vec<HiddenPhone>) {
+        let hidden = lock_ignoring_poison(&self.hidden);
+        let phones = hidden
+            .phones
+            .iter()
+            .filter(|h| !listed.iter().any(|a| a.serial == h.serial))
+            .cloned()
+            .collect();
+        (hidden.at, phones)
     }
 
     /// Tells the watcher what adb's stream showed; called before the list is told to anyone
@@ -141,6 +168,11 @@ struct Watcher {
     lab: Arc<Lab>,
     adb: Box<dyn Adb>,
     desktop: Box<dyn Desktop>,
+    /// The USB bus, swept for phones adb doesn't list.
+    usb: Box<dyn Usb>,
+    /// Whether adb's stream follows a list now: false before the first and after one ends, when
+    /// what adb lists is not known and no phone can be said to be missing from it.
+    following: bool,
     /// The phones the last list showed.
     shown: Vec<Attached>,
     /// The phones the last list before adb's stream ended showed, until the next list comes.
@@ -194,7 +226,9 @@ impl Watcher {
             match jobs.recv_timeout(until.saturating_duration_since(Instant::now())) {
                 Ok(Job::Frame(list, since)) => {
                     self.since = since;
+                    self.following = true;
                     self.frame(list);
+                    self.sweep_usb();
                     // Its probes are written: a request waiting for a phone looks again.
                     self.lab.notify();
                 }
@@ -206,6 +240,7 @@ impl Watcher {
                         self.lost = shown;
                     }
                     self.since.clear();
+                    self.following = false;
                 }
                 Ok(Job::Check(serials, fresh, reply)) => {
                     let _ = reply.send(self.check(&serials, fresh));
@@ -230,6 +265,37 @@ impl Watcher {
                 self.probe(&phone);
             }
         }
+        self.sweep_usb();
+    }
+
+    /// Looks at the USB bus for a phone with USB debugging off (#73): a device of a known
+    /// Android vendor whose serial adb doesn't list. It reads sysfs and spawns nothing. While
+    /// adb's stream follows no list, what adb lists is not known: no phone is newly said to be
+    /// missing from it, and the ones already said are kept only while the bus still shows them.
+    fn sweep_usb(&mut self) {
+        if !self.following {
+            let on_bus = self.usb.devices();
+            let mut hidden = lock_ignoring_poison(&self.lab.hidden);
+            // Still the same device: its serial and a vendor of the same maker.
+            hidden.phones.retain(|h| {
+                on_bus
+                    .iter()
+                    .any(|d| d.serial == h.serial && vendor_name(&d.vendor) == Some(h.vendor))
+            });
+            return;
+        }
+        let listed: Vec<&str> = self
+            .shown
+            .iter()
+            .chain(&self.lost)
+            .map(|a| a.serial.as_str())
+            .collect();
+        let found = hidden_phones(&self.usb.devices(), &listed);
+        let mut hidden = lock_ignoring_poison(&self.lab.hidden);
+        *hidden = Hidden {
+            at: now_ms(),
+            phones: found,
+        };
     }
 
     /// Whether no lease holds phone `serial`. A store that can't be read leaves it unknown,
