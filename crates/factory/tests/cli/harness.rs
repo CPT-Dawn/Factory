@@ -82,3 +82,42 @@ fn a_world_step_never_shows_the_fakes_a_half_written_world() {
         failed.first()
     );
 }
+
+/// An emulator killed is gone from adb by the time its unit is: the daemon that stops one
+/// waits for its unit to end, then boots a new one on the same serial, and a kill that dropped
+/// the unit first took the new emulator's line out of the world with it (docs/flakes.md).
+#[test]
+fn a_killed_emulator_is_gone_from_adb_before_its_unit_is() {
+    let sandbox = Sandbox::new();
+    let world = World::install(&sandbox);
+    let start = || {
+        let started = run(sandbox.command(
+            "systemd-run",
+            &["--user", "--unit=devlab-emu-0", "emulator", "-port", "5580"],
+        ));
+        assert_eq!(started.code, 0, "{started:?}");
+    };
+    let mut lost = 0;
+
+    for _ in 0..40 {
+        start();
+        std::thread::scope(|scope| {
+            let kill = scope
+                .spawn(|| run(sandbox.command("adb", &["-s", "emulator-5580", "emu", "kill"])));
+            // The daemon's own order: its unit ended, it boots the next emulator on the serial.
+            while world.read("units").contains("devlab-emu-0") {}
+            start();
+            assert_eq!(kill.join().unwrap().code, 0);
+        });
+        if world.read("devices").matches("emulator-5580").count() != 1 {
+            lost += 1;
+        }
+        let killed = run(sandbox.command("adb", &["-s", "emulator-5580", "emu", "kill"]));
+        assert_eq!(killed.code, 0, "{killed:?}");
+    }
+
+    assert_eq!(
+        lost, 0,
+        "the next emulator's line was taken out with the killed one's"
+    );
+}

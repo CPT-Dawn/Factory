@@ -307,7 +307,7 @@ impl Lab {
                                 lists,
                                 ends,
                             });
-                            lab.notify();
+                            lab.notify_waiters();
                         },
                         &|| {
                             // Marked under the list gate, not the store's lock: a grant deciding
@@ -323,7 +323,7 @@ impl Lab {
                             }
                             drop(lock_ignoring_poison(&lab.store));
                             lab.phone_stream_ended();
-                            lab.notify();
+                            lab.notify_waiters();
                         },
                         &|| {
                             lab.attached.send_if_modified(|d| {
@@ -469,11 +469,20 @@ impl Lab {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Something in the lab changed that a slot or a lease may have felt: waiters look again
+    /// and the stack sweep looks at the stacks again.
     fn notify(&self) {
-        self.changed.send_modify(|n| *n = n.wrapping_add(1));
+        self.notify_waiters();
         if let Some(sweep) = self.sweep.get() {
             let _ = sweep.send(());
         }
+    }
+
+    /// Only the phones changed (a list from adb, a probe, a stream that ended): waiters look
+    /// again, and no stack sweep runs, since no stack is one phone's (#47: the bar's stack
+    /// numbers don't move, nor docker get asked, on a phone's account).
+    fn notify_waiters(&self) {
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     /// Gives lease `lease` back whole, its devices as they are now, and ends request `waiter`:

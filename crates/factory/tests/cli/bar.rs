@@ -403,8 +403,9 @@ fn the_bar_runs_no_external_command_and_asks_herdr_nothing() {
     world
         .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
         .unwrap();
-    // The daemon's first look at herdr is its own, at its start; its phone's probe and its
-    // stacks' sweep are its own too, as the phone shows up and at its start.
+    // The daemon's first look at herdr is its own, at its start; its stacks' sweep is its own
+    // too, at its start. A phone showing up or being probed wakes waiters, not that sweep, so
+    // no late docker call can land after the counts below are taken.
     let mut last = Value::Null;
     assert!(
         poll_until(|| {
