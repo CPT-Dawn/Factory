@@ -25,7 +25,7 @@ factory review [--tier <tier>] --skill <its checkout's codex/code-review/SKILL.m
 - `--skill` is the reviewer skill every backend's prompt carries, so a worktree's review.sh runs that worktree's
   skill and no backend spends a turn loading it. Without it, factory takes `[review] skill` from its config,
   else `~/.agents/skills/code-review/SKILL.md`.
-- The tier picks the chain of reviewers, as review.sh's did: a spec review (`spec-*`) is hard; a diff of only
+- The tier picks the chain of reviewers, as review.sh's did: a spec review (`spec-*`) is the `spec` tier, whatever the diff or tag, on its own chain; a diff of only
   docs and config (at most 400 lines), or of at most 5 lines and no test, is `trivial` unless tagged hard; else
   the caller's tier, or standard. The chains and pools are factory's config (`[review.chains]`, `config.rs`),
   review.sh's by default. Each pool has 2 slots: a busy pool passes the review to the chain's next, and the
@@ -35,7 +35,7 @@ factory review [--tier <tier>] --skill <its checkout's codex/code-review/SKILL.m
 - The default pools are `agy-gemini` and `agy-claude` (agy's two quota groups), `codex` and `claude`. A model's
   group is the one whose "Models within this group" list in agy's `/usage` names it, so Argon, Carbon and Hydrogen
   draw on the Gemini group with Neon and Flash, and the 20% reserve covers them all; an answer that lists no models
-  falls back to a static map. The default chains: hard is Neon high, agy's Opus high, Codex high, Claude Opus high;
+  falls back to a static map. The default chains: hard is Codex high, Neon high, agy's Opus high, Claude Opus high; spec (`[review.chains] spec`) is Neon high, agy's Opus high, Codex high, Claude Opus high;
   standard is Codex medium, Neon medium, agy's Opus high, agy's Sonnet high, Claude Sonnet high; trivial is Flash high,
   Neon low, Codex low, Claude Sonnet medium. Argon is in none of them, but a chain may name it
   (`agy-gemini:gemini-4-argon-high:high`), and an old config's `agy-argon` still works: a configured pool of that

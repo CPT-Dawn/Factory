@@ -22,6 +22,9 @@ const GEMINI_MODELS: &str = "Models within this group: Gemini 4 Neon, Gemini 4 C
 const CLAUDE_MODELS: &str =
     "Models within this group: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B";
 
+/// review.sh's old hard chain, for the tests that follow an agy review through its pool.
+const AGY_FIRST_HARD: &str = "[review.chains]\nhard = [\"agy-gemini:gemini-4-neon-high:high\", \"agy-claude:claude-opus-5-5-high:high\", \"codex:gpt-6.2-sol:high\", \"claude:opus:high\"]\n";
+
 /// A usage bucket over `window` with `left` of its quota, which resets far off, so an empty
 /// one holds.
 fn bucket(window: &str, left: f64) -> Value {
@@ -219,18 +222,121 @@ fn read(path: &Path) -> String {
 }
 
 #[test]
-fn hard_runs_gemini_4_neon_high_first() {
+fn hard_runs_codex_high_first() {
     let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
 
     let out = lab.review(&["--tier", "hard", "base", "t1-r1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(lab.who(), ["codex"]);
+    assert!(
+        lab.runs()[0].contains("-m gpt-6.2-sol -c model_reasoning_effort=\"high\""),
+        "{:?}",
+        lab.runs()
+    );
+}
+
+#[test]
+fn a_spec_review_runs_gemini_4_neon_high_first_and_names_the_spec_tier() {
+    let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
+
+    let out = lab.review(&["base", "spec-x-r1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
     assert_eq!(lab.who(), ["agy gemini-4-neon-high"]);
+    let event = lab.last_event();
+    assert_eq!(event["tier"], "spec", "{event}");
+    assert_eq!(event["tier_source"], "spec", "{event}");
+}
+
+#[test]
+fn a_spec_review_runs_neon_high_then_agys_opus_high_then_codex_high_then_claude_opus_high() {
+    let lab = Lab::new("code", 0.9, 1.0, &["quota", "quota", "limit", "ok"]);
+
+    let out = lab.review(&["base", "spec-x-r1"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(
+        lab.who(),
+        [
+            "agy gemini-4-neon-high",
+            "agy claude-opus-5-5-high",
+            "codex",
+            "claude"
+        ]
+    );
+}
+
+#[test]
+fn the_spec_chain_is_configured_apart_from_the_hard_one() {
+    let lab = Lab::new("code", 0.9, 1.0, &["ok", "ok"]);
+    lab.configure("[review.chains]\nspec = [\"codex:gpt-6.2-sol:medium\"]\n");
+
+    let spec = lab.review(&["base", "spec-x-r1"]);
+    let hard = lab.review(&["--tier", "hard", "base", "t1-r1"]);
+
+    assert_eq!((spec.code, hard.code), (0, 0), "{spec:?} {hard:?}");
+    let runs = lab.runs();
+    assert!(
+        runs[0].contains("model_reasoning_effort=\"medium\""),
+        "{runs:?}"
+    );
+    assert!(
+        runs[1].contains("model_reasoning_effort=\"high\""),
+        "{runs:?}"
+    );
+    assert_eq!(runs.len(), 2, "{runs:?}");
+}
+
+#[test]
+fn an_empty_spec_chain_is_refused_like_the_other_tiers() {
+    for tier in ["hard", "standard", "trivial", "spec"] {
+        let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
+        lab.configure(&format!("[review.chains]\n{tier} = []\n"));
+
+        let out = lab.review(&["base", "t1-r1"]);
+
+        assert_eq!(out.code, 3, "{tier}: {out:?}");
+        assert!(
+            out.stderr.contains(&format!(
+                "review.chains.{tier} is empty; name at least one \"pool:model:effort\""
+            )),
+            "{tier}: {out:?}"
+        );
+        assert!(lab.runs().is_empty(), "{tier}");
+    }
+}
+
+#[test]
+fn a_spec_chain_naming_an_unknown_pool_is_refused() {
+    let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
+    lab.configure("[review.chains]\nspec = [\"nowhere\"]\n");
+
+    let out = lab.review(&["base", "t1-r1"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(out.stderr.contains("review.chains.spec: "), "{out:?}");
+}
+
+#[test]
+fn a_tiny_diff_never_downgrades_a_spec_review() {
+    let lab = Lab::new("tiny", 0.9, 1.0, &["ok", "ok"]);
+
+    let named = lab.review(&["base", "spec-x-r1", "none", "--tier", "trivial"]);
+    let unnamed = lab.review(&["base", "spec-x-r2"]);
+
+    assert_eq!((named.code, unnamed.code), (0, 0), "{named:?} {unnamed:?}");
+    assert_eq!(
+        lab.who(),
+        ["agy gemini-4-neon-high", "agy gemini-4-neon-high"]
+    );
+    assert_eq!(lab.last_event()["tier"], "spec");
 }
 
 #[test]
 fn the_event_names_tier_pool_reviewer_model_effort_and_tokens() {
     let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
+    lab.configure(AGY_FIRST_HARD);
 
     let out = lab.review(&["--tier", "hard", "base", "t1-r1"]);
 
@@ -255,6 +361,7 @@ fn the_event_names_tier_pool_reviewer_model_effort_and_tokens() {
 #[test]
 fn the_ledger_keeps_the_reviewed_head() {
     let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
+    lab.configure(AGY_FIRST_HARD);
 
     let out = lab.review(&["--tier", "hard", "base", "t1-r1"]);
 
@@ -269,6 +376,7 @@ fn the_ledger_keeps_the_reviewed_head() {
 #[test]
 fn the_bundle_holds_commits_stat_diff_spec_touched_docs_standards_and_evidence() {
     let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
+    lab.configure(AGY_FIRST_HARD);
 
     let out = lab.review(&["--tier", "hard", "base", "t1-r1"]);
 
@@ -298,6 +406,7 @@ fn the_bundle_holds_commits_stat_diff_spec_touched_docs_standards_and_evidence()
 #[test]
 fn the_prompt_carries_the_skill_and_the_bundle() {
     let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
+    lab.configure(AGY_FIRST_HARD);
 
     let out = lab.review(&["--tier", "hard", "base", "t1-r1"]);
 
@@ -371,6 +480,7 @@ fn a_spec_review_is_hard_and_may_spend_the_reserve() {
     assert_eq!(out.code, 0, "{out:?}");
     assert_eq!(lab.who(), ["agy gemini-4-neon-high"]);
     assert_eq!(lab.last_event()["tier_source"], "spec");
+    assert_eq!(lab.last_event()["tier"], "spec");
 }
 
 #[test]
@@ -456,6 +566,7 @@ fn a_spec_path_that_is_no_file_still_reviews() {
 #[test]
 fn an_empty_bucket_skips_its_pool() {
     let lab = Lab::new("code", 0.0, 1.0, &["ok"]);
+    lab.configure(AGY_FIRST_HARD);
 
     let out = lab.review(&["--tier", "hard", "base", "t4-r1", "--json"]);
 
@@ -531,6 +642,7 @@ fn a_6_line_diff_or_a_tests_only_diff_is_standard() {
 #[test]
 fn the_callers_hard_tag_wins_over_detection_even_given_last() {
     let lab = Lab::new("tiny", 0.9, 1.0, &["ok"]);
+    lab.configure(AGY_FIRST_HARD);
 
     let out = lab.review(&["base", "t7-r1", "none", "--tier", "hard"]);
 
@@ -557,6 +669,7 @@ fn codex_at_its_limit_hands_a_standard_review_to_claude_sonnet_high() {
 #[test]
 fn a_pool_with_both_slots_taken_passes_to_the_next() {
     let lab = Lab::new("code", 0.9, 1.0, &["hold", "hold", "ok", "ok", "ok"]);
+    lab.configure(AGY_FIRST_HARD);
     let holding = |label: &str| {
         let mut cmd = lab
             .sandbox
@@ -585,8 +698,8 @@ fn a_pool_with_both_slots_taken_passes_to_the_next() {
 }
 
 #[test]
-fn hard_runs_neon_high_then_agys_opus_high_then_codex_high_then_claude_opus_high() {
-    let lab = Lab::new("code", 0.9, 1.0, &["quota", "quota", "limit", "ok"]);
+fn hard_runs_codex_high_then_neon_high_then_agys_opus_high_then_claude_opus_high() {
+    let lab = Lab::new("code", 0.9, 1.0, &["limit", "quota", "quota", "ok"]);
 
     let out = lab.review(&["--tier", "hard", "base", "t12-r1"]);
 
@@ -594,15 +707,15 @@ fn hard_runs_neon_high_then_agys_opus_high_then_codex_high_then_claude_opus_high
     assert_eq!(
         lab.who(),
         [
+            "codex",
             "agy gemini-4-neon-high",
             "agy claude-opus-5-5-high",
-            "codex",
             "claude"
         ]
     );
     let runs = lab.runs();
     assert!(
-        runs[2].contains("-m gpt-6.2-sol -c model_reasoning_effort=\"high\""),
+        runs[0].contains("-m gpt-6.2-sol -c model_reasoning_effort=\"high\""),
         "{runs:?}"
     );
     assert!(
@@ -741,6 +854,7 @@ fn standard_and_trivial_skip_an_argon_step_under_the_20_percent_reserve_and_hard
 #[test]
 fn a_pool_skipped_for_an_unreadable_usage_answer_says_so_on_stderr_and_in_status() {
     let lab = Lab::new("code", 0.9, 1.0, &["ok"]);
+    lab.configure(AGY_FIRST_HARD);
     lab.usage_is(&json!({"command": {"data": {"groups": [
         {"name": "Claude and GPT models", "description": CLAUDE_MODELS, "buckets": [bucket("5h", 1.0)]},
     ]}}}));

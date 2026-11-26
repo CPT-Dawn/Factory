@@ -66,7 +66,7 @@ pub enum Command {
         #[arg(long, value_parser = duration)]
         timeout: Option<Duration>,
         /// The ticket's tier, which picks the chain of reviewers: hard, standard or trivial
-        /// (a spec review is hard; a small or docs-only diff is trivial unless tagged hard)
+        /// (a spec review is its own tier, spec; a small or docs-only diff is trivial unless tagged hard)
         #[arg(long, value_name = "TIER")]
         tier: Option<String>,
         /// The reviewer skill the prompt carries (default: the config's, else
