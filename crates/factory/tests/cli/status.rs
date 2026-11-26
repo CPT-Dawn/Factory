@@ -78,7 +78,14 @@ fn json_gives_every_field_of_every_section() {
     );
     assert_eq!(
         keys(&shown["claude"]),
-        ["resets", "until", "used_percent", "verdict"]
+        [
+            "hold",
+            "resets",
+            "until",
+            "used_percent",
+            "verdict",
+            "windows"
+        ]
     );
     assert_eq!(shown["claude"]["verdict"], "unknown", "{shown}");
     assert_eq!(

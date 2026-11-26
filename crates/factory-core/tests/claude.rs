@@ -1,11 +1,13 @@
-//! The Claude plan's quota: what the statusline and a 429 say of the 5-hour window, and whether a
-//! lead may dispatch.
+//! The Claude plan's quota: what the statusline and a 429 say of its 5-hour and weekly windows,
+//! and whether a lead may dispatch.
 
 use factory_core::claude::{
-    ClaudeQuota, LimitHit, Verdict, failure_limit, limit_reset, statusline_window, stop_failure,
+    ClaudeQuota, Holding, LimitHit, Verdict, failure_limit, limit_reset, statusline_windows,
+    stop_failure,
 };
 use factory_core::quota::Reset;
 use factory_core::timestamp::Timestamp;
+use factory_core::usage::{UsageWindow, WindowKind};
 use serde_json::json;
 
 /// 2026-11-23 05:00:00Z.
@@ -24,25 +26,57 @@ fn statusline(used: f64, resets_secs: i64) -> serde_json::Value {
                            "seven_day": {"used_percentage": 41.2, "resets_at": resets_secs + 86_400}}})
 }
 
-#[test]
-fn the_statusline_gives_the_five_hour_window() {
-    let window = statusline_window(&statusline(23.5, (NOW + 2 * HOUR) / 1000)).unwrap();
-    assert!((window.used_percent - 23.5).abs() < f64::EPSILON);
-    assert_eq!(window.resets, at(NOW + 2 * HOUR));
+/// The windows a statusline seen at `seen` gives: the 5-hour one `used` percent spent and
+/// resetting at `resets`, the weekly one 41.2% spent a day later.
+fn seen(used: f64, resets: i64, seen: i64) -> Vec<UsageWindow> {
+    statusline_windows(&statusline(used, resets / 1000), at(seen))
+}
+
+fn five_hour(used: f64, resets: i64) -> UsageWindow {
+    window(WindowKind::FiveHour, used, resets)
+}
+
+fn window(kind: WindowKind, used: f64, resets: i64) -> UsageWindow {
+    UsageWindow {
+        kind,
+        used_percent: used,
+        resets: at(resets),
+        seen: at(NOW),
+    }
 }
 
 #[test]
-fn a_statusline_without_rate_limits_gives_no_window() {
+fn the_statusline_gives_both_windows() {
     assert_eq!(
-        statusline_window(&json!({"model": {"display_name": "Opus 5.5"}})),
-        None
+        seen(23.5, NOW + 2 * HOUR, NOW),
+        vec![
+            five_hour(23.5, NOW + 2 * HOUR),
+            window(WindowKind::Weekly, 41.2, NOW + 2 * HOUR + 24 * HOUR),
+        ]
+    );
+}
+
+#[test]
+fn a_statusline_gives_the_windows_it_has_and_none_it_lacks() {
+    assert_eq!(
+        statusline_windows(&json!({"model": {"display_name": "Opus 5.5"}}), at(NOW)),
+        vec![]
     );
     assert_eq!(
-        statusline_window(
-            &json!({"rate_limits": {"seven_day": {"used_percentage": 3, "resets_at": 1}}})
+        statusline_windows(
+            &json!({"rate_limits": {"seven_day": {"used_percentage": 3, "resets_at": 1_795_500_000}}}),
+            at(NOW)
         ),
-        None
+        vec![window(WindowKind::Weekly, 3.0, 1_795_500_000_000)]
     );
+    assert_eq!(
+        statusline_windows(
+            &json!({"rate_limits": {"five_hour": {"used_percentage": "lots"}, "seven_day": 7}}),
+            at(NOW)
+        ),
+        vec![]
+    );
+    assert_eq!(statusline_windows(&json!("garbage"), at(NOW)), vec![]);
 }
 
 #[test]
@@ -56,38 +90,82 @@ fn nothing_seen_lets_a_lead_dispatch() {
 #[test]
 fn a_window_under_the_mark_lets_a_lead_dispatch_and_one_over_it_holds_until_its_reset() {
     let mut quota = ClaudeQuota::default();
-    quota.see_window(
-        statusline_window(&statusline(40.0, (NOW + 2 * HOUR) / 1000)).unwrap(),
+    quota.see(&seen(40.0, NOW + 2 * HOUR, NOW), at(NOW));
+    assert_eq!(quota.verdict(at(NOW), 90.0), Verdict::Go);
+    quota.see(&seen(92.0, NOW + 2 * HOUR, NOW + 1), at(NOW + 1));
+    let Verdict::Hold { until, by } = quota.verdict(at(NOW + 2), 90.0) else {
+        panic!("a window over the mark holds");
+    };
+    assert_eq!(until, at(NOW + 2 * HOUR));
+    assert!(matches!(by, Holding::Window(w) if w.kind == WindowKind::FiveHour));
+}
+
+#[test]
+fn a_weekly_window_over_the_mark_holds_until_the_week_resets() {
+    let week = NOW + 50 * HOUR;
+    let mut quota = ClaudeQuota::default();
+    quota.see(
+        &[
+            five_hour(10.0, NOW + 2 * HOUR),
+            window(WindowKind::Weekly, 91.0, week),
+        ],
         at(NOW),
     );
-    assert_eq!(
+    let Verdict::Hold { until, by } = quota.verdict(at(NOW), 90.0) else {
+        panic!("the weekly window holds");
+    };
+    assert_eq!(until, at(week));
+    assert!(matches!(by, Holding::Window(w) if w.kind == WindowKind::Weekly));
+}
+
+#[test]
+fn with_both_windows_over_the_mark_the_one_that_resets_last_holds() {
+    let week = NOW + 50 * HOUR;
+    let mut quota = ClaudeQuota::default();
+    quota.see(
+        &[
+            five_hour(95.0, NOW + 2 * HOUR),
+            window(WindowKind::Weekly, 92.0, week),
+        ],
+        at(NOW),
+    );
+    assert!(matches!(
         quota.verdict(at(NOW), 90.0),
-        Verdict::Go {
-            used_percent: 40.0,
-            resets: at(NOW + 2 * HOUR)
-        }
-    );
-    quota.see_window(
-        statusline_window(&statusline(92.0, (NOW + 2 * HOUR) / 1000)).unwrap(),
-        at(NOW + 1),
-    );
-    assert_eq!(
+        Verdict::Hold { until, by: Holding::Window(w) } if until == at(week) && w.kind == WindowKind::Weekly
+    ));
+}
+
+#[test]
+fn a_reading_keeps_the_window_it_does_not_mention() {
+    let week = NOW + 50 * HOUR;
+    let mut quota = ClaudeQuota::default();
+    quota.see(&[window(WindowKind::Weekly, 93.0, week)], at(NOW));
+    quota.see(&[five_hour(5.0, NOW + 2 * HOUR)], at(NOW + 1));
+    assert_eq!(quota.weekly.map(|w| w.used_percent), Some(93.0));
+    assert!(matches!(
         quota.verdict(at(NOW + 2), 90.0),
-        Verdict::Hold {
-            until: at(NOW + 2 * HOUR),
-            used_percent: Some(92.0)
-        }
-    );
+        Verdict::Hold { .. }
+    ));
 }
 
 #[test]
 fn a_window_whose_reset_has_come_says_nothing_any_more() {
     let mut quota = ClaudeQuota::default();
-    quota.see_window(
-        statusline_window(&statusline(99.0, (NOW + HOUR) / 1000)).unwrap(),
+    quota.see(&[five_hour(99.0, NOW + HOUR)], at(NOW));
+    assert_eq!(quota.verdict(at(NOW + HOUR), 90.0), Verdict::Unknown);
+}
+
+#[test]
+fn a_stale_window_leaves_the_verdict_to_the_one_that_stands() {
+    let mut quota = ClaudeQuota::default();
+    quota.see(
+        &[
+            five_hour(99.0, NOW + HOUR),
+            window(WindowKind::Weekly, 20.0, NOW + 50 * HOUR),
+        ],
         at(NOW),
     );
-    assert_eq!(quota.verdict(at(NOW + HOUR), 90.0), Verdict::Unknown);
+    assert_eq!(quota.verdict(at(NOW + 2 * HOUR), 90.0), Verdict::Go);
 }
 
 #[test]
@@ -98,7 +176,7 @@ fn a_limit_holds_until_the_reset_it_names() {
         quota.verdict(at(NOW + HOUR), 90.0),
         Verdict::Hold {
             until: at(NOW + 3 * HOUR),
-            used_percent: None
+            by: Holding::Limit
         }
     );
     assert_eq!(quota.verdict(at(NOW + 3 * HOUR), 90.0), Verdict::Unknown);
@@ -112,20 +190,17 @@ fn a_limit_without_a_time_holds_until_the_windows_reset_else_an_hour() {
         quota.verdict(at(NOW), 90.0),
         Verdict::Hold {
             until: at(NOW + HOUR),
-            used_percent: None
+            by: Holding::Limit
         }
     );
-    let mut seen = ClaudeQuota::default();
-    seen.see_window(
-        statusline_window(&statusline(97.0, (NOW + 2 * HOUR) / 1000)).unwrap(),
-        at(NOW),
-    );
-    seen.hit_limit(None, at(NOW + 1));
+    let mut seen_full = ClaudeQuota::default();
+    seen_full.see(&seen(97.0, NOW + 2 * HOUR, NOW), at(NOW));
+    seen_full.hit_limit(None, at(NOW + 1));
     assert_eq!(
-        seen.verdict(at(NOW + 2), 99.5),
+        seen_full.verdict(at(NOW + 2), 99.5),
         Verdict::Hold {
             until: at(NOW + 2 * HOUR),
-            used_percent: Some(97.0)
+            by: Holding::Limit
         }
     );
 }
@@ -145,25 +220,24 @@ fn a_window_with_room_seen_after_a_limit_lifts_it() {
     // A 429 from a capacity limit, not the plan's: the statusline still shows room.
     let mut quota = ClaudeQuota::default();
     quota.hit_limit(None, at(NOW));
-    quota.see_window(
-        statusline_window(&statusline(35.0, (NOW + 4 * HOUR) / 1000)).unwrap(),
-        at(NOW + 1),
-    );
-    assert_eq!(
-        quota.verdict(at(NOW + 2), 90.0),
-        Verdict::Go {
-            used_percent: 35.0,
-            resets: at(NOW + 4 * HOUR)
-        }
-    );
+    quota.see(&seen(35.0, NOW + 4 * HOUR, NOW + 1), at(NOW + 1));
+    assert_eq!(quota.verdict(at(NOW + 2), 90.0), Verdict::Go);
     // A full window keeps it.
     let mut full = ClaudeQuota::default();
     full.hit_limit(Some(at(NOW + 2 * HOUR)), at(NOW));
-    full.see_window(
-        statusline_window(&statusline(100.0, (NOW + 2 * HOUR) / 1000)).unwrap(),
+    full.see(&seen(100.0, NOW + 2 * HOUR, NOW + 1), at(NOW + 1));
+    assert_eq!(full.held_until(at(NOW + 2)), Some(at(NOW + 2 * HOUR)));
+    // So does a full week, whatever the 5-hour window says.
+    let mut week = ClaudeQuota::default();
+    week.hit_limit(Some(at(NOW + 9 * HOUR)), at(NOW));
+    week.see(
+        &[
+            five_hour(5.0, NOW + 4 * HOUR),
+            window(WindowKind::Weekly, 100.0, NOW + 9 * HOUR),
+        ],
         at(NOW + 1),
     );
-    assert_eq!(full.held_until(at(NOW + 2)), Some(at(NOW + 2 * HOUR)));
+    assert_eq!(week.held_until(at(NOW + 2)), Some(at(NOW + 9 * HOUR)));
 }
 
 #[test]

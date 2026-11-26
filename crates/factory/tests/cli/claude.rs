@@ -1,8 +1,8 @@
-//! The Claude plan's quota: the statusline and the StopFailure hook tell the daemon what they
-//! saw; `factory quota claude` says whether a lead may dispatch, `factory wait claude` blocks
+//! The Claude plan's quota: `factory hook statusline` and the StopFailure hook tell the daemon
+//! what they saw; `factory quota claude` says whether a lead may dispatch, `factory wait claude` blocks
 //! until it may, and `factory status` shows it.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -10,9 +10,9 @@ use crate::router::configure;
 use crate::support::world::poll_until;
 use crate::support::{Run, Sandbox, finish};
 
-const HOUR: i64 = 3_600;
+pub(crate) const HOUR: i64 = 3_600;
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -22,29 +22,45 @@ fn now_secs() -> i64 {
     .unwrap()
 }
 
-/// The statusline input of a session whose 5-hour window is `used` percent spent and resets
-/// at `resets` (seconds since the epoch).
-fn statusline_input(used: f64, resets: i64) -> String {
+/// The status line's input of a session whose 5-hour window is `used` percent spent and resets
+/// at `resets` (seconds since the epoch), and whose weekly window is `weekly` percent spent and
+/// resets a day later.
+pub(crate) fn statusline_input(used: f64, resets: i64, weekly: f64) -> String {
     json!({
         "session_id": "s1",
         "model": {"id": "claude-opus-5-5", "display_name": "Opus 5.5"},
         "workspace": {"current_dir": "/tmp/w"},
         "rate_limits": {
             "five_hour": {"used_percentage": used, "resets_at": resets},
-            "seven_day": {"used_percentage": 12.0, "resets_at": resets + 86_400}
+            "seven_day": {"used_percentage": weekly, "resets_at": resets + 86_400}
         }
     })
     .to_string()
 }
 
-fn statusline(sandbox: &Sandbox, used: f64, resets: i64) -> Run {
-    let out = sandbox.factory_stdin(&["statusline"], &statusline_input(used, resets));
-    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+/// Hands the status line's input to `factory hook statusline` with the daemon up, as systemd's
+/// socket keeps it: the hook never starts one itself.
+pub(crate) fn hook(sandbox: &Sandbox, input: &str) -> Run {
+    assert_eq!(sandbox.factory(&["monitor", "status"]).code, 0);
+    let out = sandbox.factory_stdin(&["hook", "statusline"], input);
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "", ""),
+        "{out:?}"
+    );
     out
+}
+
+pub(crate) fn statusline(sandbox: &Sandbox, used: f64, resets: i64) -> Run {
+    hook(sandbox, &statusline_input(used, resets, 12.0))
 }
 
 fn quota(sandbox: &Sandbox) -> Run {
     sandbox.factory(&["quota", "claude"])
+}
+
+fn quota_json(sandbox: &Sandbox) -> Value {
+    serde_json::from_str(&sandbox.factory(&["quota", "claude", "--json"]).stdout).unwrap()
 }
 
 /// `HH:MM` of a moment, in UTC (the sandbox runs with TZ=UTC).
@@ -53,35 +69,190 @@ fn clock(secs: i64) -> String {
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
+/// A moment as the factory prints one: `2026-11-23T04:13:00.000Z`.
+fn stamp(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    // Civil from days, after Howard Hinnant.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{}:{:02}.000Z",
+        clock(secs),
+        secs.rem_euclid(60)
+    )
+}
+
 fn utc() -> Sandbox {
     Sandbox::new().env("TZ", "UTC")
 }
 
+fn claude_row(sandbox: &Sandbox) -> String {
+    let out = sandbox.factory(&["status"]);
+    out.stdout_lines()
+        .into_iter()
+        .find(|l| l.starts_with("claude:"))
+        .unwrap_or_default()
+        .to_owned()
+}
+
 #[test]
-fn the_statusline_shows_the_model_and_the_window_in_one_line() {
+fn the_hook_records_both_windows_and_prints_nothing() {
     let sandbox = utc();
     let resets = now_secs() + 2 * HOUR;
 
-    let out = statusline(&sandbox, 23.5, resets);
+    statusline(&sandbox, 40.0, resets);
 
+    let out = quota(&sandbox);
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
     assert_eq!(
         out.stdout,
-        format!("Opus 5.5 · 5h 24% · resets {}\n", clock(resets))
+        format!(
+            "claude: 5h 40% resets {}, weekly 12% resets {}; dispatch\n",
+            stamp(resets),
+            stamp(resets + 86_400)
+        )
+    );
+    let shown = quota_json(&sandbox);
+    assert_eq!(shown["verdict"], "go", "{shown}");
+    assert_eq!(shown["used_percent"], 40, "{shown}");
+    assert_eq!(shown["resets"], resets * 1000, "{shown}");
+    assert_eq!(shown["windows"][1]["window"], "weekly", "{shown}");
+    assert_eq!(shown["windows"][1]["used_percent"], 12, "{shown}");
+    assert_eq!(
+        shown["windows"][1]["resets"],
+        (resets + 86_400) * 1000,
+        "{shown}"
     );
 }
 
 #[test]
-fn a_statusline_without_rate_limits_shows_the_model_alone() {
+fn the_hook_exits_0_in_silence_on_partial_empty_or_garbage_input() {
     let sandbox = utc();
-    let out = sandbox.factory_stdin(
-        &["statusline"],
-        r#"{"model": {"display_name": "Sonnet 5.5"}}"#,
-    );
+    let resets = now_secs() + 2 * HOUR;
+    statusline(&sandbox, 40.0, resets);
+
+    // Only the weekly window, and a malformed 5-hour one: the 5-hour reading stands.
+    let partial = json!({"rate_limits": {
+        "five_hour": {"used_percentage": "lots"},
+        "seven_day": {"used_percentage": 30.0, "resets_at": resets + 86_400}
+    }});
+    hook(&sandbox, &partial.to_string());
+    for input in [
+        "",
+        "not json at all",
+        "[1, 2, 3]",
+        "{\"rate_limits\": null}",
+        "\u{0}\u{1f}\u{7f}",
+    ] {
+        hook(&sandbox, input);
+    }
+    let raw = sandbox.factory_stdin(&["hook", "statusline", "--json"], "{\"model\": {}}");
     assert_eq!(
-        (out.code, out.stdout.as_str()),
-        (0, "Sonnet 5.5\n"),
+        (raw.code, raw.stdout.as_str(), raw.stderr.as_str()),
+        (0, "", ""),
+        "{raw:?}"
+    );
+
+    let shown = quota_json(&sandbox);
+    assert_eq!(shown["windows"][0]["used_percent"], 40, "{shown}");
+    assert_eq!(shown["windows"][1]["used_percent"], 30, "{shown}");
+}
+
+#[test]
+fn the_hook_exits_0_at_once_with_the_daemon_down_and_starts_none() {
+    let sandbox = utc();
+    let input = statusline_input(40.0, now_secs() + HOUR, 12.0);
+
+    let begun = Instant::now();
+    let out = sandbox.factory_stdin(&["hook", "statusline"], &input);
+    let took = begun.elapsed();
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "", ""),
         "{out:?}"
     );
+    assert!(took < Duration::from_millis(500), "took {took:?}");
+    assert!(
+        !sandbox.path("run/factory/daemon.pid").exists(),
+        "the hook started a daemon"
+    );
+}
+
+#[test]
+fn the_statusline_command_is_gone_from_the_cli_and_its_help() {
+    let sandbox = utc();
+    let help = sandbox.factory(&["--help"]);
+    assert_eq!(help.code, 0, "{help:?}");
+    assert!(!help.stdout.contains("statusline"), "{help:?}");
+    assert!(!help.stdout.contains("Statusline"), "{help:?}");
+
+    let gone = sandbox.factory_stdin(&["statusline"], "{}");
+    assert_eq!(gone.code, 2, "{gone:?}");
+
+    let hooks = sandbox.factory(&["hook", "--help"]);
+    assert!(hooks.stdout.contains("statusline"), "{hooks:?}");
+}
+
+#[test]
+fn a_spent_weekly_window_holds_until_the_week_resets_and_is_named() {
+    let sandbox = utc();
+    let resets = now_secs() + 2 * HOUR;
+    let weekly_resets = resets + 86_400;
+    hook(&sandbox, &statusline_input(41.0, resets, 91.0));
+
+    let out = quota(&sandbox);
+
+    assert_eq!((out.code, out.stdout.as_str()), (75, ""), "{out:?}");
+    assert_eq!(
+        out.stderr,
+        format!(
+            "factory: claude: hold: weekly 91%; hold new dispatches until {}; factory wait claude blocks until then\n",
+            stamp(weekly_resets)
+        )
+    );
+    let row = claude_row(&sandbox);
+    assert!(row.starts_with("claude: hold: weekly 91% until "), "{row}");
+    assert!(row.ends_with("; 5h 41%, weekly 91%"), "{row}");
+    let record: Value = sandbox
+        .factory(&["status", "--json"])
+        .stdout
+        .parse()
+        .unwrap();
+    assert_eq!(record["claude"]["hold"], "weekly 91%", "{record}");
+    assert_eq!(record["claude"]["until"], weekly_resets * 1000, "{record}");
+}
+
+#[test]
+fn a_reading_past_its_reset_shows_as_unknown_with_its_age() {
+    let sandbox = utc();
+    // The 5-hour window reset an hour ago; the week still stands.
+    let reset = now_secs() - HOUR;
+    hook(&sandbox, &statusline_input(97.0, reset, 12.0));
+
+    let out = quota(&sandbox);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(
+        out.stdout
+            .starts_with("claude: 5h unknown (seen 0m ago), weekly 12% resets "),
+        "{out:?}"
+    );
+    let row = claude_row(&sandbox);
+    assert!(
+        row.starts_with("claude: 5h unknown (seen 0m ago), weekly 12% resets "),
+        "{row}"
+    );
+    let shown = quota_json(&sandbox);
+    assert_eq!(shown["windows"][0]["current"], false, "{shown}");
+    assert_eq!(shown["used_percent"], Value::Null, "{shown}");
 }
 
 #[test]
@@ -103,17 +274,11 @@ fn a_window_with_room_lets_a_lead_dispatch() {
     let out = quota(&sandbox);
 
     assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
-    assert!(
-        out.stdout
-            .starts_with("claude: 40% of the 5-hour window used, resets "),
-        "{out:?}"
-    );
+    assert!(out.stdout.starts_with("claude: 5h 40% resets "), "{out:?}");
     assert!(out.stdout.ends_with("; dispatch\n"), "{out:?}");
-    let shown: Value =
-        serde_json::from_str(&sandbox.factory(&["quota", "claude", "--json"]).stdout).unwrap();
+    let shown = quota_json(&sandbox);
     assert_eq!(shown["verdict"], "go", "{shown}");
-    assert_eq!(shown["used_percent"], 40.0, "{shown}");
-    assert_eq!(shown["resets"], resets * 1000, "{shown}");
+    assert_eq!(shown["hold_at"], 90.0, "{shown}");
 }
 
 #[test]
@@ -127,9 +292,8 @@ fn a_nearly_spent_window_exits_75_naming_the_reset() {
     assert_eq!((out.code, out.stdout.as_str()), (75, ""), "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
     assert!(
-        out.stderr.starts_with(
-            "factory: claude: 93% of the 5-hour window used; hold new dispatches until "
-        ),
+        out.stderr
+            .starts_with("factory: claude: hold: 5h 93%; hold new dispatches until "),
         "{out:?}"
     );
 }
@@ -239,34 +403,19 @@ fn the_status_screen_shows_the_window() {
     );
 
     statusline(&sandbox, 40.0, resets);
-    let going = sandbox.factory(&["status"]);
-    let line = going
-        .stdout_lines()
-        .into_iter()
-        .find(|l| l.starts_with("claude:"))
-        .unwrap_or_default()
-        .to_owned();
+    let line = claude_row(&sandbox);
+    assert!(line.starts_with("claude: 5h 40% resets "), "{line}");
     assert!(
-        line.starts_with("claude: 40% of 5h used, resets "),
-        "{going:?}"
+        line.contains(&format!("{}Z, weekly 12% resets ", clock(resets))),
+        "{line}"
     );
-    assert!(line.ends_with(&format!("{}Z", clock(resets))), "{going:?}");
 
     statusline(&sandbox, 95.0, resets);
-    let holding = sandbox.factory(&["status"]);
-    let line = holding
-        .stdout_lines()
-        .into_iter()
-        .find(|l| l.starts_with("claude:"))
-        .unwrap_or_default()
-        .to_owned();
+    let line = claude_row(&sandbox);
+    assert!(line.starts_with("claude: hold: 5h 95% until "), "{line}");
     assert!(
-        line.starts_with("claude: holding dispatches until "),
-        "{holding:?}"
-    );
-    assert!(
-        line.ends_with(&format!("{}Z, 95% of 5h used", clock(resets))),
-        "{holding:?}"
+        line.ends_with(&format!("{}Z; 5h 95%, weekly 12%", clock(resets))),
+        "{line}"
     );
 }
 
@@ -276,7 +425,7 @@ fn a_wait_returns_at_once_with_room_and_times_out_while_holding() {
     let free = sandbox.factory(&["wait", "claude", "--timeout", "5s"]);
     assert_eq!(
         (free.code, free.stdout.as_str()),
-        (0, "claude: the window has room; dispatch\n"),
+        (0, "claude: the windows have room; dispatch\n"),
         "{free:?}"
     );
 
@@ -314,19 +463,79 @@ fn a_wait_ends_when_a_new_window_has_room() {
 }
 
 #[test]
-fn the_statusline_gives_one_json_object_with_json() {
+fn a_version_5_store_migrates_in_place_keeping_its_reading() {
     let sandbox = utc();
     let resets = now_secs() + 2 * HOUR;
+    std::fs::create_dir_all(sandbox.path("state/factory")).unwrap();
+    let path = sandbox.path("state/factory/factory.db");
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE claude_quota (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 used_percent REAL,
+                 resets_ms INTEGER,
+                 seen_ms INTEGER,
+                 limit_until_ms INTEGER,
+                 limit_at_ms INTEGER
+             );
+             CREATE TABLE quota (
+                 backend TEXT PRIMARY KEY,
+                 state TEXT NOT NULL CHECK (state IN ('available', 'cooling')),
+                 until_ms INTEGER
+             );
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO claude_quota (id, used_percent, resets_ms, seen_ms) VALUES (1, 40.0, ?1, ?2)",
+            [resets * 1000, now_secs() * 1000],
+        )
+        .unwrap();
+    }
 
-    let out = sandbox.factory_stdin(&["statusline", "--json"], &statusline_input(40.0, resets));
+    let out = quota(&sandbox);
 
-    assert_eq!((out.code, out.stdout_lines().len()), (0, 1), "{out:?}");
-    let shown: Value = serde_json::from_str(&out.stdout).unwrap();
-    assert_eq!(shown["model"], "Opus 5.5", "{shown}");
-    assert_eq!(shown["five_hour"]["used_percent"], 40.0, "{shown}");
-    assert_eq!(shown["five_hour"]["resets"], resets * 1000, "{shown}");
+    assert_eq!(out.code, 0, "{out:?}");
     assert_eq!(
-        shown["line"],
-        format!("Opus 5.5 · 5h 40% · resets {}", clock(resets))
+        out.stdout,
+        format!("claude: 5h 40% resets {}; dispatch\n", stamp(resets))
     );
+    hook(&sandbox, &statusline_input(41.0, resets, 91.0));
+    assert_eq!(quota(&sandbox).code, 75);
+    crate::router::kill_daemon(&sandbox);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 6);
+    let weekly: f64 = db
+        .query_row("SELECT weekly_used_percent FROM claude_quota", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!((weekly - 91.0).abs() < f64::EPSILON, "{weekly}");
+    for table in ["usage_history", "ci_runner", "ci_job"] {
+        let found: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, 1, "{table}");
+    }
+}
+
+#[test]
+fn a_store_from_a_newer_factory_is_refused() {
+    let sandbox = utc();
+    std::fs::create_dir_all(sandbox.path("state/factory")).unwrap();
+    let db = rusqlite::Connection::open(sandbox.path("state/factory/factory.db")).unwrap();
+    db.execute_batch("PRAGMA user_version = 7;").unwrap();
+    drop(db);
+
+    let out = quota(&sandbox);
+
+    assert_eq!(out.code, 3, "{out:?}");
 }

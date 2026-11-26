@@ -426,6 +426,35 @@ fn is_timeout(e: &std::io::Error) -> bool {
     )
 }
 
+/// Sends a request to a daemon that is already running, and never starts one, giving up with exit
+/// 3 after `patience`: for the callers that must stay fast and leave nothing behind, the
+/// status-line hook and the bar.
+pub fn call_running<P: Serialize, R: DeserializeOwned>(
+    paths: &Paths,
+    method: &str,
+    params: &P,
+    patience: Duration,
+) -> Result<R, Failure> {
+    let stream = UnixStream::connect(paths.socket()).map_err(|e| {
+        Failure::precondition(format!(
+            "daemon unreachable at {}: {e}; factory status starts it",
+            paths.socket().display()
+        ))
+    })?;
+    let mut session = Session {
+        reader: BufReader::new(stream),
+        paths: paths.clone(),
+        next_id: 1,
+    };
+    session.exchange(
+        method,
+        params,
+        Some(patience),
+        Exit::Precondition,
+        &mut |_| {},
+    )
+}
+
 /// Connects to the daemon, starting it first when nothing answers on the socket.
 fn connect(paths: &Paths) -> Result<UnixStream, Failure> {
     if let Ok(stream) = UnixStream::connect(paths.socket()) {

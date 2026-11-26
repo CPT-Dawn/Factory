@@ -1,35 +1,21 @@
-//! The Claude plan's quota: its 5-hour window as Claude Code's statusline reports it, the limit a
-//! 429 says was hit, and whether a lead may dispatch another agent now.
+//! The Claude plan's quota: its 5-hour and weekly windows as Claude Code's status line reports
+//! them, the limit a 429 says was hit, and whether a lead may dispatch another agent now.
 //!
-//! The statusline's `rate_limits.five_hour` (`used_percentage`, `resets_at`) is the documented
-//! signal; a limit message (`You've hit your session limit · resets 3:45pm`) is the fallback,
-//! read when a turn ends on a rate limit.
+//! The status line's `rate_limits.five_hour` and `rate_limits.seven_day` (`used_percentage`,
+//! `resets_at`) are the documented signal; a limit message (`You've hit your session limit ·
+//! resets 3:45pm`) is the fallback, read when a turn ends on a rate limit.
 
 use serde_json::Value;
 
 use crate::quota::Reset;
 use crate::status;
 use crate::timestamp::Timestamp;
+use crate::usage::{self, UsageWindow, WindowKind};
 
 const MILLIS_PER_HOUR: i64 = 3_600_000;
 
-/// How much of the window may be spent before a lead holds new dispatches, by default.
+/// How much of either window may be spent before a lead holds new dispatches, by default.
 pub const HOLD_AT_PERCENT: f64 = 90.0;
-
-/// The 5-hour window as one statusline saw it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Window {
-    /// 0 to 100.
-    pub used_percent: f64,
-    pub resets: Timestamp,
-}
-
-/// A window and when it was seen.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Seen {
-    pub window: Window,
-    pub at: Timestamp,
-}
 
 /// A limit a turn hit: dispatches hold until `until`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,36 +25,52 @@ pub struct Limit {
     pub at: Timestamp,
 }
 
-/// What is known of the Claude plan's quota.
+/// What is known of the Claude plan's quota: the last reading of each window, and a limit hit.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct ClaudeQuota {
-    pub window: Option<Seen>,
+    pub five_hour: Option<UsageWindow>,
+    pub weekly: Option<UsageWindow>,
     pub limit: Option<Limit>,
 }
 
 /// Whether a lead may dispatch now.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Verdict {
-    /// No window seen, or the last one has reset: dispatch.
+    /// No window's reading stands, and no limit holds: dispatch.
     Unknown,
-    /// The window has room.
-    Go {
-        used_percent: f64,
-        resets: Timestamp,
-    },
+    /// Every window that stands has room.
+    Go,
     /// Hold new dispatches until `until`.
-    Hold {
-        until: Timestamp,
-        used_percent: Option<f64>,
-    },
+    Hold { until: Timestamp, by: Holding },
+}
+
+/// What holds dispatches.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Holding {
+    /// A turn hit the plan's limit.
+    Limit,
+    /// A window over the mark.
+    Window(UsageWindow),
+}
+
+impl Holding {
+    /// As the screen and the quota line name it: `weekly 91%`, or `limit hit`.
+    pub fn describe(self) -> String {
+        match self {
+            Holding::Limit => "limit hit".to_owned(),
+            Holding::Window(window) => format!(
+                "{} {}%",
+                window.kind.label(),
+                usage::whole_percent(window.used_percent)
+            ),
+        }
+    }
 }
 
 impl ClaudeQuota {
-    /// The window as it stands at `now`: none once its reset has come.
-    pub fn window_at(&self, now: Timestamp) -> Option<Window> {
-        self.window
-            .map(|seen| seen.window)
-            .filter(|window| window.resets > now)
+    /// The windows a reading was seen of, the 5-hour one first.
+    pub fn windows(&self) -> Vec<UsageWindow> {
+        self.five_hour.into_iter().chain(self.weekly).collect()
     }
 
     /// The limit's reset while it holds at `now`.
@@ -78,23 +80,35 @@ impl ClaudeQuota {
             .map(|limit| limit.until)
     }
 
-    /// A statusline saw `window` at `now`. A window with room, seen after a limit was hit,
-    /// lifts the limit: the 429 was not the plan's.
-    pub fn see_window(&mut self, window: Window, now: Timestamp) {
-        if self
-            .limit
-            .is_some_and(|limit| now > limit.at && window.used_percent < 100.0)
+    /// A status line read `windows` at `now`; a window it doesn't mention keeps its last
+    /// reading. A reading in which every window has room, seen after a limit was hit, lifts the
+    /// limit: the 429 was not the plan's.
+    pub fn see(&mut self, windows: &[UsageWindow], now: Timestamp) {
+        if windows.is_empty() {
+            return;
+        }
+        if self.limit.is_some_and(|limit| now > limit.at)
+            && windows.iter().all(|window| window.used_percent < 100.0)
         {
             self.limit = None;
         }
-        self.window = Some(Seen { window, at: now });
+        for window in windows {
+            match window.kind {
+                WindowKind::FiveHour => self.five_hour = Some(*window),
+                WindowKind::Weekly => self.weekly = Some(*window),
+            }
+        }
     }
 
     /// A turn hit a limit at `now` that resets at `reset`. Without one, it holds until the
-    /// window's reset, else for an hour. A limit already holding keeps its reset unless this one
-    /// names a later one.
+    /// 5-hour window's reset, else for an hour. A limit already holding keeps its reset unless
+    /// this one names a later one.
     pub fn hit_limit(&mut self, reset: Option<Timestamp>, now: Timestamp) {
-        let named = reset.or_else(|| self.window_at(now).map(|window| window.resets));
+        let five_hour = self
+            .five_hour
+            .filter(|window| window.current(now))
+            .map(|window| window.resets);
+        let named = reset.or(five_hour);
         let until = match (self.held_until(now), reset) {
             (Some(held), None) => held,
             (Some(held), Some(reset)) => held.max(reset),
@@ -105,75 +119,82 @@ impl ClaudeQuota {
         self.limit = Some(Limit { until, at: now });
     }
 
-    /// Whether a lead may dispatch at `now`, holding once `hold_at` percent of the window is
-    /// spent or while a limit holds.
+    /// Whether a lead may dispatch at `now`, holding once `hold_at` percent of either window
+    /// is spent or while a limit holds; of both, whichever ends last.
     pub fn verdict(&self, now: Timestamp, hold_at: f64) -> Verdict {
-        let window = self.window_at(now);
-        if let Some(until) = self.held_until(now) {
-            return Verdict::Hold {
+        let windows = usage::verdict(&self.windows(), now, hold_at);
+        match (self.held_until(now), windows) {
+            (Some(until), usage::Verdict::Hold { by }) if by.resets > until => Verdict::Hold {
+                until: by.resets,
+                by: Holding::Window(by),
+            },
+            (Some(until), _) => Verdict::Hold {
                 until,
-                used_percent: window.map(|window| window.used_percent),
-            };
-        }
-        match window {
-            Some(window) if window.used_percent >= hold_at => Verdict::Hold {
-                until: window.resets,
-                used_percent: Some(window.used_percent),
+                by: Holding::Limit,
             },
-            Some(window) => Verdict::Go {
-                used_percent: window.used_percent,
-                resets: window.resets,
+            (None, usage::Verdict::Hold { by }) => Verdict::Hold {
+                until: by.resets,
+                by: Holding::Window(by),
             },
-            None => Verdict::Unknown,
-        }
-    }
-}
-
-impl Verdict {
-    pub fn state(self) -> status::ClaudeState {
-        match self {
-            Verdict::Unknown => status::ClaudeState::Unknown,
-            Verdict::Go { .. } => status::ClaudeState::Go,
-            Verdict::Hold { .. } => status::ClaudeState::Hold,
+            (None, usage::Verdict::Go) => Verdict::Go,
+            (None, usage::Verdict::Unknown) => Verdict::Unknown,
         }
     }
 
-    /// The verdict as `factory status` records it.
-    pub fn record(self) -> status::Claude {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let round = |used: f64| used.round().clamp(0.0, 100.0) as u32;
-        let (used_percent, resets, until) = match self {
-            Verdict::Unknown => (None, None, None),
-            Verdict::Go {
-                used_percent,
-                resets,
-            } => (Some(round(used_percent)), Some(resets.unix_millis()), None),
-            Verdict::Hold {
-                until,
-                used_percent,
-            } => (used_percent.map(round), None, Some(until.unix_millis())),
+    /// The quota at `now` as `factory status` and the bar record it.
+    pub fn record(&self, now: Timestamp, hold_at: f64) -> status::Claude {
+        let verdict = self.verdict(now, hold_at);
+        let five_hour = self.five_hour.filter(|window| window.current(now));
+        let (state, until, hold) = match verdict {
+            Verdict::Unknown => (status::ClaudeState::Unknown, None, None),
+            Verdict::Go => (status::ClaudeState::Go, None, None),
+            Verdict::Hold { until, by } => (
+                status::ClaudeState::Hold,
+                Some(until.unix_millis()),
+                Some(by.describe()),
+            ),
         };
         status::Claude {
-            verdict: self.state(),
-            used_percent,
-            resets,
+            verdict: state,
+            used_percent: five_hour.map(|window| usage::whole_percent(window.used_percent)),
+            resets: five_hour.map(|window| window.resets.unix_millis()),
             until,
+            hold,
+            windows: self
+                .windows()
+                .iter()
+                .map(|window| window.reading(now))
+                .collect(),
         }
     }
 }
 
-/// The 5-hour window in Claude Code's statusline input: `rate_limits.five_hour`, present for
-/// Pro and Max plans once a session has had its first answer.
-pub fn statusline_window(input: &Value) -> Option<Window> {
-    let five = input.pointer("/rate_limits/five_hour")?;
-    let used_percent = five.get("used_percentage")?.as_f64()?;
-    let resets = five.get("resets_at")?.as_f64()?;
-    #[allow(clippy::cast_possible_truncation)]
-    let resets = Timestamp::from_unix_millis((resets * 1000.0) as i64);
-    Some(Window {
-        used_percent,
-        resets,
+/// The windows in Claude Code's status-line input, read at `now`: `rate_limits.five_hour` and
+/// `rate_limits.seven_day`, present for Pro and Max plans once a session has had its first
+/// answer. A window that is missing or malformed is left out; any input at all is read.
+pub fn statusline_windows(input: &Value, now: Timestamp) -> Vec<UsageWindow> {
+    [
+        ("/rate_limits/five_hour", WindowKind::FiveHour),
+        ("/rate_limits/seven_day", WindowKind::Weekly),
+    ]
+    .into_iter()
+    .filter_map(|(pointer, kind)| {
+        let window = input.pointer(pointer)?;
+        let used_percent = window.get("used_percentage")?.as_f64()?;
+        let resets = window.get("resets_at")?.as_f64()?;
+        if !used_percent.is_finite() || !resets.is_finite() {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let resets = Timestamp::from_unix_millis((resets * 1000.0) as i64);
+        Some(UsageWindow {
+            kind,
+            used_percent,
+            resets,
+            seen: now,
+        })
     })
+    .collect()
 }
 
 /// A plan limit a message says was hit.

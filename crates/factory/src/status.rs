@@ -7,7 +7,6 @@
 use factory_core::status::{self, Status};
 use serde_json::json;
 
-use crate::claude::Claude;
 use crate::client;
 use crate::config;
 use crate::lab::service::Lab;
@@ -15,6 +14,7 @@ use crate::leads::Leads;
 use crate::output::{Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{BackendSlots, LeadContext, STATUS, StatusParams};
+use crate::quotas::QuotaKeeper;
 use crate::router::Router;
 use crate::steward::Steward;
 use factory_core::quota::WhenBusy;
@@ -54,34 +54,39 @@ pub async fn gather(
     lab: &std::sync::Arc<Lab>,
     leads: &Leads,
     steward: &Steward,
-    claude: &Claude,
+    quotas: &QuotaKeeper,
 ) -> Result<Status, Failure> {
     let now = crate::clock::now();
     let lab = lab
         .overview()
         .await
         .map_err(|e| Failure::precondition(e.message))?;
+    Ok(Status {
+        now: now.unix_millis(),
+        lab,
+        review: router.snapshot(&params.backends, now),
+        claude: quotas.claude(params.claude_hold_at),
+        waits: leads.registered(),
+        leads: leads_seen(leads, steward),
+    })
+}
+
+/// The leads in herdr as the daemon last pictured them, with what the context steward knows.
+pub fn leads_seen(leads: &Leads, steward: &Steward) -> status::Leads {
     let (error, reports) = leads.picture();
     let monitor = steward.status();
-    let leads_seen = reports
+    let seen = reports
         .into_iter()
         .map(|report| {
             let context = monitor.leads.iter().find(|ctx| ctx.lead == report.lead);
             lead(report, context)
         })
         .collect();
-    Ok(Status {
-        now: now.unix_millis(),
-        lab,
-        review: router.snapshot(&params.backends, now),
-        claude: claude.record(params.claude_hold_at),
-        waits: leads.registered(),
-        leads: status::Leads {
-            error,
-            monitor: monitor.running,
-            leads: leads_seen,
-        },
-    })
+    status::Leads {
+        error,
+        monitor: monitor.running,
+        leads: seen,
+    }
 }
 
 fn lead(report: crate::protocol::LeadReport, context: Option<&LeadContext>) -> status::Lead {

@@ -7,9 +7,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use factory_core::claude::{ClaudeQuota, Limit, Seen, Window};
+use factory_core::claude::{ClaudeQuota, Limit};
 use factory_core::quota::Quota;
 use factory_core::timestamp::Timestamp;
+use factory_core::usage::{UsageWindow, WindowKind};
 use factory_core::wait::WaitOn;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -17,7 +18,14 @@ use crate::output::Failure;
 use crate::protocol::{NotifyOn, SessionParam};
 
 /// The schema version this daemon writes, kept in `PRAGMA user_version`.
-const VERSION: i64 = 5;
+const VERSION: i64 = 6;
+
+/// What schema 6 adds to a table an older schema made: Claude's weekly window.
+const WEEKLY_COLUMNS: [(&str, &str); 3] = [
+    ("weekly_used_percent", "REAL"),
+    ("weekly_resets_ms", "INTEGER"),
+    ("weekly_seen_ms", "INTEGER"),
+];
 
 pub struct Store {
     db: Connection,
@@ -31,7 +39,7 @@ impl Store {
                 path.display()
             ))
         };
-        let db = Connection::open(path).map_err(cannot)?;
+        let mut db = Connection::open(path).map_err(cannot)?;
         // It holds the inbox tokens of the sessions that wait with --notify; SQLite gives its WAL
         // files the database's mode.
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| {
@@ -51,8 +59,11 @@ impl Store {
                 path.display()
             )));
         }
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS quota (
+        // One transaction: a store is at one schema or the next, never halfway.
+        let migration = db.transaction().map_err(cannot)?;
+        migration
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS quota (
                  backend TEXT PRIMARY KEY,
                  state TEXT NOT NULL CHECK (state IN ('available', 'cooling')),
                  until_ms INTEGER
@@ -95,7 +106,42 @@ impl Store {
                  resets_ms INTEGER,
                  seen_ms INTEGER,
                  limit_until_ms INTEGER,
-                 limit_at_ms INTEGER
+                 limit_at_ms INTEGER,
+                 weekly_used_percent REAL,
+                 weekly_resets_ms INTEGER,
+                 weekly_seen_ms INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS usage_history (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 harness TEXT NOT NULL,
+                 quota_group TEXT,
+                 window TEXT NOT NULL,
+                 used_percent REAL,
+                 resets_ms INTEGER,
+                 seen_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS usage_history_seen ON usage_history (seen_ms);
+             CREATE TABLE IF NOT EXISTS ci_runner (
+                 repo TEXT NOT NULL,
+                 id INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 busy INTEGER NOT NULL DEFAULT 0,
+                 seen_ms INTEGER NOT NULL,
+                 PRIMARY KEY (repo, id)
+             );
+             CREATE TABLE IF NOT EXISTS ci_job (
+                 repo TEXT NOT NULL,
+                 id INTEGER NOT NULL,
+                 run_id INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 conclusion TEXT,
+                 runner TEXT,
+                 queued_ms INTEGER,
+                 started_ms INTEGER,
+                 finished_ms INTEGER,
+                 PRIMARY KEY (repo, id)
              );
              CREATE TABLE IF NOT EXISTS wait (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,9 +154,16 @@ impl Store {
                  lead_pane TEXT,
                  lead_report TEXT
              );
-             PRAGMA user_version = 5;",
-        )
-        .map_err(cannot)?;
+             ",
+            )
+            .map_err(cannot)?;
+        if version < VERSION {
+            add_weekly_columns(&migration).map_err(cannot)?;
+            migration
+                .pragma_update(None, "user_version", VERSION)
+                .map_err(cannot)?;
+        }
+        migration.commit().map_err(cannot)?;
         Ok(Store { db })
     }
 
@@ -180,38 +233,38 @@ impl Store {
 impl Store {
     /// The Claude plan's quota as last recorded; nothing recorded is nothing known.
     pub fn claude_quota(&self) -> rusqlite::Result<ClaudeQuota> {
+        type Reading = (Option<f64>, Option<i64>, Option<i64>);
         let row = self
             .db
             .query_row(
-                "SELECT used_percent, resets_ms, seen_ms, limit_until_ms, limit_at_ms
+                "SELECT used_percent, resets_ms, seen_ms, limit_until_ms, limit_at_ms,
+                     weekly_used_percent, weekly_resets_ms, weekly_seen_ms
                  FROM claude_quota WHERE id = 1",
                 [],
                 |row| {
-                    Ok((
-                        row.get::<_, Option<f64>>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                    ))
+                    let five: Reading = (row.get(0)?, row.get(1)?, row.get(2)?);
+                    let weekly: Reading = (row.get(5)?, row.get(6)?, row.get(7)?);
+                    let limit = (row.get::<_, Option<i64>>(3)?, row.get::<_, Option<i64>>(4)?);
+                    Ok((five, weekly, limit))
                 },
             )
             .optional()?;
-        let Some((used, resets, seen, until, at)) = row else {
+        let Some((five, weekly, (until, at))) = row else {
             return Ok(ClaudeQuota::default());
         };
         let stamp = Timestamp::from_unix_millis;
+        let window = |kind, (used, resets, seen): Reading| match (used, resets, seen) {
+            (Some(used_percent), Some(resets), Some(seen)) => Some(UsageWindow {
+                kind,
+                used_percent,
+                resets: stamp(resets),
+                seen: stamp(seen),
+            }),
+            _ => None,
+        };
         Ok(ClaudeQuota {
-            window: match (used, resets, seen) {
-                (Some(used_percent), Some(resets), Some(seen)) => Some(Seen {
-                    window: Window {
-                        used_percent,
-                        resets: stamp(resets),
-                    },
-                    at: stamp(seen),
-                }),
-                _ => None,
-            },
+            five_hour: window(WindowKind::FiveHour, five),
+            weekly: window(WindowKind::Weekly, weekly),
             limit: until.zip(at).map(|(until, at)| Limit {
                 until: stamp(until),
                 at: stamp(at),
@@ -221,22 +274,43 @@ impl Store {
 
     /// Records the Claude plan's quota.
     pub fn set_claude_quota(&self, quota: &ClaudeQuota) -> rusqlite::Result<()> {
-        let window = quota.window;
+        let (five, weekly) = (quota.five_hour, quota.weekly);
         self.db.execute(
-            "INSERT INTO claude_quota (id, used_percent, resets_ms, seen_ms, limit_until_ms, limit_at_ms)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO claude_quota (id, used_percent, resets_ms, seen_ms, limit_until_ms,
+                 limit_at_ms, weekly_used_percent, weekly_resets_ms, weekly_seen_ms)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT (id) DO UPDATE SET used_percent = ?1, resets_ms = ?2, seen_ms = ?3,
-                 limit_until_ms = ?4, limit_at_ms = ?5",
+                 limit_until_ms = ?4, limit_at_ms = ?5, weekly_used_percent = ?6,
+                 weekly_resets_ms = ?7, weekly_seen_ms = ?8",
             params![
-                window.map(|seen| seen.window.used_percent),
-                window.map(|seen| seen.window.resets.unix_millis()),
-                window.map(|seen| seen.at.unix_millis()),
+                five.map(|window| window.used_percent),
+                five.map(|window| window.resets.unix_millis()),
+                five.map(|window| window.seen.unix_millis()),
                 quota.limit.map(|limit| limit.until.unix_millis()),
                 quota.limit.map(|limit| limit.at.unix_millis()),
+                weekly.map(|window| window.used_percent),
+                weekly.map(|window| window.resets.unix_millis()),
+                weekly.map(|window| window.seen.unix_millis()),
             ],
         )?;
         Ok(())
     }
+}
+
+/// Schema 6's weekly columns, on a `claude_quota` table an older schema made without them.
+fn add_weekly_columns(db: &Connection) -> rusqlite::Result<()> {
+    let mut columns = db.prepare("SELECT name FROM pragma_table_info('claude_quota')")?;
+    let present: Vec<String> = columns
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (name, kind) in WEEKLY_COLUMNS {
+        if !present.iter().any(|column| column == name) {
+            db.execute_batch(&format!(
+                "ALTER TABLE claude_quota ADD COLUMN {name} {kind};"
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 /// A wait that outlives its CLI, as the database keeps it.
