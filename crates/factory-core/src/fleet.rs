@@ -174,6 +174,30 @@ pub fn is_factory_branch(branch: &str) -> bool {
     branch.starts_with(BRANCH_PREFIX)
 }
 
+/// The `owner/name` a git remote's URL names on github.com, in any way git writes one
+/// (`git@github.com:o/n.git`, `https://github.com/o/n`, `ssh://git@github.com/o/n.git`);
+/// none for a remote elsewhere, or one that names no repo.
+pub fn github_repo(url: &str) -> Option<String> {
+    let url = url.trim();
+    let path = if let Some(rest) = url.strip_prefix("git@github.com:") {
+        rest
+    } else {
+        let rest = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .or_else(|| url.strip_prefix("ssh://"))?;
+        let host = rest.split('/').next()?;
+        let host = host.rsplit('@').next()?;
+        if !host.eq_ignore_ascii_case("github.com") {
+            return None;
+        }
+        rest.split_once('/')?.1
+    };
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    is_repo(path).then(|| path.to_owned())
+}
+
 /// Whether `repo` reads as `owner/name`.
 pub fn is_repo(repo: &str) -> bool {
     let part = |part: &str| {

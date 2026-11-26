@@ -5,6 +5,7 @@
 use serde_json::{Value, json};
 
 use crate::support::github::{FORBIDDEN, FakeGitHub, Job, RATE_LIMITED, TIMED_OUT};
+use crate::support::herdr::FakeHerdr;
 use crate::support::world::poll_until;
 use crate::support::{Sandbox, stop_daemon};
 
@@ -590,4 +591,66 @@ fn a_repo_that_never_answered_shows_why_and_no_numbers() {
         "no numbers rather than none: {card}"
     );
     assert_eq!(bar_ci(&sandbox).0["text"], "?");
+}
+
+/// A git checkout at `dir` on `branch`, its origin `origin`.
+fn checkout(dir: &std::path::Path, branch: &str, origin: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", branch],
+        vec!["remote", "add", "origin", origin],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+}
+
+/// A herdr with the lead `lead-<slug>` in workspace `w<n>`, at work in `cwd`.
+fn lead_in(herdr: &FakeHerdr, n: u32, slug: &str, cwd: &std::path::Path) {
+    let pane = format!("w{n}:p1");
+    herdr.workspace(&format!("w{n}"), slug);
+    herdr.agent(Some(&format!("lead-{slug}")), &pane, "working");
+    herdr.session(&pane, cwd.to_str().unwrap(), &format!("s{n}"));
+}
+
+#[test]
+fn a_live_lead_on_a_factory_branch_of_the_repo_wakes_the_watcher_with_no_wait() {
+    let sandbox = watching(2);
+    let github = FakeGitHub::install(&sandbox);
+    github.pulls(&[(12, "factory/s1-t2")]);
+    github.checks(&[(1, "test", "completed", Some("success"))]);
+    let shop = sandbox.path("work/shop");
+    checkout(&shop, "factory/s1", "git@github.com:acme/shop.git");
+    let herdr = FakeHerdr::start(&sandbox);
+    lead_in(&herdr, 1, "s1", &shop);
+
+    // No wait: the lead's work is something to watch, and its pull request is found.
+    let shown = shop_when(&sandbox, |shop| shop["pulls"][0]["number"] == 12);
+    assert_eq!(shown["pulls"][0]["state"], "passing", "{shown}");
+    assert!(!status(&sandbox)["ci"]["next"].is_null());
+}
+
+#[test]
+fn a_lead_on_another_repo_or_off_the_factory_branches_costs_github_nothing() {
+    let sandbox = watching(2);
+    let github = FakeGitHub::install(&sandbox);
+    github.pulls(&[(12, "factory/s1-t2")]);
+    let blog = sandbox.path("work/blog");
+    checkout(&blog, "factory/b1", "git@github.com:acme/blog.git");
+    let by_hand = sandbox.path("work/shop");
+    checkout(&by_hand, "main", "https://github.com/acme/shop.git");
+    let herdr = FakeHerdr::start(&sandbox);
+    lead_in(&herdr, 1, "blog", &blog);
+    lead_in(&herdr, 2, "shop", &by_hand);
+
+    for minutes in [1, 3, 10] {
+        move_clock(&sandbox, minutes * 60);
+        let ci = status(&sandbox)["ci"].clone();
+        assert!(ci["repos"][0]["seen"].is_null(), "{ci}");
+    }
+    assert_eq!(sandbox.calls("gh"), Vec::<Vec<String>>::new());
 }

@@ -29,6 +29,15 @@ devlab reserve --release [--json]                  # give this owner's reservati
   lease ended (or 2 h, when no call reached the daemon meanwhile): `devlab gc` says which and why,
   and `devlab status` shows each one's `lapses in N min unless used`.
 
+## Which stacks the bar's Lab card shows
+
+The stack sweep looks at every slot of each project the lab knows: one with a slot the store
+records, a lease or a reservation, or one whose `devlab.json` a worktree that held or reserved
+a slot names (all of its `maxSlots`, so a stack the owner started by hand on a slot no lease
+took shows as theirs). A project the lab has never seen, with no lease, reservation or slot
+record, is out of its reach: its stacks are not on the card, since nothing names the project
+or its slot ids without asking docker for every container on the machine.
+
 ## The matching change for the harness repo (implement-spec)
 
 Not made here; the harness repo is edited by its owner.

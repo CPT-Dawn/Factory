@@ -3,17 +3,21 @@
 //! `factory/*` pull requests, for the status screen and the bar.
 //!
 //! It reads only while something needs watching: a `factory wait ci` on one of the repos'
-//! pull requests wakes it, and it reads again every minute while the last answer shows an open
-//! factory pull request or a job not yet completed. Otherwise it waits without a timer, so an
-//! idle factory costs GitHub nothing. A read that fails keeps the last good answer, marked with
+//! pull requests wakes it, and it reads a repo every minute while the last answer shows an open
+//! factory pull request or a job not yet completed, or while the factory has live work in it: a
+//! lead herdr shows at work in a checkout of the repo (its `origin` on github.com), while one of
+//! the repo's worktrees is on a `factory/*` branch. Reviews and waits count through the lead
+//! they run under. Live work is looked at again on each change to the leads and every minute,
+//! with git and herdr's picture only, so an idle factory costs GitHub nothing. A read that fails keeps the last good answer, marked with
 //! why, and every answer is kept in the database, so a restarted daemon resumes the watch.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use factory_adapters::gh::{Actions, GhActions, GhError, HOST};
+use factory_adapters::git::GitRepo;
 use factory_core::ci::PullRequest;
-use factory_core::fleet::{Ci, Job, Pull, PullState, RepoCi, is_factory_branch};
+use factory_core::fleet::{Ci, Job, Pull, PullState, RepoCi, github_repo, is_factory_branch};
 use tokio::sync::watch;
 
 use crate::clock;
@@ -28,6 +32,11 @@ const TICK: Duration = Duration::from_secs(1);
 /// How far before the last good answer a read looks for runs updated since, for the clocks of
 /// GitHub and of this machine to disagree.
 const OVERLAP_MS: i64 = 120_000;
+/// What names the repos, of those it is given, that the factory has live work in.
+pub type LiveWork = Arc<dyn Fn(&[String]) -> Vec<String> + Send + Sync>;
+
+/// How often an idle watcher looks again for live work, on top of each change to the leads.
+const LIVE_LOOK: Duration = Duration::from_secs(60);
 /// How far back the first read of a repo looks for runs updated since.
 const LOOKBACK_MS: i64 = 3_600_000;
 /// What a failed GitHub read tells the owner to do.
@@ -101,54 +110,82 @@ impl<A: Actions> Fleet<A> {
         self.ci().repos.iter().any(RepoCi::needs_watching)
     }
 
-    /// Watches until the daemon stops; `watched` hears each pull request a wait watches.
-    pub async fn run(self: Arc<Self>, mut watched: watch::Receiver<Option<PullRequest>>) {
-        if self.ci().repos.is_empty() {
+    /// Watches until the daemon stops; `watched` hears each pull request a wait watches,
+    /// `leads` ticks on each change to the leads, and `live` names the repos, of those it is
+    /// given, the factory has live work in.
+    pub async fn run(
+        self: Arc<Self>,
+        mut watched: watch::Receiver<Option<PullRequest>>,
+        leads: watch::Receiver<u64>,
+        live: LiveWork,
+    ) {
+        let repos: Vec<String> = self.ci().repos.iter().map(|r| r.repo.clone()).collect();
+        if repos.is_empty() {
             return;
         }
+        let mut leads = Some(leads);
         let mut asked = false;
         let mut last: Option<i64> = None;
+        // The repos with live work, as last looked; looked at again once `look` is set.
+        let mut busy: Vec<String> = Vec::new();
+        let mut look = false;
+        let mut looked: Option<std::time::Instant> = None;
         loop {
-            let wanted = asked || self.needs_watching();
+            // A burst of changes to the leads is one look, at most one each tick.
+            let stale =
+                looked.is_none_or(|at| at.elapsed() >= LIVE_LOOK || (look && at.elapsed() >= TICK));
+            if stale {
+                look = false;
+                looked = Some(std::time::Instant::now());
+                let (live, repos) = (Arc::clone(&live), repos.clone());
+                busy = tokio::task::spawn_blocking(move || live(&repos))
+                    .await
+                    .unwrap_or_default();
+            }
+            let wanted = asked || self.needs_watching() || !busy.is_empty();
             let due = last.is_none_or(|at| clock::lab_now_ms().saturating_sub(at) >= INTERVAL_MS);
             if wanted && due {
-                asked = false;
+                let all = std::mem::take(&mut asked);
                 last = Some(clock::lab_now_ms());
-                let fleet = Arc::clone(&self);
-                let _ = tokio::task::spawn_blocking(move || fleet.read_all()).await;
-                let next = self
-                    .needs_watching()
+                let (fleet, only) = (Arc::clone(&self), busy.clone());
+                let _ = tokio::task::spawn_blocking(move || fleet.read_all(all, &only)).await;
+                let next = (self.needs_watching() || !busy.is_empty())
                     .then(|| last.map(|at| at + INTERVAL_MS));
                 self.ci().next = next.flatten();
                 continue;
             }
-            let heard = if wanted {
-                tokio::select! {
-                    () = tokio::time::sleep(TICK) => None,
-                    changed = watched.changed() => Some(changed),
-                }
-            } else {
-                Some(watched.changed().await)
-            };
-            match heard {
-                // The pollers are gone: the daemon is stopping.
-                Some(Err(_)) => return,
-                Some(Ok(())) => {
+            let wait = if wanted || look { TICK } else { LIVE_LOOK };
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = changed(&mut leads) => look = true,
+                changed = watched.changed() => {
+                    // The pollers are gone: the daemon is stopping.
+                    if changed.is_err() {
+                        return;
+                    }
                     let pr = watched.borrow_and_update().clone();
                     asked |= pr.is_some_and(|pr| self.watches(&pr));
                 }
-                None => {}
             }
         }
     }
 
-    /// Reads every repo once, keeping each answer, or the last good one marked with why.
-    fn read_all(&self) {
+    /// Reads the repos once, keeping each answer, or the last good one marked with why: every
+    /// repo with `all`, else each one that needs watching or is named in `busy`.
+    fn read_all(&self, all: bool, busy: &[String]) {
         let count = self.ci().repos.len();
         for index in 0..count {
             let Some(before) = self.ci().repos.get(index).cloned() else {
                 return;
             };
+            if !all
+                && !before.needs_watching()
+                && !busy
+                    .iter()
+                    .any(|repo| repo.eq_ignore_ascii_case(&before.repo))
+            {
+                continue;
+            }
             let read = read(&*self.actions, &before);
             let after = match read {
                 Ok((mut after, jobs)) => {
@@ -246,4 +283,41 @@ fn read<A: Actions>(actions: &A, before: &RepoCi) -> Result<(RepoCi, Vec<Job>), 
         },
         read,
     ))
+}
+
+/// The next tick of `leads`; never, once its sender is gone.
+async fn changed(leads: &mut Option<watch::Receiver<u64>>) {
+    if let Some(receiver) = leads.as_mut()
+        && receiver.changed().await.is_ok()
+    {
+        return;
+    }
+    *leads = None;
+    std::future::pending::<()>().await;
+}
+
+/// The repos among `repos` (`owner/name`, any case) that a checkout at one of `cwds` works
+/// on: one whose `origin` is the repo on github.com, while one of the repo's worktrees is on a
+/// `factory/*` branch. Asks git only.
+pub fn live_repos(repos: &[String], cwds: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut live: Vec<String> = Vec::new();
+    for cwd in cwds {
+        let repo = GitRepo::at(std::path::Path::new(&cwd));
+        let Some(named) = repo.origin_url().as_deref().and_then(github_repo) else {
+            continue;
+        };
+        let Some(configured) = repos.iter().find(|r| r.eq_ignore_ascii_case(&named)) else {
+            continue;
+        };
+        if live.contains(configured) {
+            continue;
+        }
+        if repo
+            .worktree_branches()
+            .is_ok_and(|branches| branches.iter().any(|b| is_factory_branch(b)))
+        {
+            live.push(configured.clone());
+        }
+    }
+    live
 }
