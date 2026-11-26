@@ -22,6 +22,9 @@ pub struct Status {
     pub review: Vec<Backend>,
     /// The Claude plan's 5-hour window, and whether a lead may dispatch.
     pub claude: Claude,
+    /// The Codex plan's windows, and whether a review may dispatch on it.
+    #[serde(default)]
+    pub codex: Codex,
     pub waits: Vec<Wait>,
     pub leads: Leads,
 }
@@ -142,7 +145,36 @@ pub struct Claude {
     pub windows: Vec<UsageReading>,
 }
 
-/// Whether a lead may dispatch on the Claude plan.
+/// The Codex plan's quota as `factory quota codex` judges it, and as its `app-server` last
+/// said.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Codex {
+    pub verdict: ClaudeState,
+    /// When a hold ends, in milliseconds since the epoch.
+    pub until: Option<i64>,
+    /// What holds reviews: `weekly 91%` or `5h 93%`.
+    pub hold: Option<String>,
+    /// The last reading of each window, the 5-hour one first.
+    pub windows: Vec<UsageReading>,
+    /// The plan, as Codex names it: `plus`, `pro`.
+    pub plan: Option<String>,
+    /// The rate-limit reset credits still available.
+    pub reset_credits: u32,
+    /// Why the last ask could not be read (`codex usage unreadable: <this>`); none when it
+    /// could.
+    pub unreadable: Option<String>,
+}
+
+impl Codex {
+    /// `codex usage unreadable: <reason>`, while the last ask could not be read.
+    pub fn unreadable_line(&self) -> Option<String> {
+        self.unreadable
+            .as_ref()
+            .map(|why| format!("codex usage unreadable: {why}"))
+    }
+}
+
+/// Whether a lead may dispatch on a harness's plan: the Claude plan's, and the Codex plan's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClaudeState {
@@ -221,6 +253,7 @@ pub fn screen(status: &Status) -> Vec<String> {
     lab(status, &mut rows);
     review(status, &mut rows);
     claude(status, &mut rows);
+    codex(status, &mut rows);
     waits(status, &mut rows);
     leads(status, &mut rows);
     rows.iter().map(|row| fit(row)).collect()
@@ -373,6 +406,50 @@ fn claude(status: &Status, rows: &mut Vec<String>) {
                 .collect();
             format!("claude: {}", windows.join(", "))
         }
+    };
+    rows.push(row);
+}
+
+fn codex(status: &Status, rows: &mut Vec<String>) {
+    let codex = &status.codex;
+    let now = status.now;
+    let windows: Vec<String> = codex
+        .windows
+        .iter()
+        .map(|window| window.describe_with_reset(now, |resets| moment(resets, now)))
+        .collect();
+    let row = match (
+        &codex.unreadable_line(),
+        codex.verdict,
+        codex.until,
+        &codex.hold,
+    ) {
+        // A hold that still stands is kept in the row, though the last ask could not be read.
+        (Some(line), ClaudeState::Hold, Some(until), hold) => format!(
+            "{line}; held: {} until {}",
+            hold.as_deref().unwrap_or("limit hit"),
+            moment(until, now)
+        ),
+        (Some(line), ..) => line.clone(),
+        (None, ClaudeState::Hold, Some(until), hold) => {
+            let mut row = format!(
+                "codex: hold: {} until {}",
+                hold.as_deref().unwrap_or("limit hit"),
+                moment(until, now)
+            );
+            if !codex.windows.is_empty() {
+                let windows: Vec<String> = codex
+                    .windows
+                    .iter()
+                    .map(|window| window.describe(now))
+                    .collect();
+                row.push_str("; ");
+                row.push_str(&windows.join(", "));
+            }
+            row
+        }
+        (None, ..) if windows.is_empty() => "codex: no plan window seen".to_owned(),
+        (None, ..) => format!("codex: {}", windows.join(", ")),
     };
     rows.push(row);
 }

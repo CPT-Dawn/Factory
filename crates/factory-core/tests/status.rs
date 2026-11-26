@@ -2,8 +2,8 @@
 //! ticket names (three slots, three backends, five leads) fits one terminal screen.
 
 use factory_core::status::{
-    Backend, COLUMNS, Claude, ClaudeState, Lab, Lead, Leads, Lease, Queued, QuotaState, ROWS,
-    Reservation, Slot, Status, Subagent, Wait, screen,
+    Backend, COLUMNS, Claude, ClaudeState, Codex, Lab, Lead, Leads, Lease, Queued, QuotaState,
+    ROWS, Reservation, Slot, Status, Subagent, Wait, screen,
 };
 use factory_core::timestamp::Timestamp;
 use factory_core::usage::{UsageReading, WindowKind};
@@ -19,6 +19,7 @@ fn idle() -> Status {
         lab: Lab::default(),
         review: Vec::new(),
         claude: Claude::default(),
+        codex: Codex::default(),
         waits: Vec::new(),
         leads: Leads {
             error: None,
@@ -97,6 +98,7 @@ fn an_idle_factory_has_a_dated_title_and_one_line_per_section() {
             "lab: idle",
             "review: no backends configured",
             "claude: no plan window seen",
+            "codex: no plan window seen",
             "waits: none",
             "leads: none, monitor off",
         ]
@@ -251,7 +253,7 @@ fn a_wait_names_who_waits_and_what_for() {
     ];
 
     assert_eq!(
-        &rows(&status)[4..8],
+        &rows(&status)[5..9],
         [
             "waits: 3",
             "  lead-pay -> ci o/r#12",
@@ -293,7 +295,7 @@ fn a_lead_shows_its_state_context_and_subagents() {
     status.leads.leads = vec![cart, pay, ship, lead("lead-docs", "finished", None)];
 
     assert_eq!(
-        &rows(&status)[5..10],
+        &rows(&status)[6..11],
         [
             "leads: 4, monitor on",
             "  lead-cart  working             212k  3 subs, most 170k",
@@ -310,7 +312,7 @@ fn leads_that_herdr_cannot_tell_are_one_line() {
     status.leads.error = Some("herdr unreachable at /x/herdr.sock: no such file".to_owned());
 
     assert_eq!(
-        rows(&status)[5],
+        rows(&status)[6],
         "leads: herdr unavailable, see factory lead list"
     );
 }
@@ -589,4 +591,90 @@ fn a_window_past_its_reset_shows_as_unknown_with_its_age() {
         rows(&status)[3],
         "claude: 5h unknown (seen 3h ago), weekly 12% resets 11-30 02:00Z"
     );
+}
+
+fn at(text: &str) -> i64 {
+    Timestamp::parse(text).map_or(0, Timestamp::unix_millis) / 1000
+}
+
+fn codex_window(window: WindowKind, used: u32, resets: &str, current: bool) -> UsageReading {
+    UsageReading {
+        window,
+        used_percent: used,
+        resets: at(resets) * 1000,
+        seen: now() * 1000 - 180_000,
+        current,
+    }
+}
+
+#[test]
+fn the_codex_row_shows_each_window_and_when_it_resets() {
+    let mut status = idle();
+    status.codex = Codex {
+        verdict: ClaudeState::Go,
+        windows: vec![
+            codex_window(WindowKind::FiveHour, 18, "2026-11-23T07:00:00Z", true),
+            codex_window(WindowKind::Weekly, 62, "2026-11-30T02:00:00Z", true),
+        ],
+        plan: Some("plus".to_owned()),
+        reset_credits: 2,
+        ..Codex::default()
+    };
+
+    assert_eq!(
+        rows(&status)[4],
+        "codex: 5h 18% resets 07:00Z, weekly 62% resets 11-30 02:00Z"
+    );
+}
+
+#[test]
+fn a_codex_hold_says_what_holds_and_until_when() {
+    let mut status = idle();
+    status.codex = Codex {
+        verdict: ClaudeState::Hold,
+        until: Some(at("2026-11-30T02:00:00Z") * 1000),
+        hold: Some("weekly 92%".to_owned()),
+        windows: vec![
+            codex_window(WindowKind::FiveHour, 18, "2026-11-23T07:00:00Z", true),
+            codex_window(WindowKind::Weekly, 92, "2026-11-30T02:00:00Z", true),
+        ],
+        ..Codex::default()
+    };
+
+    assert_eq!(
+        rows(&status)[4],
+        "codex: hold: weekly 92% until 11-30 02:00Z; 5h 18%, weekly 92%"
+    );
+}
+
+#[test]
+fn an_unreadable_codex_says_why_and_never_reads_as_zero() {
+    let mut status = idle();
+    status.codex = Codex {
+        unreadable: Some("it did not answer within 20s".to_owned()),
+        ..Codex::default()
+    };
+    assert_eq!(
+        rows(&status)[4],
+        "codex usage unreadable: it did not answer within 20s"
+    );
+
+    // A hold from an earlier reading is not forgotten while Codex can't be read.
+    status.codex.verdict = ClaudeState::Hold;
+    status.codex.hold = Some("5h 93%".to_owned());
+    status.codex.until = Some(at("2026-11-23T07:00:00Z") * 1000);
+    assert_eq!(
+        rows(&status)[4],
+        "codex usage unreadable: it did not answer within 20s; held: 5h 93% until 07:00Z"
+    );
+}
+
+#[test]
+fn a_status_record_from_before_codex_still_reads() {
+    let mut value = serde_json::to_value(idle()).unwrap_or_default();
+    if let Some(object) = value.as_object_mut() {
+        object.remove("codex");
+    }
+    let old: Status = serde_json::from_value(value).unwrap_or_else(|_| idle());
+    assert_eq!(old.codex, Codex::default());
 }
