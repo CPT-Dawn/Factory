@@ -301,6 +301,17 @@ impl Store {
 }
 
 impl Store {
+    /// Runs `write` in one transaction: all of what it writes lands, or none of it does.
+    pub fn atomically<T>(
+        &self,
+        write: impl FnOnce(&Store) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        let transaction = self.db.unchecked_transaction()?;
+        let done = write(self)?;
+        transaction.commit()?;
+        Ok(done)
+    }
+
     /// Appends `row` to the usage history unless it is the reading its harness, group and
     /// window last had: the latest row of that key stands for it. Whether it appended.
     pub fn append_history(&self, row: &HistoryRow) -> rusqlite::Result<bool> {

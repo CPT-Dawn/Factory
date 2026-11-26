@@ -114,7 +114,7 @@ fn run(command: Command, json: bool) -> ExitCode {
         } => claude::quota(),
         Command::Quota {
             command: QuotaCommand::History { since },
-        } => history::run(since.as_deref()),
+        } => history::run(since.as_deref(), json),
         Command::Bar => return bar::run(json),
         Command::Wait {
             command: WaitCommand::Claude { timeout },

@@ -164,6 +164,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
         );
         tokio::spawn(Arc::clone(&leads).start());
         tokio::spawn(Arc::clone(&steward).resume());
+        tokio::spawn(Arc::clone(&quotas).keep());
         let lab = Arc::new(lab);
         lab.recover();
         notifier.resume();

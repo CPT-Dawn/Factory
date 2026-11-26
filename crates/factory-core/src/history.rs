@@ -112,17 +112,24 @@ pub fn parse_since(text: &str, now: Timestamp) -> Result<Timestamp, String> {
         .ok_or_else(bad)
 }
 
-/// What a window's name is in the database: its serde name, `five_hour` or `weekly`.
+/// Each window and its name in the database, which is its serde name.
+const WINDOWS: [(WindowKind, &str); 2] = [
+    (WindowKind::FiveHour, "five_hour"),
+    (WindowKind::Weekly, "weekly"),
+];
+
+/// What a window's name is in the database: `five_hour` or `weekly`.
 pub fn window_key(kind: WindowKind) -> &'static str {
-    match kind {
-        WindowKind::FiveHour => "five_hour",
-        WindowKind::Weekly => "weekly",
-    }
+    WINDOWS
+        .iter()
+        .find(|(window, _)| *window == kind)
+        .map_or("unknown", |(_, key)| key)
 }
 
 /// The window a database name is of.
 pub fn window_of(key: &str) -> Option<WindowKind> {
-    [WindowKind::FiveHour, WindowKind::Weekly]
-        .into_iter()
-        .find(|kind| window_key(*kind) == key)
+    WINDOWS
+        .iter()
+        .find(|(_, name)| *name == key)
+        .map(|(window, _)| *window)
 }
