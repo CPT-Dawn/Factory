@@ -478,9 +478,10 @@ impl Lab {
         }
     }
 
-    /// Only the phones changed (a list from adb, a probe, a stream that ended): waiters look
-    /// again, and no stack sweep runs, since no stack is one phone's (#47: the bar's stack
-    /// numbers don't move, nor docker get asked, on a phone's account).
+    /// Something changed that no slot did (a list from adb, a probe, a stream that ended, a
+    /// request queued): waiters look again, and no stack sweep runs, since no stack is one
+    /// phone's or one queued request's (#67 story 47: the bar's stack numbers don't move, nor
+    /// docker get asked, on their account).
     fn notify_waiters(&self) {
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
@@ -2138,7 +2139,8 @@ pub async fn acquire<W, R, S>(
         }
     };
     let _attached = Present(Arc::clone(&lab), waiter);
-    lab.notify();
+    // A request queued makes no slot, so the stacks have nothing new to show: waiters look again.
+    lab.notify_waiters();
     let place = Response {
         id,
         outcome: Outcome::Queued(waiter),

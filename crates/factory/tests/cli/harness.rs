@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::support::world::World;
-use crate::support::{Sandbox, SetOnDrop, run};
+use crate::support::{DEADLINE, Sandbox, SetOnDrop, run};
 
 #[test]
 fn an_unscripted_fake_refuses_and_records_its_call() {
@@ -105,7 +105,10 @@ fn a_killed_emulator_is_gone_from_adb_before_its_unit_is() {
             let kill = scope
                 .spawn(|| run(sandbox.command("adb", &["-s", "emulator-5580", "emu", "kill"])));
             // The daemon's own order: its unit ended, it boots the next emulator on the serial.
-            while world.read("units").contains("devlab-emu-0") {}
+            let given_up = Instant::now() + DEADLINE;
+            while world.read("units").contains("devlab-emu-0") {
+                assert!(Instant::now() < given_up, "the kill never ended the unit");
+            }
             start();
             assert_eq!(kill.join().unwrap().code, 0);
         });

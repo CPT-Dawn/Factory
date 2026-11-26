@@ -3,6 +3,7 @@
 
 use serde_json::Value;
 
+use crate::bar::slot_checked;
 use crate::lab::{Agent, for_owner, lab, waiting};
 use crate::monitor::{self, append, subagent_log, usage};
 use crate::router::{
@@ -482,7 +483,8 @@ fn a_status_runs_no_external_command_and_asks_herdr_nothing() {
     ));
     assert_eq!(held.code, 0, "{held:?}");
     // The daemon's first look at herdr is its own, at its start; so is its stacks' sweep, which
-    // the lease just granted wakes: its docker calls are over once the bar shows the slot checked.
+    // the lease just granted wakes: its docker calls are over once the bar shows the slot checked
+    // (see `slot_checked`).
     screen_until(&sandbox, "the daemon to know its lead", |lines| {
         lines.contains(&"leads: 1, monitor off")
     });
@@ -491,13 +493,7 @@ fn a_status_runs_no_external_command_and_asks_herdr_nothing() {
         poll_until(|| {
             let out = sandbox.factory(&["bar", "--json"]);
             last = serde_json::from_str(&out.stdout).unwrap_or(Value::Null);
-            last["sections"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|section| section["id"] == "lab")
-                .flat_map(|section| section["rows"].as_array().into_iter().flatten())
-                .any(|row| row["label"] == "demo slot 0" && row["text"] != "unchecked, demo-a")
+            slot_checked(&last, "a")
         }),
         "the stack sweep never looked at the slot: {last}"
     );

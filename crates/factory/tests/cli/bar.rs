@@ -37,6 +37,21 @@ fn section<'a>(feed: &'a Value, id: &str) -> &'a Value {
         .unwrap_or(&Value::Null)
 }
 
+/// Whether the stack sweep has looked at the lab's slot 0, held by the worktree `demo-<owner>`:
+/// its card row no longer says "unchecked". The sweep asks docker on its own thread, as the
+/// lease is granted; a test that counts docker calls waits for this first. Nothing else wakes the
+/// sweep once the grant has (a phone's news and a queued request wake waiters only), so the one
+/// look it wakes is the last.
+pub(crate) fn slot_checked(feed: &Value, owner: &str) -> bool {
+    section(feed, "lab")["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|row| {
+            row["label"] == "demo slot 0" && row["text"] != format!("unchecked, demo-{owner}")
+        })
+}
+
 #[test]
 fn the_bar_prints_both_claude_windows_and_the_leads_in_one_line() {
     let sandbox = Sandbox::new();
@@ -404,20 +419,16 @@ fn the_bar_runs_no_external_command_and_asks_herdr_nothing() {
         .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
         .unwrap();
     // The daemon's first look at herdr is its own, at its start; its stacks' sweep is its own
-    // too, at its start. A phone showing up or being probed wakes waiters, not that sweep, so
-    // no late docker call can land after the counts below are taken.
+    // too, once the lease is granted. A phone showing up or being probed wakes waiters, not that
+    // sweep, so the sweep the grant woke is the last, and it is over once the slot shows checked.
     let mut last = Value::Null;
     assert!(
         poll_until(|| {
             last = feed(&sandbox);
-            let slot = section(&last, "lab")["rows"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|row| row["label"] == "demo slot 0" && row["text"] != "unchecked, demo-a");
-            slot && bar(&sandbox, false)
-                .stdout
-                .ends_with("· 1 lead · lab 1/1\n")
+            slot_checked(&last, "a")
+                && bar(&sandbox, false)
+                    .stdout
+                    .ends_with("· 1 lead · lab 1/1\n")
         }),
         "{last} {:?}",
         bar(&sandbox, false)

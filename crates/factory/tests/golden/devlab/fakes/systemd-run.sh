@@ -12,12 +12,13 @@ if grep -qxF systemd-run "$w/broken"; then
   echo "Failed to start transient service unit: Unit $unit.service was already loaded or has a fragment file." >&2
   exit 1
 fi
-# Each file grows under its lock, as the harness and the fake adb change them.
+# Each world file changes under its lock, as the harness and the fake adb change them: the unit
+# and its port are one step under the units lock.
 (
   flock 9
   echo "$unit" >> "$w/units"
+  echo "$unit $port" >> "$w/unit-ports"
 ) 9> "$w/units.lock"
-echo "$unit $port" >> "$w/unit-ports"
 (
   flock 9
   echo "emulator-$port device product:sdk_gphone64_x86_64 model:sdk_gphone64_x86_64 device:emu64xa" >> "$w/devices"

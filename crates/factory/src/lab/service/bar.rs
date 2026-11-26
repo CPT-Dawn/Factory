@@ -136,8 +136,9 @@ impl Lab {
     }
 
     /// Starts the stack sweep: whether each slot's stack runs, kept for the bar, looked at again
-    /// every `readinessCheckSec` and on each change to the lab, so a slot just leased is known
-    /// at once. It asks docker on its own thread, so no bar call waits on it.
+    /// every `readinessCheckSec` and on each change to a slot or a lease ([`Lab::notify`]; not
+    /// a phone's or a queued request's), so a slot just leased is known at once. It asks docker
+    /// on its own thread, so no bar call waits on it.
     pub fn sweep_stacks(self: &Arc<Self>) {
         let (wake, woken) = mpsc::channel();
         if self.sweep.set(wake).is_err() {
