@@ -265,9 +265,36 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        // The daemon leads its own process group; stop it and anything it started.
-        if let Ok(pid) = fs::read_to_string(self.path("run/factory/daemon.pid")) {
-            kill_group(pid.trim().parse().unwrap_or(0), Signal::TERM);
+        // The daemon leads its own process group; stop it and anything it started. A test may have
+        // moved the runtime dir with `env`, so the pid file is looked for where the daemon saw it.
+        let runtime = self
+            .env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "XDG_RUNTIME_DIR")
+            .map_or_else(|| self.path("run"), |(_, dir)| PathBuf::from(dir));
+        let pid_file = runtime.join("factory/daemon.pid");
+        let read_pid = || -> u32 {
+            fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse().ok())
+                .unwrap_or(0)
+        };
+        // A client the dying daemon was serving (a fake that calls devlab, say) can start a new
+        // daemon in a group of its own. Stop each one that turns up for a moment, so none outlives
+        // the sandbox and its fakes.
+        let mut stopped = read_pid();
+        if stopped == 0 {
+            return;
+        }
+        kill_group(stopped, Signal::TERM);
+        for _ in 0..6 {
+            thread::sleep(Duration::from_millis(50));
+            let pid = read_pid();
+            if pid != stopped {
+                kill_group(pid, Signal::TERM);
+                stopped = pid;
+            }
         }
     }
 }
