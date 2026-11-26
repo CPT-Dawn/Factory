@@ -18,6 +18,7 @@ use factory_adapters::reviewer::AgyUsage;
 use factory_core::claude::{ClaudeQuota, Verdict};
 use factory_core::codex::{self, CodexQuota};
 use factory_core::exit::Exit;
+use factory_core::history::{self, HistoryRow};
 use factory_core::status::Agy;
 use factory_core::timestamp::Timestamp;
 use factory_core::usage::{self, UsageWindow, WindowKind};
@@ -27,14 +28,18 @@ use tokio::time::Instant;
 use crate::clock;
 use crate::output::Failure;
 use crate::protocol::{
-    ClaudeLimitParams, ClaudeVerdict, ClaudeWindowParams, CodexParams, CodexVerdict,
-    WaitClaudeParams,
+    ClaudeLimitParams, ClaudeVerdict, ClaudeWindowParams, CodexParams, CodexVerdict, HistoryParams,
+    HistoryRows, WaitClaudeParams,
 };
 use crate::store::Store;
 
 /// How long a look waits for Codex's answer before it goes on with what it has. Under the
 /// client's own 10 seconds, so a slow Codex never reads as a daemon that is down.
 const PATIENCE: Duration = Duration::from_secs(8);
+
+/// How often the keeper looks whether the history is due a prune.
+const PRUNE_LOOK: Duration = Duration::from_secs(5);
+
 /// How long agy's reading, good or not, is shown before its usage is asked again. Routing keeps
 /// its own, shorter freshness check: a dispatch wants the newest answer, a bar poll does not.
 pub const AGY_DISPLAY_FRESH_MS: i64 = 300_000;
@@ -57,6 +62,9 @@ struct AgyState {
 pub struct QuotaKeeper {
     store: Mutex<Store>,
     claude: Mutex<ClaudeQuota>,
+    /// When the usage history was last pruned, by the wall clock and by one that never steps
+    /// back; none until this daemon has.
+    pruned: Mutex<Option<(Timestamp, Instant)>>,
     /// Woken when Claude's quota changes, so a waiting lead looks again.
     changed: Notify,
     codex: Mutex<CodexQuota>,
@@ -92,9 +100,10 @@ impl QuotaKeeper {
                 "cannot read the Codex quota: {e}; move the database aside and restart"
             ))
         })?;
-        Ok(QuotaKeeper {
+        let keeper = QuotaKeeper {
             store: Mutex::new(store),
             claude: Mutex::new(claude),
+            pruned: Mutex::new(None),
             changed: Notify::new(),
             codex: Mutex::new(codex),
             codex_usage,
@@ -104,7 +113,9 @@ impl QuotaKeeper {
             agy: Mutex::new(AgyState::default()),
             agy_asked: Notify::new(),
             usage,
-        })
+        };
+        keeper.prune_if_due(clock::now())?;
+        Ok(keeper)
     }
 
     /// Codex's quota as `factory status`, the bar and `factory quota codex` record it. A reading
@@ -288,19 +299,18 @@ impl QuotaKeeper {
     /// A status line saw Claude's windows. A window whose share or reset is out of range keeps
     /// its last reading.
     pub fn see_claude(&self, params: &ClaudeWindowParams) -> Result<(), Failure> {
-        self.change(|quota, now| {
-            let windows: Vec<UsageWindow> = [
-                (WindowKind::FiveHour, &params.five_hour),
-                (WindowKind::Weekly, &params.seven_day),
-            ]
-            .into_iter()
-            .filter_map(|(kind, reading)| {
-                let reading = reading.as_ref()?;
-                UsageWindow::read(kind, reading.used_percent, reading.resets, now)
-            })
-            .collect();
-            quota.see(&windows, now);
+        let now = clock::now();
+        let windows: Vec<UsageWindow> = [
+            (WindowKind::FiveHour, &params.five_hour),
+            (WindowKind::Weekly, &params.seven_day),
+        ]
+        .into_iter()
+        .filter_map(|(kind, reading)| {
+            let reading = reading.as_ref()?;
+            UsageWindow::read(kind, reading.used_percent, reading.resets, now)
         })
+        .collect();
+        self.change(&windows, |quota| quota.see(&windows, now))
     }
 
     /// A Claude turn ended on the plan's limit. A reset out of range counts as none named.
@@ -309,15 +319,24 @@ impl QuotaKeeper {
             .reset
             .filter(|reset| usage::representable(*reset))
             .map(Timestamp::from_unix_millis);
-        self.change(|quota, now| quota.hit_limit(reset, now))
+        let now = clock::now();
+        self.change(&[], |quota| quota.hit_limit(reset, now))
     }
 
-    fn change(&self, apply: impl FnOnce(&mut ClaudeQuota, Timestamp)) -> Result<(), Failure> {
-        let now = clock::now();
+    /// Applies a change to Claude's quota and stores it, with the `windows` it read, in the
+    /// shared path ([`QuotaKeeper::store_readings`]).
+    fn change(
+        &self,
+        windows: &[UsageWindow],
+        apply: impl FnOnce(&mut ClaudeQuota),
+    ) -> Result<(), Failure> {
         let mut quota = lock(&self.claude);
         let mut next = *quota;
-        apply(&mut next, now);
-        lock(&self.store).set_claude_quota(&next).map_err(|e| {
+        apply(&mut next);
+        self.store_readings("claude", None, windows, |store| {
+            store.set_claude_quota(&next)
+        })
+        .map_err(|e| {
             Failure::precondition(format!(
                 "cannot record the Claude quota: {e}; check the disk and FACTORY_STATE"
             ))
@@ -326,6 +345,75 @@ impl QuotaKeeper {
         drop(quota);
         self.changed.notify_waiters();
         Ok(())
+    }
+
+    /// The one path every harness's readings are stored by: `write` keeps the harness's own
+    /// state, and each of `windows` joins the usage history unless it is the reading its
+    /// window last had, all in one transaction. A harness that stores its readings here is
+    /// kept in history with no code of its own, and a stored reading is never missing from it.
+    /// `group` names the quota inside a harness that meters several. The caller holds its
+    /// harness's lock, so readings reach the history in the order they were stored.
+    fn store_readings(
+        &self,
+        harness: &str,
+        group: Option<&str>,
+        windows: &[UsageWindow],
+        write: impl FnOnce(&Store) -> rusqlite::Result<()>,
+    ) -> rusqlite::Result<()> {
+        lock(&self.store).atomically(|store| {
+            write(store)?;
+            for window in windows {
+                store.append_history(&HistoryRow::of(harness, group, window))?;
+            }
+            Ok(())
+        })
+    }
+
+    /// The usage history from `params.since` on, oldest first.
+    pub fn history(&self, params: &HistoryParams) -> Result<HistoryRows, Failure> {
+        lock(&self.store)
+            .usage_history(params.since)
+            .map(|rows| HistoryRows { rows })
+            .map_err(|e| {
+                Failure::precondition(format!(
+                    "cannot read the usage history: {e}; check the disk and FACTORY_STATE"
+                ))
+            })
+    }
+
+    /// Drops the history past its 90 days, when a day or more has passed since it last did.
+    fn prune_if_due(&self, now: Timestamp) -> Result<(), Failure> {
+        let mut pruned = lock(&self.pruned);
+        let due = pruned.is_none_or(|(at, since)| {
+            history::prune_due(Some(at), now) || history::overdue(since.elapsed())
+        });
+        if !due {
+            return Ok(());
+        }
+        lock(&self.store)
+            .prune_history(history::cutoff(now).unix_millis())
+            .map_err(|e| {
+                Failure::precondition(format!(
+                    "cannot prune the usage history: {e}; check the disk and FACTORY_STATE"
+                ))
+            })?;
+        *pruned = Some((now, Instant::now()));
+        Ok(())
+    }
+
+    /// Keeps the history to its 90 days for as long as the daemon runs, idle or not: it looks
+    /// every few seconds whether a day has passed since the last prune (a start prunes too).
+    pub async fn keep(self: Arc<Self>) {
+        let mut failing = false;
+        loop {
+            tokio::time::sleep(PRUNE_LOOK).await;
+            // The daemon's log hears of a failure once, not at every look until it is mended.
+            let pruned = self.prune_if_due(clock::now());
+            if let (Err(failure), false) = (&pruned, failing) {
+                eprintln!("factory: {}", failure.message);
+            }
+            failing = pruned.is_err();
+        }
     }
 
     /// Whether a lead may dispatch on Claude now, holding at `hold_at` percent of either window.

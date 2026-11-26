@@ -65,6 +65,8 @@ pub const CLAUDE_QUOTA: &str = "claude.quota";
 /// older than 5 minutes: [`CodexQuotaParams`] in, [`CodexVerdict`] out.
 pub const CODEX_QUOTA: &str = "codex.quota";
 
+/// The usage-window history, oldest first: [`HistoryParams`] in, [`HistoryRows`] out.
+pub const QUOTA_HISTORY: &str = "quota.history";
 /// agy's quota groups and their windows, from the keeper's reading of its usage query: no
 /// params in, [`factory_core::status::Agy`] out. It waits for a query that is under way.
 pub const AGY_QUOTA: &str = "agy.quota";
@@ -152,6 +154,18 @@ pub struct StatusParams {
     /// The config's say on Codex: its hold mark, and how long its app-server may take.
     #[serde(default)]
     pub codex: CodexParams,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HistoryParams {
+    /// The oldest reading wanted, in milliseconds since the epoch; none asks for all.
+    #[serde(default)]
+    pub since: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HistoryRows {
+    pub rows: Vec<factory_core::history::HistoryRow>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

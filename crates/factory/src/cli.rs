@@ -79,7 +79,7 @@ pub enum Command {
         #[command(subcommand)]
         command: HookCommand,
     },
-    /// Whether a lead may dispatch on the Claude or Codex plan now: exit 0, or 75 naming the reset
+    /// The harness quotas: whether a lead may dispatch on Claude or a review on Codex (exit 0, or 75 naming the reset), and the usage-window history
     Quota {
         #[command(subcommand)]
         command: QuotaCommand,
@@ -133,6 +133,12 @@ pub enum QuotaCommand {
     Claude,
     /// The Codex plan's 5-hour and weekly windows: dispatch (exit 0) or hold reviews until the holding one resets (exit 75)
     Codex,
+    /// Every usage-window reading kept (90 days), oldest first; --json for the rows
+    History {
+        /// Only readings from this moment on: a UTC time (2026-11-20T00:00:00Z), a date (2026-11-20) or an age (6h, 7d)
+        #[arg(long, value_name = "TIME")]
+        since: Option<String>,
+    },
     /// agy's quota groups and their 5-hour and weekly windows, or why its usage can't be read
     Agy,
 }
