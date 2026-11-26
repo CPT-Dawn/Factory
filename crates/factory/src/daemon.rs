@@ -32,6 +32,7 @@ use tokio::task::JoinSet;
 
 use factory_adapters::herdr::Herdr;
 use factory_adapters::inbox::Inbox;
+use factory_adapters::reviewer::{AgyAuth, AgyUsageCli};
 use listenfd::ListenFd;
 
 use crate::clock;
@@ -45,7 +46,7 @@ use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::pollers::Pollers;
 use crate::protocol::{
-    BAR, BarParams, CLAUDE_LIMIT, CLAUDE_QUOTA, CLAUDE_WINDOW, ClaudeLimitParams,
+    AGY_QUOTA, BAR, BarParams, CLAUDE_LIMIT, CLAUDE_QUOTA, CLAUDE_WINDOW, ClaudeLimitParams,
     ClaudeQuotaParams, ClaudeWindowParams, ErrorBody, LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LOG,
     LeadParams, LogParams, LogResult, MISMATCH, MONITOR_START, MONITOR_STATUS, MONITOR_STOP,
     NotifyParams, Outcome, REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, ReviewRef, STATUS,
@@ -105,7 +106,10 @@ pub fn run(json: bool) -> Result<(), Failure> {
     )?;
     let pollers = Arc::new(Pollers::new(paths.clone(), Gh));
     let router = Arc::new(Router::open(Store::open(&paths.database())?)?);
-    let quotas = Arc::new(QuotaKeeper::open(Store::open(&paths.database())?)?);
+    let quotas = Arc::new(QuotaKeeper::open(
+        Store::open(&paths.database())?,
+        Arc::new(AgyUsageCli(AgyAuth::Subscription)),
+    )?);
     let fleet = Arc::new(Fleet::open(
         crate::config::ci_watch(&paths),
         Store::open(&paths.database())?,
@@ -486,17 +490,23 @@ async fn respond(
             ),
             Err(refused) => refused,
         },
+        AGY_QUOTA => answered(Ok::<_, Failure>(
+            daemon.quotas.agy(crate::quotas::AGY_QUERY).await,
+        )),
         BAR => match params::<BarParams>(BAR, request.params) {
             Ok(params) => {
                 let lab = daemon.lab.bar().await;
-                answered(Ok::<_, Failure>(crate::bar::snapshot(
-                    &params,
-                    &daemon.leads,
-                    &daemon.steward,
-                    &daemon.quotas,
-                    &daemon.fleet,
-                    lab,
-                )))
+                answered(Ok::<_, Failure>(
+                    crate::bar::snapshot(
+                        &params,
+                        &daemon.leads,
+                        &daemon.steward,
+                        &daemon.quotas,
+                        &daemon.fleet,
+                        lab,
+                    )
+                    .await,
+                ))
             }
             Err(refused) => refused,
         },

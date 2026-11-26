@@ -4,6 +4,8 @@
 //! answers from its own state: the lease store, the router's quotas, the Claude plan's quota, the picture of the leads, the
 //! wait registry and the context steward's table. No call to adb, docker or herdr is made.
 
+use std::sync::Arc;
+
 use factory_core::status::{self, Status};
 use serde_json::json;
 
@@ -15,7 +17,7 @@ use crate::leads::Leads;
 use crate::output::{Done, Failure};
 use crate::paths::Paths;
 use crate::protocol::{BackendSlots, LeadContext, STATUS, StatusParams};
-use crate::quotas::QuotaKeeper;
+use crate::quotas::{AGY_GLANCE, QuotaKeeper};
 use crate::router::Router;
 use crate::steward::Steward;
 use factory_core::quota::WhenBusy;
@@ -55,7 +57,7 @@ pub async fn gather(
     lab: &std::sync::Arc<Lab>,
     leads: &Leads,
     steward: &Steward,
-    quotas: &QuotaKeeper,
+    quotas: &Arc<QuotaKeeper>,
     fleet: &Fleet,
 ) -> Result<Status, Failure> {
     let now = crate::clock::now();
@@ -68,6 +70,7 @@ pub async fn gather(
         lab,
         review: router.snapshot(&params.backends, now),
         claude: quotas.claude(params.claude_hold_at),
+        agy: quotas.agy(AGY_GLANCE).await,
         waits: leads.registered(),
         leads: leads_seen(leads, steward),
         ci: fleet.snapshot(),

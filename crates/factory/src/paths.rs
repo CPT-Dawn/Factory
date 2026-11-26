@@ -105,6 +105,11 @@ impl Paths {
         self.state.join("factory.db")
     }
 
+    /// `factory quota agy`'s listing of every quota group, when it is too long for the line.
+    pub fn agy_quota(&self) -> PathBuf {
+        self.state.join("agy-quota.txt")
+    }
+
     /// The failed checks of a pull request's head, with their URLs and log tails: one file per
     /// head, so a late read of an old head never overwrites a newer one's.
     pub fn ci_failures(&self, pr: &PullRequest, head: &str) -> PathBuf {

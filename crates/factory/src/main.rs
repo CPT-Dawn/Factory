@@ -1,5 +1,6 @@
 //! `factory`: the CLI and the daemon of the agent software factory (spec #1).
 
+mod agy;
 mod bar;
 mod ci;
 mod claude;
@@ -112,6 +113,9 @@ fn run(command: Command, json: bool) -> ExitCode {
         Command::Quota {
             command: QuotaCommand::Claude,
         } => claude::quota(),
+        Command::Quota {
+            command: QuotaCommand::Agy,
+        } => agy::quota(json),
         Command::Bar => return bar::run(json),
         Command::Wait {
             command: WaitCommand::Claude { timeout },
