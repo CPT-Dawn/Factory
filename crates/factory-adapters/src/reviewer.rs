@@ -197,6 +197,56 @@ const AGY_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long after its own print timeout agy is killed with its process group.
 const AGY_KILL_GRACE: Duration = Duration::from_secs(30);
 
+/// agy's free usage query: its JSON answer as it printed it, or why there is none (`exited
+/// 127`, `timed out after 60s`).
+pub trait AgyUsage: Send + Sync {
+    fn query(&self) -> Result<String, String>;
+}
+
+/// `agy -p /usage --output-format json` from PATH, as `auth` runs agy.
+pub struct AgyUsageCli(pub AgyAuth);
+
+impl AgyUsage for AgyUsageCli {
+    fn query(&self) -> Result<String, String> {
+        agy_usage_query(self.0)
+    }
+}
+
+/// A usage query that answers as it was told, and counts how often it was asked.
+pub struct FakeAgyUsage {
+    pub answer: Result<String, String>,
+    pub asked: std::sync::atomic::AtomicUsize,
+}
+
+impl AgyUsage for FakeAgyUsage {
+    fn query(&self) -> Result<String, String> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.answer.clone()
+    }
+}
+
+fn agy_usage_query(auth: AgyAuth) -> Result<String, String> {
+    let mut cmd = Command::new("agy");
+    if auth == AgyAuth::Subscription {
+        cmd.env_remove("GEMINI_API_KEY");
+    }
+    cmd.args(["-p", "/usage", "--output-format", "json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let output = process::run(cmd, AGY_CHECK_TIMEOUT).map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "exited {}",
+            output
+                .status
+                .code()
+                .map_or("by a signal".to_owned(), |code| code.to_string())
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// How agy signs in, as the factory's config names it: `subscription` or `api-key`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -234,6 +284,9 @@ pub struct Agy {
     /// The share of its group's five-hour bucket this review leaves alone: below it, the
     /// review is not its to take.
     reserve: Option<f64>,
+    /// The percent of either bucket of its group from which it holds off, until that bucket
+    /// resets.
+    hold_at: f64,
 }
 
 impl Agy {
@@ -253,7 +306,15 @@ impl Agy {
             repos: Arc::new(Git),
             namespaces: Arc::new(Unshare),
             reserve: None,
+            hold_at: quota::AGY_HOLD_AT_PERCENT,
         }
+    }
+
+    /// The same backend, holding off once `hold_at` percent of either bucket of its group is
+    /// spent.
+    pub fn holding_at(mut self, hold_at: f64) -> Agy {
+        self.hold_at = hold_at;
+        self
     }
 
     /// The same backend, keeping `reserve` of its group's five-hour bucket for other reviews.
@@ -318,11 +379,6 @@ impl Agy {
         settings.to_string()
     }
 
-    /// agy as its auth runs it: the subscription login never sees an API key.
-    fn command(&self) -> Command {
-        self.as_its_auth(Command::new("agy"))
-    }
-
     /// How a review on its auth reaches the session bus: the subscription login reads its
     /// token from the keyring over it; an API key needs none of it.
     fn bus(&self) -> guard::Bus {
@@ -355,20 +411,8 @@ impl Agy {
         {
             return Ok((usage, true));
         }
-        let mut cmd = self.command();
-        cmd.args(["-p", "/usage", "--output-format", "json"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let no_usage = |why: String| ReviewerError::NoUsage(format!("its usage query {why}"));
-        let output = process::run(cmd, AGY_CHECK_TIMEOUT).map_err(|e| no_usage(e.to_string()))?;
-        if !output.status.success() {
-            let code = output
-                .status
-                .code()
-                .map_or("by a signal".to_owned(), |code| code.to_string());
-            return Err(no_usage(format!("exited {code}")));
-        }
-        let usage = String::from_utf8_lossy(&output.stdout).into_owned();
+        let usage = agy_usage_query(self.auth)
+            .map_err(|why| ReviewerError::NoUsage(format!("its usage query {why}")))?;
         // A cache that can't be written only costs the next review another query. It is
         // replaced whole, so a review reading it alongside never sees half an answer.
         let mut fresh = self.usage_cache.clone().into_os_string();
@@ -385,12 +429,12 @@ impl Agy {
         let model = self.quota_model();
         let (mut usage, cached) = self.usage(false)?;
         let mut group = quota::agy_group(&usage, &model);
-        let mut said = quota::agy_usage(&usage, &group);
+        let mut said = quota::agy_usage(&usage, &group, self.hold_at);
         // A cached answer may name an empty bucket whose reset has come since: ask again.
         if cached && matches!(said, quota::AgyUsage::Empty { until } if until <= now()) {
             usage = self.usage(true)?.0;
             group = quota::agy_group(&usage, &model);
-            said = quota::agy_usage(&usage, &group);
+            said = quota::agy_usage(&usage, &group, self.hold_at);
         }
         if let Some(reserve) = self.reserve
             && matches!(said, quota::AgyUsage::Left)

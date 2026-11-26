@@ -11,11 +11,12 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::net::UnixListener as StdListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use factory_adapters::gh::Gh;
+use factory_adapters::codex::AppServer;
+use factory_adapters::gh::{Gh, GhActions};
 use factory_core::duration;
 use factory_core::event::Event;
 use factory_core::exit::Exit;
@@ -32,10 +33,11 @@ use tokio::task::JoinSet;
 
 use factory_adapters::herdr::Herdr;
 use factory_adapters::inbox::Inbox;
+use factory_adapters::reviewer::{AgyAuth, AgyUsageCli};
 use listenfd::ListenFd;
 
-use crate::claude::Claude;
 use crate::clock;
+use crate::fleet::Fleet;
 use crate::lab::service::{self, Lab};
 use crate::lab::wire::{ACQUIRE, RESERVE, RUN_RESUME};
 use crate::leads::{Leads, Registered};
@@ -45,21 +47,24 @@ use crate::output::{self, Done, Failure};
 use crate::paths::Paths;
 use crate::pollers::Pollers;
 use crate::protocol::{
-    CLAUDE_LIMIT, CLAUDE_QUOTA, CLAUDE_WINDOW, ClaudeLimitParams, ClaudeQuotaParams,
-    ClaudeWindowParams, ErrorBody, LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LOG, LeadParams, LogParams,
-    LogResult, MISMATCH, MONITOR_START, MONITOR_STATUS, MONITOR_STOP, NotifyParams, Outcome,
+    AGY_QUOTA, BAR, BarParams, CLAUDE_LIMIT, CLAUDE_QUOTA, CLAUDE_WINDOW, CODEX_QUOTA,
+    ClaudeLimitParams, ClaudeQuotaParams, ClaudeWindowParams, CodexQuotaParams, ErrorBody,
+    HistoryParams, LEAD_LIST, LEAD_SPAWN, LEAD_STATUS, LOG, LeadParams, LogParams, LogResult,
+    MISMATCH, MONITOR_START, MONITOR_STATUS, MONITOR_STOP, NotifyParams, Outcome, QUOTA_HISTORY,
     REVIEW_ACQUIRE, REVIEW_QUOTA, Request, Response, ReviewRef, STATUS, SpawnParams, StatusParams,
     WAIT_CI, WAIT_CLAUDE, WAIT_LEAD, WAIT_LEASE, WAIT_NOTIFY, WAIT_REVIEW, WaitCiParams,
     WaitCiResult, WaitClaudeParams, WaitLeadParams, WaitLeaseParams, WaitReviewParams,
 };
+use crate::quotas::QuotaKeeper;
 use crate::reviews::Reviews;
-use crate::router::Router;
+use crate::router::{Held as Slot, Router};
 use crate::status;
 use crate::steward::Steward;
 use crate::store::{Store, WaitRow};
 
 /// What every connection answers from: the ledger, the picture of the leads, the reviewer
-/// router, the lab's lease store, the CI pollers and the waits that outlive their CLI.
+/// router, the lab's lease store, the CI pollers, the waits that outlive their CLI and the quota
+/// keeper.
 struct Daemon {
     ledger: Arc<Ledger>,
     leads: Arc<Leads>,
@@ -69,7 +74,8 @@ struct Daemon {
     pollers: Arc<Pollers>,
     steward: Arc<Steward>,
     notifier: Arc<Notifier>,
-    claude: Arc<Claude>,
+    quotas: Arc<QuotaKeeper>,
+    fleet: Arc<Fleet>,
 }
 
 /// How long a stopping daemon gives the connections it holds to finish their requests.
@@ -101,7 +107,16 @@ pub fn run(json: bool) -> Result<(), Failure> {
     )?;
     let pollers = Arc::new(Pollers::new(paths.clone(), Gh));
     let router = Arc::new(Router::open(Store::open(&paths.database())?)?);
-    let claude = Arc::new(Claude::open(Store::open(&paths.database())?)?);
+    let quotas = Arc::new(QuotaKeeper::open(
+        Store::open(&paths.database())?,
+        Arc::new(AppServer::new()),
+        Arc::new(AgyUsageCli(AgyAuth::Subscription)),
+    )?);
+    let fleet = Arc::new(Fleet::open(
+        crate::config::ci_watch(&paths),
+        Store::open(&paths.database())?,
+        GhActions::default(),
+    ));
     let steward = Steward::new(
         paths.clone(),
         Arc::clone(&leads),
@@ -120,14 +135,14 @@ pub fn run(json: bool) -> Result<(), Failure> {
     })?;
     let listener = match activated {
         Some(listener) => listener,
-        None => bind(&paths)?,
+        None => bind(&paths.socket())?,
     };
-    listener.set_nonblocking(true).map_err(|e| {
-        Failure::precondition(format!(
-            "cannot listen on {}: {e}; retry",
-            paths.socket().display()
-        ))
-    })?;
+    let live = bind(&paths.live_socket())?;
+    for (listener, socket) in [(&listener, paths.socket()), (&live, paths.live_socket())] {
+        listener.set_nonblocking(true).map_err(|e| {
+            Failure::precondition(format!("cannot listen on {}: {e}; retry", socket.display()))
+        })?;
+    }
     let pid = std::process::id();
     fs::write(paths.daemon_pid(), format!("{pid}\n")).map_err(|e| {
         Failure::precondition(format!(
@@ -143,9 +158,13 @@ pub fn run(json: bool) -> Result<(), Failure> {
         })?;
     let socket = paths.socket();
     runtime.block_on(async {
-        let listener = UnixListener::from_std(listener).map_err(|e| {
-            Failure::precondition(format!("cannot listen on {}: {e}; retry", socket.display()))
-        })?;
+        let listen = |listener, socket: PathBuf| {
+            UnixListener::from_std(listener).map_err(|e| {
+                Failure::precondition(format!("cannot listen on {}: {e}; retry", socket.display()))
+            })
+        };
+        let listener = listen(listener, socket.clone())?;
+        let live = listen(live, paths.live_socket())?;
         // Before the ready line, so a stop that follows it drains, and a failure is the one line.
         let stop = stop_on_signal()?;
         // Ready only once requests can be answered, so this is the one line the daemon prints.
@@ -158,11 +177,29 @@ pub fn run(json: bool) -> Result<(), Failure> {
         );
         tokio::spawn(Arc::clone(&leads).start());
         tokio::spawn(Arc::clone(&steward).resume());
+        tokio::spawn(Arc::clone(&quotas).keep());
+        let working = Arc::clone(&leads);
+        let live_work = move |repos: &[String]| {
+            // The cwd of each lead whose agent herdr still shows; none while herdr is away.
+            let cwds = working
+                .seen()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|lead| lead.agent.is_some())
+                .filter_map(|lead| lead.cwd);
+            crate::fleet::live_repos(repos, cwds)
+        };
+        tokio::spawn(Arc::clone(&fleet).run(
+            pollers.watched(),
+            leads.changes(),
+            Arc::new(live_work),
+        ));
         let lab = Arc::new(lab);
         lab.recover();
         notifier.resume();
         lab.keep();
         lab.watch_phones();
+        lab.sweep_stacks();
         let daemon = Daemon {
             ledger,
             leads,
@@ -172,11 +209,14 @@ pub fn run(json: bool) -> Result<(), Failure> {
             pollers,
             steward,
             notifier,
-            claude,
+            quotas,
+            fleet,
         };
-        serve(listener, Arc::new(daemon), stop).await;
+        serve([listener, live], Arc::new(daemon), stop).await;
         Ok(())
     })?;
+    // Nothing listens on it any more: a call there is refused, as with no daemon.
+    let _ = fs::remove_file(paths.live_socket());
     // Nothing is left to answer; the herdr watcher and any stray task may go.
     runtime.shutdown_timeout(Duration::from_secs(1));
     Ok(())
@@ -242,36 +282,45 @@ fn take_daemon_lock(paths: &Paths) -> Result<File, Failure> {
     }
 }
 
-/// Binds the socket, replacing one a dead daemon left behind (the daemon lock says none runs).
-fn bind(paths: &Paths) -> Result<StdListener, Failure> {
-    let socket = paths.socket();
+/// Binds `socket`, replacing one a dead daemon left behind (the daemon lock says none runs).
+fn bind(socket: &Path) -> Result<StdListener, Failure> {
     let cannot = |e: io::Error| {
         Failure::precondition(format!(
             "cannot listen on {}: {e}; check XDG_RUNTIME_DIR (a socket path must be under 108 bytes)",
             socket.display()
         ))
     };
-    match fs::remove_file(&socket) {
+    match fs::remove_file(socket) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(cannot(e)),
     }
-    StdListener::bind(&socket).map_err(cannot)
+    StdListener::bind(socket).map_err(cannot)
 }
 
-/// Answers connections until the daemon is stopping, then lets the ones it took finish, for
-/// up to [`DRAIN_TIMEOUT`]. Connections it never took stay queued in the socket.
-async fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Stop) {
+/// Answers connections on both sockets, systemd's or its own and the live one, taking each in a
+/// fair turn, until the daemon is stopping, then lets the ones it took finish, for up to
+/// [`DRAIN_TIMEOUT`]. Connections it never took on systemd's socket stay queued there for the
+/// next daemon; those on a socket of its own are refused once it is gone.
+async fn serve(listeners: [UnixListener; 2], daemon: Arc<Daemon>, stop: Stop) {
+    let [listener, live] = listeners;
     // The connections hear of the stop only once the listener is gone, so a call made after
     // a cut-short answer queues for the next daemon instead of in this one's closing backlog.
     let (hang_up, hung_up) = watch::channel(false);
     let hung_up = Stop(hung_up);
     let mut connections = JoinSet::new();
     loop {
+        // Unbiased: when both sockets have callers, each is as likely to go first.
+        let accept = async {
+            tokio::select! {
+                accepted = listener.accept() => accepted,
+                accepted = live.accept() => accepted,
+            }
+        };
         tokio::select! {
             biased;
             () = stop.clone().stopping() => break,
-            accepted = listener.accept() => match accepted {
+            accepted = accept => match accepted {
                 Ok((stream, _)) => {
                     connections.spawn(answer(stream, Arc::clone(&daemon), hung_up.clone()));
                 }
@@ -283,6 +332,7 @@ async fn serve(listener: UnixListener, daemon: Arc<Daemon>, stop: Stop) {
         }
     }
     drop(listener);
+    drop(live);
     // Before the connections hear of it: the waits they hold stay for the next daemon.
     daemon.leads.stop();
     let _ = hang_up.send(true);
@@ -310,7 +360,7 @@ async fn answer(stream: UnixStream, daemon: Arc<Daemon>, stop: Stop) {
 }
 
 /// The requests and answers of one connection; `held` names the review slot it holds.
-async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut Option<String>) {
+async fn converse(stream: UnixStream, daemon: &Daemon, stop: &Stop, held: &mut Option<Slot>) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     let mut first = true;
@@ -382,7 +432,7 @@ async fn respond(
     request: serde_json::Result<Request>,
     daemon: &Daemon,
     stop: &Stop,
-    held: &mut Option<String>,
+    held: &mut Option<Slot>,
 ) -> Response {
     let request = match request {
         Ok(request) => request,
@@ -418,15 +468,27 @@ async fn respond(
             Err(refused) => refused,
         },
         CLAUDE_WINDOW => match params::<ClaudeWindowParams>(CLAUDE_WINDOW, request.params) {
-            Ok(params) => answered(daemon.claude.see(&params)),
+            Ok(params) => answered(daemon.quotas.see_claude(&params)),
             Err(refused) => refused,
         },
         CLAUDE_LIMIT => match params::<ClaudeLimitParams>(CLAUDE_LIMIT, request.params) {
-            Ok(params) => answered(daemon.claude.limit(&params)),
+            Ok(params) => answered(daemon.quotas.claude_limit(&params)),
+            Err(refused) => refused,
+        },
+        CODEX_QUOTA => match params::<CodexQuotaParams>(CODEX_QUOTA, request.params) {
+            Ok(params) => answered(Ok::<_, Failure>(
+                daemon.quotas.codex_verdict(&params.codex).await,
+            )),
             Err(refused) => refused,
         },
         CLAUDE_QUOTA => match params::<ClaudeQuotaParams>(CLAUDE_QUOTA, request.params) {
-            Ok(params) => answered(Ok::<_, Failure>(daemon.claude.verdict(params.hold_at))),
+            Ok(params) => answered(Ok::<_, Failure>(
+                daemon.quotas.claude_verdict(params.hold_at),
+            )),
+            Err(refused) => refused,
+        },
+        QUOTA_HISTORY => match params::<HistoryParams>(QUOTA_HISTORY, request.params) {
+            Ok(params) => answered(daemon.quotas.history(&params)),
             Err(refused) => refused,
         },
         WAIT_NOTIFY => match params::<NotifyParams>(WAIT_NOTIFY, request.params) {
@@ -449,10 +511,31 @@ async fn respond(
                     &daemon.lab,
                     &daemon.leads,
                     &daemon.steward,
-                    &daemon.claude,
+                    &daemon.quotas,
+                    &daemon.fleet,
                 )
                 .await,
             ),
+            Err(refused) => refused,
+        },
+        AGY_QUOTA => answered(Ok::<_, Failure>(
+            daemon.quotas.agy(crate::quotas::AGY_QUERY).await,
+        )),
+        BAR => match params::<BarParams>(BAR, request.params) {
+            Ok(params) => {
+                let lab = daemon.lab.bar().await;
+                answered(Ok::<_, Failure>(
+                    crate::bar::snapshot(
+                        &params,
+                        &daemon.leads,
+                        &daemon.steward,
+                        &daemon.quotas,
+                        &daemon.fleet,
+                        lab,
+                    )
+                    .await,
+                ))
+            }
             Err(refused) => refused,
         },
         LOG => {
@@ -484,7 +567,7 @@ async fn respond(
             let granted = tokio::select! {
                 biased;
                 () = stop.clone().stopping() => None,
-                granted = daemon.router.acquire(request.params, held) => Some(granted),
+                granted = daemon.router.acquire(&daemon.quotas, request.params, held) => Some(granted),
             };
             match granted {
                 // Checked again after the grant: a connection the stop hung up may have freed
@@ -666,7 +749,7 @@ where
                     .await,
             ),
             Asked::Lease(p) => answered(service::wait_lease(&daemon.lab, p, deadline, limit).await),
-            Asked::Claude(p) => answered(daemon.claude.wait(p, deadline, limit).await),
+            Asked::Claude(p) => answered(daemon.quotas.wait_claude(p, deadline, limit).await),
         }
     };
     // Biased: a stopping daemon answers no wait, even one that ends as it stops; the next

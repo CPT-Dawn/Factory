@@ -1,15 +1,21 @@
 //! The daemon's SQLite database, `<state>/factory.db`, in WAL mode: what a daemon restart must
-//! not lose: each review backend's quota, the Claude plan's quota, the leads spawned whose end is not yet in the
+//! not lose: each review backend's quota, the Claude and Codex plans' quotas, the leads spawned whose end is not yet in the
 //! ledger, whether the context steward runs and what it has done to each session, each wait
-//! that outlives its CLI (`--notify`), and each blocking `factory wait` the daemon holds.
+//! that outlives its CLI (`--notify`), each blocking `factory wait` the daemon holds, and the
+//! watched repos' CI as GitHub last answered it, with every job's queued, started and finished
+//! times.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use factory_core::claude::{ClaudeQuota, Limit, Seen, Window};
+use factory_core::claude::{ClaudeQuota, Limit};
+use factory_core::codex::CodexQuota;
+use factory_core::fleet::{Job, Pull, PullState, RepoCi, Runner, RunnerState};
+use factory_core::history::{self, HistoryRow};
 use factory_core::quota::Quota;
 use factory_core::timestamp::Timestamp;
+use factory_core::usage::{UsageWindow, WindowKind};
 use factory_core::wait::WaitOn;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -17,7 +23,14 @@ use crate::output::Failure;
 use crate::protocol::{NotifyOn, SessionParam};
 
 /// The schema version this daemon writes, kept in `PRAGMA user_version`.
-const VERSION: i64 = 5;
+const VERSION: i64 = 6;
+
+/// What schema 6 adds to a table an older schema made: Claude's weekly window.
+const WEEKLY_COLUMNS: [(&str, &str); 3] = [
+    ("weekly_used_percent", "REAL"),
+    ("weekly_resets_ms", "INTEGER"),
+    ("weekly_seen_ms", "INTEGER"),
+];
 
 pub struct Store {
     db: Connection,
@@ -31,7 +44,7 @@ impl Store {
                 path.display()
             ))
         };
-        let db = Connection::open(path).map_err(cannot)?;
+        let mut db = Connection::open(path).map_err(cannot)?;
         // It holds the inbox tokens of the sessions that wait with --notify; SQLite gives its WAL
         // files the database's mode.
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| {
@@ -51,8 +64,11 @@ impl Store {
                 path.display()
             )));
         }
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS quota (
+        // One transaction: a store is at one schema or the next, never halfway.
+        let migration = db.transaction().map_err(cannot)?;
+        migration
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS quota (
                  backend TEXT PRIMARY KEY,
                  state TEXT NOT NULL CHECK (state IN ('available', 'cooling')),
                  until_ms INTEGER
@@ -95,7 +111,69 @@ impl Store {
                  resets_ms INTEGER,
                  seen_ms INTEGER,
                  limit_until_ms INTEGER,
-                 limit_at_ms INTEGER
+                 limit_at_ms INTEGER,
+                 weekly_used_percent REAL,
+                 weekly_resets_ms INTEGER,
+                 weekly_seen_ms INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS codex_quota (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 used_percent REAL,
+                 resets_ms INTEGER,
+                 seen_ms INTEGER,
+                 weekly_used_percent REAL,
+                 weekly_resets_ms INTEGER,
+                 weekly_seen_ms INTEGER,
+                 plan TEXT,
+                 reset_credits INTEGER NOT NULL DEFAULT 0,
+                 asked_ms INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS usage_history (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 harness TEXT NOT NULL,
+                 quota_group TEXT,
+                 window TEXT NOT NULL,
+                 used_percent REAL,
+                 resets_ms INTEGER,
+                 seen_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS usage_history_seen ON usage_history (seen_ms);
+             CREATE INDEX IF NOT EXISTS usage_history_key
+                 ON usage_history (harness, quota_group, window, id);
+             CREATE TABLE IF NOT EXISTS ci_runner (
+                 repo TEXT NOT NULL,
+                 id INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 busy INTEGER NOT NULL DEFAULT 0,
+                 seen_ms INTEGER NOT NULL,
+                 PRIMARY KEY (repo, id)
+             );
+             CREATE TABLE IF NOT EXISTS ci_job (
+                 repo TEXT NOT NULL,
+                 id INTEGER NOT NULL,
+                 run_id INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 conclusion TEXT,
+                 runner TEXT,
+                 queued_ms INTEGER,
+                 started_ms INTEGER,
+                 finished_ms INTEGER,
+                 PRIMARY KEY (repo, id)
+             );
+             CREATE TABLE IF NOT EXISTS ci_pull (
+                 repo TEXT NOT NULL,
+                 number INTEGER NOT NULL,
+                 branch TEXT NOT NULL,
+                 url TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 seen_ms INTEGER NOT NULL,
+                 PRIMARY KEY (repo, number)
+             );
+             CREATE TABLE IF NOT EXISTS ci_seen (
+                 repo TEXT PRIMARY KEY,
+                 seen_ms INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS wait (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,9 +186,17 @@ impl Store {
                  lead_pane TEXT,
                  lead_report TEXT
              );
-             PRAGMA user_version = 5;",
-        )
-        .map_err(cannot)?;
+             ",
+            )
+            .map_err(cannot)?;
+        add_codex_asked_column(&migration).map_err(cannot)?;
+        if version < VERSION {
+            add_weekly_columns(&migration).map_err(cannot)?;
+            migration
+                .pragma_update(None, "user_version", VERSION)
+                .map_err(cannot)?;
+        }
+        migration.commit().map_err(cannot)?;
         Ok(Store { db })
     }
 
@@ -180,38 +266,38 @@ impl Store {
 impl Store {
     /// The Claude plan's quota as last recorded; nothing recorded is nothing known.
     pub fn claude_quota(&self) -> rusqlite::Result<ClaudeQuota> {
+        type Reading = (Option<f64>, Option<i64>, Option<i64>);
         let row = self
             .db
             .query_row(
-                "SELECT used_percent, resets_ms, seen_ms, limit_until_ms, limit_at_ms
+                "SELECT used_percent, resets_ms, seen_ms, limit_until_ms, limit_at_ms,
+                     weekly_used_percent, weekly_resets_ms, weekly_seen_ms
                  FROM claude_quota WHERE id = 1",
                 [],
                 |row| {
-                    Ok((
-                        row.get::<_, Option<f64>>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                    ))
+                    let five: Reading = (row.get(0)?, row.get(1)?, row.get(2)?);
+                    let weekly: Reading = (row.get(5)?, row.get(6)?, row.get(7)?);
+                    let limit = (row.get::<_, Option<i64>>(3)?, row.get::<_, Option<i64>>(4)?);
+                    Ok((five, weekly, limit))
                 },
             )
             .optional()?;
-        let Some((used, resets, seen, until, at)) = row else {
+        let Some((five, weekly, (until, at))) = row else {
             return Ok(ClaudeQuota::default());
         };
         let stamp = Timestamp::from_unix_millis;
+        let window = |kind, (used, resets, seen): Reading| match (used, resets, seen) {
+            (Some(used_percent), Some(resets), Some(seen)) => Some(UsageWindow {
+                kind,
+                used_percent,
+                resets: stamp(resets),
+                seen: stamp(seen),
+            }),
+            _ => None,
+        };
         Ok(ClaudeQuota {
-            window: match (used, resets, seen) {
-                (Some(used_percent), Some(resets), Some(seen)) => Some(Seen {
-                    window: Window {
-                        used_percent,
-                        resets: stamp(resets),
-                    },
-                    at: stamp(seen),
-                }),
-                _ => None,
-            },
+            five_hour: window(WindowKind::FiveHour, five),
+            weekly: window(WindowKind::Weekly, weekly),
             limit: until.zip(at).map(|(until, at)| Limit {
                 until: stamp(until),
                 at: stamp(at),
@@ -221,22 +307,383 @@ impl Store {
 
     /// Records the Claude plan's quota.
     pub fn set_claude_quota(&self, quota: &ClaudeQuota) -> rusqlite::Result<()> {
-        let window = quota.window;
+        let (five, weekly) = (quota.five_hour, quota.weekly);
         self.db.execute(
-            "INSERT INTO claude_quota (id, used_percent, resets_ms, seen_ms, limit_until_ms, limit_at_ms)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO claude_quota (id, used_percent, resets_ms, seen_ms, limit_until_ms,
+                 limit_at_ms, weekly_used_percent, weekly_resets_ms, weekly_seen_ms)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT (id) DO UPDATE SET used_percent = ?1, resets_ms = ?2, seen_ms = ?3,
-                 limit_until_ms = ?4, limit_at_ms = ?5",
+                 limit_until_ms = ?4, limit_at_ms = ?5, weekly_used_percent = ?6,
+                 weekly_resets_ms = ?7, weekly_seen_ms = ?8",
             params![
-                window.map(|seen| seen.window.used_percent),
-                window.map(|seen| seen.window.resets.unix_millis()),
-                window.map(|seen| seen.at.unix_millis()),
+                five.map(|window| window.used_percent),
+                five.map(|window| window.resets.unix_millis()),
+                five.map(|window| window.seen.unix_millis()),
                 quota.limit.map(|limit| limit.until.unix_millis()),
                 quota.limit.map(|limit| limit.at.unix_millis()),
+                weekly.map(|window| window.used_percent),
+                weekly.map(|window| window.resets.unix_millis()),
+                weekly.map(|window| window.seen.unix_millis()),
             ],
         )?;
         Ok(())
     }
+}
+
+impl Store {
+    /// The Codex plan's windows, plan and reset credits as last read; nothing recorded is
+    /// nothing known.
+    pub fn codex_quota(&self) -> rusqlite::Result<CodexQuota> {
+        type Reading = (Option<f64>, Option<i64>, Option<i64>);
+        let row = self
+            .db
+            .query_row(
+                "SELECT used_percent, resets_ms, seen_ms, weekly_used_percent, weekly_resets_ms,
+                     weekly_seen_ms, plan, reset_credits, asked_ms
+                 FROM codex_quota WHERE id = 1",
+                [],
+                |row| {
+                    let five: Reading = (row.get(0)?, row.get(1)?, row.get(2)?);
+                    let weekly: Reading = (row.get(3)?, row.get(4)?, row.get(5)?);
+                    let credits: i64 = row.get(7)?;
+                    let asked: Option<i64> = row.get(8)?;
+                    Ok((
+                        five,
+                        weekly,
+                        row.get::<_, Option<String>>(6)?,
+                        credits,
+                        asked,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((five, weekly, plan, credits, asked)) = row else {
+            return Ok(CodexQuota::default());
+        };
+        let stamp = Timestamp::from_unix_millis;
+        let window = |kind, (used, resets, seen): Reading| match (used, resets, seen) {
+            (Some(used_percent), Some(resets), Some(seen)) => Some(UsageWindow {
+                kind,
+                used_percent,
+                resets: stamp(resets),
+                seen: stamp(seen),
+            }),
+            _ => None,
+        };
+        let (five_hour, weekly) = (
+            window(WindowKind::FiveHour, five),
+            window(WindowKind::Weekly, weekly),
+        );
+        Ok(CodexQuota {
+            // A restart within 5 minutes of an ask, read or not, does not ask again.
+            asked: asked.map(stamp),
+            five_hour,
+            weekly,
+            plan,
+            reset_credits: u32::try_from(credits).unwrap_or(0),
+            ..CodexQuota::default()
+        })
+    }
+
+    /// Records the Codex plan's windows, plan, reset credits and when it was last asked. Whether
+    /// the last ask could be read is not kept: a daemon that starts within 5 minutes of the ask
+    /// does not press a Codex that was down.
+    pub fn set_codex_quota(&self, quota: &CodexQuota) -> rusqlite::Result<()> {
+        let (five, weekly) = (quota.five_hour, quota.weekly);
+        self.db.execute(
+            "INSERT INTO codex_quota (id, used_percent, resets_ms, seen_ms, weekly_used_percent,
+                 weekly_resets_ms, weekly_seen_ms, plan, reset_credits, asked_ms)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT (id) DO UPDATE SET used_percent = ?1, resets_ms = ?2, seen_ms = ?3,
+                 weekly_used_percent = ?4, weekly_resets_ms = ?5, weekly_seen_ms = ?6,
+                 plan = ?7, reset_credits = ?8, asked_ms = ?9",
+            params![
+                five.map(|window| window.used_percent),
+                five.map(|window| window.resets.unix_millis()),
+                five.map(|window| window.seen.unix_millis()),
+                weekly.map(|window| window.used_percent),
+                weekly.map(|window| window.resets.unix_millis()),
+                weekly.map(|window| window.seen.unix_millis()),
+                quota.plan,
+                i64::from(quota.reset_credits),
+                quota.asked.map(Timestamp::unix_millis),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Runs `write` in one transaction: all of what it writes lands, or none of it does.
+    pub fn atomically<T>(
+        &self,
+        write: impl FnOnce(&Store) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        let transaction = self.db.unchecked_transaction()?;
+        let done = write(self)?;
+        transaction.commit()?;
+        Ok(done)
+    }
+
+    /// Appends `row` to the usage history unless it is the reading its harness, group and
+    /// window last had: the latest row of that key stands for it. Whether it appended.
+    pub fn append_history(&self, row: &HistoryRow) -> rusqlite::Result<bool> {
+        let last = self
+            .db
+            .query_row(
+                "SELECT used_percent, resets_ms, seen_ms FROM usage_history
+                 WHERE harness = ?1 AND quota_group IS ?2 AND window = ?3
+                 ORDER BY id DESC LIMIT 1",
+                params![row.harness, row.group, history::window_key(row.window)],
+                |last| {
+                    Ok(HistoryRow {
+                        used_percent: last.get::<_, Option<f64>>(0)?.unwrap_or(f64::NAN),
+                        resets: last.get::<_, Option<i64>>(1)?.unwrap_or(i64::MIN),
+                        seen: last.get(2)?,
+                        ..row.clone()
+                    })
+                },
+            )
+            .optional()?;
+        if !row.adds_to(last.as_ref()) {
+            return Ok(false);
+        }
+        self.db.execute(
+            "INSERT INTO usage_history (harness, quota_group, window, used_percent, resets_ms, seen_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                row.harness,
+                row.group,
+                history::window_key(row.window),
+                row.used_percent,
+                row.resets,
+                row.seen
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// The usage history from `since` (in milliseconds since the epoch) on, oldest first.
+    pub fn usage_history(&self, since: Option<i64>) -> rusqlite::Result<Vec<HistoryRow>> {
+        let mut rows = self.db.prepare(
+            "SELECT harness, quota_group, window, used_percent, resets_ms, seen_ms
+             FROM usage_history WHERE seen_ms >= ?1 ORDER BY seen_ms, id",
+        )?;
+        let rows = rows.query_map(params![since.unwrap_or(i64::MIN)], |row| {
+            let window: String = row.get(2)?;
+            Ok((
+                window,
+                HistoryRow {
+                    harness: row.get(0)?,
+                    group: row.get(1)?,
+                    window: WindowKind::FiveHour,
+                    used_percent: row.get::<_, Option<f64>>(3)?.unwrap_or(f64::NAN),
+                    resets: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    seen: row.get(5)?,
+                },
+            ))
+        })?;
+        // A row of a window this factory doesn't know (a newer one wrote it) is left out.
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(window, row)| {
+                history::window_of(&window).map(|window| HistoryRow { window, ..row })
+            })
+            .collect())
+    }
+
+    /// Drops the usage history seen before `before` (in milliseconds since the epoch); how many
+    /// rows went.
+    pub fn prune_history(&self, before: i64) -> rusqlite::Result<usize> {
+        self.db.execute(
+            "DELETE FROM usage_history WHERE seen_ms < ?1",
+            params![before],
+        )
+    }
+    /// Records a repo's CI as GitHub just answered it: its runners and open factory pull
+    /// requests replace the last ones, and every job read keeps the times it had.
+    pub fn record_ci(&mut self, ci: &RepoCi, read: &[Job]) -> rusqlite::Result<()> {
+        let seen = ci.seen.unwrap_or_default();
+        let tx = self.db.transaction()?;
+        tx.execute("DELETE FROM ci_runner WHERE repo = ?1", params![ci.repo])?;
+        for runner in &ci.runners {
+            let (status, busy) = runner.state.github();
+            tx.execute(
+                "INSERT INTO ci_runner (repo, id, name, status, busy, seen_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![ci.repo, sql(runner.id), runner.name, status, busy, seen],
+            )?;
+        }
+        for job in read {
+            tx.execute(
+                "INSERT INTO ci_job (repo, id, run_id, name, status, conclusion, runner,
+                     queued_ms, started_ms, finished_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT (repo, id) DO UPDATE SET run_id = ?3, name = ?4, status = ?5,
+                     conclusion = ?6, runner = COALESCE(?7, runner),
+                     queued_ms = COALESCE(?8, queued_ms), started_ms = COALESCE(?9, started_ms),
+                     finished_ms = COALESCE(?10, finished_ms)",
+                params![
+                    ci.repo,
+                    sql(job.id),
+                    sql(job.run_id),
+                    job.name,
+                    job.status,
+                    job.conclusion,
+                    job.runner,
+                    job.queued,
+                    job.started,
+                    job.finished,
+                ],
+            )?;
+        }
+        tx.execute("DELETE FROM ci_pull WHERE repo = ?1", params![ci.repo])?;
+        for pull in &ci.pulls {
+            tx.execute(
+                "INSERT INTO ci_pull (repo, number, branch, url, state, seen_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    ci.repo,
+                    sql(pull.number),
+                    pull.branch,
+                    pull.url,
+                    pull.state.word(),
+                    seen
+                ],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO ci_seen (repo, seen_ms) VALUES (?1, ?2)
+             ON CONFLICT (repo) DO UPDATE SET seen_ms = ?2",
+            params![ci.repo, seen],
+        )?;
+        tx.commit()
+    }
+
+    /// A repo's CI as last recorded: its runners, its jobs not yet completed, its open factory
+    /// pull requests and its latest completed jobs; nothing, and never seen, before the first
+    /// answer.
+    pub fn ci(&self, repo: &str) -> rusqlite::Result<RepoCi> {
+        let seen = self
+            .db
+            .query_row(
+                "SELECT seen_ms FROM ci_seen WHERE repo = ?1",
+                params![repo],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut runners = self
+            .db
+            .prepare("SELECT id, name, status, busy FROM ci_runner WHERE repo = ?1 ORDER BY id")?;
+        let runners = runners
+            .query_map(params![repo], |row| {
+                let status: String = row.get(2)?;
+                Ok(Runner {
+                    id: unsql(row.get(0)?),
+                    name: row.get(1)?,
+                    state: RunnerState::of(&status, row.get(3)?),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let jobs = self.ci_jobs(repo, "status != 'completed' ORDER BY id", u32::MAX)?;
+        let finished = self.ci_jobs(
+            repo,
+            "status = 'completed' ORDER BY finished_ms DESC, id DESC",
+            FINISHED_KEPT,
+        )?;
+        let mut pulls = self.db.prepare(
+            "SELECT number, branch, url, state FROM ci_pull WHERE repo = ?1 ORDER BY number",
+        )?;
+        let pulls = pulls
+            .query_map(params![repo], |row| {
+                let state: String = row.get(3)?;
+                Ok(Pull {
+                    number: unsql(row.get(0)?),
+                    branch: row.get(1)?,
+                    url: row.get(2)?,
+                    state: PullState::parse(&state),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(RepoCi {
+            repo: repo.to_owned(),
+            seen,
+            error: None,
+            runners,
+            jobs,
+            pulls,
+            finished,
+        })
+    }
+
+    /// At most `limit` of `repo`'s jobs, those `filter` (a SQL condition and order) picks.
+    fn ci_jobs(&self, repo: &str, filter: &str, limit: u32) -> rusqlite::Result<Vec<Job>> {
+        let mut jobs = self.db.prepare(&format!(
+            "SELECT id, run_id, name, status, conclusion, runner, queued_ms, started_ms,
+                 finished_ms
+             FROM ci_job WHERE repo = ?1 AND {filter} LIMIT ?2"
+        ))?;
+        jobs.query_map(params![repo, limit], |row| {
+            Ok(Job {
+                id: unsql(row.get(0)?),
+                run_id: unsql(row.get(1)?),
+                name: row.get(2)?,
+                status: row.get(3)?,
+                conclusion: row.get(4)?,
+                runner: row.get(5)?,
+                queued: row.get(6)?,
+                started: row.get(7)?,
+                finished: row.get(8)?,
+            })
+        })?
+        .collect()
+    }
+}
+
+/// How many of a repo's latest completed jobs `factory status --json` shows.
+const FINISHED_KEPT: u32 = 10;
+
+/// A GitHub id as SQLite keeps it.
+fn sql(id: u64) -> i64 {
+    i64::try_from(id).unwrap_or(i64::MAX)
+}
+
+/// A GitHub id SQLite kept.
+fn unsql(id: i64) -> u64 {
+    u64::try_from(id).unwrap_or_default()
+}
+
+/// Schema 6's weekly columns, on a `claude_quota` table an older schema made without them.
+fn add_weekly_columns(db: &Connection) -> rusqlite::Result<()> {
+    let mut columns = db.prepare("SELECT name FROM pragma_table_info('claude_quota')")?;
+    let present: Vec<String> = columns
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (name, kind) in WEEKLY_COLUMNS {
+        if !present.iter().any(|column| column == name) {
+            db.execute_batch(&format!(
+                "ALTER TABLE claude_quota ADD COLUMN {name} {kind};"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// `codex_quota.asked_ms`, on a table an earlier build made without it (at this same schema):
+/// the last ask is taken to be the last window it saw, so a restart soon after it asks nothing.
+fn add_codex_asked_column(db: &Connection) -> rusqlite::Result<()> {
+    let present: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('codex_quota') WHERE name = 'asked_ms'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        db.execute_batch(
+            "ALTER TABLE codex_quota ADD COLUMN asked_ms INTEGER;
+             UPDATE codex_quota
+                 SET asked_ms = NULLIF(MAX(COALESCE(seen_ms, 0), COALESCE(weekly_seen_ms, 0)), 0);",
+        )?;
+    }
+    Ok(())
 }
 
 /// A wait that outlives its CLI, as the database keeps it.

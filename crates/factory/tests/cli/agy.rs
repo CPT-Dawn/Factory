@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
 
-use crate::support::{BWRAP_PASSES, PROXY_LISTENS, Sandbox, finish, spawn};
+use crate::support::{BWRAP_PASSES, PROXY_LISTENS, Run, Sandbox, finish, spawn};
 
 const CLEAN_REPORT: &str = r#"## Standards
 
@@ -1219,7 +1219,9 @@ fn a_cached_usage_whose_empty_bucket_has_reset_is_asked_again() {
 
     assert_eq!(later.code, 0, "{later:?}");
     assert_eq!(shown(&later.stdout)["backend"], "agy", "{later:?}");
-    assert_eq!(usage_queries(&sandbox), 2, "{:?}", sandbox.calls("agy"));
+    // Two by routing, which asks again once its own cache is stale, and one by the daemon's
+    // display of agy's quota, which the polling of `factory status` set going.
+    assert_eq!(usage_queries(&sandbox), 3, "{:?}", sandbox.calls("agy"));
 }
 
 /// Whether the process `pid` has died (a zombie has), within a deadline.
@@ -1365,5 +1367,461 @@ fn agy_out_of_quota_is_not_granted_again_while_the_review_waits_for_codex() {
         reviews_run(&sandbox).len(),
         2,
         "agy is not granted to t2 again"
+    );
+}
+
+/// agy's usage with two quota groups, each with a 5-hour and a weekly window, as agy prints it:
+/// Gemini 30% and 7% spent, Claude and GPT 24% and 63%, all resetting far ahead.
+fn two_groups() -> String {
+    let bucket = |window: &str, left: f64| json!({"id": window, "name": window, "window": window, "remaining_fraction": left, "reset_time": "2099-01-01T00:00:00Z"});
+    json!({"status": "SUCCESS", "command": {"name": "usage", "data": {"groups": [
+        {"name": "Gemini Models", "buckets": [bucket("weekly", 0.93), bucket("5h", 0.7)]},
+        {"name": "Claude and GPT models", "buckets": [bucket("5h", 0.76), bucket("weekly", 0.37)]},
+    ]}}})
+    .to_string()
+}
+
+/// A fake agy that answers its usage query with `answer`.
+fn agy_says(answer: &str) -> String {
+    format!("cat <<'USAGE'\n{answer}\nUSAGE")
+}
+
+fn quota_agy(sandbox: &Sandbox) -> Run {
+    sandbox.factory(&["quota", "agy"])
+}
+
+/// Starts the daemon, which the bar never does: `factory status` does.
+fn start(sandbox: &Sandbox) {
+    let out = sandbox.factory(&["status"]);
+    assert_eq!(out.code, 0, "{out:?}");
+}
+
+fn bar_json(sandbox: &Sandbox) -> Value {
+    let out = sandbox.factory(&["bar", "--json"]);
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    serde_json::from_str(&out.stdout).unwrap_or(Value::Null)
+}
+
+fn agy_chip(feed: &Value) -> Value {
+    feed["glance"]
+        .as_array()
+        .and_then(|chips| chips.iter().find(|chip| chip["id"] == "agy"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn agy_card(feed: &Value) -> Value {
+    feed["sections"]
+        .as_array()
+        .and_then(|cards| cards.iter().find(|card| card["id"] == "agy"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+#[test]
+fn quota_agy_lists_each_quota_groups_windows() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", &agy_says(&two_groups()));
+
+    let out = quota_agy(&sandbox);
+
+    assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{out:?}");
+    assert_eq!(
+        out.stdout,
+        "agy: Gemini Models: 5h 30%, weekly 7%; Claude and GPT models: 5h 24%, weekly 63%\n"
+    );
+    let json = sandbox.factory(&["quota", "agy", "--json"]);
+    let shown = shown(&json.stdout);
+    assert_eq!(shown["groups"].as_array().map(Vec::len), Some(2), "{shown}");
+    assert_eq!(shown["error"], Value::Null, "{shown}");
+}
+
+/// The usage history's agy rows, as `group window used`.
+fn agy_history(sandbox: &Sandbox) -> Vec<String> {
+    let out = sandbox.factory(&["quota", "history", "--json"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    let document = shown(&out.stdout);
+    document["rows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter(|row| row["harness"] == "agy")
+        .map(|row| {
+            format!(
+                "{} {} {}",
+                row["group"].as_str().unwrap_or("-"),
+                row["window"],
+                row["used_percent"]
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn each_agy_reading_joins_the_usage_history_by_group_and_window_once() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", &agy_says(&two_groups()));
+
+    assert_eq!(quota_agy(&sandbox).code, 0);
+    assert_eq!(
+        quota_agy(&sandbox).code,
+        0,
+        "a second look reads the same reading"
+    );
+
+    let mut rows = agy_history(&sandbox);
+    rows.sort();
+    assert_eq!(
+        rows,
+        [
+            "Claude and GPT models \"five_hour\" 24.0",
+            "Claude and GPT models \"weekly\" 63.0",
+            "Gemini Models \"five_hour\" 30.0",
+            "Gemini Models \"weekly\" 7.0",
+        ],
+        "one row per group and window"
+    );
+}
+
+#[test]
+fn a_failed_usage_query_adds_nothing_to_the_history() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", "exit 1");
+
+    let _ = quota_agy(&sandbox);
+
+    assert_eq!(agy_history(&sandbox), Vec::<String>::new());
+}
+
+#[test]
+fn the_bar_shows_the_worst_window_and_a_block_per_quota_group() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", &agy_says(&two_groups()));
+    start(&sandbox);
+
+    let feed = bar_json(&sandbox);
+
+    let chip = agy_chip(&feed);
+    assert_eq!(
+        (&chip["text"], &chip["tone"]),
+        (&json!("63%"), &json!("ok")),
+        "{feed}"
+    );
+    let rows = agy_card(&feed)["rows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let meters: Vec<(&str, &str)> = rows
+        .iter()
+        .filter(|row| row["kind"] == "meter")
+        .map(|row| {
+            (
+                row["label"].as_str().unwrap_or(""),
+                row["text"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        meters,
+        [
+            ("5h", "30%"),
+            ("weekly", "7%"),
+            ("5h", "24%"),
+            ("weekly", "63%")
+        ]
+    );
+    let groups: Vec<&str> = rows
+        .iter()
+        .filter(|row| row["kind"] == "text")
+        .map(|row| row["label"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(groups, ["Gemini Models", "Claude and GPT models"]);
+    assert_eq!(
+        sandbox.factory(&["bar"]).stdout,
+        "claude ?/? · codex ?/? · agy 30/63 · ? leads · lab 0/0\n"
+    );
+}
+
+/// What a failed or garbled usage query shows everywhere: not a share, but "agy usage
+/// unreadable" and why.
+fn assert_unreadable(sandbox: &Sandbox, why: &str) {
+    let said = format!("agy usage unreadable: {why}");
+    start(sandbox);
+    let feed = bar_json(sandbox);
+    let chip = agy_chip(&feed);
+    assert_eq!(
+        (&chip["text"], &chip["tone"]),
+        (&json!("?"), &json!("muted")),
+        "{feed}"
+    );
+    assert_eq!(agy_card(&feed)["error"], said, "{feed}");
+    assert!(!agy_card(&feed).to_string().contains('%'), "{feed}");
+    assert_eq!(
+        sandbox.factory(&["bar"]).stdout,
+        "claude ?/? · codex ?/? · agy unreadable · ? leads · lab 0/0\n"
+    );
+
+    let status = sandbox.factory(&["status"]);
+    assert!(status.stdout_lines().contains(&said.as_str()), "{status:?}");
+    let quota = quota_agy(sandbox);
+    assert_eq!(
+        (quota.code, quota.stdout.as_str()),
+        (0, format!("{said}\n").as_str()),
+        "{quota:?}"
+    );
+}
+
+#[test]
+fn a_failed_usage_query_is_unreadable_everywhere_never_a_share() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", "exit 3");
+
+    assert_unreadable(&sandbox, "exited 3");
+}
+
+#[test]
+fn a_garbled_usage_answer_is_unreadable_everywhere_never_a_share() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", &agy_says("this is not json"));
+
+    assert_unreadable(&sandbox, "its answer is not JSON");
+}
+
+#[test]
+fn a_used_bucket_with_no_reset_is_unreadable_never_a_reset_that_passed() {
+    let sandbox = Sandbox::new();
+    let used = two_groups().replace("2099-01-01T00:00:00Z", "1970-01-01T00:00:00Z");
+    sandbox.fake("agy", &agy_says(&used));
+
+    let out = quota_agy(&sandbox);
+
+    // Every bucket of that answer is used and without a reset: each window is unknown.
+    assert_eq!(
+        out.stdout,
+        "agy: Gemini Models: 5h unknown, weekly unknown; Claude and GPT models: 5h unknown, weekly unknown\n",
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_second_bar_within_five_minutes_asks_agy_nothing_and_routing_asks_again_after_two() {
+    let sandbox = sandboxed();
+    agy_then_codex(&sandbox);
+    let repo = sandbox.repo();
+    sandbox.fake("agy", &agy(&two_groups(), &agy_writes(CLEAN_REPORT)));
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+
+    start(&sandbox);
+    bar_json(&sandbox);
+    bar_json(&sandbox);
+    sandbox.factory(&["bar"]);
+    sandbox.factory(&["status"]);
+    quota_agy(&sandbox);
+
+    assert_eq!(usage_queries(&sandbox), 1, "{:?}", sandbox.calls("agy"));
+
+    // A review asks on its own cache, which the daemon's display never fills, and keeps it for
+    // 120 s: a second review close behind asks nothing, and one after them asks again.
+    let first = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let second = sandbox.factory_in(&repo, &["review", "main", "t2"]);
+    assert_eq!((first.code, second.code), (0, 0), "{first:?} {second:?}");
+    assert_eq!(usage_queries(&sandbox), 2, "{:?}", sandbox.calls("agy"));
+    let cache = sandbox.path("state/factory/agy-usage.json");
+    let stale = SystemTime::now() - Duration::from_secs(121);
+    fs::File::options()
+        .write(true)
+        .open(&cache)
+        .and_then(|file| file.set_modified(stale))
+        .expect("age the routing cache");
+    let third = sandbox.factory_in(&repo, &["review", "main", "t3"]);
+    assert_eq!(third.code, 0, "{third:?}");
+    assert_eq!(usage_queries(&sandbox), 3, "{:?}", sandbox.calls("agy"));
+
+    bar_json(&sandbox);
+    assert_eq!(
+        usage_queries(&sandbox),
+        3,
+        "the bar's reading is still fresh"
+    );
+}
+
+/// A fake agy whose usage query waits for `gate` to exist before it answers with `answer`.
+fn agy_says_when(gate: &std::path::Path, answer: &str) -> String {
+    format!(
+        "until [ -e '{}' ]; do sleep 0.05; done\n{}",
+        gate.display(),
+        agy_says(answer)
+    )
+}
+
+#[test]
+fn a_slow_usage_query_is_asked_once_and_holds_no_bar_up() {
+    let sandbox = Sandbox::new();
+    let gate = sandbox.path("agy-may-answer");
+    sandbox.fake("agy", &agy_says_when(&gate, &two_groups()));
+    start(&sandbox);
+
+    let begun = Instant::now();
+    let first = bar_json(&sandbox);
+    let waited = begun.elapsed();
+    let second = bar_json(&sandbox);
+
+    // The bar gave up on the query after a few seconds, not its ten, and showed no reading.
+    assert!(waited < Duration::from_secs(8), "the bar waited {waited:?}");
+    assert_eq!(agy_chip(&first)["text"], "?", "{first}");
+    assert_eq!(agy_chip(&second)["text"], "?", "{second}");
+    assert_eq!(usage_queries(&sandbox), 1, "{:?}", sandbox.calls("agy"));
+
+    // The query finishes on its own once agy answers: the next look has it, and asks nothing.
+    fs::write(&gate, "").expect("let agy answer");
+    assert!(
+        until_it(|| agy_chip(&bar_json(&sandbox))["text"] == "63%"),
+        "the late answer never landed"
+    );
+    assert_eq!(usage_queries(&sandbox), 1, "{:?}", sandbox.calls("agy"));
+}
+
+#[test]
+fn a_pool_held_at_the_configs_mark_is_a_critical_bar_chip() {
+    let sandbox = Sandbox::new();
+    sandbox.fake("agy", &agy_says(&two_groups()));
+    configure(&sandbox, "[agy]\nhold_at_percent = 40\n");
+    start(&sandbox);
+
+    // Claude and GPT's weekly 63% is past the 40% mark, where routing holds the pool.
+    assert!(
+        until_it(|| agy_chip(&bar_json(&sandbox))["text"] == "63%"),
+        "no reading landed"
+    );
+    let chip = agy_chip(&bar_json(&sandbox));
+    assert_eq!(chip["tone"], "critical", "{chip}");
+    assert!(
+        chip["tooltip"]
+            .as_str()
+            .is_some_and(|tip| tip.ends_with(" · held from 40%")),
+        "{chip}"
+    );
+}
+
+#[test]
+fn a_reading_is_shown_for_five_minutes_and_asked_again_after() {
+    let skew = Sandbox::new();
+    let clock = skew.path("clock-skew");
+    let sandbox = skew.env("FACTORY_CLOCK_SKEW_FILE", &clock);
+    sandbox.fake("agy", &agy_says(&two_groups()));
+    start(&sandbox);
+    bar_json(&sandbox);
+    assert_eq!(usage_queries(&sandbox), 1, "{:?}", sandbox.calls("agy"));
+
+    fs::write(&clock, "299").expect("move the clock on");
+    bar_json(&sandbox);
+    quota_agy(&sandbox);
+    assert_eq!(usage_queries(&sandbox), 1, "{:?}", sandbox.calls("agy"));
+
+    fs::write(&clock, "301").expect("move the clock on");
+    let out = quota_agy(&sandbox);
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(usage_queries(&sandbox), 2, "{:?}", sandbox.calls("agy"));
+}
+
+#[test]
+fn a_failed_usage_query_is_not_repeated_for_five_minutes_either() {
+    let skew = Sandbox::new();
+    let clock = skew.path("clock-skew");
+    let sandbox = skew.env("FACTORY_CLOCK_SKEW_FILE", &clock);
+    sandbox.fake("agy", "exit 3");
+    start(&sandbox);
+
+    bar_json(&sandbox);
+    sandbox.factory(&["status"]);
+    let quota = quota_agy(&sandbox);
+    assert_eq!(
+        quota.stdout, "agy usage unreadable: exited 3\n",
+        "{quota:?}"
+    );
+    assert_eq!(usage_queries(&sandbox), 1, "{:?}", sandbox.calls("agy"));
+
+    fs::write(&clock, "301").expect("move the clock on");
+    quota_agy(&sandbox);
+    assert_eq!(usage_queries(&sandbox), 2, "{:?}", sandbox.calls("agy"));
+}
+
+#[test]
+fn many_quota_groups_are_a_summary_line_naming_a_file_with_a_row_each() {
+    let sandbox = Sandbox::new();
+    let bucket = |window: &str, left: f64| json!({"window": window, "remaining_fraction": left, "reset_time": "2099-01-01T00:00:00Z"});
+    let groups: Vec<Value> = (1..=12)
+        .map(|n| json!({"name": format!("Quota group number {n} of the plan"), "buckets": [bucket("5h", 0.5), bucket("weekly", 0.9)]}))
+        .collect();
+    let answer = json!({"command": {"data": {"groups": groups}}}).to_string();
+    sandbox.fake("agy", &agy_says(&answer));
+
+    let out = quota_agy(&sandbox);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let listing = sandbox.path("state/factory/agy-quota.txt");
+    assert_eq!(
+        out.stdout,
+        format!(
+            "agy: 12 quota groups, worst window 50%; listing in {}\n",
+            listing.display()
+        ),
+        "{out:?}"
+    );
+    assert!(out.stdout.chars().count() <= 200, "{out:?}");
+    let rows = fs::read_to_string(&listing).expect("the listing");
+    let rows: Vec<&str> = rows.lines().collect();
+    assert_eq!(rows.len(), 12, "{rows:?}");
+    assert_eq!(
+        rows[0],
+        "Quota group number 1 of the plan: 5h 50%, weekly 10%"
+    );
+    let json = sandbox.factory(&["quota", "agy", "--json"]);
+    assert_eq!(
+        shown(&json.stdout)["groups"].as_array().map(Vec::len),
+        Some(12)
+    );
+}
+
+#[test]
+fn a_listing_that_cannot_be_written_is_an_error_while_json_still_has_every_group() {
+    let sandbox = Sandbox::new();
+    let bucket = |window: &str| json!({"window": window, "remaining_fraction": 0.5, "reset_time": "2099-01-01T00:00:00Z"});
+    let groups: Vec<Value> = (1..=12)
+        .map(|n| json!({"name": format!("Quota group number {n} of the plan"), "buckets": [bucket("5h"), bucket("weekly")]}))
+        .collect();
+    let answer = json!({"command": {"data": {"groups": groups}}}).to_string();
+    sandbox.fake("agy", &agy_says(&answer));
+    // A directory where the listing goes: nothing can be written there.
+    fs::create_dir_all(sandbox.path("state/factory/agy-quota.txt")).expect("block the listing");
+
+    let out = quota_agy(&sandbox);
+
+    assert_ne!(out.code, 0, "{out:?}");
+    assert_eq!(out.stdout, "", "{out:?}");
+    assert!(out.stderr.contains("cannot write"), "{out:?}");
+    assert!(out.stderr.contains("use --json"), "{out:?}");
+    let json = sandbox.factory(&["quota", "agy", "--json"]);
+    assert_eq!(json.code, 0, "{json:?}");
+    assert_eq!(
+        shown(&json.stdout)["groups"].as_array().map(Vec::len),
+        Some(12)
+    );
+}
+
+#[test]
+fn a_group_name_with_a_line_break_is_still_one_line() {
+    let sandbox = Sandbox::new();
+    let answer = two_groups().replace("Gemini Models", "Gemini\\nModels");
+    sandbox.fake("agy", &agy_says(&answer));
+
+    let out = quota_agy(&sandbox);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(out.stdout_lines().len(), 1, "{out:?}");
+    assert!(
+        out.stdout.starts_with("agy: Gemini Models: 5h 30%"),
+        "{out:?}"
     );
 }

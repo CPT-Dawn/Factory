@@ -3,6 +3,7 @@
 
 use serde_json::Value;
 
+use crate::bar::slot_checked;
 use crate::lab::{Agent, for_owner, lab, waiting};
 use crate::monitor::{self, append, subagent_log, usage};
 use crate::router::{
@@ -54,11 +55,20 @@ fn an_idle_factory_says_so_in_every_section() {
         .collect();
     assert_eq!(
         sections,
-        ["factory", "lab", "review", "claude", "waits", "leads"],
+        [
+            "factory", "lab", "review", "claude", "codex", "agy", "waits", "leads"
+        ],
         "{out:?}"
     );
     assert!(lines.contains(&"lab: idle"), "{out:?}");
     assert!(lines.contains(&"waits: none"), "{out:?}");
+    // No Codex to ask is no 0%: the row says it could not read.
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("codex usage unreadable: ")),
+        "{out:?}"
+    );
 }
 
 #[test]
@@ -74,11 +84,22 @@ fn json_gives_every_field_of_every_section() {
     };
     assert_eq!(
         keys(&shown),
-        ["claude", "lab", "leads", "now", "review", "waits"]
+        [
+            "agy", "ci", "claude", "codex", "lab", "leads", "now", "review", "waits"
+        ]
     );
+    assert_eq!(keys(&shown["agy"]), ["error", "groups", "seen"]);
+    assert_eq!(keys(&shown["ci"]), ["error", "expected", "next", "repos"]);
     assert_eq!(
         keys(&shown["claude"]),
-        ["resets", "until", "used_percent", "verdict"]
+        [
+            "hold",
+            "resets",
+            "until",
+            "used_percent",
+            "verdict",
+            "windows"
+        ]
     );
     assert_eq!(shown["claude"]["verdict"], "unknown", "{shown}");
     assert_eq!(
@@ -110,6 +131,7 @@ fn json_gives_every_field_of_every_section() {
             "reason",
             "resets",
             "running",
+            "tiers",
             "when_busy"
         ]
     );
@@ -467,10 +489,21 @@ fn a_status_runs_no_external_command_and_asks_herdr_nothing() {
         &["acquire", "--no-device"],
     ));
     assert_eq!(held.code, 0, "{held:?}");
-    // The daemon's first look at herdr is its own, at its start.
+    // The daemon's first look at herdr is its own, at its start; so is its stacks' sweep, which
+    // the lease just granted wakes: its docker calls are over once the bar shows the slot checked
+    // (see `slot_checked`).
     screen_until(&sandbox, "the daemon to know its lead", |lines| {
         lines.contains(&"leads: 1, monitor off")
     });
+    let mut last = Value::Null;
+    assert!(
+        poll_until(|| {
+            let out = sandbox.factory(&["bar", "--json"]);
+            last = serde_json::from_str(&out.stdout).unwrap_or(Value::Null);
+            slot_checked(&last, "a")
+        }),
+        "the stack sweep never looked at the slot: {last}"
+    );
     let tools = ["adb", "docker", "systemctl", "gh", "codex", "claude", "agy"];
     let calls = |sandbox: &Sandbox| -> Vec<usize> {
         tools.iter().map(|tool| sandbox.calls(tool).len()).collect()

@@ -5,16 +5,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use factory_core::timestamp::Timestamp;
 
+/// The wall clock, moved by the test clock's skew when a test set one.
 pub fn now() -> Timestamp {
-    let since_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    Timestamp::from_unix_millis(i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX))
+    Timestamp::from_unix_millis(lab_now_ms())
 }
 
 /// The variable that names the test clock's file: the seconds, possibly fractional or negative,
 /// that the lab's wall clock runs ahead of the system's. Read on each look, so a test can move
-/// time on while a daemon runs; set by no one but the tests (the lab's 2 h reservation expiry).
+/// time on while a daemon runs; set by no one but the tests (the lab's 2 h reservation expiry, the usage history's 90 days).
 pub const SKEW_FILE: &str = "FACTORY_CLOCK_SKEW_FILE";
 
 /// The lab's wall clock in ms since the epoch: the system's, plus the test clock's skew.

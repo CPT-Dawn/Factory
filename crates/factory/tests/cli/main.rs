@@ -7,10 +7,22 @@
 #[cfg(test)]
 mod adb_stream;
 mod agy;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
+mod bar;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
+mod bar_lab;
 mod ci;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
+mod ci_fleet;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
 mod claude;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
+mod codex;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
 mod cutover;
@@ -21,6 +33,9 @@ mod devlab_golden;
 mod durations;
 mod harness;
 mod help;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
+mod history;
 mod install;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
@@ -38,6 +53,9 @@ mod lab_ready;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
 mod lab_reclaim;
+// cfg(test) for the same reason as support: its helpers unwrap.
+#[cfg(test)]
+mod lab_usb;
 // cfg(test) for the same reason as support: its helpers unwrap.
 #[cfg(test)]
 mod lab_share;

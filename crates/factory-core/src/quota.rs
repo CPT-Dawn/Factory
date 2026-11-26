@@ -5,6 +5,7 @@
 use serde_json::Value;
 
 use crate::timestamp::Timestamp;
+use crate::usage::{self, GroupWindow, QuotaGroup, WindowKind, WindowState};
 
 const MILLIS_PER_MINUTE: i64 = 60_000;
 const MILLIS_PER_DAY: i64 = 86_400_000;
@@ -199,21 +200,30 @@ fn codex_error(line: &str) -> Option<String> {
     message.and_then(Value::as_str).map(str::to_owned)
 }
 
+/// The share of either bucket of agy's model group, in percent, from which reviews hold off
+/// that group by default: `[agy] hold_at_percent`.
+pub const AGY_HOLD_AT_PERCENT: f64 = 90.0;
+
+/// The reset agy reports for a window nobody has used: the Unix epoch.
+const AGY_EPOCH_MILLIS: i64 = 0;
+
 /// What agy's free usage query (`agy -p /usage --output-format json`) says of one model
 /// group's quota.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgyUsage {
-    /// Every bucket of the group has some left.
+    /// Every bucket of the group is under the hold mark.
     Left,
-    /// A bucket is empty; the group has quota again once the last empty one resets.
+    /// A bucket is at the hold mark or empty; the group has quota again once the last such
+    /// bucket resets.
     Empty { until: Timestamp },
     /// The answer names no buckets for the group, or none it can read: why.
     Unreadable(String),
 }
 
 /// Reads agy's usage for the model `group` (`Gemini Models`): each of its buckets (five-hour,
-/// weekly) has a `remaining_fraction` and a `reset_time`.
-pub fn agy_usage(usage: &str, group: &str) -> AgyUsage {
+/// weekly) has a `remaining_fraction` and a `reset_time`. A bucket `hold_at` percent spent or
+/// more holds the group until it resets, as Claude's and Codex's windows hold theirs.
+pub fn agy_usage(usage: &str, group: &str, hold_at: f64) -> AgyUsage {
     let Ok(usage) = serde_json::from_str::<Value>(usage) else {
         return AgyUsage::Unreadable("its answer is not JSON".to_owned());
     };
@@ -223,13 +233,20 @@ pub fn agy_usage(usage: &str, group: &str) -> AgyUsage {
     }
     let mut until = None;
     for bucket in buckets {
-        let left = bucket.get("remaining_fraction").and_then(Value::as_f64);
-        let reset = bucket
-            .get("reset_time")
-            .and_then(Value::as_str)
-            .and_then(Timestamp::parse);
+        let left = bucket_left(bucket);
+        let reset = bucket_reset(bucket);
         match (left, reset) {
-            (Some(left), _) if left > 0.0 => {}
+            // The epoch is no reset: the bucket has been used, or it has not. Only a whole
+            // quota left says it has not.
+            (Some(left), Some(reset))
+                if reset.unix_millis() == AGY_EPOCH_MILLIS && !epoch_means_unused(left) =>
+            {
+                return AgyUsage::Unreadable(format!(
+                    "a {group} bucket has used some quota but reports no reset"
+                ));
+            }
+            (Some(_), Some(reset)) if reset.unix_millis() == AGY_EPOCH_MILLIS => {}
+            (Some(left), _) if used_percent(left) < hold_at => {}
             (Some(_), Some(reset)) => until = until.max(Some(reset)),
             _ => {
                 return AgyUsage::Unreadable(format!(
@@ -239,6 +256,135 @@ pub fn agy_usage(usage: &str, group: &str) -> AgyUsage {
         }
     }
     until.map_or(AgyUsage::Left, |until| AgyUsage::Empty { until })
+}
+
+/// Every quota group agy's usage answer lists, each with its 5-hour and weekly windows as the
+/// answer reads them, or why the answer can't be read at all.
+///
+/// A bucket that agy reports with the Unix epoch as its reset has no clock running: it is an
+/// unused window when its remaining fraction is 1, and unknown otherwise. It is never read as
+/// a reset that has passed.
+pub fn agy_groups(usage: &str) -> Result<Vec<QuotaGroup>, String> {
+    let Ok(usage) = serde_json::from_str::<Value>(usage) else {
+        return Err("its answer is not JSON".to_owned());
+    };
+    let listed = usage
+        .pointer("/command/data/groups")
+        .and_then(Value::as_array)
+        .filter(|groups| !groups.is_empty())
+        .ok_or_else(|| "its answer lists no quota groups".to_owned())?;
+    let (mut placed, mut read) = (false, false);
+    let mut groups = Vec::new();
+    for group in listed {
+        let (Some(name), Some(buckets)) = (
+            group.get("name").and_then(Value::as_str),
+            group.get("buckets").and_then(Value::as_array),
+        ) else {
+            return Err("a quota group of its answer has no name or buckets".to_owned());
+        };
+        // Both windows of every group, so a bucket the answer leaves out is an unknown window
+        // on the screen and not a window that is not there.
+        let mut windows = [WindowKind::FiveHour, WindowKind::Weekly].map(|window| GroupWindow {
+            window,
+            state: WindowState::Unknown,
+        });
+        let mut seen = [false; 2];
+        for bucket in buckets {
+            let Some(kind) = bucket_window(bucket) else {
+                continue;
+            };
+            let at = usize::from(kind == WindowKind::Weekly);
+            if !std::mem::replace(&mut seen[at], true) {
+                placed = true;
+                let reading = read_bucket(bucket);
+                read |= reading.is_some();
+                windows[at].state = bucket_state(reading);
+            }
+        }
+        groups.push(QuotaGroup {
+            name: name.to_owned(),
+            windows: windows.to_vec(),
+        });
+    }
+    if !placed {
+        return Err("its answer lists no 5-hour or weekly window".to_owned());
+    }
+    if !read {
+        return Err("its answer has no bucket it can read".to_owned());
+    }
+    Ok(groups)
+}
+
+/// Whether a bucket with the epoch as its reset, which has no clock running, is untouched: only
+/// when the whole quota is left.
+#[allow(clippy::float_cmp)]
+fn epoch_means_unused(left: f64) -> bool {
+    left == 1.0
+}
+
+/// The percent of a bucket spent, from the share left. Rounded to a millionth: 1 - 0.9 is
+/// 0.0999... in floats, and 10% spent.
+fn used_percent(left: f64) -> f64 {
+    ((1.0 - left) * 100.0 * 1e6).round() / 1e6
+}
+
+/// The share of a bucket left, 0 to 1, as agy printed it.
+fn bucket_left(bucket: &Value) -> Option<f64> {
+    bucket
+        .get("remaining_fraction")
+        .and_then(Value::as_f64)
+        .filter(|left| (0.0..=1.0).contains(left))
+}
+
+/// When a bucket resets, as agy printed it.
+fn bucket_reset(bucket: &Value) -> Option<Timestamp> {
+    bucket
+        .get("reset_time")
+        .and_then(Value::as_str)
+        .and_then(Timestamp::parse)
+}
+
+/// A bucket as agy printed it, for the display: the share left and when it resets, the reset
+/// a time that can stand (or the epoch, which says none).
+fn read_bucket(bucket: &Value) -> Option<(f64, i64)> {
+    let left = bucket_left(bucket)?;
+    let resets = bucket_reset(bucket)?.unix_millis();
+    (resets == AGY_EPOCH_MILLIS || usage::representable(resets)).then_some((left, resets))
+}
+
+/// Which window a bucket is: its `window` (`5h`, `weekly`), else what its id or name says.
+fn bucket_window(bucket: &Value) -> Option<WindowKind> {
+    ["window", "id", "name"]
+        .into_iter()
+        .filter_map(|key| bucket.get(key)?.as_str())
+        .find_map(|text| {
+            let text = text.to_lowercase();
+            if text.contains("5h") || text.contains("five hour") || text.contains("5-hour") {
+                Some(WindowKind::FiveHour)
+            } else if text.contains("week") {
+                Some(WindowKind::Weekly)
+            } else {
+                None
+            }
+        })
+}
+
+/// What a bucket says of its window.
+fn bucket_state(reading: Option<(f64, i64)>) -> WindowState {
+    match reading {
+        Some((left, resets)) if resets == AGY_EPOCH_MILLIS => {
+            if epoch_means_unused(left) {
+                WindowState::Unused
+            } else {
+                WindowState::Unknown
+            }
+        }
+        Some((left, resets)) if usage::representable(resets) => WindowState::Used {
+            used_percent: usage::whole_percent(used_percent(left)),
+            resets,
+        },
+        _ => WindowState::Unknown,
+    }
 }
 
 /// Whether a bucket of agy's model `group` over `window` (`5h`, `weekly`) has less than

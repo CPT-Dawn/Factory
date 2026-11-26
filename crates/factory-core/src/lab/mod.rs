@@ -12,6 +12,7 @@
 //! - [`reserve`] sets slots aside for a lead's implementers.
 //! - [`ready`] says whether a phone can run unattended, and what to tell the owner.
 //! - [`events`] builds the lab's events in the stats ledger.
+//! - [`usb`] finds a phone with USB debugging off on the USB bus.
 
 pub mod args;
 pub mod config;
@@ -25,6 +26,7 @@ pub mod ready;
 pub mod reserve;
 pub mod run;
 pub mod slots;
+pub mod usb;
 
 /// `Math.round` as devlab's TypeScript did it: halves round up.
 pub fn js_round(x: f64) -> i64 {

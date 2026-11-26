@@ -12,6 +12,9 @@ pub const POWER_PROBE: &str = "dumpsys power | grep -E 'mWakefulness=' | head -1
 /// The shell line that prints adb's authorization timeout; `0` when it is off.
 pub const AUTH_TIMEOUT_PROBE: &str = "settings get global adb_allowed_connection_time";
 
+/// What a phone with USB debugging off asks of the owner, on the bar and in `devlab status`.
+pub const USB_DEBUGGING_OFF_WORDS: &str = "turn on USB debugging";
+
 /// An instant, in milliseconds since the epoch: what a probe's time is kept in. Its own type so
 /// that seconds can't stand in for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -84,6 +87,9 @@ pub enum Readiness {
     Unauthorized,
     /// adb lists it but can't reach it.
     Offline,
+    /// Plugged in, but adb doesn't list it: its USB debugging is off ([`crate::lab::usb`]).
+    #[serde(rename = "usb-debugging-off")]
+    UsbDebuggingOff,
 }
 
 impl Readiness {
@@ -96,6 +102,7 @@ impl Readiness {
             Readiness::StayAwakeOff => "stay-awake off",
             Readiness::Unauthorized => "unauthorized",
             Readiness::Offline => "offline",
+            Readiness::UsbDebuggingOff => "usb-debugging-off",
         }
     }
 
@@ -107,6 +114,7 @@ impl Readiness {
             Readiness::StayAwakeOff,
             Readiness::Unauthorized,
             Readiness::Offline,
+            Readiness::UsbDebuggingOff,
         ]
         .into_iter()
         .find(|r| r.word() == word)
@@ -182,6 +190,20 @@ fn power_sources(battery: &str) -> u32 {
         })
         .fold(0, |bits, bit| bits | bit);
     if named { on } else { 2 }
+}
+
+/// The name a phone goes by, in notifications and on the bar: its `model`, else its serial;
+/// with the last 4 of its serial when `shared`, another phone being of its model.
+pub fn phone_name(model: &str, serial: &str, shared: bool) -> String {
+    if model.is_empty() {
+        return serial.to_owned();
+    }
+    if !shared {
+        return model.to_owned();
+    }
+    let chars: Vec<char> = serial.chars().collect();
+    let last: String = chars[chars.len().saturating_sub(4)..].iter().collect();
+    format!("{model} ({last})")
 }
 
 /// How loud a notification is: `notify-send -u`.
@@ -277,6 +299,11 @@ pub fn notice(name: &str, before: Option<Known>, now: Readiness) -> Option<Notic
             "adb can't reach it: replug it, or run adb kill-server.",
             Urgency::Normal,
         ),
+        Readiness::UsbDebuggingOff => (
+            format!("{name}: turn on USB debugging"),
+            "Settings > Developer options > USB debugging: adb can't see it until it is on.",
+            Urgency::Normal,
+        ),
     };
     Some(Notice {
         summary,
@@ -334,6 +361,9 @@ pub fn check_line(
                 .to_owned()
         }
         Some(Readiness::Offline) => "offline: replug it, or run adb kill-server".to_owned(),
+        Some(Readiness::UsbDebuggingOff) => {
+            "USB debugging off: turn it on in Developer options, then replug it".to_owned()
+        }
     };
     format!("{name}: {what}")
 }

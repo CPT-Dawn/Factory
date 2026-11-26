@@ -5,15 +5,15 @@ use std::collections::BTreeMap;
 use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{DeviceRow, device_line};
 use factory_core::lab::queue::{Holding, held_by, live_queue, owner_slot_counts, waiter_capped};
+use factory_core::lab::ready::{Readiness, USB_DEBUGGING_OFF_WORDS};
 use factory_core::lab::reserve::lapses_at;
-use factory_core::lab::slots::slot_project_id;
 use factory_core::lab::{ago, js_round};
 use serde::Serialize;
 
 use super::context::{self, project_config};
 use super::host::mem_available_mb;
 use super::stack;
-use super::wire::{Board, DeviceLine, Lease, Reservation, STATUS, SlotRow, Waiter};
+use super::wire::{Board, DeviceLine, Lease, Reservation, STATUS, Waiter, slot_inventory};
 use crate::client;
 use crate::output::Failure;
 use crate::paths::Paths;
@@ -105,6 +105,10 @@ pub fn screen(board: &Board) -> Result<String, Failure> {
             // A phone adb calls ready shows its readiness (#55): locked, asleep, …
             let state = match &d.readiness {
                 Some(word) if d.kind == "phone" && d.state == "ready" => word.clone(),
+                // A phone adb doesn't list says what to do, not adb's word for it (#73).
+                Some(word) if word == Readiness::UsbDebuggingOff.word() => {
+                    USB_DEBUGGING_OFF_WORDS.to_owned()
+                }
                 _ => d.state.clone(),
             };
             out.push(device_line(&DeviceRow {
@@ -186,24 +190,7 @@ pub fn screen(board: &Board) -> Result<String, Failure> {
 }
 
 fn report(board: &Board, cfg: &MachineConfig) -> Report {
-    // A reserved slot that was never leased has no row of its own yet.
-    let mut rows: Vec<SlotRow> = board.slots.clone();
-    for r in &board.reservations {
-        if !rows
-            .iter()
-            .any(|s| s.project == r.project && s.slot == r.slot)
-        {
-            rows.push(SlotRow {
-                project: r.project.clone(),
-                slot: r.slot,
-                last_worktree: None,
-                stack_ours: false,
-                idle_since: None,
-                stopping: false,
-            });
-        }
-    }
-    rows.sort_by(|a, b| (&a.project, a.slot).cmp(&(&b.project, b.slot)));
+    let rows = slot_inventory(&board.slots, &board.reservations);
     let slots = rows
         .iter()
         .map(|s| {
@@ -214,16 +201,7 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
                 .reservations
                 .iter()
                 .find(|r| r.project == s.project && r.slot == s.slot);
-            let id = s
-                .last_worktree
-                .as_deref()
-                .and_then(|wt| {
-                    let p = project_config(wt).ok().flatten()?;
-                    stack::info(&p, wt, s.slot).ok().flatten()
-                })
-                .map(|info| info.project_id)
-                .filter(|id| !id.is_empty())
-                .unwrap_or_else(|| slot_project_id(&s.project, s.slot));
+            let id = stack::slot_stack_id(&s.project, s.slot, s.last_worktree.as_deref());
             SlotLine {
                 project: s.project.clone(),
                 slot: s.slot,

@@ -1,13 +1,18 @@
 //! `factory`: the CLI and the daemon of the agent software factory (spec #1).
 
+mod agy;
+mod bar;
 mod ci;
 mod claude;
 mod cli;
 mod client;
 mod clock;
+mod codex;
 mod config;
 mod cutover;
 mod daemon;
+mod fleet;
+mod history;
 mod hook;
 mod install;
 mod lab;
@@ -22,6 +27,7 @@ mod output;
 mod paths;
 mod pollers;
 mod protocol;
+mod quotas;
 mod review;
 mod reviews;
 mod router;
@@ -59,10 +65,6 @@ fn main() -> ExitCode {
             command: Command::Hook { command },
             json,
         }) => hook::run(&command, json),
-        Ok(Cli {
-            command: Command::Statusline,
-            json,
-        }) => claude::statusline(json),
         Ok(cli::Cli {
             command: Command::Lab { args },
             json,
@@ -113,8 +115,16 @@ fn run(command: Command, json: bool) -> ExitCode {
         Command::Quota {
             command: QuotaCommand::Claude,
         } => claude::quota(),
-        // Handled in main, before the output contract: its line is Claude Code's.
-        Command::Statusline => return claude::statusline(json),
+        Command::Quota {
+            command: QuotaCommand::Codex,
+        } => codex::quota(),
+        Command::Quota {
+            command: QuotaCommand::History { since },
+        } => history::run(since.as_deref(), json),
+        Command::Quota {
+            command: QuotaCommand::Agy,
+        } => agy::quota(json),
+        Command::Bar => return bar::run(json),
         Command::Wait {
             command: WaitCommand::Claude { timeout },
         } => claude::wait(timeout),

@@ -25,17 +25,22 @@ factory review [--tier <tier>] --skill <its checkout's codex/code-review/SKILL.m
 - `--skill` is the reviewer skill every backend's prompt carries, so a worktree's review.sh runs that worktree's
   skill and no backend spends a turn loading it. Without it, factory takes `[review] skill` from its config,
   else `~/.agents/skills/code-review/SKILL.md`.
-- The tier picks the chain of reviewers, as review.sh's did: a spec review (`spec-*`) is hard; a diff of only
+- The tier picks the chain of reviewers, as review.sh's did: a spec review (`spec-*`) is the `spec` tier, whatever the diff or tag, on its own chain; a diff of only
   docs and config (at most 400 lines), or of at most 5 lines and no test, is `trivial` unless tagged hard; else
   the caller's tier, or standard. The chains and pools are factory's config (`[review.chains]`, `config.rs`),
   review.sh's by default. Each pool has 2 slots: a busy pool passes the review to the chain's next, and the
   chain's last waits. A pool out of quota (agy's free `/usage`, or a quota error mid-run) cools down until its
   reset. A failed `claude -p` counts as out of quota when its `result` or stderr says a plan limit (`You've hit your session limit · resets 3:45pm`, `usage limit reached|<epoch>`), a rate limit (`rate_limit_error`, HTTP 429 as a status) or a message naming a reset (`resets 3:45pm`, `resets Mon 12:00am`): the pool cools until the reset named, else for an hour, and any other failure is exit 3; a mid-run hit tries the same pool's next model first when it is next in the chain. Standard and
-  trivial reviews leave the Gemini pool alone while its 5-hour bucket is under 20%.
+  trivial reviews leave the Gemini pool alone while its 5-hour bucket is under 20%. An agy pool holds, as Claude and
+  Codex do, once `[agy] hold_at_percent` (default 90, more than 0 and at most 100) of either bucket of its group is
+  spent, until that bucket resets: it cools down and the chain's next takes the review. Each reading the daemon takes
+  of agy's usage (`factory status`, `factory bar`, `factory quota agy`) joins the usage history as harness `agy`,
+  one row per group and touched window, as its whole percent; a review's own usage query runs in the review's
+  process and is not the daemon's reading.
 - The default pools are `agy-gemini` and `agy-claude` (agy's two quota groups), `codex` and `claude`. A model's
   group is the one whose "Models within this group" list in agy's `/usage` names it, so Argon, Carbon and Hydrogen
   draw on the Gemini group with Neon and Flash, and the 20% reserve covers them all; an answer that lists no models
-  falls back to a static map. The default chains: hard is Neon high, agy's Opus high, Codex high, Claude Opus high;
+  falls back to a static map. The default chains: hard is Codex high, Neon high, agy's Opus high, Claude Opus high; spec (`[review.chains] spec`) is Neon high, agy's Opus high, Codex high, Claude Opus high, the former built-in hard chain; a config that sets a `hard` chain and no `spec` chain runs spec reviews on its `hard` chain, as before the spec tier existed;
   standard is Codex medium, Neon medium, agy's Opus high, agy's Sonnet high, Claude Sonnet high; trivial is Flash high,
   Neon low, Codex low, Claude Sonnet medium. Argon is in none of them, but a chain may name it
   (`agy-gemini:gemini-4-argon-high:high`), and an old config's `agy-argon` still works: a configured pool of that

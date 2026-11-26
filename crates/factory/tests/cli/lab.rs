@@ -484,7 +484,16 @@ fn an_emulator_a_dead_daemon_left_booting_is_stopped_and_forgotten_never_ready()
         sandbox.calls("adb")
     );
     // The caller asks the next daemon again, and an emulator that was never ready is not there
-    // to reuse: its acquire boots afresh.
+    // to reuse: its acquire boots afresh. The new emulator stays stalled until the daemon has
+    // its start, and adb's stream has shown the world as it is: the daemon's view of the
+    // serial is of the new emulator, not of the killed one, when it finishes booting.
+    let rebooted = poll_until(|| sandbox.calls("systemd-run").len() == 2);
+    assert!(
+        rebooted,
+        "no new emulator was started: {:?}",
+        sandbox.calls("systemd-run")
+    );
+    world.settle_trackers();
     fs::write(sandbox.path("world/stalled"), "").unwrap();
     let again = finish(child);
     assert_eq!(again.code, 0, "{again:?}");

@@ -1,8 +1,8 @@
 //! The daemon's watch over phones (#55): a phone is prepped when adb's stream first shows it as
-//! `device` and after every replug, every attached phone is probed every `readinessCheckSec`,
-//! and its readiness is kept in the store. Each change of it posts one desktop notification
-//! saying what to do: one per change of a phone, told by its serial and named the same way each
-//! time, and an offline that its unplug soon follows is said as the unplug alone (#63). One
+//! `device` and after every replug, every free phone is probed every `readinessCheckSec` (two
+//! minutes unless set, #72; a leased one is its holder's and isn't), and its readiness is kept
+//! in the store. Each change of it posts one desktop notification saying what to do: one per
+//! change of a phone, told by its serial and named the same way each time, and an offline that its unplug soon follows is said as the unplug alone (#63). One
 //! thread does it all, so the probes, the store's rows and the notifications follow the stream's
 //! order; `devlab check` is answered on it too.
 
@@ -13,17 +13,20 @@ use std::time::{Duration, Instant};
 
 use factory_adapters::adb::{Adb, AdbCli};
 use factory_adapters::desktop::{Desktop, NotifySend, PostError};
+use factory_adapters::usb::{Sysfs, Usb};
 use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{Attached, LOCK_PROBE, prep_command};
 use factory_core::lab::events as event;
 use factory_core::lab::ready::{
     AUTH_TIMEOUT_PROBE, BATTERY_PROBE, EpochMs, Known, Notice, POWER_PROBE, Probe, Readiness,
-    STAY_ON_PROBE, after, auth_timeout_warning, judge, notice, refresh_again, unplugged,
+    STAY_ON_PROBE, after, auth_timeout_warning, judge, notice, phone_name, refresh_again,
+    unplugged,
 };
+use factory_core::lab::usb::{HiddenPhone, hidden_phones, vendor_name};
 
 use super::super::check::PhoneCheck;
 use super::super::readiness::{self, ReadyRow};
-use super::super::{context, events};
+use super::super::{context, events, store};
 use super::{Answer, Lab, Mark, failed, lock_ignoring_poison, now_ms};
 
 /// How old a probe `devlab check` answers from may be.
@@ -35,6 +38,23 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long an offline is held back: a phone being unplugged goes offline first, and its unplug
 /// within this is said alone.
 const FOLD: Duration = Duration::from_secs(3);
+
+/// The phones with USB debugging off at the watcher's last sweep of the USB bus that could read
+/// it, and when it was made, in ms since the epoch; and why the last sweep could not read the
+/// bus, while it can't: the phones are then the last ones read, which may be out of date.
+#[derive(Default)]
+pub(super) struct Hidden {
+    pub at: i64,
+    pub phones: Vec<HiddenPhone>,
+    pub error: Option<String>,
+}
+
+/// What the bar is told of the phones with USB debugging off: [`Hidden`] as of a call.
+pub(super) struct HiddenNow {
+    pub at: i64,
+    pub phones: Vec<HiddenPhone>,
+    pub error: Option<String>,
+}
 
 /// What the watcher thread is asked to do.
 pub enum Job {
@@ -65,7 +85,10 @@ impl Lab {
                     lab,
                     adb: Box::new(AdbCli),
                     desktop: Box::new(NotifySend),
+                    usb: Box::new(Sysfs::from_env()),
+                    following: false,
                     shown: Vec::new(),
+                    lost: Vec::new(),
                     since: BTreeMap::new(),
                     said_missing: false,
                     doubted: HashSet::new(),
@@ -77,6 +100,25 @@ impl Lab {
             });
         if spawned.is_ok() && self.phones.set(tx).is_ok() {
             self.track();
+        }
+    }
+
+    /// The phones adb doesn't list that the USB bus shows (#73), as the watcher last found them,
+    /// and when; those `listed`, the list the caller shows beside them, are left out, so that
+    /// no phone is said to be missing from a list that has it. Reads what is kept: it spawns
+    /// nothing and reads no sysfs.
+    pub(super) fn hidden_phones(&self, listed: &[Attached]) -> HiddenNow {
+        let hidden = lock_ignoring_poison(&self.hidden);
+        let phones = hidden
+            .phones
+            .iter()
+            .filter(|h| !listed.iter().any(|a| a.serial == h.serial))
+            .cloned()
+            .collect();
+        HiddenNow {
+            at: hidden.at,
+            phones,
+            error: hidden.error.clone(),
         }
     }
 
@@ -139,8 +181,15 @@ struct Watcher {
     lab: Arc<Lab>,
     adb: Box<dyn Adb>,
     desktop: Box<dyn Desktop>,
+    /// The USB bus, swept for phones adb doesn't list.
+    usb: Box<dyn Usb>,
+    /// Whether adb's stream follows a list now: false before the first and after one ends, when
+    /// what adb lists is not known and no phone can be said to be missing from it.
+    following: bool,
     /// The phones the last list showed.
     shown: Vec<Attached>,
+    /// The phones the last list before adb's stream ended showed, until the next list comes.
+    lost: Vec<Attached>,
     /// Which attachment of each device the last list shows.
     since: BTreeMap<String, i64>,
     /// Whether the log already said notify-send is missing.
@@ -168,27 +217,20 @@ fn config() -> MachineConfig {
 }
 
 fn every(cfg: &MachineConfig) -> Duration {
-    Duration::try_from_secs_f64(cfg.readiness_check_sec).unwrap_or(Duration::from_secs(60))
-}
-
-/// The name a notification gives phone `serial`: its `model`, else its serial; with the last 4
-/// of its serial when `shared`, another attached phone being of its model.
-fn name(model: &str, serial: &str, shared: bool) -> String {
-    if model.is_empty() {
-        return serial.to_owned();
-    }
-    if !shared {
-        return model.to_owned();
-    }
-    let chars: Vec<char> = serial.chars().collect();
-    let last: String = chars[chars.len().saturating_sub(4)..].iter().collect();
-    format!("{model} ({last})")
+    Duration::try_from_secs_f64(cfg.readiness_check_sec).unwrap_or(Duration::from_secs(120))
 }
 
 impl Watcher {
     fn run(&mut self, jobs: &mpsc::Receiver<Job>) {
         let mut next = Instant::now() + every(&config());
         loop {
+            // What is due goes first, however many jobs wait: a stream of them that never lets
+            // up holds back no re-check and no offline.
+            self.say_held();
+            if Instant::now() >= next {
+                self.recheck();
+                next = Instant::now() + every(&config());
+            }
             let until = self
                 .held
                 .values()
@@ -197,14 +239,21 @@ impl Watcher {
             match jobs.recv_timeout(until.saturating_duration_since(Instant::now())) {
                 Ok(Job::Frame(list, since)) => {
                     self.since = since;
+                    self.following = true;
                     self.frame(list);
+                    self.sweep_usb();
                     // Its probes are written: a request waiting for a phone looks again.
-                    self.lab.notify();
+                    self.lab.notify_waiters();
                 }
-                // The next list's phones are all new to it: each is prepped and probed again.
+                // The next list's phones are all new to it: each free one is prepped and probed
+                // again, and the ones it showed are kept to tell a leased phone that stayed.
                 Ok(Job::StreamEnded) => {
-                    self.shown.clear();
+                    let shown = std::mem::take(&mut self.shown);
+                    if !shown.is_empty() {
+                        self.lost = shown;
+                    }
                     self.since.clear();
+                    self.following = false;
                 }
                 Ok(Job::Check(serials, fresh, reply)) => {
                     let _ = reply.send(self.check(&serials, fresh));
@@ -213,23 +262,77 @@ impl Watcher {
                     self.refresh(&serials, by);
                     let _ = reply.send(());
                 }
-                Err(RecvTimeoutError::Timeout) if Instant::now() < next => self.say_held(),
-                Err(RecvTimeoutError::Timeout) => {
-                    self.say_held();
-                    for phone in self.shown.clone() {
-                        if phone.state == "device" {
-                            self.probe(&phone);
-                        }
-                    }
-                    next = Instant::now() + every(&config());
-                }
+                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
     }
 
+    /// Probes each free phone adb can use. A leased phone is its holder's, whose run the
+    /// watcher leaves alone: no re-check probes it while a lease holds it (#72); only a replug
+    /// readies it again, as any phone is (#55). Whether one does is read right before each probe, so a lease granted during
+    /// the round is seen by the next phone's.
+    fn recheck(&mut self) {
+        for phone in self.shown.clone() {
+            if phone.state == "device" && self.free(&phone.serial) {
+                self.probe(&phone);
+            }
+        }
+        self.sweep_usb();
+    }
+
+    /// Looks at the USB bus for a phone with USB debugging off (#73): a device of a known
+    /// Android vendor whose serial adb doesn't list. It reads sysfs and spawns nothing. While
+    /// adb's stream follows no list, what adb lists is not known: no phone is newly said to be
+    /// missing from it, and the ones already said are kept only while the bus still shows them.
+    ///
+    /// A bus that can't be read changes no phone: the last ones found stand, and the error says
+    /// they may be out of date, until a sweep reads the bus again.
+    fn sweep_usb(&mut self) {
+        let on_bus = match self.usb.devices() {
+            Ok(on_bus) => on_bus,
+            Err(why) => {
+                lock_ignoring_poison(&self.lab.hidden).error = Some(why);
+                return;
+            }
+        };
+        if !self.following {
+            let mut hidden = lock_ignoring_poison(&self.lab.hidden);
+            hidden.error = None;
+            // Still the same device: its serial and a vendor of the same maker.
+            hidden.phones.retain(|h| {
+                on_bus
+                    .iter()
+                    .any(|d| d.serial == h.serial && vendor_name(&d.vendor) == Some(h.vendor))
+            });
+            return;
+        }
+        let listed: Vec<&str> = self
+            .shown
+            .iter()
+            .chain(&self.lost)
+            .map(|a| a.serial.as_str())
+            .collect();
+        let found = hidden_phones(&on_bus, &listed);
+        let mut hidden = lock_ignoring_poison(&self.lab.hidden);
+        *hidden = Hidden {
+            at: now_ms(),
+            phones: found,
+            error: None,
+        };
+    }
+
+    /// Whether no lease holds phone `serial`. A store that can't be read leaves it unknown,
+    /// which is not free: the phone may be someone's.
+    fn free(&self, serial: &str) -> bool {
+        self.lab
+            .read(store::taken)
+            .is_ok_and(|taken| !taken.iter().any(|s| s == serial))
+    }
+
     /// A new list: unplugged phones are forgotten, each phone that has just become `device`
-    /// is prepped and probed, and one adb can't use is kept as adb says it is.
+    /// is prepped and probed (a leased one only when it was replugged), and one adb can't use
+    /// is kept as adb says it is.
     fn frame(&mut self, list: Vec<Attached>) {
         let phones: Vec<Attached> = list.into_iter().filter(|a| a.kind == "phone").collect();
         let rows = self.lab.write(|c, _| readiness::all(c)).unwrap_or_default();
@@ -258,6 +361,7 @@ impl Watcher {
             self.models.insert(p.serial.clone(), p.model.clone());
         }
         let before = std::mem::replace(&mut self.shown, phones.clone());
+        let lost = std::mem::take(&mut self.lost);
         self.doubted.clear();
         for phone in &phones {
             let was = before.iter().find(|b| b.serial == phone.serial);
@@ -265,6 +369,14 @@ impl Watcher {
                 continue;
             }
             if phone.state == "device" {
+                // Replugged: missing from the list before, and from the one before adb's
+                // stream ended. Anything else is adb's own transition (offline or unauthorized
+                // to device, or its stream coming back): a free phone is readied again, a
+                // leased one is left to its holder, unprepped and unprobed.
+                let replugged = was.is_none() && !lost.iter().any(|l| l.serial == phone.serial);
+                if !replugged && !self.free(&phone.serial) {
+                    continue;
+                }
                 let cfg = config();
                 let _ = self.adb.shell(
                     &phone.serial,
@@ -297,7 +409,7 @@ impl Watcher {
                 .models
                 .iter()
                 .any(|(other, m)| other != serial && m == model);
-        name(model, serial, shared)
+        phone_name(model, serial, shared)
     }
 
     /// Says `n`: phone `serial` is now `what`, unless that was the last thing said of it. An
@@ -437,7 +549,7 @@ impl Watcher {
         }
         if changed {
             // A request waiting for a phone looks again.
-            self.lab.notify();
+            self.lab.notify_waiters();
         }
         Some(row)
     }
