@@ -551,8 +551,11 @@ fn codex(status: &Status, rows: &mut Vec<String>) {
 
 fn agy(status: &Status, rows: &mut Vec<String>) {
     let agy = &status.agy;
+    // The agy row, whichever it is: a skipped review is worse news than the usage, which
+    // `factory quota agy` and the bar still show.
     if let Some(guard) = &agy.guard {
         rows.push(guard.clone());
+        return;
     }
     if let Some(problem) = agy.problem() {
         rows.push(problem);

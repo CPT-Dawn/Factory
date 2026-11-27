@@ -8,7 +8,7 @@
 //! reading its rc is refused `agent_pane_busy`: that is asked again, not read as a dialog.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use factory_adapters::herdr::{HerdrApi, HerdrError};
 use factory_core::lead::{
@@ -101,7 +101,7 @@ async fn started<H: HerdrApi>(
     pane: &str,
     plan: &Plan<'_>,
 ) -> Result<bool, Failed> {
-    let mut waited = Duration::ZERO;
+    let began = Instant::now();
     let mut pause = BUSY_PAUSE;
     loop {
         match herdr
@@ -110,6 +110,7 @@ async fn started<H: HerdrApi>(
         {
             Ok(()) => return Ok(true),
             Err(HerdrError::Refused { code, .. }) if code == BUSY => {
+                let waited = began.elapsed();
                 if waited >= plan.busy_for {
                     return Err(at.failed(
                         &format!(
@@ -121,7 +122,6 @@ async fn started<H: HerdrApi>(
                 }
                 let nap = pause.min(plan.busy_for - waited);
                 sleep(nap).await;
-                waited += nap;
                 pause = (pause * 2).min(BUSY_PAUSE_MAX);
             }
             Err(_) => return Ok(false),
@@ -227,41 +227,4 @@ async fn typed<H: HerdrApi>(
 /// The text with its whitespace removed: Claude wraps its input box anywhere, even inside a path.
 fn flat(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use factory_adapters::herdr::fake::FakeHerdr;
-
-    #[tokio::test]
-    async fn a_pane_that_stays_busy_fails_naming_herdrs_code() {
-        let herdr = FakeHerdr::new();
-        for _ in 0..50 {
-            herdr.refuse(
-                "agent.start",
-                BUSY,
-                "agent target pane w1:p1 is not an available shell",
-            );
-        }
-        let plan = Plan {
-            name: "lead-cart",
-            repo: Path::new("/repos/repo"),
-            branch: "factory/cart",
-            base: "main",
-            label: "cart",
-            claude_args: &[],
-            prompt: "go",
-            pause: Duration::ZERO,
-            busy_for: Duration::from_millis(250),
-        };
-
-        let failed = start(&herdr, &plan).await.err();
-
-        let message = failed.map(|f| f.message).unwrap_or_default();
-        assert!(message.contains("agent_pane_busy"), "{message}");
-        assert!(message.contains("see workspace w1"), "{message}");
-        assert!(!herdr.calls().iter().any(|call| call == "agent.read"));
-        assert!(herdr.prompts().is_empty());
-    }
 }

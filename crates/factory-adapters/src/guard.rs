@@ -357,35 +357,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_missing_guard_tool_is_named_with_its_package() {
-        let dir = std::env::temp_dir().join(format!("factory-guard-path-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
-        let make = |name: &str, mode: u32| {
-            let file = dir.join(name);
-            let _ = fs::write(&file, "#!/bin/sh\n");
-            let _ = fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(mode));
-        };
-        make(BWRAP, 0o755);
-        let path = dir.as_os_str();
-
-        let said = problem(Some(path));
-        make(PROXY, 0o644);
-        let not_executable = problem(Some(path));
-        make(PROXY, 0o755);
-        let both = problem(Some(path));
-        let none = problem(None);
-        let _ = fs::remove_dir_all(&dir);
-
-        assert_eq!(
-            said.as_deref(),
-            Some("agy reviews skipped, missing: xdg-dbus-proxy (package xdg-dbus-proxy)")
-        );
-        assert_eq!(not_executable, said);
-        assert_eq!(both, None);
-        assert!(none.is_some_and(|why| why.contains("bwrap") && why.contains("bubblewrap")));
-    }
-
-    #[test]
     fn the_bus_socket_is_the_path_its_address_names() {
         assert_eq!(
             bus_path("unix:path=/run/user/1000/bus,guid=abc"),

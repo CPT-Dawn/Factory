@@ -424,6 +424,32 @@ fn a_pane_still_busy_with_its_shell_is_retried_until_it_takes_the_agent() {
 }
 
 #[test]
+fn a_pane_that_stays_busy_fails_the_spawn_naming_herdrs_code() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    for _ in 0..200 {
+        herdr.refuse(
+            "agent.start",
+            "agent_pane_busy",
+            "agent target pane w1:p1 is not an available shell",
+        );
+    }
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr.contains("could not start Claude") && out.stderr.contains("agent_pane_busy"),
+        "{out:?}"
+    );
+    assert!(herdr.count("agent.start") > 4);
+    assert_eq!(herdr.count("agent.read"), 0);
+    assert_eq!(herdr.count("agent.prompt"), 0);
+}
+
+#[test]
 fn a_start_that_fails_off_the_trust_dialog_is_reported() {
     let sandbox = Sandbox::new();
     let herdr = FakeHerdr::start(&sandbox);
