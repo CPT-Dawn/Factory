@@ -9,15 +9,27 @@ page together.
 ## Arguments
 
 ```
-review.sh [--tier hard|standard|trivial] <base> <label> [<spec>] [<previous-report>]
+review.sh [--tier hard|standard|trivial] [--escalation] <base> <label> [<spec>] [<previous-report>]
 ```
+
+(`--escalation` is passed through to factory; a review.sh older than the round cap, docs/adr/0002, lacks it.)
 
 The shim checks the label (letters, digits, `_`, `-`) and the tier before it calls factory, and exits 2 with a
 `code-review: ` line on stderr when either is wrong. It runs:
 
 ```
-factory review [--tier <tier>] --skill <its checkout's codex/code-review/SKILL.md> <base> <label> <spec or none> [<previous-report>]
+factory review [--tier <tier>] [--escalation] --skill <its checkout's codex/code-review/SKILL.md> <base> <label> <spec or none> [<previous-report>]
 ```
+
+- The label's `-rN` suffix is the round, and factory holds the cap (docs/adr/0002): rounds 1 and 2 always run;
+  rounds 3 and 4 only with `--escalation` (implement-spec's Opus re-dispatch); after the last round, 2 or 4, one
+  light review, `<prefix>-rN-light`, reviews only the last fix, from round N's head, once. Any other round
+  (`-r3` without `--escalation`, `-r5`, a light review after round 1 or 3, a second light review) is refused
+  with exit 2 and one line saying to report what is still open; `--escalation` on rounds 1 and 2 is refused too.
+  A label with no `-rN` suffix is held to no cap.
+- Round N > 1 and a light review continue the round before (`<prefix>-r<N-1>`, or round N for `-rN-light`):
+  without a previous report, factory takes that round's report from `<state>/reviews/<repo>/`, and refuses with
+  exit 2, naming the missing report, when there is none. It never reviews such a round fresh.
 
 - The spec is a file, `none`, or an issue ref: `#12`, `12`, `owner/repo#12` or an issue URL. factory fetches
   an issue with `gh` into `<label>.spec.md`, since the reviewers' sandboxes have no network. A path with no file
@@ -73,7 +85,9 @@ diff, spec, previous review, touched docs, coding standards, evidence), the prom
 (`.md`), the reviewer's run record (Codex `.jsonl`, agy `.agy.json`, Claude `.claude.json`, which factory-stats
 reads), `.ledger.json` (review.sh's: `label round base from head tier pool model effort verdict report
 findings`, the head a fix round diffs from) and factory's `.findings.json`. A fix round finds the previous
-head in `.findings.json`, else `.ledger.json`, else the last ok `review` event naming that report.
+head in `.findings.json`, else `.ledger.json`, else the last ok `review` event naming that report. A previous
+head that is not on the branch (an escalation on a new branch) makes the round review the whole diff, with a line
+on stderr, but the previous round's open findings still go to the reviewer and its ledger marks them.
 
 Every run, failed ones too, logs one `review` event with review.sh's fields: `repo label round base from head
 branch spec outcome verdict reason reviewer tier tier_source pool model effort tokens duration_s report stream

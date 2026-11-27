@@ -34,16 +34,90 @@ pub fn check_label(label: &str) -> Result<(), BadLabel> {
 }
 
 /// The round a review is: the `-rN` suffix of its label, else 1, and 2 when a round-1 label
-/// comes with a previous report.
+/// comes with a previous report. The light review after round N (`-rN-light`) is round N + 1.
 pub fn round(label: &str, has_previous: bool) -> u32 {
-    let suffix = label
-        .rsplit_once("-r")
-        .and_then(|(_, n)| (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(n))
-        .and_then(|n| n.parse().ok());
-    match suffix {
-        Some(1) | None if has_previous => 2,
-        Some(n) => n,
-        None => 1,
+    match Place::of(label) {
+        Place::Round { n: 1, .. } | Place::Single if has_previous => 2,
+        Place::Round { n, .. } => n,
+        Place::Light { after, .. } => after.saturating_add(1),
+        Place::Single => 1,
+    }
+}
+
+/// The rounds every ticket's review gets.
+pub const CAP: u32 = 2;
+/// The rounds an escalation's review may reach, its own being the two after `CAP`.
+pub const ESCALATION_CAP: u32 = 4;
+
+/// Where a label stands among its ticket's rounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place<'a> {
+    /// No `-rN` suffix: a review on its own, held to no cap.
+    Single,
+    /// `<prefix>-rN`, round N.
+    Round { prefix: &'a str, n: u32 },
+    /// `<prefix>-rN-light`: the one light review of a last fix, after round N.
+    Light { prefix: &'a str, after: u32 },
+}
+
+impl<'a> Place<'a> {
+    pub fn of(label: &'a str) -> Place<'a> {
+        let (rest, light) = match label.strip_suffix("-light") {
+            Some(rest) => (rest, true),
+            None => (label, false),
+        };
+        let parsed = rest.rsplit_once("-r").and_then(|(prefix, n)| {
+            let digits = !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+            Some((prefix, n.parse::<u32>().ok().filter(|_| digits)?))
+        });
+        match parsed {
+            Some((prefix, n)) if light => Place::Light { prefix, after: n },
+            Some((prefix, n)) => Place::Round { prefix, n },
+            None => Place::Single,
+        }
+    }
+
+    /// The label of the round this one continues: round N-1's for round N > 1, round N's for
+    /// the light review after it.
+    pub fn previous(&self) -> Option<String> {
+        match *self {
+            Place::Round { prefix, n } if n > 1 => Some(format!("{prefix}-r{}", n - 1)),
+            Place::Light { prefix, after } => Some(format!("{prefix}-r{after}")),
+            _ => None,
+        }
+    }
+}
+
+/// Holds a label to the round cap: rounds 1 to `CAP` always, the two after only for an
+/// escalation, the light review only after round `CAP` or `ESCALATION_CAP`. A refusal is the
+/// one line that says so and what to do instead.
+pub fn admit(label: &str, escalation: bool) -> Result<(), String> {
+    let report = "report what is still open as open in your final report";
+    match Place::of(label) {
+        Place::Single if escalation => Err(format!(
+            "--escalation is for rounds {} and {ESCALATION_CAP} of a label <prefix>-rN, not {label}",
+            CAP + 1
+        )),
+        Place::Single => Ok(()),
+        Place::Round { prefix, n: 0 } => Err(format!(
+            "{label}: rounds count from 1; start with {prefix}-r1"
+        )),
+        Place::Round { n, .. } if n > ESCALATION_CAP => Err(format!(
+            "{label} is past the review cap ({CAP} rounds, {ESCALATION_CAP} for an escalation): {report}"
+        )),
+        Place::Round { prefix, n } if n > CAP && !escalation => Err(format!(
+            "{label} is past the {CAP}-round review cap: {report} ({prefix}-r{CAP}-light may review a last fix; rounds {} and {ESCALATION_CAP} are an escalation's, with --escalation)",
+            CAP + 1
+        )),
+        Place::Round { n, .. } if n <= CAP && escalation => Err(format!(
+            "--escalation is for rounds {} and {ESCALATION_CAP}, not {label}",
+            CAP + 1
+        )),
+        Place::Round { .. } => Ok(()),
+        Place::Light { prefix, after } if after != CAP && after != ESCALATION_CAP => Err(format!(
+            "{label}: a light review follows the last round, {prefix}-r{CAP} or an escalation's {prefix}-r{ESCALATION_CAP}"
+        )),
+        Place::Light { .. } => Ok(()),
     }
 }
 
@@ -957,6 +1031,50 @@ fn finding(value: &Value) -> Option<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cap_admits_rounds_1_and_2_then_3_and_4_for_an_escalation_then_one_light_review() {
+        for (label, escalation, admitted) in [
+            ("t1", false, true),
+            ("t1", true, false),
+            ("t1-r0", false, false),
+            ("t1-r1", false, true),
+            ("t1-r2", false, true),
+            ("t1-r2", true, false),
+            ("t1-r3", false, false),
+            ("t1-r3", true, true),
+            ("t1-r4", true, true),
+            ("t1-r5", true, false),
+            ("t1-r1-light", false, false),
+            ("t1-r2-light", false, true),
+            ("t1-r3-light", true, false),
+            ("t1-r4-light", false, true),
+            ("spec-x-r2", false, true),
+        ] {
+            assert_eq!(
+                admit(label, escalation).is_ok(),
+                admitted,
+                "{label} escalation={escalation}: {:?}",
+                admit(label, escalation)
+            );
+        }
+    }
+
+    #[test]
+    fn a_later_round_and_a_light_review_continue_the_round_before() {
+        for (label, previous) in [
+            ("t1", None),
+            ("t1-r1", None),
+            ("t1-r2", Some("t1-r1")),
+            ("spec-x-r4", Some("spec-x-r3")),
+            ("t1-r2-light", Some("t1-r2")),
+            ("t1-light", None),
+        ] {
+            assert_eq!(Place::of(label).previous().as_deref(), previous, "{label}");
+        }
+        assert_eq!(round("t1-r2-light", true), 3);
+        assert_eq!(round("t1-r4-light", false), 5);
+    }
 
     #[test]
     fn round_is_the_label_suffix_else_1_and_2_for_a_first_label_with_a_previous_report() {

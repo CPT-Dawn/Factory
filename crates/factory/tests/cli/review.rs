@@ -465,8 +465,19 @@ fn a_failed_run_logs_its_event_with_outcome_error_and_the_reason() {
     let sandbox = Sandbox::new();
     let repo = sandbox.repo();
     sandbox.fake("codex", "echo 'stream so far'; exit 1");
+    let previous = sandbox.path("t1-r1.md");
+    fs::write(&previous, "a lacks a test\nVERDICT: findings\n").unwrap();
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1-r2", "none"]);
+    let out = sandbox.factory_in(
+        &repo,
+        &[
+            "review",
+            "main",
+            "t1-r2",
+            "none",
+            previous.to_str().unwrap(),
+        ],
+    );
 
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
@@ -997,4 +1008,226 @@ fn a_fix_rounds_prompt_asks_for_each_old_finding_marked_and_new_ones_only_on_the
     }
     let first_round = fs::read_to_string(sandbox.reviews().join("t1-r1.prompt")).unwrap();
     assert!(!first_round.contains("still_present"), "{first_round}");
+}
+
+#[test]
+fn a_later_round_without_a_previous_report_continues_from_the_round_before_it() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake("codex", &codex_writes(FINDINGS_REPORT));
+    sandbox.factory_in(&repo, &["review", "main", "t1-r1"]);
+    fs::write(repo.join("b.txt"), "b\n").unwrap();
+    sandbox.git(&repo, &["add", "."]);
+    sandbox.git(&repo, &["commit", "-q", "-m", "fix: add b"]);
+    sandbox.fake("codex", &codex_writes(FIXED_REPORT));
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1-r2", "none"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let bundle = fs::read_to_string(sandbox.reviews().join("t1-r2.bundle.md")).unwrap();
+    assert!(bundle.contains("+++ b/b.txt"), "{bundle}");
+    assert!(!bundle.contains("+++ b/a.txt"), "{bundle}");
+    assert!(bundle.contains("## Previous findings"), "{bundle}");
+    let ledger: Value = serde_json::from_str(
+        &fs::read_to_string(sandbox.reviews().join("t1-r2.findings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ledger["fixed"], 4, "{ledger}");
+    assert!(
+        ledger["from"].as_str().is_some_and(|from| !from.is_empty()),
+        "{ledger}"
+    );
+}
+
+#[test]
+fn a_later_round_whose_round_before_has_no_report_is_refused_naming_it_not_reviewed_fresh() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1-r2", "none"]);
+
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(out.stdout, "", "{out:?}");
+    assert_eq!(
+        out.stderr,
+        format!(
+            "factory: code-review: t1-r2 continues t1-r1, which has no report at {}: run t1-r1 first, or pass its report as the previous report\n",
+            sandbox.reviews().join("t1-r1.md").display()
+        )
+    );
+    assert!(sandbox.calls("codex").is_empty(), "{out:?}");
+}
+
+/// Runs `labels` in turn, each after a fix commit of its own (`<label>.txt`), the fake codex
+/// answering each with `report`, and returns the last run's output.
+fn rounds(
+    sandbox: &Sandbox,
+    repo: &std::path::Path,
+    report: &str,
+    labels: &[&[&str]],
+) -> crate::support::Run {
+    sandbox.fake("codex", &codex_writes(report));
+    let mut last = None;
+    for (at, args) in labels.iter().enumerate() {
+        if at > 0 {
+            fs::write(repo.join(format!("{}.txt", args[0])), "fix\n").unwrap();
+            sandbox.git(repo, &["add", "."]);
+            sandbox.git(
+                repo,
+                &["commit", "-q", "-m", &format!("fix: before {}", args[0])],
+            );
+        }
+        let mut argv = vec!["review", "main", args[0], "none"];
+        argv.extend_from_slice(&args[1..]);
+        last = Some(sandbox.factory_in(repo, &argv));
+    }
+    last.unwrap()
+}
+
+#[test]
+fn round_3_without_escalation_is_refused_in_one_line_that_says_to_report_what_is_open() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+
+    let out = rounds(
+        &sandbox,
+        &repo,
+        FINDINGS_REPORT,
+        &[&["t1-r1"], &["t1-r2"], &["t1-r3"]],
+    );
+
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(out.stdout, "", "{out:?}");
+    assert_eq!(
+        out.stderr,
+        "factory: code-review: t1-r3 is past the 2-round review cap: report what is still open as open in your final report (t1-r2-light may review a last fix; rounds 3 and 4 are an escalation's, with --escalation)\n"
+    );
+    assert_eq!(sandbox.calls("codex").len(), 2, "{out:?}");
+    assert!(!sandbox.reviews().join("t1-r3.bundle.md").exists());
+}
+
+#[test]
+fn an_escalations_round_3_continues_round_2s_ledger_and_round_5_is_refused() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+
+    let third = rounds(
+        &sandbox,
+        &repo,
+        FINDINGS_REPORT,
+        &[&["t1-r1"], &["t1-r2"], &["t1-r3", "--escalation"]],
+    );
+
+    assert_eq!(third.code, 10, "{third:?}");
+    let bundle = fs::read_to_string(sandbox.reviews().join("t1-r3.bundle.md")).unwrap();
+    assert!(bundle.contains("+++ b/t1-r3.txt"), "{bundle}");
+    assert!(!bundle.contains("+++ b/t1-r2.txt"), "{bundle}");
+    assert!(bundle.contains("## Previous findings"), "{bundle}");
+    assert!(
+        bundle.contains(&sandbox.reviews().join("t1-r2.md").display().to_string()),
+        "{bundle}"
+    );
+    let ledger: Value = serde_json::from_str(
+        &fs::read_to_string(sandbox.reviews().join("t1-r3.findings.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(ledger.get("still_present").is_some(), "{ledger}");
+
+    let fifth = sandbox.factory_in(&repo, &["review", "main", "t1-r5", "none", "--escalation"]);
+    assert_eq!(fifth.code, 2, "{fifth:?}");
+    assert_eq!(
+        fifth.stderr,
+        "factory: code-review: t1-r5 is past the review cap (2 rounds, 4 for an escalation): report what is still open as open in your final report\n"
+    );
+}
+
+#[test]
+fn escalation_is_refused_on_rounds_1_and_2() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1-r1", "none", "--escalation"]);
+
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(
+        out.stderr,
+        "factory: code-review: --escalation is for rounds 3 and 4, not t1-r1\n"
+    );
+}
+
+#[test]
+fn the_light_review_after_round_2_reviews_only_the_last_fix_and_runs_once() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+
+    let light = rounds(
+        &sandbox,
+        &repo,
+        FINDINGS_REPORT,
+        &[&["t1-r1"], &["t1-r2"], &["t1-r2-light"]],
+    );
+
+    assert_eq!(light.code, 10, "{light:?}");
+    let bundle = fs::read_to_string(sandbox.reviews().join("t1-r2-light.bundle.md")).unwrap();
+    assert!(bundle.contains("+++ b/t1-r2-light.txt"), "{bundle}");
+    assert!(!bundle.contains("+++ b/t1-r2.txt"), "{bundle}");
+    assert!(bundle.contains("## Previous findings"), "{bundle}");
+    let event: Value = serde_json::from_str(sandbox.ledger_lines().last().unwrap()).unwrap();
+    assert_eq!(event["label"], "t1-r2-light", "{event}");
+    assert_eq!(event["round"], 3, "{event}");
+
+    let again = sandbox.factory_in(&repo, &["review", "main", "t1-r2-light", "none"]);
+    assert_eq!(again.code, 2, "{again:?}");
+    assert_eq!(
+        again.stderr,
+        "factory: code-review: t1-r2-light has run, and the light review is the last: report what is still open as open in your final report\n"
+    );
+    assert_eq!(sandbox.calls("codex").len(), 3, "{again:?}");
+}
+
+#[test]
+fn a_light_review_after_any_round_but_the_last_is_refused() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1-r1-light", "none"]);
+
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(
+        out.stderr,
+        "factory: code-review: t1-r1-light: a light review follows the last round, t1-r2 or an escalation's t1-r4\n"
+    );
+}
+
+#[test]
+fn a_round_on_a_new_branch_reviews_the_whole_diff_but_still_marks_the_round_befores_findings() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    rounds(&sandbox, &repo, FINDINGS_REPORT, &[&["t1-r1"], &["t1-r2"]]);
+    // The escalation starts over on a branch of its own: round 2's head is not on it.
+    sandbox.git(&repo, &["checkout", "-q", "-b", "again", "main"]);
+    fs::write(repo.join("c.txt"), "c\n").unwrap();
+    sandbox.git(&repo, &["add", "."]);
+    sandbox.git(&repo, &["commit", "-q", "-m", "feat: add c"]);
+    sandbox.fake("codex", &codex_writes(SECOND_REPORT));
+
+    let out = sandbox.factory_in(&repo, &["review", "main", "t1-r3", "none", "--escalation"]);
+
+    assert_eq!(out.code, 10, "{out:?}");
+    assert!(
+        out.stderr.contains("round 3 reviews the whole diff"),
+        "{out:?}"
+    );
+    let bundle = fs::read_to_string(sandbox.reviews().join("t1-r3.bundle.md")).unwrap();
+    assert!(bundle.contains("+++ b/c.txt"), "{bundle}");
+    assert!(bundle.contains("## Previous findings"), "{bundle}");
+    let ledger: Value = serde_json::from_str(
+        &fs::read_to_string(sandbox.reviews().join("t1-r3.findings.json")).unwrap(),
+    )
+    .unwrap();
+    // Round 2's five open findings: SECOND_REPORT fixes f1 and f3, keeps f2 and f4, and leaves
+    // f5 unmarked, which stays open.
+    assert_eq!(ledger["fixed"], 2, "{ledger}");
+    assert_eq!(ledger["still_present"], 3, "{ledger}");
 }

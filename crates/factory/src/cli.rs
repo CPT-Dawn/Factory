@@ -73,6 +73,10 @@ pub enum Command {
         /// ~/.agents/skills/code-review/SKILL.md)
         #[arg(long, value_name = "FILE")]
         skill: Option<PathBuf>,
+        /// An escalation's review, which may run rounds 3 and 4 (every ticket gets rounds 1 and 2,
+        /// and one light review, <prefix>-r2-light, after the last)
+        #[arg(long)]
+        escalation: bool,
     },
     /// Answer a Claude Code hook: its JSON on stdin, its hook protocol on stdout
     Hook {

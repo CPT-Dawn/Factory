@@ -1,6 +1,10 @@
-//! `factory review [--tier] <base> <label> [spec] [prev]`: review.sh's arguments, a prepared review
-//! bundle, a run on the first step of the tier's chain the daemon's router grants a slot, and
-//! one line back.
+//! `factory review [--tier] [--escalation] <base> <label> [spec] [prev]`: review.sh's arguments,
+//! a prepared review bundle, a run on the first step of the tier's chain the daemon's router
+//! grants a slot, and one line back.
+//!
+//! The label's round is held to the cap (docs/adr/0002): rounds 1 and 2, 3 and 4 for an
+//! escalation, then one light review (`-rN-light`). A later round finds the round before it
+//! among this repo's reviews when the caller names no previous report.
 //!
 //! The tier picks the chain (spec review spec, on a chain of its own; small or docs-only diff trivial; else the
 //! caller's, or standard), and each step names a pool, a model and an effort. The daemon holds
@@ -31,7 +35,7 @@ use factory_adapters::reviewer::{Agy, Claude, Codex, Job, Reviewer, ReviewerErro
 use factory_core::exit::Exit;
 use factory_core::quota::{Reset, WhenBusy};
 use factory_core::review::{
-    self, Bundle, Doc, Finding, Fix, Part, Previous, Reading, Record, Verdict,
+    self, Bundle, Doc, Finding, Fix, Part, Place, Previous, Reading, Record, Verdict,
 };
 use factory_core::tier::{self, Tier};
 use factory_core::timestamp::Timestamp;
@@ -78,10 +82,13 @@ pub struct Args {
     pub tier: Option<String>,
     /// The reviewer skill the prompt carries, over the config's.
     pub skill: Option<PathBuf>,
+    /// The review is an escalation's, which may run rounds 3 and 4.
+    pub escalation: bool,
 }
 
 pub fn run(args: &Args) -> Result<Done, Failure> {
     review::check_label(&args.label).map_err(|e| Failure::usage(e.to_string()))?;
+    review::admit(&args.label, args.escalation).map_err(Failure::usage)?;
     let caller = args
         .tier
         .as_deref()
@@ -258,7 +265,8 @@ fn review(
     })?;
     run.branch = repo.branch().unwrap_or_default();
     let files = Files::new(paths, &run.repo, &args.label)?;
-    let inputs = Inputs::gather(&repo, args, &files)?;
+    let previous = previous_report(args, &files)?;
+    let inputs = Inputs::gather(&repo, args, previous.as_deref(), &files)?;
     let (tier, source) = tier::tier(&args.label, caller, &inputs.whole);
     run.tier = Some(tier);
     run.tier_source = source.as_str();
@@ -270,10 +278,7 @@ fn review(
         .join(",");
     run.head = inputs.head.clone();
     run.notes.extend(inputs.notes.iter().cloned());
-    run.from = inputs
-        .fix
-        .as_ref()
-        .map_or_else(String::new, |fix| fix.head.clone());
+    run.from = inputs.from.clone().unwrap_or_default();
     let spec = inputs.spec.as_ref().map_or("none", |(name, _)| name);
     run.spec = spec.to_owned();
     let bundle = inputs.bundle(args, &run.repo, tier).render();
@@ -403,15 +408,10 @@ fn review(
             }
             Err(e) => return Err(reviewer_failed(reviewer.as_ref(), &e, &files.prompt)),
         }
-        let fix_round = inputs.fix.as_ref().is_some_and(|fix| fix.open.is_some());
+        let fix_round = inputs.open.is_some();
         let prompt = review::prompt(
             skill.as_deref(),
-            &reviewer.opening(
-                inputs
-                    .fix
-                    .as_ref()
-                    .map_or(args.base.as_str(), |fix| short(&fix.head)),
-            ),
+            &reviewer.opening(inputs.from.as_deref().map_or(args.base.as_str(), short)),
             &files.bundle.display().to_string(),
             spec,
             inputs.previous.as_ref().map(|(name, _)| name.as_str()),
@@ -482,7 +482,7 @@ fn review(
         Failure::precondition(format!("{e}: {}; read it there", files.report.display()))
     })?;
     // A fix round is held to its rules: old findings marked, new ones only on the fix's lines.
-    let reading = match inputs.fix.as_ref().and_then(|fix| fix.open.as_deref()) {
+    let reading = match inputs.open.as_deref() {
         Some(open) => reading.within(open, &Fix::of_diff(&inputs.diff)),
         None => reading,
     };
@@ -520,6 +520,8 @@ fn review(
     });
     if !run.from.is_empty() {
         ledger["from"] = run.from.clone().into();
+    }
+    if !run.from.is_empty() || inputs.open.is_some() {
         ledger["fixed"] = reading.fixed.into();
         ledger["still_present"] = reading.still_present.into();
         ledger["dropped"] = reading.dropped.len().into();
@@ -665,8 +667,10 @@ struct Inputs {
     /// The whole diff's files, from the base, whatever the round: what the tier is read from.
     whole: Vec<tier::Change>,
     /// On a fix round, what the previous round's ledger gave: the head it reviewed, where the
-    /// diff starts, and its open findings.
-    fix: Option<Previous>,
+    /// diff starts, when that is on this branch.
+    from: Option<String>,
+    /// On a fix round, the previous round's open findings, from its findings ledger.
+    open: Option<Vec<Finding>>,
     /// Why this fix round reviews the whole diff after all.
     notes: Vec<String>,
     spec: Option<(String, String)>,
@@ -680,15 +684,19 @@ struct Inputs {
 
 impl Inputs {
     /// Gathers the inputs, refusing an unknown base or an empty diff before anything runs.
-    fn gather(repo: &impl Repo, args: &Args, files: &Files) -> Result<Inputs, Failure> {
+    fn gather(
+        repo: &impl Repo,
+        args: &Args,
+        previous: Option<&Path>,
+        files: &Files,
+    ) -> Result<Inputs, Failure> {
         let base = &args.base;
         let base_commit = repo.commit(base).map_err(git_failed)?.ok_or_else(|| {
             Failure::usage(format!("unknown ref: {base}; name a branch, tag or commit"))
         })?;
         let mut notes = Vec::new();
-        let previous = args
-            .previous
-            .as_deref()
+        let report = previous;
+        let previous = report
             .map(|path| {
                 Ok((
                     path.display().to_string(),
@@ -696,23 +704,23 @@ impl Inputs {
                 ))
             })
             .transpose()?;
-        let fix = match &args.previous {
+        let Continued { head: from, open } = match report {
             Some(previous) => fix_start(repo, args, previous, files, &mut notes)?,
-            None => None,
+            None => Continued::default(),
         };
-        let since = fix.as_ref().map_or(base.as_str(), |fix| fix.head.as_str());
+        let since = from.as_deref().unwrap_or(base.as_str());
         let diff = repo.diff(since, DIFF_CONTEXT).map_err(git_failed)?;
         let touched = tier::numstat(&repo.numstat(since).map_err(git_failed)?);
         if diff.is_empty() && touched.is_empty() {
-            return Err(Failure::usage(match &fix {
-                Some(fix) => format!(
+            return Err(Failure::usage(match &from {
+                Some(from) => format!(
                     "no committed changes since the previous review's head {} (commit the fix first)",
-                    short(&fix.head)
+                    short(from)
                 ),
                 None => format!("no committed changes since {base} (commit first)"),
             }));
         }
-        let whole = match fix {
+        let whole = match from {
             Some(_) => tier::numstat(&repo.numstat(base).map_err(git_failed)?),
             None => touched.clone(),
         };
@@ -755,7 +763,8 @@ impl Inputs {
             diff_stat: repo.diff_stat(since).map_err(git_failed)?,
             diff,
             whole,
-            fix,
+            from,
+            open,
             notes,
             spec,
             previous,
@@ -775,8 +784,8 @@ impl Inputs {
             base: &args.base,
             base_commit: &self.base_commit,
             head: &self.head,
-            fix_from: self.fix.as_ref().map(|fix| fix.head.as_str()),
-            open: self.fix.as_ref().and_then(|fix| fix.open.as_deref()),
+            fix_from: self.from.as_deref(),
+            open: self.open.as_deref(),
             commits: &self.commits,
             diff_stat: &self.diff_stat,
             diff: &self.diff,
@@ -796,8 +805,36 @@ impl Inputs {
     }
 }
 
+/// The report a fix round continues: the caller's, else, for round N > 1 and the light review,
+/// the round before it in this repo's reviews. A round whose round before has no report is
+/// refused, never reviewed fresh. The light review runs once.
+fn previous_report(args: &Args, files: &Files) -> Result<Option<PathBuf>, Failure> {
+    let place = Place::of(&args.label);
+    if matches!(place, Place::Light { .. }) && files.findings.is_file() {
+        return Err(Failure::usage(format!(
+            "{} has run, and the light review is the last: report what is still open as open in your final report",
+            args.label
+        )));
+    }
+    if let Some(given) = &args.previous {
+        return Ok(Some(given.clone()));
+    }
+    let Some(before) = place.previous() else {
+        return Ok(None);
+    };
+    let report = files.dir.join(format!("{before}.md"));
+    if report.is_file() {
+        return Ok(Some(report));
+    }
+    Err(Failure::usage(format!(
+        "{} continues {before}, which has no report at {}: run {before} first, or pass its report as the previous report",
+        args.label,
+        report.display()
+    )))
+}
+
 /// Where a fix round's diff starts: the head the previous round reviewed, when that is on
-/// this branch. Its findings ledger (`.findings.json`) names it with the open findings;
+/// this branch, and the open findings it carries. Its findings ledger (`.findings.json`) names it with the open findings;
 /// review.sh's ledger (`.ledger.json`) or the last ok `review` event of that report name
 /// it alone. Otherwise the round reviews the whole diff, and says why in `notes`.
 fn fix_start(
@@ -806,7 +843,7 @@ fn fix_start(
     previous: &Path,
     files: &Files,
     notes: &mut Vec<String>,
-) -> Result<Option<Previous>, Failure> {
+) -> Result<Continued, Failure> {
     let read = |extension: &str| {
         fs::read_to_string(previous.with_extension(extension))
             .ok()
@@ -835,23 +872,30 @@ fn fix_start(
     let named = read("findings.json")
         .or_else(|| read("ledger.json"))
         .or_else(logged);
-    let on_branch = match named {
+    let (head, open) = match named {
         Some(named) => match repo.commit(&named.head).map_err(git_failed)? {
-            Some(head) if repo.is_ancestor(&head).map_err(git_failed)? => {
-                Some(Previous { head, ..named })
-            }
-            _ => None,
+            Some(head) if repo.is_ancestor(&head).map_err(git_failed)? => (Some(head), named.open),
+            _ => (None, named.open),
         },
-        None => None,
+        None => (None, None),
     };
-    if on_branch.is_none() {
+    if head.is_none() {
         notes.push(format!(
             "no reviewed head for {} on this branch; round {} reviews the whole diff",
             previous.display(),
             review::round(&args.label, true)
         ));
     }
-    Ok(on_branch)
+    Ok(Continued { head, open })
+}
+
+/// What a fix round continues from the round before: the head that round reviewed, where the
+/// diff starts when it is on this branch, and its open findings, which carry over either way,
+/// so a round on a new branch still marks them.
+#[derive(Default)]
+struct Continued {
+    head: Option<String>,
+    open: Option<Vec<Finding>>,
 }
 
 fn short(sha: &str) -> &str {

@@ -405,7 +405,7 @@ fn a_tiny_diff_never_downgrades_a_spec_review() {
     let lab = Lab::new("tiny", 0.9, 1.0, &["ok", "ok"]);
 
     let named = lab.review(&["base", "spec-x-r1", "none", "--tier", "trivial", "--json"]);
-    let unnamed = lab.review(&["base", "spec-x-r2", "--json"]);
+    let unnamed = lab.review(&["base", "spec-y-r1", "--json"]);
 
     assert_eq!((named.code, unnamed.code), (0, 0), "{named:?} {unnamed:?}");
     assert_eq!(
@@ -1053,6 +1053,7 @@ fn round_2_reviews_only_the_fix_with_the_previous_report_and_logs_where_it_start
         "t10-r3",
         "none",
         lab.reviews().join("t10-r2.md").to_str().unwrap(),
+        "--escalation",
     ]);
     assert_eq!(again.code, 2, "{again:?}");
     assert!(again.stderr.contains("commit the fix first"), "{again:?}");
