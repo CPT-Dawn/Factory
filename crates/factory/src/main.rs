@@ -175,6 +175,7 @@ fn run(command: Command, json: bool) -> ExitCode {
             timeout,
             tier,
             skill,
+            escalation,
         } => review::run(&review::Args {
             base,
             label,
@@ -183,6 +184,7 @@ fn run(command: Command, json: bool) -> ExitCode {
             timeout,
             tier,
             skill,
+            escalation,
         })
         // review.sh's failures said so, and factory-stats' classifier still matches the text.
         .map_err(|failure| Failure::new(failure.exit, format!("code-review: {}", failure.message))),
