@@ -398,6 +398,31 @@ fn a_trust_dialog_met_while_coming_up_is_answered_with_down_and_enter() {
     assert_eq!(herdr.count("agent.prompt"), 1);
 }
 
+/// herdr refuses `agent.start` with `agent_pane_busy` while the pane's shell still runs its rc,
+/// which is the case right after `worktree.create`.
+#[test]
+fn a_pane_still_busy_with_its_shell_is_retried_until_it_takes_the_agent() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    for _ in 0..3 {
+        herdr.refuse(
+            "agent.start",
+            "agent_pane_busy",
+            "agent target pane w1:p1 is not an available shell",
+        );
+    }
+    // A bare shell mid-rc: were the refusal taken for the trust path, this is what it would read.
+    herdr.screen("w1:p1", "user@host ~ $ \n");
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(herdr.count("agent.start"), 4);
+    assert_eq!(herdr.count("agent.send_keys"), 0);
+    assert_eq!(herdr.count("agent.prompt"), 1);
+}
+
 #[test]
 fn a_start_that_fails_off_the_trust_dialog_is_reported() {
     let sandbox = Sandbox::new();

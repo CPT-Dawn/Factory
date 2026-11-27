@@ -191,12 +191,13 @@ fn claude_gets_no_settings_when_no_plugin_is_disabled() {
 
 /// Every herdr call at its limit: the worktree, Claude's two minutes to come up, the trust
 /// dialog's minute, the prompt's minute, then five stalled tries of the pause and a minute
-/// each, with 10 s of connect and answer on each of the 17 calls.
+/// each, a busy pane's 10 s of waiting and one more call, with 10 s of connect and answer on
+/// each of the 18 calls.
 #[test]
 fn a_spawns_longest_run_is_every_herdr_call_at_its_limit() {
     assert_eq!(
         spawn_longest(Duration::from_secs(2)),
-        Duration::from_millis(720_300)
+        Duration::from_millis(740_300)
     );
 }
 

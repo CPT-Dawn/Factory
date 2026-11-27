@@ -4,20 +4,24 @@
 //! Claude in a freshly made worktree can stop at the folder-trust dialog, and one that has
 //! just come up can take the prompt's keys before its input box submits them, which herdr
 //! reports as `agent_prompt_stalled`. Both are handled here, as lead.sh handled them, so a
-//! spawn that only needed an enter doesn't come back as a failure.
+//! spawn that only needed an enter doesn't come back as a failure. A pane whose shell is still
+//! reading its rc is refused `agent_pane_busy`: that is asked again, not read as a dialog.
 
 use std::path::Path;
 use std::time::Duration;
 
 use factory_adapters::herdr::{HerdrApi, HerdrError};
 use factory_core::lead::{
-    KEY_PAUSE, PROMPT_TIMEOUT, START_TIMEOUT, SUBMIT_TIMEOUT, TRIES, TRUST_TIMEOUT,
+    BUSY_PAUSE, BUSY_PAUSE_MAX, KEY_PAUSE, PROMPT_TIMEOUT, START_TIMEOUT, SUBMIT_TIMEOUT, TRIES,
+    TRUST_TIMEOUT,
 };
 use tokio::time::sleep;
 
 /// How many characters of the prompt identify it on the screen.
 const HEAD: usize = 60;
 const STALLED: &str = "agent_prompt_stalled";
+/// What herdr answers `agent.start` while the pane's shell is still running its rc.
+const BUSY: &str = "agent_pane_busy";
 const TRUST_TEXT: &str = "Yes, I trust this folder";
 
 /// What to start.
@@ -35,6 +39,8 @@ pub struct Plan<'a> {
     pub prompt: &'a str,
     /// How long to wait before looking at a prompt that stalled.
     pub pause: Duration,
+    /// How long to keep asking a busy pane to take the agent.
+    pub busy_for: Duration,
 }
 
 /// A lead that is working.
@@ -75,11 +81,7 @@ pub async fn start<H: HerdrApi>(herdr: &H, plan: &Plan<'_>) -> Result<Started, F
         name: plan.name,
         workspace: &made.workspace_id,
     };
-    if herdr
-        .start_agent(plan.name, &made.pane_id, plan.claude_args, START_TIMEOUT)
-        .await
-        .is_err()
-    {
+    if !started(herdr, &at, &made.pane_id, plan).await? {
         pass_trust_dialog(herdr, &at, &made.path).await?;
     }
     let stalls = submit(herdr, &at, plan).await?;
@@ -88,6 +90,43 @@ pub async fn start<H: HerdrApi>(herdr: &H, plan: &Plan<'_>) -> Result<Started, F
         worktree: made.path,
         stalls,
     })
+}
+
+/// Starts Claude in the pane: true once it is up, false when it stopped on something that may be
+/// the trust dialog. A pane whose shell is busy is asked again, with a doubling pause, until
+/// `plan.busy_for` has gone by.
+async fn started<H: HerdrApi>(
+    herdr: &H,
+    at: &Spot<'_>,
+    pane: &str,
+    plan: &Plan<'_>,
+) -> Result<bool, Failed> {
+    let mut waited = Duration::ZERO;
+    let mut pause = BUSY_PAUSE;
+    loop {
+        match herdr
+            .start_agent(plan.name, pane, plan.claude_args, START_TIMEOUT)
+            .await
+        {
+            Ok(()) => return Ok(true),
+            Err(HerdrError::Refused { code, .. }) if code == BUSY => {
+                if waited >= plan.busy_for {
+                    return Err(at.failed(
+                        &format!(
+                            "could not start Claude: its pane stayed busy for {}s ({BUSY})",
+                            plan.busy_for.as_secs()
+                        ),
+                        0,
+                    ));
+                }
+                let nap = pause.min(plan.busy_for - waited);
+                sleep(nap).await;
+                waited += nap;
+                pause = (pause * 2).min(BUSY_PAUSE_MAX);
+            }
+            Err(_) => return Ok(false),
+        }
+    }
 }
 
 /// Where a lead is, for the lines that say what went wrong.
@@ -188,4 +227,41 @@ async fn typed<H: HerdrApi>(
 /// The text with its whitespace removed: Claude wraps its input box anywhere, even inside a path.
 fn flat(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use factory_adapters::herdr::fake::FakeHerdr;
+
+    #[tokio::test]
+    async fn a_pane_that_stays_busy_fails_naming_herdrs_code() {
+        let herdr = FakeHerdr::new();
+        for _ in 0..50 {
+            herdr.refuse(
+                "agent.start",
+                BUSY,
+                "agent target pane w1:p1 is not an available shell",
+            );
+        }
+        let plan = Plan {
+            name: "lead-cart",
+            repo: Path::new("/repos/repo"),
+            branch: "factory/cart",
+            base: "main",
+            label: "cart",
+            claude_args: &[],
+            prompt: "go",
+            pause: Duration::ZERO,
+            busy_for: Duration::from_millis(250),
+        };
+
+        let failed = start(&herdr, &plan).await.err();
+
+        let message = failed.map(|f| f.message).unwrap_or_default();
+        assert!(message.contains("agent_pane_busy"), "{message}");
+        assert!(message.contains("see workspace w1"), "{message}");
+        assert!(!herdr.calls().iter().any(|call| call == "agent.read"));
+        assert!(herdr.prompts().is_empty());
+    }
 }

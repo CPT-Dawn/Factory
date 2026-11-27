@@ -14,6 +14,14 @@ pub const PREFIX: &str = "lead-";
 
 /// How long herdr waits for Claude to come up in a lead's pane.
 pub const START_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long herdr gets to call a fresh pane's shell available, once it has refused
+/// `agent.start` with `agent_pane_busy` while the shell runs its rc.
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+/// The first wait before `agent.start` is asked again on a busy pane; each wait doubles up to
+/// [`BUSY_PAUSE_MAX`].
+pub const BUSY_PAUSE: Duration = Duration::from_millis(100);
+/// The longest single wait between asks on a busy pane.
+pub const BUSY_PAUSE_MAX: Duration = Duration::from_secs(1);
 /// How long Claude has to settle once the folder-trust dialog is answered.
 pub const TRUST_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long Claude has to start working once the prompt is typed.
@@ -32,7 +40,8 @@ const CALL_SLACK: Duration = Duration::from_secs(10);
 /// again), so a caller that waits this long always hears how the spawn ended.
 pub fn spawn_longest(pause: Duration) -> Duration {
     let worktree = CALL_SLACK;
-    let start = START_TIMEOUT + CALL_SLACK;
+    // The busy pane's waits, and the last call that could still be refused.
+    let start = START_TIMEOUT + CALL_SLACK + BUSY_TIMEOUT + CALL_SLACK;
     // The screen read, down, enter and the wait for Claude to settle.
     let trust = CALL_SLACK * 4 + KEY_PAUSE + TRUST_TIMEOUT;
     let prompt = PROMPT_TIMEOUT + CALL_SLACK;
