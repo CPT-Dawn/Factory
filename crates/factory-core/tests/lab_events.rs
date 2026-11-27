@@ -165,6 +165,7 @@ fn other_wait_reasons_are_named_by_kind_and_keep_no_text() {
         "queued behind claude:0 @ wt0 (waiting since 0 min)",
         "all 2 stack slots of demo are held",
         "no free phone (1 phone(s) busy) and too little memory for an emulator (100 MB free, need 4096)",
+        "too little memory to start a stack (3400 MB free, need 7168)",
         "adb is restarting",
         "a phone is being probed again",
         "something new",
@@ -176,7 +177,7 @@ fn other_wait_reasons_are_named_by_kind_and_keep_no_text() {
     assert_eq!(
         kinds,
         [
-            "queue", "slots", "memory", "adb", "reprobe", "other", "none"
+            "queue", "slots", "memory", "memory", "adb", "reprobe", "other", "none"
         ]
     );
 }

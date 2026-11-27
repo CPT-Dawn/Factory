@@ -75,7 +75,7 @@ pub fn ask(
         )));
     }
     let project = match &ctx.project {
-        Some(p) => Some(project_ask(ctx, p)?),
+        Some(p) => Some(project_ask(ctx, p, opts.stack)?),
         None => None,
     };
     let wait_sec = opts.wait_sec.unwrap_or(ctx.cfg.wait_sec);
@@ -208,12 +208,15 @@ pub fn wake(lease: &Lease) {
     }
 }
 
-/// The project as a grant needs it: its cap here, its ports and its stack's.
-pub fn project_ask(ctx: &Ctx, p: &ProjectConfig) -> Result<ProjectAsk, Failure> {
+/// The project as a grant needs it: its cap here, its ports and its stack's. `start_stack`:
+/// whether the request starts the stack, which then needs the machine's free-memory floor.
+pub fn project_ask(ctx: &Ctx, p: &ProjectConfig, start_stack: bool) -> Result<ProjectAsk, Failure> {
     let stack = stack::info(p, &ctx.worktree, 0)?.map(|info| StackAsk {
         project_id: info.project_id,
         ports: info.ports.iter().map(|(_, port)| *port).collect(),
     });
+    let stack_need_mb =
+        (start_stack && stack.is_some()).then_some(ctx.cfg.stack_ram_mb + ctx.cfg.host_floor_mb);
     Ok(ProjectAsk {
         name: p.name.clone(),
         max_slots: p.max_slots,
@@ -221,6 +224,7 @@ pub fn project_ask(ctx: &Ctx, p: &ProjectConfig) -> Result<ProjectAsk, Failure> 
         cap: owner_cap(&ctx.cfg, p),
         ports: p.ports.iter().map(|(_, port)| *port).collect(),
         stack,
+        stack_need_mb,
     })
 }
 

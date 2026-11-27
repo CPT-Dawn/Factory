@@ -95,6 +95,10 @@ pub struct ProjectAsk {
     /// The project's own slot-0 ports.
     pub ports: Vec<u32>,
     pub stack: Option<StackAsk>,
+    /// The free memory a start of the stack needs (`stackRamMB` and `hostFloorMB`), when this
+    /// request starts it (`--stack`): a slot whose stack is down waits below it.
+    #[serde(default)]
+    pub stack_need_mb: Option<i64>,
 }
 
 /// The project's local stack in slot 0.

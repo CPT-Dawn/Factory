@@ -2292,6 +2292,47 @@ fn a_release_takes_back_the_reverses_its_phone_was_given() {
 }
 
 #[test]
+fn a_stack_start_below_the_memory_floor_waits_and_says_why_instead_of_failing_the_start() {
+    let (sandbox, world) = lab();
+    // No host has this much free.
+    write_machine_config(&sandbox, r#""hostFloorMB": 100000000"#);
+    let wt = world.worktree("demo-memory");
+
+    let out = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--wait", "1"],
+    );
+
+    assert_eq!(out.code, 75, "{out:?}");
+    assert!(
+        out.stderr.contains("too little memory to start a stack ("),
+        "{out:?}"
+    );
+    assert!(out.stderr.contains("MB free, need 100000000)"), "{out:?}");
+    // It waited for a lease: none was granted, so none is kept with a stack that never ran.
+    assert_eq!(owned(&sandbox, &wt, &["env"]).code, 4);
+}
+
+#[test]
+fn a_running_stack_is_granted_below_the_memory_floor_as_it_starts_nothing() {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""hostFloorMB": 100000000"#);
+    let containers = sandbox.path("world/containers");
+    fs::write(&containers, "supabase_db_demo\n").expect("start a stack outside devlab");
+    let wt = world.worktree("demo-memory-running");
+
+    let out = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--wait", "1"],
+    );
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(out.stdout.contains("export DEVLAB_SLOT=0\n"), "{out:?}");
+}
+
+#[test]
 fn a_new_lease_clears_the_reverses_an_earlier_one_left_on_its_phone_before_its_own() {
     let (sandbox, world) = lab();
     world

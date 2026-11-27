@@ -211,7 +211,9 @@ pub fn wait_reason(why: &str) -> Fields {
         "none"
     } else if let Some((kind, _)) = CAPS.iter().find(|(_, re)| re.is_match(why)) {
         kind
-    } else if why.contains("too little memory for an emulator") {
+    } else if why.contains("too little memory for an emulator")
+        || why.contains("too little memory to start a stack")
+    {
         "memory"
     } else if why.starts_with("no free phone") {
         "phones"

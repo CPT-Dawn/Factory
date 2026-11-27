@@ -897,8 +897,14 @@ struct Facts {
 }
 
 fn gather(lab: &Lab, p: &AcquireParams, attached: Vec<Attached>, probes_by: Instant) -> Facts {
-    let mem_available_mb = if p.devices.is_some() {
+    if p.devices.is_some() {
         forget_dead_emulators(lab, &attached);
+    }
+    let starts_stack = p
+        .project
+        .as_ref()
+        .is_some_and(|project| project.stack_need_mb.is_some());
+    let mem_available_mb = if p.devices.is_some() || starts_stack {
         host::mem_available_mb()
     } else {
         0
@@ -1336,6 +1342,7 @@ fn grant_project(project: &ProjectAsk) -> grant::ProjectAsk {
         max_slots: project.max_slots,
         cap: project.cap,
         has_stack: project.stack.is_some(),
+        stack_need_mb: project.stack_need_mb,
     }
 }
 
@@ -1398,6 +1405,7 @@ fn grant_board(
                 .collect()
         }),
         listening: facts.listening.clone(),
+        mem_available_mb: facts.mem_available_mb,
     })
 }
 
