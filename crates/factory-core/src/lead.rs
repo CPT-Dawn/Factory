@@ -41,7 +41,7 @@ const CALL_SLACK: Duration = Duration::from_secs(10);
 pub fn spawn_longest(pause: Duration) -> Duration {
     let worktree = CALL_SLACK;
     // A busy pane is asked again until BUSY_TIMEOUT has gone by on the clock, so the longest is
-    // that, plus the one refused call that was under way when it did.
+    // that, plus one last attempt that can start just past it.
     let start = START_TIMEOUT + CALL_SLACK + BUSY_TIMEOUT + CALL_SLACK;
     // The screen read, down, enter and the wait for Claude to settle.
     let trust = CALL_SLACK * 4 + KEY_PAUSE + TRUST_TIMEOUT;
