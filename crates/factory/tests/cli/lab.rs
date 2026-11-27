@@ -2258,13 +2258,6 @@ fn an_owner_that_exits_frees_its_lease_within_a_second_even_before_it_is_reaped(
     );
 }
 
-/// adb's call that takes back the reverse of device port `port` on `serial`.
-fn unreverse(serial: &str, port: &str) -> Vec<String> {
-    ["-s", serial, "reverse", "--remove", port]
-        .map(str::to_owned)
-        .to_vec()
-}
-
 #[test]
 fn a_release_takes_back_the_reverses_its_phone_was_given() {
     let (sandbox, world) = lab();
@@ -2274,21 +2267,84 @@ fn a_release_takes_back_the_reverses_its_phone_was_given() {
     let wt = world.worktree("demo-reverse");
     let held = owned(&sandbox, &wt, &["acquire", "--phone", "--quiet"]);
     assert_eq!(held.code, 0, "{held:?}");
-    let given = ["-s", "FAKEPHONE01", "reverse", "tcp:8787", "tcp:27787"].map(str::to_owned);
-    assert!(
-        sandbox.calls("adb").contains(&given.to_vec()),
-        "{:?}",
-        sandbox.calls("adb")
-    );
+    let kept = reverses(&sandbox, "FAKEPHONE01");
+    assert!(kept.contains("tcp:8787 tcp:27787"), "{kept}");
 
     let out = owned(&sandbox, &wt, &["release"]);
 
     assert_eq!(out.code, 0, "{out:?}");
-    let calls = sandbox.calls("adb");
-    assert!(
-        calls.contains(&unreverse("FAKEPHONE01", "tcp:8787")),
-        "{calls:?}"
+    let kept = reverses(&sandbox, "FAKEPHONE01");
+    assert!(!kept.contains("tcp:8787"), "{kept}");
+}
+
+#[test]
+fn a_stack_start_below_the_memory_floor_waits_and_says_why_instead_of_failing_the_start() {
+    let (sandbox, world) = lab();
+    // No host has this much free.
+    write_machine_config(&sandbox, r#""hostFloorMB": 100000000"#);
+    let wt = world.worktree("demo-memory");
+
+    let out = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--wait", "1"],
     );
+
+    assert_eq!(out.code, 75, "{out:?}");
+    assert!(
+        out.stderr.contains("too little memory to start a stack ("),
+        "{out:?}"
+    );
+    assert!(out.stderr.contains("MB free, need 100000000)"), "{out:?}");
+    // It waited for a lease: none was granted, so none is kept with a stack that never ran.
+    assert_eq!(owned(&sandbox, &wt, &["env"]).code, 4);
+}
+
+#[test]
+fn a_running_stack_is_granted_below_the_memory_floor_as_it_starts_nothing() {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""hostFloorMB": 100000000"#);
+    let containers = sandbox.path("world/containers");
+    fs::write(&containers, "supabase_db_demo\n").expect("start a stack outside devlab");
+    let wt = world.worktree("demo-memory-running");
+
+    let out = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--wait", "1"],
+    );
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(out.stdout.contains("export DEVLAB_SLOT=0\n"), "{out:?}");
+}
+
+/// The reverses `serial` keeps, as `adb reverse --list` shows them.
+fn reverses(sandbox: &Sandbox, serial: &str) -> String {
+    let out = run(sandbox.command("adb", &["-s", serial, "reverse", "--list"]));
+    assert_eq!(out.code, 0, "{out:?}");
+    out.stdout
+}
+
+#[test]
+fn a_new_lease_clears_the_reverses_an_earlier_one_left_on_its_phone_before_its_own() {
+    let (sandbox, world) = lab();
+    world
+        .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
+        .unwrap();
+    // An earlier lease's debug session left its Metro reverse on the phone.
+    let stale = run(sandbox.command(
+        "adb",
+        &["-s", "FAKEPHONE01", "reverse", "tcp:8081", "tcp:8081"],
+    ));
+    assert_eq!(stale.code, 0, "{stale:?}");
+    let wt = world.worktree("demo-reverse");
+
+    let held = owned(&sandbox, &wt, &["acquire", "--phone", "--quiet"]);
+
+    assert_eq!(held.code, 0, "{held:?}");
+    let kept = reverses(&sandbox, "FAKEPHONE01");
+    assert!(!kept.contains("tcp:8081"), "{kept}");
+    assert!(kept.contains("tcp:8787 tcp:27787"), "{kept}");
 }
 
 #[test]
@@ -2306,15 +2362,13 @@ fn the_lease_of_an_owner_that_exits_takes_back_its_reverses_too() {
         &["acquire", "--phone", "--quiet"],
     );
     assert_eq!(held.code, 0, "{held:?}");
+    let kept = reverses(&sandbox, "FAKEPHONE01");
+    assert!(kept.contains("tcp:8787 tcp:27787"), "{kept}");
 
     kill_owner(owner);
 
-    let taken_back = poll_until(|| {
-        sandbox
-            .calls("adb")
-            .contains(&unreverse("FAKEPHONE01", "tcp:8787"))
-    });
-    assert!(taken_back, "{:?}", sandbox.calls("adb"));
+    let taken_back = poll_until(|| !reverses(&sandbox, "FAKEPHONE01").contains("tcp:8787"));
+    assert!(taken_back, "{}", reverses(&sandbox, "FAKEPHONE01"));
     assert!(
         status(&sandbox, &wt)
             .contains("FAKEPHONE01        phone    Pixel 8        ready        free"),

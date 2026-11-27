@@ -50,7 +50,7 @@ fn run(ctx: &Ctx, opts: &ReserveOpts) -> Result<(String, serde_json::Value), Fai
             ctx.worktree
         )));
     };
-    let ask = project_ask(ctx, project)?;
+    let ask = project_ask(ctx, project, false)?;
     if opts.release {
         let released: usize = client::call(
             &paths()?,

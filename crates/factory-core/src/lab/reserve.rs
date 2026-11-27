@@ -215,6 +215,7 @@ mod tests {
             max_slots,
             cap,
             has_stack: false,
+            stack_need_mb: None,
         }
     }
 
@@ -251,6 +252,7 @@ mod tests {
                 })
                 .collect(),
             listening: std::collections::BTreeSet::new(),
+            mem_available_mb: 0,
         }
     }
 

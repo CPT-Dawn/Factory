@@ -270,6 +270,18 @@ pub struct Plan {
     pub boot: u32,
 }
 
+/// `phones` in the order a grant takes them: the one granted longest ago first, those never
+/// granted before any that was (`last_granted`: serial to when it was last granted), ties by
+/// serial. Always the first by serial would leave a phone that sorts late to no one.
+pub fn rotate_phones(phones: &mut [String], last_granted: &BTreeMap<String, i64>) {
+    phones.sort_by(|a, b| {
+        last_granted
+            .get(a)
+            .cmp(&last_granted.get(b))
+            .then_with(|| a.cmp(b))
+    });
+}
+
 /// All or nothing: free ready phones first, then idle emulators, then new emulators while the
 /// emulator cap and the memory floor allow; else why the request waits.
 pub fn plan_devices(p: &PlanInput) -> Result<Plan, String> {
@@ -547,6 +559,22 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| (*x).to_owned()).collect()
+    }
+
+    #[test]
+    fn phones_are_taken_least_recently_granted_first_never_granted_before_any() {
+        let mut phones = s(&["A", "B", "C", "D"]);
+        let last = BTreeMap::from([
+            ("A".to_owned(), 300),
+            ("B".to_owned(), 100),
+            ("D".to_owned(), 100),
+        ]);
+        rotate_phones(&mut phones, &last);
+        // C was never granted; B and D tie, and go by serial; A was granted last.
+        assert_eq!(phones, s(&["C", "B", "D", "A"]));
+        let mut none = s(&["Z", "M", "A"]);
+        rotate_phones(&mut none, &BTreeMap::new());
+        assert_eq!(none, s(&["A", "M", "Z"]));
     }
 
     #[test]

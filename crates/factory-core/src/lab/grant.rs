@@ -17,6 +17,9 @@ pub struct ProjectAsk {
     pub cap: u32,
     /// Whether the project runs a local stack.
     pub has_stack: bool,
+    /// The free memory a stack start needs (its RAM and the host's floor), when the request
+    /// starts one: a slot whose stack is down is not granted below it.
+    pub stack_need_mb: Option<i64>,
 }
 
 /// One acquire request.
@@ -46,6 +49,8 @@ pub struct Board {
     pub slots: Vec<SlotView>,
     /// TCP ports something listens on.
     pub listening: BTreeSet<u32>,
+    /// The memory available to start a stack with.
+    pub mem_available_mb: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,7 +135,22 @@ pub fn decide(ask: &Ask, board: &Board, now: i64) -> Decision {
             }
         })
         .collect();
-    match pick_slot(&project.name, &slots, &board.listening, project.has_stack) {
+    let starved = project
+        .stack_need_mb
+        .filter(|need| board.mem_available_mb < *need)
+        .map(|need| {
+            format!(
+                "too little memory to start a stack ({} MB free, need {need})",
+                board.mem_available_mb
+            )
+        });
+    match pick_slot(
+        &project.name,
+        &slots,
+        &board.listening,
+        project.has_stack,
+        starved.as_deref(),
+    ) {
         Ok(slot) => Decision::Grant {
             slot: Some(slot),
             new: true,
@@ -196,6 +216,7 @@ mod tests {
                 max_slots,
                 cap,
                 has_stack: false,
+                stack_need_mb: None,
             }),
             existing,
             devices: None,
@@ -214,7 +235,37 @@ mod tests {
                 })
                 .collect(),
             listening: BTreeSet::new(),
+            mem_available_mb: 0,
         }
+    }
+
+    #[test]
+    fn a_stack_start_waits_for_memory_when_no_slot_has_its_stack_running() {
+        let mut a = ask(1, 2, 2, None);
+        if let Some(p) = a.project.as_mut() {
+            p.has_stack = true;
+            p.stack_need_mb = Some(7168);
+        }
+        let mut b = board(vec![], vec![entry(1, 0, 0, 1, 2)], 2);
+        b.mem_available_mb = 3400;
+        assert_eq!(
+            decide(&a, &b, 0),
+            Decision::Wait(
+                "too little memory to start a stack (3400 MB free, need 7168)".to_owned()
+            )
+        );
+        // Once memory is back, or when a slot's stack already runs, it is granted.
+        b.mem_available_mb = 7168;
+        assert!(matches!(decide(&a, &b, 0), Decision::Grant { .. }));
+        b.mem_available_mb = 3400;
+        b.slots[1].stack_running = true;
+        assert_eq!(
+            decide(&a, &b, 0),
+            Decision::Grant {
+                slot: Some(1),
+                new: true
+            }
+        );
     }
 
     #[test]

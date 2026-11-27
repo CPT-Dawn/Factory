@@ -26,7 +26,7 @@ use factory_core::lab::args::{LONGEST_WAIT, wait_span};
 use factory_core::lab::config::device_cap;
 use factory_core::lab::devices::{
     Attached, EmulatorView, HeldBy, Mode, Plan, PlanInput, Unready, device_rows, plan_devices,
-    shown_since,
+    rotate_phones, shown_since,
 };
 use factory_core::lab::emulator::{
     Boot, Settle, State, after_restart, boot_step, booting_note, free_indexes, serial_of, unit_name,
@@ -897,8 +897,14 @@ struct Facts {
 }
 
 fn gather(lab: &Lab, p: &AcquireParams, attached: Vec<Attached>, probes_by: Instant) -> Facts {
-    let mem_available_mb = if p.devices.is_some() {
+    if p.devices.is_some() {
         forget_dead_emulators(lab, &attached);
+    }
+    let starts_stack = p
+        .project
+        .as_ref()
+        .is_some_and(|project| project.stack_need_mb.is_some());
+    let mem_available_mb = if p.devices.is_some() || starts_stack {
         host::mem_available_mb()
     } else {
         0
@@ -1036,7 +1042,7 @@ fn plan(
         .filter(|a| !is_taken(&a.serial) && ready_of(a) == Some(Readiness::Ready))
         .map(|a| a.serial.clone())
         .collect();
-    free_phones.sort();
+    rotate_phones(&mut free_phones, &store::phone_grants(c)?);
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     // The free phones that can't be granted, by what is wrong with each; a held one is busy.
     // A request for emulators alone takes no phone, and its wait counts none of them.
@@ -1336,6 +1342,7 @@ fn grant_project(project: &ProjectAsk) -> grant::ProjectAsk {
         max_slots: project.max_slots,
         cap: project.cap,
         has_stack: project.stack.is_some(),
+        stack_need_mb: project.stack_need_mb,
     }
 }
 
@@ -1398,6 +1405,7 @@ fn grant_board(
                 .collect()
         }),
         listening: facts.listening.clone(),
+        mem_available_mb: facts.mem_available_mb,
     })
 }
 
@@ -1672,6 +1680,7 @@ fn try_grant(
                         state: None,
                     },
                 )?;
+                store::record_phone_grant(c, serial, now_ms())?;
                 phones.push(serial.clone());
             }
             for serial in &plan.reuse {

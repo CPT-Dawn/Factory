@@ -305,12 +305,15 @@ pub struct SlotView {
 
 /// The slot to hand out, or why none can be: the free slots tried in order (the same worktree as
 /// last time, then a running stack, then the lowest), skipping one whose ports something else
-/// listens on. `has_stack` is whether the project runs a stack.
+/// listens on. `has_stack` is whether the project runs a stack. `starved` is why a stack can't
+/// be started now (too little memory): a slot whose stack doesn't run is passed over, and if
+/// that leaves no slot, that is why the request waits.
 pub fn pick_slot(
     project: &str,
     slots: &[SlotView],
     listening: &BTreeSet<u32>,
     has_stack: bool,
+    starved: Option<&str>,
 ) -> Result<u32, String> {
     let score = |view: &SlotView| {
         if view.last_is_mine {
@@ -325,6 +328,7 @@ pub fn pick_slot(
         (0u32..).zip(slots).filter(|(_, view)| !view.held).collect();
     free.sort_by_key(|(slot, view)| (score(view), *slot));
     let mut busy = Vec::new();
+    let mut lacks_memory = None;
     for (slot, view) in free {
         if view.stopping {
             busy.push(format!("slot {slot}: its idle stack is stopping"));
@@ -347,7 +351,14 @@ pub fn pick_slot(
             busy.push(format!("slot {slot}: stack ports in use by something else"));
             continue;
         }
+        if let Some(why) = starved.filter(|_| has_stack && !view.stack_running) {
+            lacks_memory = Some(why);
+            continue;
+        }
         return Ok(slot);
+    }
+    if let Some(why) = lacks_memory {
+        return Err(why.to_owned());
     }
     let blocked = if busy.is_empty() {
         String::new()
@@ -600,9 +611,26 @@ port = 54327
             view(false, false, true, 1),
             view(false, true, false, 2),
         ];
-        assert_eq!(pick_slot("p", &slots, &none, true), Ok(2));
-        assert_eq!(pick_slot("p", &slots[..2], &none, true), Ok(1));
-        assert_eq!(pick_slot("p", &slots[..2], &none, false), Ok(0));
+        assert_eq!(pick_slot("p", &slots, &none, true, None), Ok(2));
+        assert_eq!(pick_slot("p", &slots[..2], &none, true, None), Ok(1));
+        assert_eq!(pick_slot("p", &slots[..2], &none, false, None), Ok(0));
+    }
+
+    #[test]
+    fn with_too_little_memory_to_start_a_stack_only_a_slot_whose_stack_runs_is_picked() {
+        let none = BTreeSet::new();
+        let why = "too little memory to start a stack (100 MB free, need 7168)";
+        // Slot 0 ran this worktree's schema last, but its stack is down: slot 1's runs.
+        let slots = [view(false, true, false, 0), view(false, false, true, 1)];
+        assert_eq!(pick_slot("p", &slots, &none, true, Some(why)), Ok(1));
+        // No stack runs: the request waits for memory, which is what it says.
+        let down = [view(false, false, false, 0), view(true, false, false, 1)];
+        assert_eq!(
+            pick_slot("p", &down, &none, true, Some(why)),
+            Err(why.to_owned())
+        );
+        // A project with no stack starts none.
+        assert_eq!(pick_slot("p", &down, &none, false, Some(why)), Ok(0));
     }
 
     #[test]
@@ -610,21 +638,27 @@ port = 54327
         let slots = [view(false, false, false, 0), view(true, false, false, 1)];
         let listening = BTreeSet::from([8787]);
         assert_eq!(
-            pick_slot("p", &slots, &listening, true),
+            pick_slot("p", &slots, &listening, true, None),
             Err("all 2 stack slots of p are held or blocked (slot 0: port 8787 in use)".to_owned())
         );
         let stack = BTreeSet::from([54321]);
         assert_eq!(
-            pick_slot("p", &slots, &stack, true),
+            pick_slot("p", &slots, &stack, true, None),
             Err(
                 "all 2 stack slots of p are held or blocked (slot 0: stack ports in use by something else)"
                     .to_owned()
             )
         );
         let ours = [view(false, false, true, 0)];
-        assert_eq!(pick_slot("p", &ours, &stack, true), Ok(0));
+        assert_eq!(pick_slot("p", &ours, &stack, true, None), Ok(0));
         assert_eq!(
-            pick_slot("p", &[view(true, false, false, 0)], &BTreeSet::new(), true),
+            pick_slot(
+                "p",
+                &[view(true, false, false, 0)],
+                &BTreeSet::new(),
+                true,
+                None
+            ),
             Err("all 1 stack slots of p are held".to_owned())
         );
     }
@@ -636,9 +670,9 @@ port = 54327
             ..view(false, true, true, 0)
         };
         let slots = [stopping.clone(), view(false, false, false, 1)];
-        assert_eq!(pick_slot("p", &slots, &BTreeSet::new(), true), Ok(1));
+        assert_eq!(pick_slot("p", &slots, &BTreeSet::new(), true, None), Ok(1));
         assert_eq!(
-            pick_slot("p", &[stopping], &BTreeSet::new(), true),
+            pick_slot("p", &[stopping], &BTreeSet::new(), true, None),
             Err(
                 "all 1 stack slots of p are held or blocked (slot 0: its idle stack is stopping)"
                     .to_owned()

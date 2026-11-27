@@ -124,6 +124,22 @@ track-devices)
     fi
     exit 0 ;;
   reverse)
+    # world/reverses holds "serial device-port host-port" lines, as the device keeps its
+    # reverses; `reverse --list` shows a phone's. Setting one prints nothing. Each change is
+    # made under the file's lock and renamed whole into place.
+    r="$w/reverses"
+    (
+      flock 9
+      touch "$r"
+      case "$1:$2" in
+      reverse:--remove-all) awk -v s="$serial" '$1 != s' "$r" > "$r.new.$$"; mv "$r.new.$$" "$r" ;;
+      reverse:--remove) awk -v s="$serial" -v p="$3" '!($1 == s && $2 == p)' "$r" > "$r.new.$$"; mv "$r.new.$$" "$r" ;;
+      reverse:--list) awk -v s="$serial" '$1 == s' "$r" ;;
+      *)
+        { awk -v s="$serial" -v p="$2" '!($1 == s && $2 == p)' "$r"; echo "$serial $2 $3"; } > "$r.new.$$"
+        mv "$r.new.$$" "$r" ;;
+      esac
+    ) 9> "$w/reverses.lock"
     exit 0 ;;
   esac ;;
 esac
