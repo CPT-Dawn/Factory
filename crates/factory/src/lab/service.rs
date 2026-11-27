@@ -26,7 +26,7 @@ use factory_core::lab::args::{LONGEST_WAIT, wait_span};
 use factory_core::lab::config::device_cap;
 use factory_core::lab::devices::{
     Attached, EmulatorView, HeldBy, Mode, Plan, PlanInput, Unready, device_rows, plan_devices,
-    shown_since,
+    rotate_phones, shown_since,
 };
 use factory_core::lab::emulator::{
     Boot, Settle, State, after_restart, boot_step, booting_note, free_indexes, serial_of, unit_name,
@@ -1036,7 +1036,7 @@ fn plan(
         .filter(|a| !is_taken(&a.serial) && ready_of(a) == Some(Readiness::Ready))
         .map(|a| a.serial.clone())
         .collect();
-    free_phones.sort();
+    rotate_phones(&mut free_phones, &store::phone_grants(c)?);
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     // The free phones that can't be granted, by what is wrong with each; a held one is busy.
     // A request for emulators alone takes no phone, and its wait counts none of them.
@@ -1672,6 +1672,7 @@ fn try_grant(
                         state: None,
                     },
                 )?;
+                store::record_phone_grant(c, serial, now_ms())?;
                 phones.push(serial.clone());
             }
             for serial in &plan.reuse {

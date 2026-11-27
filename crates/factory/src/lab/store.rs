@@ -106,6 +106,10 @@ CREATE TABLE IF NOT EXISTS emulator_boots (
   idx INTEGER PRIMARY KEY,
   lease INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS phone_grants (
+  serial TEXT PRIMARY KEY,
+  granted_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS lease_stacks (
   lease INTEGER PRIMARY KEY,
   stack TEXT NOT NULL
@@ -124,7 +128,7 @@ pub struct EmulatorRow {
 }
 /// The schema's version, in `PRAGMA user_version`. Version 0 kept waiters only while the
 /// daemon that queued them ran, so their table is rebuilt; `stoppers` is new. Version 2 adds
-/// `runs`. `run_leases` (#53) and `lease_stacks` (#63) need no new version: `SCHEMA` makes them
+/// `runs`. `run_leases` (#53), `lease_stacks` (#63) and `phone_grants` need no new version: `SCHEMA` makes them
 /// on every open.
 const VERSION: i64 = 2;
 
@@ -266,6 +270,24 @@ pub fn lease_devices(c: &Connection, id: i64) -> rusqlite::Result<Vec<LeaseDevic
 pub fn taken(c: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut q = c.prepare("SELECT serial FROM lease_devices ORDER BY rowid")?;
     q.query_map([], |row| row.get(0))?.collect()
+}
+
+/// When each phone was last granted to a lease, in ms since the epoch, by serial; a phone never
+/// granted is not there.
+pub fn phone_grants(c: &Connection) -> rusqlite::Result<BTreeMap<String, i64>> {
+    let mut q = c.prepare("SELECT serial, granted_ms FROM phone_grants")?;
+    q.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect()
+}
+
+/// Records that `serial` was granted at `ms`.
+pub fn record_phone_grant(c: &Connection, serial: &str, ms: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO phone_grants (serial, granted_ms) VALUES (?1, ?2)
+         ON CONFLICT(serial) DO UPDATE SET granted_ms = excluded.granted_ms",
+        params![serial, ms],
+    )?;
+    Ok(())
 }
 
 pub fn insert_lease_device(c: &Connection, lease: i64, d: &LeaseDevice) -> rusqlite::Result<()> {

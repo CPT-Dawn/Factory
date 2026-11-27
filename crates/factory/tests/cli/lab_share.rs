@@ -186,3 +186,39 @@ fn a_waiter_short_of_a_phone_lets_a_request_for_no_device_have_its_slot() {
     assert_eq!(short.code, 75, "{short:?}");
     assert!(short.stderr.contains("no free phone"), "{short:?}");
 }
+
+/// The serial a `devlab acquire` printed its lease's `ANDROID_SERIAL` as.
+fn granted_serial(out: &str) -> String {
+    let at = out.find("ANDROID_SERIAL=").expect("an ANDROID_SERIAL line") + "ANDROID_SERIAL=".len();
+    out[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+#[test]
+fn successive_phone_leases_rotate_through_the_phones_least_recently_granted_first() {
+    let (sandbox, world) = phones(3);
+    let lead = Agent::start();
+    let wt = world.worktree("plain-rotate");
+    let mut granted = Vec::new();
+
+    for _ in 0..4 {
+        let held = run(for_owner(
+            &sandbox,
+            &wt,
+            lead.pid(),
+            &["acquire", "--phone"],
+        ));
+        assert_eq!(held.code, 0, "{held:?}");
+        granted.push(granted_serial(&held.stdout));
+        let released = run(for_owner(&sandbox, &wt, lead.pid(), &["release"]));
+        assert_eq!(released.code, 0, "{released:?}");
+    }
+
+    // Never-granted phones first (by serial), then the one granted longest ago.
+    assert_eq!(
+        granted,
+        ["FAKEPHONE01", "FAKEPHONE02", "FAKEPHONE03", "FAKEPHONE01"]
+    );
+}
