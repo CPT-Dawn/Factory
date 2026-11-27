@@ -144,6 +144,7 @@ pub fn take(
             }
         }
     }
+    clear_reverses(&lease, warn);
     apply_reverses(&lease, ctx.project.as_ref(), warn)?;
     Ok(lease)
 }
@@ -162,6 +163,17 @@ fn device_ask(cfg: &MachineConfig, project: Option<&ProjectConfig>, opts: &Opts)
         stay_awake: cfg.prep_stay_awake,
         animations_off: cfg.prep_animations_off,
         max_per_owner: devices_per_owner(cfg, project),
+    }
+}
+
+/// Takes every `adb reverse` off each device the lease holds, as a lease starts: one an earlier
+/// lease left behind (a `tcp:8081` to another Metro) would send a debug build to the wrong host
+/// port. The project's own map is applied after this.
+pub fn clear_reverses(lease: &Lease, warn: &mut dyn FnMut(&str)) {
+    for d in &lease.devices {
+        if !AdbCli.unreverse_all(&d.serial) {
+            warn(&format!("adb reverse --remove-all failed on {}", d.serial));
+        }
     }
 }
 

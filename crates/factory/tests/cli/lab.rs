@@ -2292,6 +2292,28 @@ fn a_release_takes_back_the_reverses_its_phone_was_given() {
 }
 
 #[test]
+fn a_new_lease_clears_the_reverses_an_earlier_one_left_on_its_phone_before_its_own() {
+    let (sandbox, world) = lab();
+    world
+        .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
+        .unwrap();
+    let wt = world.worktree("demo-reverse");
+
+    let held = owned(&sandbox, &wt, &["acquire", "--phone", "--quiet"]);
+
+    assert_eq!(held.code, 0, "{held:?}");
+    let calls = sandbox.calls("adb");
+    let at = |call: &[&str]| {
+        let call: Vec<String> = call.iter().map(|s| (*s).to_owned()).collect();
+        calls.iter().position(|c| *c == call)
+    };
+    let cleared = at(&["-s", "FAKEPHONE01", "reverse", "--remove-all"]);
+    let given = at(&["-s", "FAKEPHONE01", "reverse", "tcp:8787", "tcp:27787"]);
+    assert!(cleared.is_some(), "{calls:?}");
+    assert!(cleared < given, "{calls:?}");
+}
+
+#[test]
 fn the_lease_of_an_owner_that_exits_takes_back_its_reverses_too() {
     let (sandbox, world) = lab();
     world
