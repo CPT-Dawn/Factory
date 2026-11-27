@@ -2258,13 +2258,6 @@ fn an_owner_that_exits_frees_its_lease_within_a_second_even_before_it_is_reaped(
     );
 }
 
-/// adb's call that takes back the reverse of device port `port` on `serial`.
-fn unreverse(serial: &str, port: &str) -> Vec<String> {
-    ["-s", serial, "reverse", "--remove", port]
-        .map(str::to_owned)
-        .to_vec()
-}
-
 #[test]
 fn a_release_takes_back_the_reverses_its_phone_was_given() {
     let (sandbox, world) = lab();
@@ -2274,21 +2267,14 @@ fn a_release_takes_back_the_reverses_its_phone_was_given() {
     let wt = world.worktree("demo-reverse");
     let held = owned(&sandbox, &wt, &["acquire", "--phone", "--quiet"]);
     assert_eq!(held.code, 0, "{held:?}");
-    let given = ["-s", "FAKEPHONE01", "reverse", "tcp:8787", "tcp:27787"].map(str::to_owned);
-    assert!(
-        sandbox.calls("adb").contains(&given.to_vec()),
-        "{:?}",
-        sandbox.calls("adb")
-    );
+    let kept = reverses(&sandbox, "FAKEPHONE01");
+    assert!(kept.contains("tcp:8787 tcp:27787"), "{kept}");
 
     let out = owned(&sandbox, &wt, &["release"]);
 
     assert_eq!(out.code, 0, "{out:?}");
-    let calls = sandbox.calls("adb");
-    assert!(
-        calls.contains(&unreverse("FAKEPHONE01", "tcp:8787")),
-        "{calls:?}"
-    );
+    let kept = reverses(&sandbox, "FAKEPHONE01");
+    assert!(!kept.contains("tcp:8787"), "{kept}");
 }
 
 #[test]
@@ -2376,15 +2362,13 @@ fn the_lease_of_an_owner_that_exits_takes_back_its_reverses_too() {
         &["acquire", "--phone", "--quiet"],
     );
     assert_eq!(held.code, 0, "{held:?}");
+    let kept = reverses(&sandbox, "FAKEPHONE01");
+    assert!(kept.contains("tcp:8787 tcp:27787"), "{kept}");
 
     kill_owner(owner);
 
-    let taken_back = poll_until(|| {
-        sandbox
-            .calls("adb")
-            .contains(&unreverse("FAKEPHONE01", "tcp:8787"))
-    });
-    assert!(taken_back, "{:?}", sandbox.calls("adb"));
+    let taken_back = poll_until(|| !reverses(&sandbox, "FAKEPHONE01").contains("tcp:8787"));
+    assert!(taken_back, "{}", reverses(&sandbox, "FAKEPHONE01"));
     assert!(
         status(&sandbox, &wt)
             .contains("FAKEPHONE01        phone    Pixel 8        ready        free"),

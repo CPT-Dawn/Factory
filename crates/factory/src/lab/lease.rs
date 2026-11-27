@@ -166,6 +166,15 @@ fn device_ask(cfg: &MachineConfig, project: Option<&ProjectConfig>, opts: &Opts)
     }
 }
 
+/// What brings a device of `kind` (`phone` or `emulator`) back to adb after a call to it failed.
+fn back_online(kind: &str) -> &'static str {
+    if kind == "emulator" {
+        "check that the emulator still shows in `adb devices` as a device"
+    } else {
+        "replug the phone"
+    }
+}
+
 /// Takes every `adb reverse` off each device the lease holds, as a lease is taken (an acquire or
 /// run that asks again takes it again, and the project's map is applied anew): one an earlier
 /// lease left behind (a `tcp:8081` to another Metro) would send a debug build to the wrong host
@@ -174,8 +183,9 @@ pub fn clear_reverses(lease: &Lease, warn: &mut dyn FnMut(&str)) {
     for d in &lease.devices {
         if !AdbCli.unreverse_all(&d.serial) {
             warn(&format!(
-                "adb reverse --remove-all failed on {}: an old reverse may still point at another host port; once the device is back, devlab release and acquire again",
-                d.serial
+                "adb reverse --remove-all failed on {}: an old reverse may still point at another host port; {}, then devlab release and acquire again",
+                d.serial,
+                back_online(&d.kind)
             ));
         }
     }
@@ -196,8 +206,9 @@ pub fn apply_reverses(
         for &(on_device, on_host) in &ports {
             if on_device > 0 && on_host > 0 && !AdbCli.reverse(&d.serial, on_device, on_host) {
                 warn(&format!(
-                    "adb reverse tcp:{on_device} -> {on_host} failed on {}",
-                    d.serial
+                    "adb reverse tcp:{on_device} -> {on_host} failed on {}: the app can't reach that host port; {}, then run devlab acquire again to map it (devlab run maps it too)",
+                    d.serial,
+                    back_online(&d.kind)
                 ));
             }
         }
