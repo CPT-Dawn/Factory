@@ -89,6 +89,8 @@ pub struct QuotaKeeper {
     /// Woken when agy's usage query ends.
     agy_asked: Notify,
     usage: Arc<dyn AgyUsage>,
+    /// Why agy's reviews can't run, found at start: shown with every agy reading.
+    agy_guard: Option<String>,
 }
 
 impl QuotaKeeper {
@@ -122,9 +124,16 @@ impl QuotaKeeper {
             agy: Mutex::new(AgyState::default()),
             agy_asked: Notify::new(),
             usage,
+            agy_guard: None,
         };
         keeper.prune_if_due(clock::now())?;
         Ok(keeper)
+    }
+
+    /// The keeper, told why agy's reviews can't run, which every agy reading then carries.
+    pub fn with_agy_guard(mut self, problem: Option<String>) -> QuotaKeeper {
+        self.agy_guard = problem;
+        self
     }
 
     /// Codex's quota as `factory status`, the bar and `factory quota codex` record it. A reading
@@ -289,6 +298,12 @@ impl QuotaKeeper {
     /// the query goes on and lands for the next caller. An answer that can't be read is the
     /// reading too, with its reason: it is shown, and asked again after the same time.
     pub async fn agy(self: &Arc<Self>, patience: Duration) -> Agy {
+        let mut reading = self.agy_reading(patience).await;
+        reading.guard.clone_from(&self.agy_guard);
+        reading
+    }
+
+    async fn agy_reading(self: &Arc<Self>, patience: Duration) -> Agy {
         let mut asked = std::pin::pin!(self.agy_asked.notified());
         {
             let mut state = lock(&self.agy);

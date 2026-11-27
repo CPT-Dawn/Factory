@@ -408,6 +408,7 @@ fn five_leads_three_slots_and_three_backends_fit_one_terminal_screen() {
         ],
         error: None,
         seen: Some(now() * 1000),
+        guard: None,
     };
     status.leads.monitor = true;
     status.leads.leads = (0..5)
@@ -710,6 +711,7 @@ fn agys_row_names_each_quota_group_and_its_worst_window() {
         ],
         error: None,
         seen: Some(now() * 1000),
+        guard: None,
     };
 
     let shown = rows(&status);
@@ -753,6 +755,7 @@ fn agys_unreadable_answer_is_said_in_one_row_never_as_a_share() {
         groups: Vec::new(),
         error: Some("its usage query exited 127".to_owned()),
         seen: Some(now() * 1000),
+        guard: None,
     };
 
     let shown = rows(&status);

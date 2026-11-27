@@ -107,11 +107,20 @@ pub fn run(json: bool) -> Result<(), Failure> {
     )?;
     let pollers = Arc::new(Pollers::new(paths.clone(), Gh));
     let router = Arc::new(Router::open(Store::open(&paths.database())?)?);
-    let quotas = Arc::new(QuotaKeeper::open(
-        Store::open(&paths.database())?,
-        Arc::new(AppServer::new()),
-        Arc::new(AgyUsageCli(AgyAuth::Subscription)),
-    )?);
+    // Said once, here: without the guard's programs every agy review is skipped, and each skip
+    // is only a line in that review's own result.
+    let guard_problem = factory_adapters::guard::problem(std::env::var_os("PATH").as_deref());
+    if let Some(problem) = &guard_problem {
+        eprintln!("factory: WARNING: {problem}");
+    }
+    let quotas = Arc::new(
+        QuotaKeeper::open(
+            Store::open(&paths.database())?,
+            Arc::new(AppServer::new()),
+            Arc::new(AgyUsageCli(AgyAuth::Subscription)),
+        )?
+        .with_agy_guard(guard_problem),
+    );
     let fleet = Arc::new(Fleet::open(
         crate::config::ci_watch(&paths),
         Store::open(&paths.database())?,

@@ -365,7 +365,9 @@ pub fn line(snapshot: &Snapshot) -> String {
             .map_or_else(|| "?".to_owned(), |used| used.to_string())
     };
     // An answer that can't be read is said so, apart from a reading not yet taken (`?/?`).
-    let agy = if snapshot.agy.error.is_some() {
+    let agy = if snapshot.agy.guard.is_some() {
+        "no guard".to_owned()
+    } else if snapshot.agy.error.is_some() {
         "unreadable".to_owned()
     } else {
         format!(
@@ -611,6 +613,15 @@ fn codex_section(snapshot: &Snapshot) -> Section {
 fn agy_chip(snapshot: &Snapshot) -> Chip {
     let agy = &snapshot.agy;
     let label = glyph::AGY.char.to_string();
+    if let Some(guard) = &agy.guard {
+        return Chip {
+            id: "agy".to_owned(),
+            label,
+            text: "!".to_owned(),
+            tone: Tone::Critical,
+            tooltip: Some(guard.clone()),
+        };
+    }
     if let Some(problem) = agy.problem() {
         return Chip {
             id: "agy".to_owned(),

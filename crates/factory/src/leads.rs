@@ -350,6 +350,7 @@ impl<H: HerdrApi> Leads<H> {
             claude_args: &params.claude_args,
             prompt: &prompt,
             pause: Duration::from_millis(params.retry_pause_ms),
+            busy_for: lead::BUSY_TIMEOUT,
         };
         let started = spawn::start(&self.herdr, &plan).await;
         let (outcome, reason, stalls) = match &started {
