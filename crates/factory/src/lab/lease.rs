@@ -174,7 +174,7 @@ pub fn clear_reverses(lease: &Lease, warn: &mut dyn FnMut(&str)) {
     for d in &lease.devices {
         if !AdbCli.unreverse_all(&d.serial) {
             warn(&format!(
-                "adb reverse --remove-all failed on {}: an old reverse may still point at another host port; replug the phone, then devlab release and acquire again",
+                "adb reverse --remove-all failed on {}: an old reverse may still point at another host port; once the device is back, devlab release and acquire again",
                 d.serial
             ));
         }
