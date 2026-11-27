@@ -9,8 +9,10 @@ page together.
 ## Arguments
 
 ```
-review.sh [--tier hard|standard|trivial] <base> <label> [<spec>] [<previous-report>]
+review.sh [--tier hard|standard|trivial] [--escalation] <base> <label> [<spec>] [<previous-report>]
 ```
+
+(`--escalation` is passed through to factory; a review.sh older than the round cap, docs/adr/0002, lacks it.)
 
 The shim checks the label (letters, digits, `_`, `-`) and the tier before it calls factory, and exits 2 with a
 `code-review: ` line on stderr when either is wrong. It runs:

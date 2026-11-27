@@ -872,17 +872,12 @@ fn fix_start(
     let named = read("findings.json")
         .or_else(|| read("ledger.json"))
         .or_else(logged);
-    let Some(named) = named else {
-        notes.push(format!(
-            "no reviewed head for {} on this branch; round {} reviews the whole diff",
-            previous.display(),
-            review::round(&args.label, true)
-        ));
-        return Ok(Continued::default());
-    };
-    let head = match repo.commit(&named.head).map_err(git_failed)? {
-        Some(head) if repo.is_ancestor(&head).map_err(git_failed)? => Some(head),
-        _ => None,
+    let (head, open) = match named {
+        Some(named) => match repo.commit(&named.head).map_err(git_failed)? {
+            Some(head) if repo.is_ancestor(&head).map_err(git_failed)? => (Some(head), named.open),
+            _ => (None, named.open),
+        },
+        None => (None, None),
     };
     if head.is_none() {
         notes.push(format!(
@@ -891,10 +886,7 @@ fn fix_start(
             review::round(&args.label, true)
         ));
     }
-    Ok(Continued {
-        head,
-        open: named.open,
-    })
+    Ok(Continued { head, open })
 }
 
 /// What a fix round continues from the round before: the head that round reviewed, where the

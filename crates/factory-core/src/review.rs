@@ -99,6 +99,9 @@ pub fn admit(label: &str, escalation: bool) -> Result<(), String> {
             CAP + 1
         )),
         Place::Single => Ok(()),
+        Place::Round { prefix, n: 0 } => Err(format!(
+            "{label}: rounds count from 1; start with {prefix}-r1"
+        )),
         Place::Round { n, .. } if n > ESCALATION_CAP => Err(format!(
             "{label} is past the review cap ({CAP} rounds, {ESCALATION_CAP} for an escalation): {report}"
         )),
@@ -1028,6 +1031,50 @@ fn finding(value: &Value) -> Option<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cap_admits_rounds_1_and_2_then_3_and_4_for_an_escalation_then_one_light_review() {
+        for (label, escalation, admitted) in [
+            ("t1", false, true),
+            ("t1", true, false),
+            ("t1-r0", false, false),
+            ("t1-r1", false, true),
+            ("t1-r2", false, true),
+            ("t1-r2", true, false),
+            ("t1-r3", false, false),
+            ("t1-r3", true, true),
+            ("t1-r4", true, true),
+            ("t1-r5", true, false),
+            ("t1-r1-light", false, false),
+            ("t1-r2-light", false, true),
+            ("t1-r3-light", true, false),
+            ("t1-r4-light", false, true),
+            ("spec-x-r2", false, true),
+        ] {
+            assert_eq!(
+                admit(label, escalation).is_ok(),
+                admitted,
+                "{label} escalation={escalation}: {:?}",
+                admit(label, escalation)
+            );
+        }
+    }
+
+    #[test]
+    fn a_later_round_and_a_light_review_continue_the_round_before() {
+        for (label, previous) in [
+            ("t1", None),
+            ("t1-r1", None),
+            ("t1-r2", Some("t1-r1")),
+            ("spec-x-r4", Some("spec-x-r3")),
+            ("t1-r2-light", Some("t1-r2")),
+            ("t1-light", None),
+        ] {
+            assert_eq!(Place::of(label).previous().as_deref(), previous, "{label}");
+        }
+        assert_eq!(round("t1-r2-light", true), 3);
+        assert_eq!(round("t1-r4-light", false), 5);
+    }
 
     #[test]
     fn round_is_the_label_suffix_else_1_and_2_for_a_first_label_with_a_previous_report() {
