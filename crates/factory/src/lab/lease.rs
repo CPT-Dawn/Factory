@@ -166,13 +166,17 @@ fn device_ask(cfg: &MachineConfig, project: Option<&ProjectConfig>, opts: &Opts)
     }
 }
 
-/// Takes every `adb reverse` off each device the lease holds, as a lease starts: one an earlier
+/// Takes every `adb reverse` off each device the lease holds, as a lease is taken (an acquire or
+/// run that asks again takes it again, and the project's map is applied anew): one an earlier
 /// lease left behind (a `tcp:8081` to another Metro) would send a debug build to the wrong host
 /// port. The project's own map is applied after this.
 pub fn clear_reverses(lease: &Lease, warn: &mut dyn FnMut(&str)) {
     for d in &lease.devices {
         if !AdbCli.unreverse_all(&d.serial) {
-            warn(&format!("adb reverse --remove-all failed on {}", d.serial));
+            warn(&format!(
+                "adb reverse --remove-all failed on {}: an old reverse may still point at another host port; replug the phone, then devlab release and acquire again",
+                d.serial
+            ));
         }
     }
 }

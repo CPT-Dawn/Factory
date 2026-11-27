@@ -124,6 +124,17 @@ track-devices)
     fi
     exit 0 ;;
   reverse)
+    # world/reverses holds "serial device-port host-port" lines, as the device keeps its
+    # reverses; `reverse --list` shows a phone's. Setting one prints nothing.
+    r="$w/reverses"; touch "$r"
+    case "$1:$2" in
+    reverse:--remove-all) awk -v s="$serial" '$1 != s' "$r" > "$r.new"; mv "$r.new" "$r" ;;
+    reverse:--remove) awk -v s="$serial" -v p="$3" '!($1 == s && $2 == p)' "$r" > "$r.new"; mv "$r.new" "$r" ;;
+    reverse:--list) awk -v s="$serial" '$1 == s' "$r" ;;
+    *)
+      awk -v s="$serial" -v p="$2" '!($1 == s && $2 == p)' "$r" > "$r.new"; mv "$r.new" "$r"
+      echo "$serial $2 $3" >> "$r" ;;
+    esac
     exit 0 ;;
   esac ;;
 esac

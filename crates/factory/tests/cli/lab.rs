@@ -2332,26 +2332,33 @@ fn a_running_stack_is_granted_below_the_memory_floor_as_it_starts_nothing() {
     assert!(out.stdout.contains("export DEVLAB_SLOT=0\n"), "{out:?}");
 }
 
+/// The reverses `serial` keeps, as `adb reverse --list` shows them.
+fn reverses(sandbox: &Sandbox, serial: &str) -> String {
+    let out = run(sandbox.command("adb", &["-s", serial, "reverse", "--list"]));
+    assert_eq!(out.code, 0, "{out:?}");
+    out.stdout
+}
+
 #[test]
 fn a_new_lease_clears_the_reverses_an_earlier_one_left_on_its_phone_before_its_own() {
     let (sandbox, world) = lab();
     world
         .apply("plug FAKEPHONE01 device usb:1-1 model:Pixel_8")
         .unwrap();
+    // An earlier lease's debug session left its Metro reverse on the phone.
+    let stale = run(sandbox.command(
+        "adb",
+        &["-s", "FAKEPHONE01", "reverse", "tcp:8081", "tcp:8081"],
+    ));
+    assert_eq!(stale.code, 0, "{stale:?}");
     let wt = world.worktree("demo-reverse");
 
     let held = owned(&sandbox, &wt, &["acquire", "--phone", "--quiet"]);
 
     assert_eq!(held.code, 0, "{held:?}");
-    let calls = sandbox.calls("adb");
-    let at = |call: &[&str]| {
-        let call: Vec<String> = call.iter().map(|s| (*s).to_owned()).collect();
-        calls.iter().position(|c| *c == call)
-    };
-    let cleared = at(&["-s", "FAKEPHONE01", "reverse", "--remove-all"]);
-    let given = at(&["-s", "FAKEPHONE01", "reverse", "tcp:8787", "tcp:27787"]);
-    assert!(cleared.is_some(), "{calls:?}");
-    assert!(cleared < given, "{calls:?}");
+    let kept = reverses(&sandbox, "FAKEPHONE01");
+    assert!(!kept.contains("tcp:8081"), "{kept}");
+    assert!(kept.contains("tcp:8787 tcp:27787"), "{kept}");
 }
 
 #[test]
