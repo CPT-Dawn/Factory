@@ -193,6 +193,10 @@ pub struct Agy {
     /// When the answer was read, in milliseconds since the epoch; none before the first.
     #[serde(default)]
     pub seen: Option<i64>,
+    /// Why every agy review is skipped: a program its write guard needs is missing. Said by the
+    /// daemon, from what it found at start.
+    #[serde(default)]
+    pub guard: Option<String>,
 }
 
 impl Agy {
@@ -206,11 +210,13 @@ impl Agy {
                 groups,
                 error: None,
                 seen,
+                guard: None,
             },
             Err(why) => Agy {
                 groups: Vec::new(),
                 error: Some(why),
                 seen,
+                guard: None,
             },
         }
     }
@@ -545,6 +551,9 @@ fn codex(status: &Status, rows: &mut Vec<String>) {
 
 fn agy(status: &Status, rows: &mut Vec<String>) {
     let agy = &status.agy;
+    if let Some(guard) = &agy.guard {
+        rows.push(guard.clone());
+    }
     if let Some(problem) = agy.problem() {
         rows.push(problem);
     } else if agy.groups.is_empty() {

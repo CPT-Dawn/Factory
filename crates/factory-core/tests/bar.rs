@@ -189,6 +189,7 @@ fn agy_read() -> Agy {
         ],
         error: None,
         seen: Some(at("2026-11-23T04:10:00Z")),
+        guard: None,
     }
 }
 
@@ -197,6 +198,7 @@ fn agy_unreadable() -> Agy {
         groups: Vec::new(),
         error: Some("its answer is not JSON".to_owned()),
         seen: Some(at("2026-11-23T04:10:00Z")),
+        guard: None,
     }
 }
 
@@ -977,5 +979,27 @@ fn the_line_names_codexs_windows_and_hides_them_while_unreadable() {
     assert_eq!(
         line(&shot),
         "claude ?/? · codex ?/? · agy ?/? · 0 leads · lab 0/0"
+    );
+}
+
+#[test]
+fn an_agy_whose_write_guard_is_missing_says_so_in_the_line_and_a_critical_chip() {
+    let mut agy = agy_read();
+    agy.guard =
+        Some("agy reviews skipped, missing: xdg-dbus-proxy (package xdg-dbus-proxy)".to_owned());
+    let snapshot = with_agy(agy);
+
+    let feed = json(&feed(&snapshot));
+
+    assert!(
+        line(&snapshot).contains("agy no guard"),
+        "{}",
+        line(&snapshot)
+    );
+    let agy = chip(&feed, "agy");
+    assert_eq!(agy["tone"], "critical", "{agy}");
+    assert_eq!(
+        agy["tooltip"],
+        "agy reviews skipped, missing: xdg-dbus-proxy (package xdg-dbus-proxy)"
     );
 }

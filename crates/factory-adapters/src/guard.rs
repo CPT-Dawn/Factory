@@ -34,6 +34,8 @@ use rustix::process::{Pid, Signal, kill_process_group};
 pub const BWRAP: &str = "bwrap";
 /// The program that filters the session bus for the guard.
 pub const PROXY: &str = "xdg-dbus-proxy";
+/// Where each program the guard needs comes from, as an Arch package.
+const PACKAGES: [(&str, &str); 2] = [(BWRAP, "bubblewrap"), (PROXY, "xdg-dbus-proxy")];
 /// The one bus name a guarded program may talk to: the Secret Service, agy's keyring.
 const KEYRING: &str = "org.freedesktop.secrets";
 /// How long the proxy may take to say it is listening.
@@ -88,6 +90,28 @@ impl Guard {
         cmd.args(&self.args).arg(program);
         cmd
     }
+}
+
+/// Why agy reviews can't run: the programs of the write guard that `path` (a PATH value)
+/// doesn't lead to, each with its package, in one line short enough for `factory status`; none
+/// when both are there. Without one, every
+/// agy review is skipped, so the daemon says it at start rather than leave it to each review.
+pub fn problem(path: Option<&std::ffi::OsStr>) -> Option<String> {
+    let missing: Vec<String> = PACKAGES
+        .iter()
+        .filter(|(program, _)| !on_path(program, path))
+        .map(|(program, package)| format!("{program} (package {package})"))
+        .collect();
+    (!missing.is_empty()).then(|| format!("agy reviews skipped, missing: {}", missing.join(", ")))
+}
+
+/// Whether `program` is an executable file in a directory of `path`.
+fn on_path(program: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.into_iter().flat_map(env::split_paths).any(|dir| {
+        fs::metadata(dir.join(program))
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    })
 }
 
 /// A running `xdg-dbus-proxy`, listening on `socket`, in a process group of its own. It stops
@@ -331,6 +355,35 @@ fn args(env: &Env, writable: &[&Path], bus: Option<(&Path, &Path)>) -> Vec<OsStr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_guard_tool_is_named_with_its_package() {
+        let dir = std::env::temp_dir().join(format!("factory-guard-path-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let make = |name: &str, mode: u32| {
+            let file = dir.join(name);
+            let _ = fs::write(&file, "#!/bin/sh\n");
+            let _ = fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(mode));
+        };
+        make(BWRAP, 0o755);
+        let path = dir.as_os_str();
+
+        let said = problem(Some(path));
+        make(PROXY, 0o644);
+        let not_executable = problem(Some(path));
+        make(PROXY, 0o755);
+        let both = problem(Some(path));
+        let none = problem(None);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            said.as_deref(),
+            Some("agy reviews skipped, missing: xdg-dbus-proxy (package xdg-dbus-proxy)")
+        );
+        assert_eq!(not_executable, said);
+        assert_eq!(both, None);
+        assert!(none.is_some_and(|why| why.contains("bwrap") && why.contains("bubblewrap")));
+    }
 
     #[test]
     fn the_bus_socket_is_the_path_its_address_names() {

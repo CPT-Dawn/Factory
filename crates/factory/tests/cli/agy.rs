@@ -1825,3 +1825,59 @@ fn a_group_name_with_a_line_break_is_still_one_line() {
         "{out:?}"
     );
 }
+
+/// The daemon's log.
+fn daemon_log(sandbox: &Sandbox) -> String {
+    fs::read_to_string(sandbox.path("run/factory/daemon.log")).unwrap_or_default()
+}
+
+/// A sandbox whose PATH is its fake tools alone, with `missing` taken off it: agy's write guard
+/// needs bwrap and xdg-dbus-proxy, and the host's own would show through /usr/bin.
+// cfg(test), as the harness is, so clippy lets it unwrap.
+#[cfg(test)]
+fn without(missing: &str) -> Sandbox {
+    let sandbox = Sandbox::new();
+    let bin = sandbox.path("bin");
+    let sandbox = sandbox.env("PATH", &bin);
+    fs::remove_file(bin.join(missing)).expect("remove a fake tool");
+    sandbox
+}
+
+#[test]
+fn a_daemon_without_xdg_dbus_proxy_says_agy_reviews_are_skipped_in_log_status_and_bar() {
+    let sandbox = without("xdg-dbus-proxy");
+
+    let status = sandbox.factory(&["status"]);
+
+    assert_eq!(status.code, 0, "{status:?}");
+    let why = "agy reviews skipped, missing: xdg-dbus-proxy (package xdg-dbus-proxy)";
+    assert!(status.stdout_lines().contains(&why), "{status:?}");
+    let log = daemon_log(&sandbox);
+    assert_eq!(log.matches(why).count(), 1, "{log}");
+    sandbox.factory(&["status"]);
+    assert_eq!(
+        daemon_log(&sandbox).matches(why).count(),
+        1,
+        "said once, at start"
+    );
+    let bar = sandbox.factory(&["bar", "--json"]);
+    let feed: Value = serde_json::from_str(&bar.stdout).expect("the bar feed is JSON");
+    let chip = feed["glance"]
+        .as_array()
+        .and_then(|chips| chips.iter().find(|chip| chip["id"] == "agy"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(chip["tone"], "critical", "{chip}");
+    assert_eq!(chip["tooltip"], why, "{chip}");
+}
+
+#[test]
+fn a_daemon_with_both_guard_tools_says_nothing_of_them() {
+    let sandbox = Sandbox::new();
+
+    let status = sandbox.factory(&["status"]);
+
+    assert_eq!(status.code, 0, "{status:?}");
+    assert!(!status.stdout.contains("agy reviews skipped"), "{status:?}");
+    assert!(!daemon_log(&sandbox).contains("agy reviews skipped"));
+}
