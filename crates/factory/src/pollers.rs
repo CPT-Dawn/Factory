@@ -416,46 +416,60 @@ impl<G: PullRequests> Reader<G> {
 
     /// The answer for a head whose checks all finished, writing the failures' file.
     fn finished(&self, head: &str, tally: &Tally) -> Result<WaitCiResult, String> {
-        let file = if tally.failed.is_empty() {
+        let file = if tally.exit() == Exit::Ok {
             None
         } else {
-            Some(self.write_failures(head, &tally.failed)?)
+            Some(self.write_failures(head, tally)?)
         };
+        let names = |runs: &[CheckRun]| runs.iter().map(|run| run.name.clone()).collect();
         Ok(WaitCiResult {
             pr: self.pr.to_string(),
             url: self.pr.url(),
             head: head.to_owned(),
             passed: tally.passed,
             skipped: tally.skipped,
-            failed: tally.failed.iter().map(|run| run.name.clone()).collect(),
+            failed: names(&tally.failed),
+            cancelled: names(&tally.cancelled),
             file: file.map(|path| path.to_string_lossy().into_owned()),
             exit: tally.exit().code(),
         })
     }
 
-    /// Writes each failed run's URL and log tail to
+    /// Writes each failed and cancelled run's URL, and the log tail of each job that ran, to
     /// `<state>/ci/<host>/<owner>/<repo>/<number>-<head>.md`,
     /// readable by its owner only: the logs can be a private repo's.
-    fn write_failures(&self, head: &str, failed: &[CheckRun]) -> Result<PathBuf, String> {
+    fn write_failures(&self, head: &str, tally: &Tally) -> Result<PathBuf, String> {
         let path = self.paths.ci_failures(&self.pr, head);
         let mut text = format!(
-            "# {} at {}: {} failed\n",
+            "# {} at {}: {} failed",
             self.pr,
             head.get(..12).unwrap_or(head),
-            failed.len()
+            tally.failed.len()
         );
-        for run in failed {
+        if !tally.cancelled.is_empty() {
+            text.push_str(&format!(", {} cancelled", tally.cancelled.len()));
+        }
+        text.push('\n');
+        for run in tally.failed.iter().chain(&tally.cancelled) {
             let conclusion = run.conclusion.as_deref().unwrap_or("unknown");
             text.push_str(&format!(
                 "\n## {} ({conclusion})\n\n{}\n\n",
                 run.name, run.url
             ));
             match run.app.as_deref() {
-                Some(ACTIONS) => match self.gh.job_log(&self.pr, run.id) {
+                Some(ci::ACTIONS) if !run.has_log() => {
+                    text.push_str(&if conclusion == "cancelled" {
+                        "No log: GitHub keeps none for a cancelled job; it may have run a while.\n"
+                            .to_owned()
+                    } else {
+                        format!("No log: the job never started ({conclusion}).\n")
+                    })
+                }
+                Some(ci::ACTIONS) => match self.gh.job_log(&self.pr, run.id) {
                     Ok(log) => {
                         text.push_str("```text\n");
                         for line in ci::tail(&log, TAIL_LINES) {
-                            text.push_str(line);
+                            text.push_str(&line);
                             text.push('\n');
                         }
                         text.push_str("```\n");
@@ -475,9 +489,6 @@ impl<G: PullRequests> Reader<G> {
         Ok(path)
     }
 }
-
-/// The app whose check runs are GitHub Actions jobs, with logs behind the jobs API.
-const ACTIONS: &str = "github-actions";
 
 mod private {
     //! Files only their owner reads.
