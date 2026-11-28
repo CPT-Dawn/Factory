@@ -129,6 +129,12 @@ fn a_dollar_inside_a_quoted_grep_pattern_is_denied() {
         "rg -t rust 'fn$'",
         "git grep -n -e 'x$'",
         "rg --max-count 2 'x$' src",
+        "grep --color 'end$' notes.txt",
+        "grep -n --colour 'end$' notes.txt",
+        "git grep --color 'x$'",
+        "git grep --open-files-in-pager 'x$'",
+        "git grep -Oless 'x$'",
+        "rg --color never 'x$' src",
     ];
     let calls: Vec<Value> = commands.iter().map(|c| bash(c)).collect();
     assert_denied_with(&calls, ANCHOR_FIX);
@@ -165,6 +171,9 @@ fn an_unquoted_or_fixed_string_dollar_passes() {
         "grep -e foo 'dir$'",
         "rg -f pats.txt 'dir$'",
         "rg -iF 'a$' src",
+        "grep --color=auto x 'a$.txt'",
+        "rg --color always x 'a$.txt'",
+        "git grep -Oless x 'a$.txt'",
     ];
     let calls: Vec<Value> = commands.iter().map(|c| bash(c)).collect();
     assert_passes(&calls);
@@ -204,7 +213,6 @@ fn the_shell_denies_reach_the_text_of_each_repl_template() {
         ("await $`bash -c 'rm /tmp/a'`;", RM_FIX),
         ("await $`rg 'foo$' src`.text();", ANCHOR_FIX),
         ("await $`[object Object] > out`;", "pass a string or array"),
-        ("await $('rm -f *.log');", RM_FIX),
         ("const a = 1;\nawait $`stress -c 4`;", "line 2"),
         ("await $`echo \\`rm $x\\``;", RM_FIX),
         ("$`cd ${dir} && rm \\${name}`", RM_FIX),
@@ -230,6 +238,10 @@ fn an_interpolation_is_one_literal_word_and_raw_text_is_unknown() {
         "await $`git rm -r --cached ${dir}`;",
         "await $`echo \\${HOME}`;",
         "x.$`rm $y`;",
+        // The shell denies read templates only: a string's text is the script's own words.
+        "await $('rm -f *.log');",
+        "await $(\"rg 'foo$' src\", 60000);",
+        "await $(\"bash -c 'rm /tmp/a'\");",
     ];
     let calls: Vec<Value> = codes.iter().map(|c| repl(c)).collect();
     assert_passes(&calls);
@@ -260,6 +272,11 @@ fn a_repl_script_that_waits_more_than_once_is_denied() {
         "for (const x of xs)\n  await $`factory wait ci ${x}`\n    .timeout(600000);",
         "p.then(function () { return $`factory wait ci 1` })",
         "p.then(r => r.ok ? $`factory wait ci 1` : null)",
+        "p.then((() => $`factory wait ci 1`))",
+        "p.then(((r) => $`factory wait ci 1`))",
+        "p.then(x, (async () => { await $`factory wait ci 1` }))",
+        "setTimeout((async () => { await $`factory wait ci 1` }), 10)",
+        "p.then(((() => $`factory wait ci 1`)))",
     ];
     let calls: Vec<Value> = codes.iter().map(|c| repl(c)).collect();
     assert_denied_with(&calls, WAIT_FIX);
@@ -286,6 +303,9 @@ fn one_awaited_wait_and_mere_mentions_pass() {
         "for (const f of fs) log(f)\nawait $`factory wait ci 1`",
         "p.then((await $`factory wait ci 1`, handler))",
         "p.then(handler, (await $`factory wait ci 1`).text())",
+        "p.then((handler), (await $`factory wait ci 1`).text())",
+        "p.then(((await $`factory wait ci 1`)), handler)",
+        "p.then((a, b) => a);\nawait $`factory wait ci 1`",
         "await x.then(r => r.text());\nawait $`factory wait ci 1`",
     ];
     let calls: Vec<Value> = codes.iter().map(|c| repl(c)).collect();

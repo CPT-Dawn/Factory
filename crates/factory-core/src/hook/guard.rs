@@ -14,17 +14,21 @@ pub fn shell_trap(command: &str) -> Option<String> {
     trap_in(command, false)
 }
 
-/// The refusal for a REPL script whose shell text one of the guards stops, naming its line. Text
-/// the script doesn't say, such as a `${{raw: s}}` splice, is let through.
+/// The refusal for a REPL script whose wait loop, or the shell text of one of whose `$`…``
+/// templates, one of the guards stops, naming its line. Text the script doesn't say, such as a
+/// `${{raw: s}}` splice, is let through, and so is a `$(…)` string call's text.
 pub fn repl_trap(code: &str) -> Option<String> {
     let calls = js::shell_calls(code);
     if let Some(reason) = repl_waits(&calls) {
         return Some(reason);
     }
-    calls.iter().filter(|call| call.exact).find_map(|call| {
-        let reason = shell_trap(&call.text)?;
-        Some(format!("REPL line {}: {reason}", call.line))
-    })
+    calls
+        .iter()
+        .filter(|call| call.template && call.exact)
+        .find_map(|call| {
+            let reason = shell_trap(&call.text)?;
+            Some(format!("REPL line {}: {reason}", call.line))
+        })
 }
 
 /// The time a `git push` needs in this repository's REPL calls: the pre-push hook runs verify.
@@ -143,10 +147,31 @@ const OBJECT: &str = "A JS object was interpolated into the command; pass a stri
 /// The refusal for a grep pattern whose `$` sits inside shell quotes.
 const QUOTED_ANCHOR: &str = "A $ inside a quoted grep or rg pattern stops on an approval dialog nobody answers: use rg -F 'text' for a fixed string, or rg -e foo$ with the anchor outside shell quoting.";
 
-/// The short options that take a value, attached or as the next word, of grep, rg and git grep.
-const GREP_SHORT_VALUES: &str = "efmABCdD";
-const RG_SHORT_VALUES: &str = "efgmtTjMABCErd";
-const GIT_GREP_SHORT_VALUES: &str = "efmABC";
+/// How a grep reads its options' values.
+struct Grammar {
+    /// The short options that take a value, attached or as the next word.
+    short: &'static str,
+    /// The short options whose value, when there is one, is only the rest of their word.
+    attached: &'static str,
+    /// The long options of `GREP_LONG_VALUES` whose value only `=` gives, as GNU grep's `--color`.
+    optional: &'static [&'static str],
+}
+
+const GREP: Grammar = Grammar {
+    short: "efmABCdD",
+    attached: "",
+    optional: &["color"],
+};
+const RG: Grammar = Grammar {
+    short: "efgmtTjMABCErd",
+    attached: "",
+    optional: &[],
+};
+const GIT_GREP: Grammar = Grammar {
+    short: "efmABC",
+    attached: "O",
+    optional: &["color", "open-files-in-pager"],
+};
 
 /// Their long options that take the next word as their value when no `=` gives it.
 const GREP_LONG_VALUES: &[&str] = &[
@@ -179,6 +204,7 @@ const GREP_LONG_VALUES: &[&str] = &[
     "max-count",
     "max-depth",
     "max-filesize",
+    "open-files-in-pager",
     "path-separator",
     "pre",
     "pre-glob",
@@ -196,16 +222,16 @@ const GREP_LONG_VALUES: &[&str] = &[
 /// Whether a grep, egrep, rg or git grep call has a pattern with a quoted `$`, unless it matches
 /// fixed strings. `quoted` says it of the argument that many words from the command's end.
 fn quoted_anchor(call: &Invocation<'_>, quoted: impl Fn(usize) -> bool) -> bool {
-    let (args, short_values) = match call.program {
-        "grep" | "egrep" => (call.args, GREP_SHORT_VALUES),
-        "rg" => (call.args, RG_SHORT_VALUES),
+    let (args, grammar) = match call.program {
+        "grep" | "egrep" => (call.args, &GREP),
+        "rg" => (call.args, &RG),
         "git" => match super::GitGlobals::of(call, None).rest.split_first() {
-            Some((sub, rest)) if sub == "grep" => (rest, GIT_GREP_SHORT_VALUES),
+            Some((sub, rest)) if sub == "grep" => (rest, &GIT_GREP),
             _ => return false,
         },
         _ => return false,
     };
-    patterns(args, short_values).is_some_and(|patterns| {
+    patterns(args, grammar).is_some_and(|patterns| {
         patterns
             .into_iter()
             .any(|at| at < args.len() && quoted(args.len() - at))
@@ -214,7 +240,7 @@ fn quoted_anchor(call: &Invocation<'_>, quoted: impl Fn(usize) -> bool) -> bool 
 
 /// Which of a grep's `args` are patterns: the values of `-e` and `--regexp`, or else its first
 /// word that is no option nor an option's value. None when it matches fixed strings.
-fn patterns(args: &[String], short_values: &str) -> Option<Vec<usize>> {
+fn patterns(args: &[String], grammar: &Grammar) -> Option<Vec<usize>> {
     let mut patterns = Vec::new();
     let mut positional = None;
     // Patterns come from `-e` or `-f`, so the words that are no options are all paths.
@@ -234,7 +260,8 @@ fn patterns(args: &[String], short_values: &str) -> Option<Vec<usize>> {
                 .map_or((long, None), |(n, v)| (n, Some(v)));
             fixed |= name == "fixed-strings";
             given |= matches!(name, "regexp" | "file");
-            let takes = matches!(name, "regexp" | "file") || GREP_LONG_VALUES.contains(&name);
+            let takes = matches!(name, "regexp" | "file")
+                || (GREP_LONG_VALUES.contains(&name) && !grammar.optional.contains(&name));
             match (name, value) {
                 ("regexp", Some(_)) => patterns.push(at - 1),
                 ("regexp", None) => patterns.push(at),
@@ -245,7 +272,10 @@ fn patterns(args: &[String], short_values: &str) -> Option<Vec<usize>> {
             let group = &arg[1..];
             for (pos, flag) in group.char_indices() {
                 fixed |= flag == 'F';
-                if !short_values.contains(flag) {
+                if grammar.attached.contains(flag) {
+                    break;
+                }
+                if !grammar.short.contains(flag) {
                     continue;
                 }
                 let attached = pos + flag.len_utf8() < group.len();

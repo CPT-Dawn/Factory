@@ -45,6 +45,8 @@ pub struct ShellCall {
     /// Whether `text` is what runs: false when an expression splices in text the script doesn't
     /// say, as `${{raw: s}}` does, or `${…}` in a template passed to `$(…)`.
     pub exact: bool,
+    /// It is a `$`…`` template, whose text the shell denies read; a `$(…)` string call is not.
+    pub template: bool,
     /// It sits in a loop's body, a `.then`, `.catch`, `.finally`, `.forEach`, `.map` or `.flatMap`
     /// callback, or a `setTimeout` or `setInterval`: it may run more than once.
     pub repeated: bool,
@@ -70,6 +72,7 @@ pub fn shell_calls(code: &str) -> Vec<ShellCall> {
         if !dollar || property {
             continue;
         }
+        let is_template = tokens.get(at + 1).map(|next| &next.tok) == Some(&Tok::TemplateOpen);
         let shell = match tokens.get(at + 1).map(|next| &next.tok) {
             Some(Tok::TemplateOpen) => {
                 template(&tokens, at + 1, true).map(|(text, exact, end)| (text, exact, None, end))
@@ -84,6 +87,7 @@ pub fn shell_calls(code: &str) -> Vec<ShellCall> {
             line: token.line,
             text,
             exact,
+            template: is_template,
             repeated: nesting.repeats(),
             timeout: chained_timeout(&tokens, end + 1).or(given),
         });
@@ -309,7 +313,18 @@ impl Nesting {
                 let after_dot = two_before.is_some_and(|b| tokens[b].tok == Tok::Punct('.'));
                 let callback = word(before)
                     .is_some_and(|w| TIMERS.contains(&w) || (after_dot && CALLBACKS.contains(&w)));
-                let holds = match (head, callback) {
+                // A grouping `(` that starts a callback's argument, as in `.then((() => …))`: what
+                // it holds is that argument.
+                let starts_argument =
+                    before.is_some_and(|b| matches!(tokens[b].tok, Tok::Punct('(' | ',')));
+                let in_callback = matches!(
+                    self.open.last(),
+                    Some(Bracket {
+                        holds: Holds::Callback { .. },
+                        ..
+                    })
+                );
+                let holds = match (head, callback || (starts_argument && in_callback)) {
                     (true, _) => Holds::LoopHead,
                     (_, true) => Holds::Callback { armed: false },
                     _ => Holds::Other,
