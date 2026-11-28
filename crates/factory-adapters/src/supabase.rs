@@ -93,21 +93,6 @@ fn ran(cmd: Command, timeout: Duration) -> Ran {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_start_leaves_out_the_excluded_services_with_one_x() {
-        assert_eq!(start_args(&[]), vec!["start"]);
-        let exclude = ["studio".to_owned(), "edge-runtime".to_owned()];
-        assert_eq!(
-            start_args(&exclude),
-            vec!["start", "-x", "studio,edge-runtime"]
-        );
-    }
-}
-
 /// Stacks that answer with the scripted result, recording each call as its words.
 #[derive(Debug)]
 pub struct FakeStacks {

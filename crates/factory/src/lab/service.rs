@@ -439,7 +439,11 @@ impl Lab {
         }
         let freed: Vec<Lease> = freed.into_iter().chain(ended).collect();
         if !freed.is_empty() {
-            keeper::take_back_reverses_on_thread(self.attached.borrow().shown.clone(), freed);
+            keeper::take_back_reverses_on_thread(
+                self.attached.borrow().shown.clone(),
+                freed,
+                keeper::Power::Restore,
+            );
         }
         Ok((out, lines))
     }
@@ -504,7 +508,11 @@ impl Lab {
         })?;
         if let Some(held) = dropped {
             self.notify();
-            keeper::take_back_reverses_on_thread(self.attached.borrow().shown.clone(), vec![held]);
+            keeper::take_back_reverses_on_thread(
+                self.attached.borrow().shown.clone(),
+                vec![held],
+                keeper::Power::Restore,
+            );
         }
         Ok(())
     }
@@ -744,6 +752,7 @@ fn release(lab: &Lab, p: ReleaseParams) -> Answer<Released> {
     keeper::take_back_reverses(
         lab.attached.borrow().shown.clone().as_deref(),
         &released.dropped,
+        keeper::Power::Restore,
     );
     Ok(released)
 }
@@ -886,7 +895,18 @@ fn status(lab: &Lab, seen: &[Attached]) -> Answer<Board> {
 }
 
 fn slot(lab: &Lab, p: SlotParams) -> Answer<()> {
-    lab.write(|c, _| store::set_stack_ours(c, &p.project, p.slot, p.stack_ours))
+    let how = if p.claimed {
+        store::Owned::Claimed
+    } else {
+        store::Owned::Started
+    };
+    lab.write(|c, _| {
+        if p.stack_ours {
+            store::own_stack(c, &p.project, p.slot, p.stack_id.as_deref(), how)
+        } else {
+            store::disown_stack(c, &p.project, p.slot)
+        }
+    })
 }
 
 /// What a grant needs from outside the store, gathered before its transaction.
@@ -2666,6 +2686,7 @@ impl Run {
                         keeper::take_back_reverses_on_thread(
                             self.lab.attached.borrow().shown.clone(),
                             vec![ended],
+                            keeper::Power::Restore,
                         );
                     }
                 }

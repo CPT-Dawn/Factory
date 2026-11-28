@@ -137,11 +137,21 @@ pub fn take(
                 base_name(&schema.worktree)
             ));
         }
-        if opts.stack && info.is_some() {
-            let env = lease_env(&lease, Some(p))?;
-            // One it finds running is devlab's too: else nothing ever stops it (#84).
-            stack::up(p, &ctx.worktree, slot, &env, &ctx.cfg)?;
-            stack_ours(&p.name, slot, true)?;
+        if let Some(info) = &info {
+            // One it finds running is devlab's too, --stack or not: else nothing ever stops it
+            // (#84).
+            let how = if opts.stack {
+                let env = lease_env(&lease, Some(p))?;
+                Some(stack::up(p, &ctx.worktree, slot, &env, &ctx.cfg, warn)?)
+            } else if stack::running(&info.project_id) {
+                stack::keep_down_after_reboot(&info.project_id, warn);
+                Some(stack::Up::Running)
+            } else {
+                None
+            };
+            if let Some(how) = how {
+                own_stack(&p.name, slot, &info.project_id, how)?;
+            }
         }
     }
     clear_reverses(&lease, warn);
@@ -352,14 +362,33 @@ pub fn gc() -> Result<Vec<String>, Failure> {
     client::call(&paths()?, GC, &())
 }
 
-pub fn stack_ours(project: &str, slot: u32, ours: bool) -> Result<(), Failure> {
+/// Makes the slot's stack, Supabase project `stack_id`, devlab's to stop once idle: one this
+/// lease started (`Up::Started`), or one it found running, which keeps the schema it ran.
+pub fn own_stack(project: &str, slot: u32, stack_id: &str, how: stack::Up) -> Result<(), Failure> {
     client::call(
         &paths()?,
         SLOT,
         &SlotParams {
             project: project.to_owned(),
             slot,
-            stack_ours: ours,
+            stack_ours: true,
+            stack_id: Some(stack_id.to_owned()),
+            claimed: how == stack::Up::Running,
+        },
+    )
+}
+
+/// The slot's stack stopped: it is no longer devlab's to stop.
+pub fn disown_stack(project: &str, slot: u32) -> Result<(), Failure> {
+    client::call(
+        &paths()?,
+        SLOT,
+        &SlotParams {
+            project: project.to_owned(),
+            slot,
+            stack_ours: false,
+            stack_id: None,
+            claimed: false,
         },
     )
 }

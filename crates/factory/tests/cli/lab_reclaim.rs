@@ -90,6 +90,32 @@ fn an_idle_leases_phone_goes_to_the_agent_waiting_for_one_and_its_next_exec_exit
 }
 
 #[test]
+fn a_reclaimed_phone_keeps_its_battery_for_the_lease_it_goes_to_and_a_release_restores_it() {
+    let (sandbox, world) = one_phone();
+    let (a, b) = (Owner::new(), Owner::new());
+    let (wt_a, wt_b) = (world.worktree("plain-a"), world.worktree("plain-b"));
+    let held = owned_by(&sandbox, &wt_a, &a, &["acquire", "--phone", "--quiet"]);
+    assert!(held.stdout.contains("FAKEPHONE01"), "{held:?}");
+    let taken = owned_by(&sandbox, &wt_b, &b, &["acquire", "--phone", "--wait", "60"]);
+    assert!(
+        taken.stdout.contains("ANDROID_SERIAL=FAKEPHONE01"),
+        "{taken:?}"
+    );
+
+    // The release puts the battery back before it answers; the reclaim, which may come after
+    // the phone's next grant, never does (#84).
+    assert_eq!(owned_by(&sandbox, &wt_b, &b, &["release"]).code, 0);
+
+    let restore = "dumpsys battery reset; dumpsys deviceidle unforce";
+    let restores = sandbox
+        .calls("adb")
+        .iter()
+        .filter(|c| c.last().is_some_and(|cmd| cmd == restore))
+        .count();
+    assert_eq!(restores, 1, "{:?}", sandbox.calls("adb"));
+}
+
+#[test]
 fn a_phone_whose_lease_runs_an_exec_is_not_taken_however_long_it_runs() {
     let (sandbox, world) = one_phone();
     let (a, b) = (Owner::new(), Owner::new());

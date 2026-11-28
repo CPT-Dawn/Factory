@@ -283,7 +283,7 @@ fn the_card_lists_emulators_stacks_the_queue_and_the_room_left() {
 }
 
 #[test]
-fn the_room_row_says_what_is_free_after_ci_when_there_is_a_ci_slice() {
+fn the_room_row_says_what_is_free_after_ci_when_the_daemon_counts_it() {
     let card = Lab {
         mem_after_ci_mb: Some(9 * 1024 + 512),
         ..lab(vec![])
@@ -292,10 +292,7 @@ fn the_room_row_says_what_is_free_after_ci_when_there_is_a_ci_slice() {
         .into_iter()
         .find(|r| r["label"] == "room")
         .unwrap_or(Value::Null);
-    assert_eq!(
-        room["text"],
-        "emulators 0 of 2 · 12.0 GB free · 9.5 GB free after CI"
-    );
+    assert_eq!(room["text"], "emulators 0 of 2 · 9.5 GB free after CI");
 }
 
 #[test]

@@ -18,6 +18,7 @@ use factory_core::lab::slots::{
 
 use super::context::{devlab_state, project_config};
 use super::host;
+use super::wire::SlotRow;
 use crate::output::Failure;
 
 /// Files of the worktree's supabase dir a slot's workdir doesn't link.
@@ -139,17 +140,22 @@ pub fn migration_head(worktree: &str) -> Option<String> {
         .map(|(_, name)| name)
 }
 
-/// The project id of slot `slot` of `project`'s stack: as its last worktree's supabase config
-/// names it, else as the project's name would make it.
-pub fn slot_stack_id(project: &str, slot: u32, last_worktree: Option<&str>) -> String {
-    last_worktree
-        .and_then(|wt| {
+/// The project id of the slot's stack: the one the slot kept as its stack last became devlab's
+/// (#84), else as its last worktree's supabase config names it, else as the project's name
+/// would make it.
+pub fn slot_stack_id(row: &SlotRow) -> String {
+    row.stack_id
+        .clone()
+        .or_else(|| {
+            let wt = row.last_worktree.as_deref()?;
             let p = project_config(wt).ok().flatten()?;
-            info(&p, wt, slot).ok().flatten()
+            info(&p, wt, row.slot)
+                .ok()
+                .flatten()
+                .map(|info| info.project_id)
         })
-        .map(|info| info.project_id)
         .filter(|id| !id.is_empty())
-        .unwrap_or_else(|| slot_project_id(project, slot))
+        .unwrap_or_else(|| slot_project_id(&row.project, row.slot))
 }
 
 pub fn running(project_id: &str) -> bool {
@@ -157,9 +163,13 @@ pub fn running(project_id: &str) -> bool {
 }
 
 /// Sets the stack's containers to restart never: docker's `unless-stopped` would bring a stack
-/// back after a reboot with no lease on it.
-pub fn keep_down_after_reboot(project_id: &str) {
-    Docker.no_restart(project_id);
+/// back after a reboot with no lease on it. When docker refuses, `warn` is told so.
+pub fn keep_down_after_reboot(project_id: &str, warn: &mut dyn FnMut(&str)) {
+    if !Docker.no_restart(project_id) {
+        warn(&format!(
+            "docker update --restart=no failed on stack {project_id}: a reboot may start it again with no lease"
+        ));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,13 +187,15 @@ impl Up {
     }
 }
 
-/// Starts the slot's stack unless it runs; its output goes to the slot's log.
+/// Starts the slot's stack unless it runs; its output goes to the slot's log. Either way its
+/// containers are kept down after a reboot; a warning about that goes to `warn`.
 pub fn up(
     p: &ProjectConfig,
     worktree: &str,
     slot: u32,
     env: &Env,
     cfg: &MachineConfig,
+    warn: &mut dyn FnMut(&str),
 ) -> Result<Up, Failure> {
     let Some(info) = info(p, worktree, slot)? else {
         return Err(Failure::precondition(
@@ -191,7 +203,7 @@ pub fn up(
         ));
     };
     if running(&info.project_id) {
-        keep_down_after_reboot(&info.project_id);
+        keep_down_after_reboot(&info.project_id, warn);
         return Ok(Up::Running);
     }
     let memory = host::memory(&cfg.ci_slice);
@@ -226,7 +238,7 @@ pub fn up(
             ),
         ));
     }
-    keep_down_after_reboot(&info.project_id);
+    keep_down_after_reboot(&info.project_id, warn);
     Ok(Up::Started)
 }
 
@@ -235,12 +247,16 @@ pub fn down(p: &ProjectConfig, project_id: &str, cwd: &str) -> Result<(), Failur
     stop(cli, project_id, Path::new(cwd))
 }
 
-/// Stops slot `slot` of `project`'s stack by its project id, as the idle timer does: with the
-/// CLI of the worktree it last ran when that worktree's devlab.json is still there, else the
-/// default CLI from devlab's own directory, as the CLI needs a directory that exists.
-pub fn down_slot(project: &str, slot: u32, last_worktree: Option<&str>) -> Result<(), Failure> {
-    let project_id = slot_stack_id(project, slot, last_worktree);
-    let config = last_worktree.and_then(|wt| project_config(wt).ok().flatten().map(|p| (wt, p)));
+/// Stops the slot's stack by its project id ([`slot_stack_id`]), as the idle timer does: with
+/// the CLI of the worktree it last ran when that worktree's devlab.json is still there, else
+/// (no worktree on record, or one removed) the default CLI from devlab's own directory, as the
+/// CLI needs a directory that exists.
+pub fn down_slot(row: &SlotRow) -> Result<(), Failure> {
+    let project_id = slot_stack_id(row);
+    let config = row
+        .last_worktree
+        .as_deref()
+        .and_then(|wt| project_config(wt).ok().flatten().map(|p| (wt, p)));
     match config {
         Some((worktree, p)) if Path::new(worktree).is_dir() => down(&p, &project_id, worktree),
         _ => {

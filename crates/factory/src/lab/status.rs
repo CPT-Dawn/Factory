@@ -208,7 +208,7 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
                 .reservations
                 .iter()
                 .find(|r| r.project == s.project && r.slot == s.slot);
-            let id = stack::slot_stack_id(&s.project, s.slot, s.last_worktree.as_deref());
+            let id = stack::slot_stack_id(s);
             SlotLine {
                 project: s.project.clone(),
                 slot: s.slot,

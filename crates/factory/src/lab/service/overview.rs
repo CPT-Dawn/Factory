@@ -84,7 +84,7 @@ impl Lab {
                 mem_after_ci_mb: {
                     let cfg = crate::lab::context::machine_config().unwrap_or_default();
                     let memory = crate::lab::host::memory(&cfg.ci_slice);
-                    memory.ci_headroom_mb.map(|_| memory.free_mb())
+                    Some(memory.free_mb())
                 },
             })
         })

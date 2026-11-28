@@ -89,7 +89,8 @@ pub struct Lab {
     pub max_emulators: u32,
     /// `MemAvailable`, in MB.
     pub mem_available_mb: i64,
-    /// What is free after the CI slice's headroom, in MB; none without a CI slice (#84).
+    /// What is free after the CI slice's headroom (none without a slice), in MB (#84); none from a
+    /// daemon from before it was counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_after_ci_mb: Option<i64>,
     /// Why the lab couldn't be read.
@@ -343,16 +344,16 @@ pub fn section(lab: &Lab) -> Section {
         } else {
             text("queue", format!("{} waiting", lab.queue), Tone::Busy)
         });
-        let after_ci = lab.mem_after_ci_mb.map_or_else(String::new, |mb| {
-            format!(" · {} GB free after CI", crate::lab::memory::gb(mb))
-        });
+        let free = lab.mem_after_ci_mb.map_or_else(
+            || format!("{} GB free", crate::lab::memory::gb(lab.mem_available_mb)),
+            |mb| format!("{} GB free after CI", crate::lab::memory::gb(mb)),
+        );
         rows.push(text(
             "room",
             format!(
-                "emulators {} of {} · {} GB free{after_ci}",
+                "emulators {} of {} · {free}",
                 lab.emulators.len(),
-                lab.max_emulators,
-                crate::lab::memory::gb(lab.mem_available_mb)
+                lab.max_emulators
             ),
             Tone::Muted,
         ));

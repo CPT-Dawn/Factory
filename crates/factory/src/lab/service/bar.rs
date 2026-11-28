@@ -132,7 +132,7 @@ impl Lab {
                 queue: store::waiters(c)?.len(),
                 max_emulators: cfg.max_emulators,
                 mem_available_mb: memory.available_mb,
-                mem_after_ci_mb: memory.ci_headroom_mb.map(|_| memory.free_mb()),
+                mem_after_ci_mb: Some(memory.free_mb()),
                 error: None,
                 usb_error,
             })
@@ -158,11 +158,7 @@ impl Lab {
                         let seen: BTreeMap<(String, u32), bool> = slots
                             .into_iter()
                             .map(|row| {
-                                let id = stack::slot_stack_id(
-                                    &row.project,
-                                    row.slot,
-                                    row.last_worktree.as_deref(),
-                                );
+                                let id = stack::slot_stack_id(&row);
                                 ((row.project, row.slot), stack::running(&id))
                             })
                             .collect();
@@ -222,6 +218,7 @@ fn unrecorded(project: &str, slot: u32) -> SlotRow {
         slot,
         last_worktree: None,
         stack_ours: false,
+        stack_id: None,
         idle_since: None,
         stopping: false,
     }

@@ -46,7 +46,8 @@ pub struct Lab {
     pub reservations: Vec<Reservation>,
     /// Oldest first.
     pub queue: Vec<Queued>,
-    /// What is free after the CI slice's headroom, in MB; none without a CI slice (#84).
+    /// What is free after the CI slice's headroom (none without a slice), in MB (#84); none from a
+    /// daemon from before it was counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_after_ci_mb: Option<i64>,
 }

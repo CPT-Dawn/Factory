@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
-use factory_core::lab::memory::{Memory, ci_headroom_mb};
+use factory_core::lab::memory::{Memory, ci_headroom_mb, slice_path};
 
 /// One process, from `/proc/<pid>/stat`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,20 +66,24 @@ pub fn memory(ci_slice: &str) -> Memory {
 }
 
 /// The CI slice's headroom in MB, from its cgroup v2 `memory.max` and `memory.current`; none
-/// when it doesn't exist.
+/// when it doesn't exist. systemd nests a slice under the slices its dashes name
+/// (`peekabus.slice/peekabus-ci.slice`); a slice found directly under the manager counts too.
 fn ci_headroom(ci_slice: &str) -> Option<i64> {
     if ci_slice.is_empty() {
         return None;
     }
     let uid = rustix::process::getuid().as_raw();
-    let dir = cgroup_root()
-        .join(format!("user.slice/user-{uid}.slice/user@{uid}.service"))
-        .join(ci_slice);
-    let read = |name: &str| fs::read_to_string(dir.join(name)).ok();
-    ci_headroom_mb(
-        read("memory.max").as_deref(),
-        read("memory.current").as_deref(),
-    )
+    let manager = cgroup_root().join(format!("user.slice/user-{uid}.slice/user@{uid}.service"));
+    [slice_path(ci_slice), ci_slice.to_owned()]
+        .iter()
+        .find_map(|path| {
+            let dir = manager.join(path);
+            let read = |name: &str| fs::read_to_string(dir.join(name)).ok();
+            ci_headroom_mb(
+                read("memory.max").as_deref(),
+                read("memory.current").as_deref(),
+            )
+        })
 }
 
 /// The cgroup v2 tree: `/sys/fs/cgroup`, or `DEVLAB_CGROUP_ROOT` (where tests keep fake files).

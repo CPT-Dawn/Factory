@@ -40,6 +40,29 @@ impl Memory {
     }
 }
 
+/// Where systemd keeps the slice `slice` in the cgroup tree, relative to the manager that owns
+/// it: a slice nests in the slice each dash of its name names, so `a-b-c.slice` is
+/// `a.slice/a-b.slice/a-b-c.slice` (systemd.slice(5)). A unit that isn't a slice is the
+/// manager's direct child.
+pub fn slice_path(slice: &str) -> String {
+    let Some(stem) = slice
+        .strip_suffix(".slice")
+        .filter(|s| !s.is_empty() && *s != "-")
+    else {
+        return slice.to_owned();
+    };
+    let mut parents = Vec::new();
+    let mut name = String::new();
+    for part in stem.split('-') {
+        if !name.is_empty() {
+            name.push('-');
+        }
+        name.push_str(part);
+        parents.push(format!("{name}.slice"));
+    }
+    parents.join("/")
+}
+
 /// MB as GB with one decimal: `12.3`.
 pub fn gb(mb: i64) -> String {
     #[allow(clippy::cast_precision_loss)]
@@ -93,6 +116,19 @@ mod tests {
             ci_headroom_mb: None,
         };
         assert_eq!(none.free_mb(), 12 * 1024);
+    }
+
+    #[test]
+    fn a_slice_nests_in_the_slices_its_dashes_name() {
+        for (slice, path) in [
+            ("peekabus-ci.slice", "peekabus.slice/peekabus-ci.slice"),
+            ("a-b-c.slice", "a.slice/a-b.slice/a-b-c.slice"),
+            ("ci.slice", "ci.slice"),
+            ("-.slice", "-.slice"),
+            ("runner.service", "runner.service"),
+        ] {
+            assert_eq!(slice_path(slice), path, "{slice}");
+        }
     }
 
     #[test]
