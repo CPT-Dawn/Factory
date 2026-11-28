@@ -39,6 +39,7 @@ fn cart_prompt(sandbox: &Sandbox) -> String {
         "#12",
         "factory/cart",
         &report.to_string_lossy(),
+        false,
     )
 }
 
@@ -149,6 +150,142 @@ fn the_config_file_picks_the_model_effort_and_plugins() {
     let settings: Value =
         serde_json::from_str(args[5].as_str().expect("settings text")).expect("--settings is JSON");
     assert_eq!(settings, json!({"enabledPlugins": {"a@b": false}}));
+}
+
+/// What Claude was started with, from herdr's `agent.start`.
+// cfg(test), as the harness is, so clippy lets it unwrap.
+#[cfg(test)]
+fn started_args(herdr: &FakeHerdr) -> Vec<String> {
+    herdr.requests("agent.start")[0]["args"]
+        .as_array()
+        .expect("agent.start args")
+        .iter()
+        .filter_map(|arg| arg.as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn model_and_effort_flags_beat_the_config_and_land_on_the_start_event() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    configure(&sandbox, "[lead]\nmodel = \"sonnet\"\neffort = \"high\"\n");
+
+    let out = sandbox.factory_in(
+        &repo,
+        &[
+            "lead", "spawn", "cart", "#12", "--model", "opus", "--effort", "xhigh",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(
+        started_args(&herdr)[..4],
+        ["--model", "opus", "--effort", "xhigh"]
+    );
+    let starts = events(&sandbox, "lead-start");
+    assert_eq!(starts[0]["model"], "opus", "{starts:?}");
+    assert_eq!(starts[0]["effort"], "xhigh", "{starts:?}");
+    let prompted = herdr.requests("agent.prompt");
+    assert_eq!(prompted[0]["text"], cart_prompt(&sandbox));
+}
+
+#[test]
+fn one_flag_leaves_the_other_to_the_config() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    configure(&sandbox, "[lead]\nmodel = \"sonnet\"\neffort = \"high\"\n");
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12", "--effort", "max"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(
+        started_args(&herdr)[..4],
+        ["--model", "sonnet", "--effort", "max"]
+    );
+}
+
+#[test]
+fn an_unknown_effort_is_a_usage_error_before_anything_starts() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+
+    let out = sandbox.factory_in(
+        &repo,
+        &["lead", "spawn", "cart", "#12", "--effort", "turbo"],
+    );
+
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(out.stdout, "");
+    assert!(out.stderr.contains("turbo"), "{out:?}");
+    assert_eq!(out.stderr.lines().count(), 1, "{out:?}");
+    assert_eq!(herdr.count("worktree.create"), 0);
+    assert!(events(&sandbox, "lead-start").is_empty());
+}
+
+#[test]
+fn every_effort_claude_takes_is_accepted() {
+    for effort in ["low", "medium", "high", "xhigh", "max"] {
+        let sandbox = Sandbox::new();
+        let herdr = FakeHerdr::start(&sandbox);
+        let repo = sandbox.repo();
+
+        let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12", "--effort", effort]);
+
+        assert_eq!(out.code, 0, "{effort}: {out:?}");
+        assert_eq!(started_args(&herdr)[3], effort);
+    }
+}
+
+#[test]
+fn an_attended_lead_is_not_told_it_runs_unattended() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12", "--attended"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let report = sandbox.path("state/factory/leads/repo/cart.md");
+    let text = herdr.requests("agent.prompt")[0]["text"]
+        .as_str()
+        .expect("the prompt")
+        .to_owned();
+    assert!(!text.contains("unattended"), "{text}");
+    assert!(!text.contains("decide from the spec"), "{text}");
+    assert!(
+        text.starts_with("/implement-spec #12. Integration branch: factory/cart"),
+        "{text}"
+    );
+    assert!(text.contains("run devlab release"), "{text}");
+    assert!(
+        text.ends_with(&format!("write your final report to {}.", report.display())),
+        "{text}"
+    );
+    let starts = events(&sandbox, "lead-start");
+    assert_eq!(starts[0]["attended"], "true", "{starts:?}");
+}
+
+#[test]
+fn a_lead_is_unattended_unless_told_otherwise_and_the_event_says_so() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let text = herdr.requests("agent.prompt")[0]["text"]
+        .as_str()
+        .expect("the prompt")
+        .to_owned();
+    assert!(
+        text.contains("You run unattended: wherever a skill says to ask"),
+        "{text}"
+    );
+    assert_eq!(events(&sandbox, "lead-start")[0]["attended"], "false");
 }
 
 #[test]

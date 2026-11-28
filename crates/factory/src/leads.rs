@@ -39,6 +39,7 @@ use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
+use crate::buildinfo;
 use crate::ledger::Ledger;
 use crate::output::Failure;
 use crate::paths::Paths;
@@ -340,6 +341,7 @@ impl<H: HerdrApi> Leads<H> {
             &params.spec,
             &branch,
             &report.to_string_lossy(),
+            params.attended,
         );
         let plan = spawn::Plan {
             name: &name,
@@ -369,6 +371,8 @@ impl<H: HerdrApi> Leads<H> {
             ("stalls", &stalls.to_string()),
             ("model", params.model.as_str()),
             ("effort", params.effort.as_str()),
+            ("attended", &params.attended.to_string()),
+            ("build", buildinfo::BUILD),
         ]
         .map(|(key, value)| format!("{key}={value}"));
         let event = event::Event::from_args("lead-start", &pairs, params.session.as_deref())

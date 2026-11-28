@@ -31,6 +31,12 @@ pub struct SpawnArgs {
     pub base: String,
     pub skill: String,
     pub repo: Option<PathBuf>,
+    /// Overrides `[lead] model`.
+    pub model: Option<String>,
+    /// Overrides `[lead] effort`.
+    pub effort: Option<String>,
+    /// Whether a person is at the lead's pane, so its prompt need not say it runs unattended.
+    pub attended: bool,
 }
 
 /// Starts the lead `args.slug` and says where it is. Everything that can be refused is refused
@@ -39,6 +45,8 @@ pub fn spawn(args: &SpawnArgs) -> Result<Done, Failure> {
     let name = lead_name(&args.slug).map_err(|e| Failure::usage(e.to_string()))?;
     let paths = Paths::from_env()?;
     let setup = config::lead_setup(&paths)?;
+    let model = args.model.clone().unwrap_or(setup.model);
+    let effort = args.effort.clone().unwrap_or(setup.effort);
     let dir = match &args.repo {
         Some(dir) => dir.clone(),
         None => env::current_dir().map_err(|e| {
@@ -85,9 +93,10 @@ pub fn spawn(args: &SpawnArgs) -> Result<Done, Failure> {
         base: args.base.clone(),
         skill: args.skill.clone(),
         spec: args.spec.clone(),
-        claude_args: lead::claude_args(&setup.model, &setup.effort, &setup.disable_plugins),
-        model: setup.model,
-        effort: setup.effort,
+        claude_args: lead::claude_args(&model, &effort, &setup.disable_plugins),
+        model,
+        effort,
+        attended: args.attended,
         retry_pause_ms: u64::try_from(setup.retry_pause.as_millis()).unwrap_or(u64::MAX),
         session: env::var("CLAUDE_CODE_SESSION_ID")
             .ok()

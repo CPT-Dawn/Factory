@@ -1,5 +1,7 @@
 //! `factory --help` stays short, and the command line refuses in one line.
 
+use std::process::Command;
+
 use crate::support::Sandbox;
 
 #[test]
@@ -48,4 +50,50 @@ fn a_bad_command_line_with_json_is_one_object() {
     assert_eq!(out.code, 2, "{out:?}");
     let shown: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(shown["exit"], 2);
+}
+
+/// The build's commit, from the checkout the tests were built in: its short sha, or `unknown`
+/// when there is no git to ask, as in a source tarball.
+fn checkout_sha() -> String {
+    Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map_or_else(
+            || "unknown".to_owned(),
+            |out| String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        )
+}
+
+#[test]
+fn version_names_the_build_by_its_commit() {
+    let sandbox = Sandbox::new();
+
+    let out = sandbox.factory(&["--version"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(out.stderr, "");
+    let sha = checkout_sha();
+    let prefix = format!("factory {} (", env!("CARGO_PKG_VERSION"));
+    let build = out
+        .stdout
+        .trim_end()
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_default()
+        .to_owned();
+    // A tree with edits since its commit says so, and a tree without git says unknown.
+    assert!(
+        build == sha || build == format!("{sha}-dirty"),
+        "{sha} in {:?}",
+        out.stdout
+    );
+    if sha != "unknown" {
+        assert!(
+            sha.len() == 7 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{sha}"
+        );
+    }
 }

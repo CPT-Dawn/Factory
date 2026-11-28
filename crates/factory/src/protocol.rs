@@ -398,6 +398,9 @@ pub struct SpawnParams {
     pub claude_args: Vec<String>,
     pub model: String,
     pub effort: String,
+    /// Whether a person is at the lead's pane, so its prompt does not say it runs unattended.
+    #[serde(default)]
+    pub attended: bool,
     pub retry_pause_ms: u64,
     /// The Claude Code session that asked, for the ledger.
     pub session: Option<String>,
