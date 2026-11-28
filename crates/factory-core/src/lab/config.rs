@@ -54,6 +54,9 @@ pub struct MachineConfig {
     pub notify: bool,
     /// Seconds between two probes of each free phone's readiness: two minutes (#72).
     pub readiness_check_sec: f64,
+    /// The systemd user slice the CI runners run in, whose headroom no grant may count on
+    /// (#84); empty counts none.
+    pub ci_slice: String,
 }
 
 impl Default for MachineConfig {
@@ -78,6 +81,7 @@ impl Default for MachineConfig {
             device_idle_min: 10.0,
             notify: true,
             readiness_check_sec: 120.0,
+            ci_slice: crate::lab::memory::DEFAULT_CI_SLICE.to_owned(),
         }
     }
 }
@@ -171,6 +175,7 @@ pub fn machine_config(file: &str, text: &str) -> Result<MachineConfig, ConfigErr
         ("emulatorImage", &mut cfg.emulator_image),
         ("emulatorDevice", &mut cfg.emulator_device),
         ("emulatorGpu", &mut cfg.emulator_gpu),
+        ("ciSlice", &mut cfg.ci_slice),
     ] {
         if let Some(v) = raw.get(key) {
             *at = v
@@ -205,6 +210,12 @@ pub fn machine_config(file: &str, text: &str) -> Result<MachineConfig, ConfigErr
                 "{file}: \"readinessCheckSec\" must be a number of seconds above 0"
             ))
         })?;
+    }
+    if cfg.ci_slice.contains('/') || cfg.ci_slice.starts_with('.') {
+        return Err(ConfigError(format!(
+            "{file}: \"ciSlice\" must be a slice's name, such as {}",
+            crate::lab::memory::DEFAULT_CI_SLICE
+        )));
     }
     cfg.max_slots_per_owner = cap(&raw, file, "maxSlotsPerOwner")?;
     cfg.max_devices_per_owner = cap(&raw, file, "maxDevicesPerOwner")?;
@@ -563,6 +574,26 @@ mod tests {
             machine_config("m", r#"{"stackIdleMin":-1}"#),
             Err(ConfigError(
                 "m: \"stackIdleMin\" must be a number of minutes".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn the_ci_slice_is_peekabus_ci_unless_the_config_names_another_or_none() {
+        assert_eq!(
+            machine_config("m", "{}").unwrap().ci_slice,
+            "peekabus-ci.slice"
+        );
+        let cfg = machine_config("m", r#"{"ciSlice":"ci.slice"}"#).unwrap();
+        assert_eq!(cfg.ci_slice, "ci.slice");
+        assert_eq!(
+            machine_config("m", r#"{"ciSlice":""}"#).unwrap().ci_slice,
+            ""
+        );
+        assert_eq!(
+            machine_config("m", r#"{"ciSlice":"../ci.slice"}"#),
+            Err(ConfigError(
+                "m: \"ciSlice\" must be a slice's name, such as peekabus-ci.slice".to_owned()
             ))
         );
     }

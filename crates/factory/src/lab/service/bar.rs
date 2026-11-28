@@ -31,6 +31,7 @@ impl Lab {
 
     fn bar_now(&self) -> Answer<BarLab> {
         let cfg = context::machine_config().unwrap_or_default();
+        let memory = host::memory(&cfg.ci_slice);
         let shown = self.attached.borrow().shown.clone();
         let stacks_seen = lock_ignoring_poison(&self.stacks).clone();
         let hidden = self.hidden_phones(shown.as_deref().unwrap_or_default());
@@ -130,7 +131,8 @@ impl Lab {
                 stacks,
                 queue: store::waiters(c)?.len(),
                 max_emulators: cfg.max_emulators,
-                mem_available_mb: host::mem_available_mb(),
+                mem_available_mb: memory.available_mb,
+                mem_after_ci_mb: memory.ci_headroom_mb.map(|_| memory.free_mb()),
                 error: None,
                 usb_error,
             })

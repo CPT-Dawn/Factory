@@ -2318,6 +2318,64 @@ fn a_running_stack_is_granted_below_the_memory_floor_as_it_starts_nothing() {
     assert!(out.stdout.contains("export DEVLAB_SLOT=0\n"), "{out:?}");
 }
 
+/// Writes the CI slice's cgroup files as the sandbox's user manager keeps them: it may grow to
+/// `max_mb` and uses `current_mb`.
+pub(super) fn ci_slice(sandbox: &Sandbox, max_mb: i64, current_mb: i64) {
+    let uid = rustix::process::getuid().as_raw();
+    let dir = sandbox.path(format!(
+        "cgroup/user.slice/user-{uid}.slice/user@{uid}.service/peekabus-ci.slice"
+    ));
+    fs::create_dir_all(&dir).expect("make the CI slice");
+    let mb = 1024 * 1024;
+    fs::write(dir.join("memory.max"), format!("{}\n", max_mb * mb)).expect("write memory.max");
+    fs::write(dir.join("memory.current"), format!("{}\n", current_mb * mb))
+        .expect("write memory.current");
+}
+
+#[test]
+fn a_stack_start_counts_the_memory_ci_may_still_take_and_says_so() {
+    let (sandbox, world) = lab();
+    // The CI runners may still grow by more memory than any host has.
+    ci_slice(&sandbox, 100_000_000, 0);
+    let wt = world.worktree("demo-ci");
+
+    let out = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--wait", "1"],
+    );
+
+    assert_eq!(out.code, 75, "{out:?}");
+    assert!(
+        out.stderr.contains("too little memory to start a stack ("),
+        "{out:?}"
+    );
+    assert!(
+        out.stderr
+            .contains(": too little memory after CI's headroom (100000000 MB)"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn status_shows_the_memory_free_after_ci_only_when_there_is_a_ci_slice() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-ci-status");
+    let before = status(&sandbox, &wt);
+    assert!(!before.contains("after CI"), "{before}");
+
+    ci_slice(&sandbox, 4096, 1024);
+
+    let after = status(&sandbox, &wt);
+    let line = after.lines().last().unwrap_or_default();
+    assert!(line.starts_with("memory "), "{after}");
+    assert!(line.contains(" GB free, "), "{after}");
+    assert!(
+        line.ends_with(" GB free after CI; watcher active"),
+        "{after}"
+    );
+}
+
 /// The reverses `serial` keeps, as `adb reverse --list` shows them.
 fn reverses(sandbox: &Sandbox, serial: &str) -> String {
     let out = run(sandbox.command("adb", &["-s", serial, "reverse", "--list"]));

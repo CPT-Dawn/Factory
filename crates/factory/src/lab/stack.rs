@@ -11,12 +11,13 @@ use factory_adapters::docker::{Containers, Docker};
 use factory_adapters::supabase::{Stacks, SupabaseCli};
 use factory_core::exit::Exit;
 use factory_core::lab::config::{MachineConfig, ProjectConfig};
+use factory_core::lab::memory::after_ci;
 use factory_core::lab::slots::{
     Env, StackInfo, patch_supabase_config, project_id_of, read_supabase_ports, slot_project_id,
 };
 
 use super::context::{devlab_state, project_config};
-use super::host::mem_available_mb;
+use super::host;
 use crate::output::Failure;
 
 /// Files of the worktree's supabase dir a slot's workdir doesn't link.
@@ -186,13 +187,15 @@ pub fn up(
     if running(&info.project_id) {
         return Ok(Up::Running);
     }
-    let free = mem_available_mb();
+    let memory = host::memory(&cfg.ci_slice);
+    let free = memory.free_mb();
     if free - cfg.stack_ram_mb < cfg.host_floor_mb {
         return Err(Failure::new(
             Exit::Stack,
             format!(
-                "too little memory to start a stack ({free} MB free, need {})",
-                cfg.stack_ram_mb + cfg.host_floor_mb
+                "too little memory to start a stack ({free} MB free, need {}){}",
+                cfg.stack_ram_mb + cfg.host_floor_mb,
+                after_ci(memory.headroom_mb())
             ),
         ));
     }

@@ -34,6 +34,7 @@ use factory_core::lab::emulator::{
 use factory_core::lab::events::{Asked, LeaseEnd};
 use factory_core::lab::grant::{self, Ask, Decision};
 use factory_core::lab::js_number;
+use factory_core::lab::memory::{DEFAULT_CI_SLICE, Memory};
 use factory_core::lab::queue::{DeviceNeed, QueueEntry, devices_held_by, over_device_cap};
 use factory_core::lab::ready::{Readiness, for_grant};
 use factory_core::lab::run::{End, Phase};
@@ -56,7 +57,7 @@ use super::wire::{
     Waiter,
 };
 use super::{activity, events, readiness, reservations};
-use super::{android, host};
+use super::{android, context, host};
 use crate::ledger::Ledger;
 use crate::output::Failure;
 use crate::protocol::{ErrorBody, Outcome, Request, Response, WaitLeaseParams, WaitLeaseResult};
@@ -893,7 +894,7 @@ struct Facts {
     listening: BTreeSet<u32>,
     /// Whether each slot's stack runs, by slot.
     running: Vec<bool>,
-    mem_available_mb: i64,
+    memory: Memory,
 }
 
 fn gather(lab: &Lab, p: &AcquireParams, attached: Vec<Attached>, probes_by: Instant) -> Facts {
@@ -904,13 +905,15 @@ fn gather(lab: &Lab, p: &AcquireParams, attached: Vec<Attached>, probes_by: Inst
         .project
         .as_ref()
         .is_some_and(|project| project.stack_need_mb.is_some());
-    let mem_available_mb = if p.devices.is_some() || starts_stack {
-        host::mem_available_mb()
+    let memory = if p.devices.is_some() || starts_stack {
+        let slice = context::machine_config()
+            .map_or_else(|_| DEFAULT_CI_SLICE.to_owned(), |cfg| cfg.ci_slice);
+        host::memory(&slice)
     } else {
-        0
+        Memory::default()
     };
     let facts = Facts {
-        mem_available_mb,
+        memory,
         ..gather_stack(p.project.as_ref())
     };
     // Last, so the probes are as young as can be when the grant reads them.
@@ -937,7 +940,7 @@ fn gather_stack(project: Option<&ProjectAsk>) -> Facts {
     Facts {
         listening: host::listening_ports(),
         running,
-        mem_available_mb: 0,
+        memory: Memory::default(),
     }
 }
 
@@ -1008,7 +1011,7 @@ fn plan(
     ask: &DeviceAsk,
     lease: Option<&Lease>,
     sight: Sight<'_>,
-    mem_available_mb: i64,
+    memory: Memory,
     now: std::time::Instant,
     stopping: &keeper::Stopping,
 ) -> rusqlite::Result<Result<Option<Planned>, String>> {
@@ -1083,7 +1086,8 @@ fn plan(
                 .count(),
         ),
         max_emulators: ask.max_emulators,
-        mem_available_mb,
+        mem_available_mb: memory.free_mb(),
+        ci_headroom_mb: memory.headroom_mb(),
         host_floor_mb: ask.host_floor_mb,
         emulator_ram_mb: ask.emulator_ram_mb,
         unready,
@@ -1405,7 +1409,8 @@ fn grant_board(
                 .collect()
         }),
         listening: facts.listening.clone(),
-        mem_available_mb: facts.mem_available_mb,
+        mem_available_mb: facts.memory.free_mb(),
+        ci_headroom_mb: facts.memory.headroom_mb(),
     })
 }
 
@@ -1551,7 +1556,7 @@ fn try_grant(
                     since: &since,
                     probes: &probes,
                 },
-                facts.mem_available_mb,
+                facts.memory,
                 probed_by,
                 &stopping,
             )?,

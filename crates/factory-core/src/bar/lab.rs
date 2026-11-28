@@ -84,6 +84,9 @@ pub struct Lab {
     pub max_emulators: u32,
     /// `MemAvailable`, in MB.
     pub mem_available_mb: i64,
+    /// What is free after the CI slice's headroom, in MB; none without a CI slice (#84).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_after_ci_mb: Option<i64>,
     /// Why the lab couldn't be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -335,14 +338,16 @@ pub fn section(lab: &Lab) -> Section {
         } else {
             text("queue", format!("{} waiting", lab.queue), Tone::Busy)
         });
-        #[allow(clippy::cast_precision_loss)]
-        let gb = lab.mem_available_mb as f64 / 1024.0;
+        let after_ci = lab.mem_after_ci_mb.map_or_else(String::new, |mb| {
+            format!(" · {} GB free after CI", crate::lab::memory::gb(mb))
+        });
         rows.push(text(
             "room",
             format!(
-                "emulators {} of {} · {gb:.1} GB free",
+                "emulators {} of {} · {} GB free{after_ci}",
                 lab.emulators.len(),
-                lab.max_emulators
+                lab.max_emulators,
+                crate::lab::memory::gb(lab.mem_available_mb)
             ),
             Tone::Muted,
         ));

@@ -226,7 +226,10 @@ pub struct PlanInput {
     /// The emulators still booting: their RAM is not taken yet, but it will be.
     pub emulators_booting: u32,
     pub max_emulators: u32,
+    /// The memory free for an emulator, after CI's headroom.
     pub mem_available_mb: i64,
+    /// The CI headroom already taken from `mem_available_mb`, in MB, to explain a wait.
+    pub ci_headroom_mb: i64,
     pub host_floor_mb: i64,
     pub emulator_ram_mb: i64,
     /// The free phones that are not ready, to explain a wait.
@@ -317,10 +320,11 @@ pub fn plan_devices(p: &PlanInput) -> Result<Plan, String> {
         let ram = i64::from(need + p.emulators_booting) * p.emulator_ram_mb;
         if p.mem_available_mb - ram < p.host_floor_mb {
             return Err(format!(
-                "no free phone ({}) and too little memory for an emulator ({} MB free, need {})",
+                "no free phone ({}) and too little memory for an emulator ({} MB free, need {}){}",
                 why(),
                 p.mem_available_mb,
-                ram + p.host_floor_mb
+                ram + p.host_floor_mb,
+                crate::lab::memory::after_ci(p.ci_headroom_mb)
             ));
         }
     }
@@ -720,6 +724,15 @@ mod tests {
                 ..base()
             }),
             Err("no free phone (0 phone(s) busy) and too little memory for an emulator (7000 MB free, need 8192)".into())
+        );
+        // CI's headroom was taken from the free memory before the plan: the wait says so.
+        assert_eq!(
+            plan_devices(&PlanInput {
+                mem_available_mb: 7000,
+                ci_headroom_mb: 4096,
+                ..base()
+            }),
+            Err("no free phone (0 phone(s) busy) and too little memory for an emulator (7000 MB free, need 8192): too little memory after CI's headroom (4096 MB)".into())
         );
     }
 
