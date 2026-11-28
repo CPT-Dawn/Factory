@@ -302,6 +302,15 @@ impl FakeGitHub {
         fs::write(self.dir.join("logs").join(id.to_string()), text).expect("write a job log");
     }
 
+    /// The jobs whose logs were read so far, oldest first.
+    pub fn log_reads(&self) -> Vec<u64> {
+        fs::read_to_string(self.dir.join("log-reads"))
+            .unwrap_or_default()
+            .lines()
+            .map(|id| id.parse().expect("a job id"))
+            .collect()
+    }
+
     /// Scripts `gh event listen`: `body` is shell run in place of the refusal, with the fake's
     /// dir in `$G`.
     pub fn listen(&self, body: &str) {
@@ -345,12 +354,13 @@ pr)
     if [ -f "$G/url" ]; then cat "$G/url"; else echo 'no pull requests found for branch "work"' >&2; exit 1; fi ;;
 api)
     shift
-    etag_in=''; path=''
+    etag_in=''; path=''; escapes=''
     while [ $# -gt 0 ]; do
         case "$1" in
         -H) shift; case "$1" in "If-None-Match: "*) etag_in="${{1#If-None-Match: }}" ;; esac ;;
         --hostname) shift ;;
         -i) ;;
+        --allow-escape-sequences) escapes=1 ;;
         *) path="$1" ;;
         esac
         shift
@@ -376,6 +386,10 @@ api)
     repos/acme/shop/commits/*/status\?*) file="$G/status.json" ;;
     repos/acme/shop/actions/jobs/*/logs)
         id="${{path%/logs}}"; id="${{id##*/}}"
+        echo "$id" >> "$G/log-reads"
+        if [ -z "$escapes" ] && [ -f "$G/logs/$id" ] && grep -q "$(printf '\033')" "$G/logs/$id"; then
+            echo 'fake gh: this log has escape sequences and no --allow-escape-sequences' >&2; exit 1
+        fi
         if [ -f "$G/logs/$id" ]; then cat "$G/logs/$id"; exit 0; fi
         echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
     *) echo "fake gh: no route for $path" >&2; exit 1 ;;

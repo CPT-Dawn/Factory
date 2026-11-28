@@ -564,9 +564,13 @@ pub struct WaitCiResult {
     pub skipped: usize,
     /// The failed checks' names.
     pub failed: Vec<String>,
-    /// The file holding each failure's URL and log tail; none when nothing failed.
+    /// The cancelled checks' names: the newest run of each, so none a newer run replaced.
+    #[serde(default)]
+    pub cancelled: Vec<String>,
+    /// The file holding each failed and cancelled check's URL and log tail; none when every
+    /// check passed or was skipped.
     pub file: Option<String>,
-    /// 0 when nothing failed, 10 when something did.
+    /// 0 when every check passed or was skipped, 10 when one failed or was cancelled.
     pub exit: u8,
 }
 

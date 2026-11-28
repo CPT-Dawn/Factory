@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ci::{self, CheckRun, Verdict};
+use crate::exit::Exit;
 
 /// The branches whose pull requests the factory opened.
 pub const BRANCH_PREFIX: &str = "factory/";
@@ -141,14 +142,19 @@ pub enum PullState {
 }
 
 impl PullState {
-    /// Where a head's runs stand: failing as soon as one failed, even while others run.
+    /// Where a head's runs stand, by the newest run of each check: failing as soon as one
+    /// failed, even while others run, and once all finished with one cancelled.
     pub fn of(runs: &[CheckRun]) -> PullState {
-        if runs.iter().any(|run| run.bucket() == ci::Bucket::Failed) {
+        if ci::latest(runs)
+            .iter()
+            .any(|run| run.bucket() == ci::Bucket::Failed)
+        {
             return PullState::Failing;
         }
         match ci::verdict(runs) {
             Verdict::Pending { .. } => PullState::Pending,
-            Verdict::Finished(_) => PullState::Passing,
+            Verdict::Finished(tally) if tally.exit() == Exit::Ok => PullState::Passing,
+            Verdict::Finished(_) => PullState::Failing,
         }
     }
 

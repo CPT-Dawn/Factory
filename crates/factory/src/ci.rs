@@ -56,7 +56,8 @@ fn cwd() -> Result<String, Failure> {
     Ok(cwd.to_string_lossy().into_owned())
 }
 
-/// `<pr>: <n> passed, <n> failed[, <n> skipped][; logs in <file>; failed: <names>]`, with as
+/// `<pr>: <n> passed, <n> failed[, <n> cancelled][, <n> skipped][; logs in <file>][; failed:
+/// <names>]`, with as
 /// many names as fit the line and a count of the rest, which the file and `--json` list. Only a
 /// state dir so deep that its path alone fills the line gets cut.
 pub fn line(answer: &WaitCiResult) -> String {
@@ -66,6 +67,9 @@ pub fn line(answer: &WaitCiResult) -> String {
         answer.passed,
         answer.failed.len()
     );
+    if !answer.cancelled.is_empty() {
+        line.push_str(&format!(", {} cancelled", answer.cancelled.len()));
+    }
     if answer.skipped > 0 {
         line.push_str(&format!(", {} skipped", answer.skipped));
     }
