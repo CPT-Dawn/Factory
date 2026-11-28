@@ -336,6 +336,123 @@ fn wait_times_out_with_124_never_0() {
     assert_eq!(herdr.count("agent.list"), 2, "{:?}", herdr.methods());
 }
 
+/// Starts `wait lead --any` on `slugs`, and returns once the daemon holds a wait on each.
+// cfg(test), as the harness is, so clippy lets it unwrap.
+#[cfg(test)]
+fn waiting_any(sandbox: &Sandbox, herdr: &FakeHerdr, slugs: &[(&str, &str)]) -> Child {
+    let mut all = vec!["wait", "lead", "--any"];
+    all.extend(slugs.iter().map(|(slug, _)| *slug));
+    let child = spawn(sandbox.factory_command(&all));
+    for (slug, pane) in slugs {
+        herdr.await_watch(pane);
+        let lead = format!("lead-{slug}");
+        assert!(
+            poll_until(|| waited_on(sandbox, "lead", &lead)),
+            "the daemon never held the wait on {lead}"
+        );
+    }
+    child
+}
+
+#[test]
+fn wait_any_answers_with_the_first_lead_that_needs_attention() {
+    let sandbox = Sandbox::new();
+    let herdr = shop(
+        &sandbox,
+        &[
+            ("lead-cart", "w1:p1", "working"),
+            ("lead-pay", "w2:p1", "working"),
+        ],
+    );
+    herdr.screen("w2:p1", "Run cargo publish?\n1. Yes  2. No\n");
+    let child = waiting_any(&sandbox, &herdr, &[("cart", "w1:p1"), ("pay", "w2:p1")]);
+
+    herdr.status("w2:p1", "blocked");
+    let out = finish(child);
+
+    assert_eq!(out.code, 10, "{out:?}");
+    assert_eq!(
+        out.stdout_lines(),
+        vec!["lead-pay blocked", "Run cargo publish?", "1. Yes  2. No"]
+    );
+    assert_eq!(out.stderr, "");
+    // The other waits end with the CLI: none is left held.
+    assert!(
+        poll_until(|| !waited_on(&sandbox, "lead", "lead-cart")),
+        "the wait on lead-cart outlived the CLI"
+    );
+}
+
+#[test]
+fn wait_any_answers_0_when_the_first_lead_to_settle_finished() {
+    let sandbox = Sandbox::new();
+    let herdr = shop(
+        &sandbox,
+        &[
+            ("lead-cart", "w1:p1", "working"),
+            ("lead-pay", "w2:p1", "working"),
+        ],
+    );
+    let child = waiting_any(&sandbox, &herdr, &[("cart", "w1:p1"), ("pay", "w2:p1")]);
+
+    let shipped = report(&sandbox, "cart");
+    herdr.status("w1:p1", "done");
+    let out = finish(child);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(out.stdout, format!("lead-cart finished: {shipped}\n"));
+}
+
+#[test]
+fn wait_any_times_out_with_124_naming_every_lead() {
+    let sandbox = Sandbox::new();
+    let _herdr = shop(
+        &sandbox,
+        &[
+            ("lead-cart", "w1:p1", "working"),
+            ("lead-pay", "w2:p1", "working"),
+        ],
+    );
+
+    let out = sandbox.factory(&["wait", "lead", "--any", "cart", "pay", "--timeout", "1s"]);
+
+    assert_eq!(out.code, 124, "{out:?}");
+    assert_eq!(out.stdout, "");
+    assert_eq!(
+        out.stderr,
+        "factory: none of lead-cart, lead-pay settled within 1s; \
+         wait again, or see factory lead list\n"
+    );
+}
+
+#[test]
+fn wait_any_on_a_lead_herdr_lacks_is_refused_at_once() {
+    let sandbox = Sandbox::new();
+    let _herdr = shop(&sandbox, &[("lead-cart", "w1:p1", "working")]);
+
+    let out = sandbox.factory(&["wait", "lead", "--any", "cart", "pay"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(
+        out.stderr,
+        "factory: herdr has no lead named lead-pay; see factory lead list\n"
+    );
+}
+
+#[test]
+fn several_leads_without_any_is_a_usage_error() {
+    let sandbox = Sandbox::new();
+
+    let out = sandbox.factory(&["wait", "lead", "cart", "pay"]);
+
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(out.stdout, "");
+    assert_eq!(
+        out.stderr,
+        "factory: factory wait lead takes one lead; wait on several with --any\n"
+    );
+}
+
 #[test]
 fn a_timeout_that_is_not_a_duration_is_a_usage_error() {
     let sandbox = Sandbox::new();

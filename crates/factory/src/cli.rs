@@ -196,8 +196,12 @@ pub enum MonitorCommand {
 pub enum WaitCommand {
     /// Until the lead finishes (exit 0), blocks, asks or dies (exit 10)
     Lead {
-        /// The lead's slug, or lead-<slug>
-        lead: String,
+        /// The lead's slug, or lead-<slug>; several with --any
+        #[arg(required = true, value_name = "LEAD")]
+        leads: Vec<String>,
+        /// Until the first of the leads finishes, blocks, asks or dies, with its line
+        #[arg(long, conflicts_with = "notify")]
+        any: bool,
         /// Give up after this long with exit 124: seconds, or 90s, 9m or 1h [default: 9m,
         /// or 2h with --notify]
         #[arg(long, value_parser = duration)]
