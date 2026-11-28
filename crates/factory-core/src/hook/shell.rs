@@ -4,6 +4,8 @@
 //! backslashes, and leaves expansions alone. That is enough for a hook that must tell
 //! `npm install` from `git commit -m "no npm here"`.
 
+use std::collections::BTreeMap;
+
 /// One simple command: its words, with quotes and escapes resolved.
 pub type Words = Vec<String>;
 
@@ -26,10 +28,48 @@ pub enum Part {
 /// What a word holds in place of a command substitution's output, which the line does not say.
 const SUBSTITUTION: &str = "$(…)";
 
+/// A command line read into its parts, with what the quoting of each word said.
+pub struct Line {
+    pub parts: Vec<Part>,
+    /// The marks of each word of a [`Part::Command`] that has any, by (part, word).
+    marks: BTreeMap<(usize, usize), Marks>,
+}
+
+/// What quoting says about a word, which its text after quote removal no longer does.
+#[derive(Clone, Copy, Default)]
+struct Marks {
+    /// It holds a `$` that quotes keep from the shell, such as the anchor in `rg 'foo$'`.
+    quoted_dollar: bool,
+    /// The shell expands part of it: a variable, a command substitution or a glob outside quotes.
+    expands: bool,
+}
+
+impl Line {
+    /// Whether word `word` of the command at `part` holds a `$` that quotes keep literal: any
+    /// in single quotes, and one in double quotes that starts no expansion. One escaped with a
+    /// backslash is not counted.
+    pub fn quoted_dollar(&self, part: usize, word: usize) -> bool {
+        self.marks
+            .get(&(part, word))
+            .is_some_and(|m| m.quoted_dollar)
+    }
+
+    /// Whether the shell expands part of that word, so it is only known when it runs: a `$name`,
+    /// `${…}` or `$(…)` outside single quotes, a backquote, or a `*`, `?` or `[` outside quotes.
+    pub fn expands(&self, part: usize, word: usize) -> bool {
+        self.marks.get(&(part, word)).is_some_and(|m| m.expands)
+    }
+}
+
 /// The simple commands of `text`, in order, with where the children they run in start and end.
 /// A command substitution and a subshell hold commands of their own, and a here-document's body
 /// is text, not commands.
 pub fn parts(text: &str) -> Vec<Part> {
+    line(text).parts
+}
+
+/// [`parts`], with which words hold a quoted `$`.
+pub fn line(text: &str) -> Line {
     let chars: Vec<char> = text.chars().collect();
     let mut out = Lexer::default();
     let mut in_backticks = false;
@@ -55,6 +95,9 @@ pub fn parts(text: &str) -> Vec<Part> {
             '\'' => {
                 out.open_word();
                 while at < chars.len() && chars[at] != '\'' {
+                    if chars[at] == '$' && !out.word.ends_with('\\') {
+                        out.word_marks.quoted_dollar = true;
+                    }
                     out.word.push(chars[at]);
                     at += 1;
                 }
@@ -66,6 +109,16 @@ pub fn parts(text: &str) -> Vec<Part> {
                     let c = chars[at];
                     at += 1;
                     if c != '\\' {
+                        match c {
+                            '$' if starts_expansion(chars.get(at)) => {
+                                out.word_marks.expands = true;
+                            }
+                            '$' if !out.word.ends_with('\\') => {
+                                out.word_marks.quoted_dollar = true;
+                            }
+                            '`' => out.word_marks.expands = true,
+                            _ => {}
+                        }
                         out.word.push(c);
                         continue;
                     }
@@ -152,11 +205,28 @@ pub fn parts(text: &str) -> Vec<Part> {
                 at += 1;
                 out.substitute();
             }
-            c => out.push(c),
+            c => {
+                let expands = match c {
+                    '*' | '?' | '[' => true,
+                    '$' => starts_expansion(chars.get(at)),
+                    _ => false,
+                };
+                out.push(c);
+                out.word_marks.expands |= expands;
+            }
         }
     }
     out.end_command();
-    out.parts
+    Line {
+        parts: out.parts,
+        marks: out.marks,
+    }
+}
+
+/// Whether a `$` before `next` starts an expansion: a name, `${`, `$(`, a
+/// positional or a special parameter.
+fn starts_expansion(next: Option<&char>) -> bool {
+    next.is_some_and(|c| c.is_alphanumeric() || "_{(?!#@*-$".contains(*c))
 }
 
 /// Where a here-document's body that starts at `from` ends: after its delimiter line.
@@ -192,7 +262,19 @@ struct Lexer {
     joined: bool,
     /// What each open `(`, `$(` or backquote interrupted: for a command substitution, the
     /// command it is part of, which goes on once it closes; none for a subshell.
-    open: Vec<Option<(Words, String, bool)>>,
+    open: Vec<Option<Interrupted>>,
+    /// The marks of the word being read, of each word of the command so far, and of the line.
+    word_marks: Marks,
+    words_marks: Vec<Marks>,
+    marks: BTreeMap<(usize, usize), Marks>,
+}
+
+/// The command a command substitution interrupted, with the word it is part of.
+struct Interrupted {
+    words: Words,
+    words_marks: Vec<Marks>,
+    word: String,
+    word_marks: Marks,
 }
 
 impl Lexer {
@@ -213,12 +295,19 @@ impl Lexer {
     fn end_word(&mut self) {
         if self.in_word {
             self.words.push(std::mem::take(&mut self.word));
+            self.words_marks.push(std::mem::take(&mut self.word_marks));
             self.in_word = false;
         }
     }
 
     fn end_command(&mut self) {
         self.end_word();
+        let part = self.parts.len();
+        for (word, marks) in self.words_marks.drain(..).enumerate() {
+            if marks.quoted_dollar || marks.expands {
+                self.marks.insert((part, word), marks);
+            }
+        }
         if !self.words.is_empty() {
             self.parts
                 .push(Part::Command(std::mem::take(&mut self.words)));
@@ -228,10 +317,14 @@ impl Lexer {
     /// Starts a command substitution: its commands run in a child, before the command it is
     /// part of, which goes on after it.
     fn substitute(&mut self) {
-        let words = std::mem::take(&mut self.words);
-        let word = std::mem::take(&mut self.word);
-        let in_word = std::mem::take(&mut self.in_word);
-        self.open.push(Some((words, word, in_word)));
+        let interrupted = Interrupted {
+            words: std::mem::take(&mut self.words),
+            words_marks: std::mem::take(&mut self.words_marks),
+            word: std::mem::take(&mut self.word),
+            word_marks: std::mem::take(&mut self.word_marks),
+        };
+        self.in_word = false;
+        self.open.push(Some(interrupted));
         self.mark(Part::Enter);
     }
 
@@ -239,9 +332,11 @@ impl Lexer {
     /// of a word, which stands for it as [`SUBSTITUTION`].
     fn close(&mut self) {
         self.mark(Part::Leave);
-        if let Some(Some((words, word, _))) = self.open.pop() {
-            (self.words, self.word) = (words, word);
+        if let Some(Some(was)) = self.open.pop() {
+            (self.words, self.words_marks) = (was.words, was.words_marks);
+            (self.word, self.word_marks) = (was.word, was.word_marks);
             self.push_str(SUBSTITUTION);
+            self.word_marks.expands = true;
         }
     }
 
