@@ -41,6 +41,7 @@ use factory_core::tier::{self, Tier};
 use factory_core::timestamp::Timestamp;
 use serde_json::{Value, json};
 
+use crate::buildinfo;
 use crate::client;
 use crate::clock;
 use crate::config::{self, Backend, Cli, ReviewSetup, Step};
@@ -147,6 +148,7 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         stream: &run.stream,
         findings: &run.findings,
         from: &run.from,
+        build: buildinfo::BUILD,
         result: match (&run.reading, &failed) {
             (Some(reading), None) => Ok(reading),
             _ => Err(failed

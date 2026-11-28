@@ -39,6 +39,7 @@ fn cart_prompt(sandbox: &Sandbox) -> String {
         "#12",
         "factory/cart",
         &report.to_string_lossy(),
+        false,
     )
 }
 
@@ -151,6 +152,142 @@ fn the_config_file_picks_the_model_effort_and_plugins() {
     assert_eq!(settings, json!({"enabledPlugins": {"a@b": false}}));
 }
 
+/// What Claude was started with, from herdr's `agent.start`.
+// cfg(test), as the harness is, so clippy lets it unwrap.
+#[cfg(test)]
+fn started_args(herdr: &FakeHerdr) -> Vec<String> {
+    herdr.requests("agent.start")[0]["args"]
+        .as_array()
+        .expect("agent.start args")
+        .iter()
+        .filter_map(|arg| arg.as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn model_and_effort_flags_beat_the_config_and_land_on_the_start_event() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    configure(&sandbox, "[lead]\nmodel = \"sonnet\"\neffort = \"high\"\n");
+
+    let out = sandbox.factory_in(
+        &repo,
+        &[
+            "lead", "spawn", "cart", "#12", "--model", "opus", "--effort", "xhigh",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(
+        started_args(&herdr)[..4],
+        ["--model", "opus", "--effort", "xhigh"]
+    );
+    let starts = events(&sandbox, "lead-start");
+    assert_eq!(starts[0]["model"], "opus", "{starts:?}");
+    assert_eq!(starts[0]["effort"], "xhigh", "{starts:?}");
+    let prompted = herdr.requests("agent.prompt");
+    assert_eq!(prompted[0]["text"], cart_prompt(&sandbox));
+}
+
+#[test]
+fn one_flag_leaves_the_other_to_the_config() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    configure(&sandbox, "[lead]\nmodel = \"sonnet\"\neffort = \"high\"\n");
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12", "--effort", "max"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(
+        started_args(&herdr)[..4],
+        ["--model", "sonnet", "--effort", "max"]
+    );
+}
+
+#[test]
+fn an_unknown_effort_is_a_usage_error_before_anything_starts() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+
+    let out = sandbox.factory_in(
+        &repo,
+        &["lead", "spawn", "cart", "#12", "--effort", "turbo"],
+    );
+
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(out.stdout, "");
+    assert!(out.stderr.contains("turbo"), "{out:?}");
+    assert_eq!(out.stderr.lines().count(), 1, "{out:?}");
+    assert_eq!(herdr.count("worktree.create"), 0);
+    assert!(events(&sandbox, "lead-start").is_empty());
+}
+
+#[test]
+fn every_effort_claude_takes_is_accepted() {
+    for effort in ["low", "medium", "high", "xhigh", "max"] {
+        let sandbox = Sandbox::new();
+        let herdr = FakeHerdr::start(&sandbox);
+        let repo = sandbox.repo();
+
+        let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12", "--effort", effort]);
+
+        assert_eq!(out.code, 0, "{effort}: {out:?}");
+        assert_eq!(started_args(&herdr)[3], effort);
+    }
+}
+
+#[test]
+fn an_attended_lead_is_not_told_it_runs_unattended() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12", "--attended"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let report = sandbox.path("state/factory/leads/repo/cart.md");
+    let text = herdr.requests("agent.prompt")[0]["text"]
+        .as_str()
+        .expect("the prompt")
+        .to_owned();
+    assert!(!text.contains("unattended"), "{text}");
+    assert!(!text.contains("decide from the spec"), "{text}");
+    assert!(
+        text.starts_with("/implement-spec #12. Integration branch: factory/cart"),
+        "{text}"
+    );
+    assert!(text.contains("run devlab release"), "{text}");
+    assert!(
+        text.ends_with(&format!("write your final report to {}.", report.display())),
+        "{text}"
+    );
+    let starts = events(&sandbox, "lead-start");
+    assert_eq!(starts[0]["attended"], "true", "{starts:?}");
+}
+
+#[test]
+fn a_lead_is_unattended_unless_told_otherwise_and_the_event_says_so() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let text = herdr.requests("agent.prompt")[0]["text"]
+        .as_str()
+        .expect("the prompt")
+        .to_owned();
+    assert!(
+        text.contains("You run unattended: wherever a skill says to ask"),
+        "{text}"
+    );
+    assert_eq!(events(&sandbox, "lead-start")[0]["attended"], "false");
+}
+
 #[test]
 fn a_lead_start_event_lands_in_the_ledger() {
     let sandbox = Sandbox::new();
@@ -177,6 +314,13 @@ fn a_lead_start_event_lands_in_the_ledger() {
         assert_eq!(start[field], value, "{field} in {start}");
     }
     assert_eq!(start["stalls"], 0, "{start}");
+    // The build names itself the way `--version` does: a short sha, maybe dirty, or unknown.
+    let build = start["build"].as_str().expect("build in the start event");
+    let sha = build.strip_suffix("-dirty").unwrap_or(build);
+    assert!(
+        sha == "unknown" || (sha.len() == 7 && sha.bytes().all(|b| b.is_ascii_hexdigit())),
+        "{start}"
+    );
     assert!(start.get("reason").is_none(), "{start}");
 }
 
@@ -421,6 +565,20 @@ fn a_pane_still_busy_with_its_shell_is_retried_until_it_takes_the_agent() {
     assert_eq!(herdr.count("agent.start"), 4);
     assert_eq!(herdr.count("agent.send_keys"), 0);
     assert_eq!(herdr.count("agent.prompt"), 1);
+    // Three asks were refused, so three retries, and the event keeps the count.
+    assert_eq!(events(&sandbox, "lead-start")[0]["busy_retries"], 3);
+}
+
+#[test]
+fn a_pane_that_is_never_busy_records_no_retries() {
+    let sandbox = Sandbox::new();
+    let _herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(events(&sandbox, "lead-start")[0]["busy_retries"], 0);
 }
 
 #[test]
@@ -444,9 +602,16 @@ fn a_pane_that_stays_busy_fails_the_spawn_naming_herdrs_code() {
         out.stderr.contains("could not start Claude") && out.stderr.contains("agent_pane_busy"),
         "{out:?}"
     );
+    // herdr's own words for the last refusal ride along with its code.
+    assert!(out.stderr.contains("is not an available shell"), "{out:?}");
     assert!(herdr.count("agent.start") > 4);
     assert_eq!(herdr.count("agent.read"), 0);
     assert_eq!(herdr.count("agent.prompt"), 0);
+    // The failed start still says how long it pushed: one retry per refusal but the last.
+    let starts = events(&sandbox, "lead-start");
+    assert_eq!(starts[0]["outcome"], "error", "{starts:?}");
+    let retries = starts[0]["busy_retries"].as_u64().expect("busy_retries");
+    assert_eq!(retries, herdr.count("agent.start") as u64 - 1, "{starts:?}");
 }
 
 #[test]
@@ -454,7 +619,11 @@ fn a_start_that_fails_off_the_trust_dialog_is_reported() {
     let sandbox = Sandbox::new();
     let herdr = FakeHerdr::start(&sandbox);
     let repo = sandbox.repo();
-    herdr.refuse("agent.start", "timeout", "agent did not become ready");
+    herdr.refuse(
+        "agent.start",
+        "agent_not_ready",
+        "agent lead-cart is blocked during startup",
+    );
     herdr.agent(Some("lead-cart"), "w1:p1", "idle");
     herdr.screen("w1:p1", "something else entirely\n");
 
@@ -468,10 +637,137 @@ fn a_start_that_fails_off_the_trust_dialog_is_reported() {
         ),
         "{out:?}"
     );
+    // herdr's own words ride along, in the same one line.
+    assert!(
+        out.stderr.contains("agent_not_ready") && out.stderr.contains("blocked during startup"),
+        "{out:?}"
+    );
+    assert_eq!(out.stderr.lines().count(), 1, "{out:?}");
     assert_eq!(herdr.count("agent.prompt"), 0);
     let starts = events(&sandbox, "lead-start");
     assert_eq!(starts.len(), 1, "{starts:?}");
     assert_eq!(starts[0]["outcome"], "error");
+}
+
+/// A start that herdr refuses for any other reason is not a stop at startup: the line carries
+/// herdr's own error, and nothing says the lead is stuck on a dialog.
+#[test]
+fn a_start_herdr_refuses_for_another_reason_carries_herdrs_error() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    herdr.refuse(
+        "agent.start",
+        "agent_name_taken",
+        "an agent named lead-cart already exists",
+    );
+    herdr.screen("w1:p1", "something else entirely\n");
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr.starts_with("factory: lead.sh: lead-cart could not start Claude: herdr refused (agent_name_taken): an agent named lead-cart already exists"),
+        "{out:?}"
+    );
+    assert!(!out.stderr.contains("stuck at startup"), "{out:?}");
+    assert_eq!(out.stderr.lines().count(), 1, "{out:?}");
+    assert!(out.stderr.len() < 400, "{out:?}");
+    assert_eq!(herdr.count("agent.prompt"), 0);
+    let starts = events(&sandbox, "lead-start");
+    assert_eq!(starts[0]["outcome"], "error", "{starts:?}");
+    assert!(
+        starts[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("agent_name_taken")),
+        "{starts:?}"
+    );
+}
+
+#[test]
+fn a_trust_dialog_that_cannot_be_answered_carries_herdrs_error() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    herdr.blocks_at_startup();
+    herdr.screen(
+        "w1:p1",
+        "Do you trust /worktrees/repo/cart?\n  1. Yes, I trust this folder\n  2. No\n",
+    );
+    herdr.refuse("agent.send_keys", "pane_closed", "pane w1:p1 was closed");
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(
+        out.stderr
+            .contains("did not come up after the trust dialog")
+            && out.stderr.contains("pane_closed")
+            && out.stderr.contains("pane w1:p1 was closed"),
+        "{out:?}"
+    );
+    assert_eq!(out.stderr.lines().count(), 1, "{out:?}");
+}
+
+#[test]
+fn a_prompt_herdr_refuses_carries_herdrs_error() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    herdr.refuse("agent.prompt", "agent_gone", "agent lead-cart has exited");
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(
+        out.stderr.contains("did not start working")
+            && out.stderr.contains("agent_gone")
+            && out.stderr.contains("agent lead-cart has exited"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_prompt_that_stalls_to_the_end_carries_herdrs_last_words() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    configure(&sandbox, "[lead]\nretry_pause = 0\n");
+    for _ in 0..8 {
+        herdr.refuse(
+            "agent.prompt",
+            "agent_prompt_stalled",
+            "the input box never submitted",
+        );
+    }
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(
+        out.stderr.contains("never started working")
+            && out.stderr.contains("agent_prompt_stalled")
+            && out.stderr.contains("the input box never submitted"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_long_multi_line_herdr_error_still_fits_one_line() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    let message = format!("first line\nsecond line {}", "x".repeat(600));
+    herdr.refuse("agent.start", "agent_name_taken", &message);
+    herdr.screen("w1:p1", "something else entirely\n");
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(out.stderr.lines().count(), 1, "{out:?}");
+    assert!(out.stderr.contains("first line second line xxx"), "{out:?}");
+    assert!(out.stderr.chars().count() < 400, "{out:?}");
 }
 
 #[test]

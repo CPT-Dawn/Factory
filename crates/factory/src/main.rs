@@ -2,6 +2,7 @@
 
 mod agy;
 mod bar;
+mod buildinfo;
 mod ci;
 mod claude;
 mod cli;
@@ -95,6 +96,9 @@ fn run(command: Command, json: bool) -> ExitCode {
                     base,
                     skill,
                     repo,
+                    model,
+                    effort,
+                    attended,
                 },
         } => lead::spawn(&lead::SpawnArgs {
             slug,
@@ -102,6 +106,9 @@ fn run(command: Command, json: bool) -> ExitCode {
             base,
             skill,
             repo,
+            model,
+            effort,
+            attended,
         })
         // lead.sh's failures said so, and factory-stats' classifier still matches the text.
         .map_err(|failure| Failure::new(failure.exit, format!("lead.sh: {}", failure.message))),

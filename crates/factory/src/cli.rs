@@ -5,15 +5,17 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use clap::builder::{NonEmptyStringValueParser, PossibleValuesParser};
 use clap::error::ErrorKind;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use factory_core::exit::Exit;
+use factory_core::lead::EFFORTS;
 
 use crate::output::{self, Failure};
 
 /// The agent software factory: one daemon does the waiting, polling and bookkeeping.
 #[derive(Parser, Debug)]
-#[command(name = "factory", version, disable_help_subcommand = true)]
+#[command(name = "factory", version = crate::buildinfo::VERSION, disable_help_subcommand = true)]
 pub struct Cli {
     /// Print one JSON object instead of one line
     #[arg(long, global = true)]
@@ -164,6 +166,15 @@ pub enum LeadCommand {
         /// The repository to work in (default: the current directory's)
         #[arg(long, value_name = "PATH")]
         repo: Option<PathBuf>,
+        /// The model Claude starts with (default: [lead] model)
+        #[arg(long, value_name = "MODEL", value_parser = NonEmptyStringValueParser::new())]
+        model: Option<String>,
+        /// The effort Claude starts with: low, medium, high, xhigh or max (default: [lead] effort)
+        #[arg(long, value_name = "EFFORT", value_parser = PossibleValuesParser::new(EFFORTS))]
+        effort: Option<String>,
+        /// A person is at this lead's pane: its prompt drops "You run unattended"
+        #[arg(long)]
+        attended: bool,
     },
     /// One line per lead: working, waiting (on what), blocked, asking, finished or dead
     List,
