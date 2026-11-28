@@ -124,6 +124,68 @@ fn pre_tool_denies_a_repl_script_that_uses_process() {
     );
 }
 
+fn repl(code: &str) -> Value {
+    json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "REPL",
+        "tool_input": {"code": code, "description": "x"},
+    })
+}
+
+#[test]
+fn pre_tool_adds_the_verify_hint_to_a_push_with_a_short_timeout() {
+    let sandbox = Sandbox::new();
+
+    let out = pre_tool(
+        &sandbox,
+        &repl("await $`git push -u origin HEAD`.timeout(300000)"),
+    );
+
+    let said = answer(&out);
+    let verdict = &said["hookSpecificOutput"];
+    assert_eq!(verdict["hookEventName"], "PreToolUse");
+    assert_eq!(verdict.get("permissionDecision"), None, "{said}");
+    let context = verdict["additionalContext"].as_str().unwrap();
+    assert!(
+        context.contains("pre-push hook runs verify (212-290 s)")
+            && context.contains(".timeout(590000)"),
+        "{context}"
+    );
+}
+
+#[test]
+fn pre_tool_lets_a_push_given_its_time_through_in_silence() {
+    let sandbox = Sandbox::new();
+
+    let out = pre_tool(&sandbox, &repl("await $`git push`.timeout(590000)"));
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "", "")
+    );
+}
+
+#[test]
+fn pre_tool_denies_a_repl_wait_loop_and_a_bash_burner() {
+    let sandbox = Sandbox::new();
+    for (call, fix) in [
+        (
+            repl("for (const pr of prs) await $`factory wait ci ${pr}`;"),
+            "factory wait lead --any",
+        ),
+        (bash("while :; do :; done"), "CPUQuota=200%"),
+    ] {
+        let out = pre_tool(&sandbox, &call);
+
+        let said = answer(&out);
+        assert_eq!(said["hookSpecificOutput"]["permissionDecision"], "deny");
+        let reason = said["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap();
+        assert!(reason.contains(fix), "{reason}");
+    }
+}
+
 fn post_tool(sandbox: &Sandbox, stdout: &str) -> Run {
     let call = json!({
         "hook_event_name": "PostToolUse",

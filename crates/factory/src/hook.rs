@@ -49,6 +49,10 @@ fn answer(command: &HookCommand) -> Result<Option<Value>, Failure> {
         HookCommand::PreTool => match hook::pre_tool(&input, escape_set()) {
             PreTool::Allow => None,
             PreTool::Block(reason) => Some(deny(&reason)),
+            PreTool::Hint(line) => Some(json!({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": line,
+            }})),
             PreTool::Check(actions) => {
                 // A config that can't be read refuses the call: a leak must not slip by on a typo.
                 match leak(&input, &actions) {

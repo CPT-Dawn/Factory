@@ -134,7 +134,7 @@ fn parse_pairs<S: AsRef<str>>(pairs: &[S]) -> Result<Fields, EventError> {
 /// (`round`, `duration_s`, `tokens` and the finding counts) and the other counts its lines
 /// have always held as numbers. Every other field keeps the text it was given, so a sha of
 /// digits like `0475004` stays a sha.
-pub const NUMERIC_FIELDS: [&str; 32] = [
+pub const NUMERIC_FIELDS: [&str; 33] = [
     "round",
     "duration_s",
     "tokens",
@@ -147,6 +147,7 @@ pub const NUMERIC_FIELDS: [&str; 32] = [
     "still_present",
     "bundle_bytes",
     "stalls",
+    "busy_retries",
     "blocking",
     "advisory",
     "question",

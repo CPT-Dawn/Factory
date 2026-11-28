@@ -150,6 +150,7 @@ fn the_lead_prompt_is_the_one_lead_sh_sent() {
         "#12",
         "factory/cart",
         "$HOME/leads/Shop/cart.md",
+        false,
     );
 
     assert_eq!(
@@ -159,6 +160,24 @@ fn the_lead_prompt_is_the_one_lead_sh_sent() {
          the spec and tickets yourself and list each such decision in your report. When everything \
          is finished, run devlab release (a finished lead must not hold a stack slot or a phone), \
          then write your final report to $HOME/leads/Shop/cart.md."
+    );
+}
+
+#[test]
+fn an_attended_lead_prompt_leaves_out_only_the_unattended_sentences() {
+    let text = prompt(
+        "implement-spec",
+        "#12",
+        "factory/cart",
+        "$HOME/leads/Shop/cart.md",
+        true,
+    );
+
+    assert_eq!(
+        text,
+        "/implement-spec #12. Integration branch: factory/cart, already checked out here. \
+         When everything is finished, run devlab release (a finished lead must not hold a stack \
+         slot or a phone), then write your final report to $HOME/leads/Shop/cart.md."
     );
 }
 

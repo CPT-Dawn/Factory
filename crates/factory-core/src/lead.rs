@@ -196,17 +196,24 @@ pub fn branch(slug: &str) -> String {
     format!("factory/{slug}")
 }
 
-/// What a freshly started lead is told: run `skill` on `spec`, unattended, and leave the final
-/// report at `report`.
-pub fn prompt(skill: &str, spec: &str, branch: &str, report: &str) -> String {
+/// What a freshly started lead is told: run `skill` on `spec`, unattended unless `attended`
+/// says a person is at its pane, and leave the final report at `report`.
+pub fn prompt(skill: &str, spec: &str, branch: &str, report: &str, attended: bool) -> String {
+    let unattended = if attended {
+        ""
+    } else {
+        "You run unattended: wherever a skill says to ask or confirm with the user, decide from \
+         the spec and tickets yourself and list each such decision in your report. "
+    };
     format!(
         "/{skill} {spec}. Integration branch: {branch}, already checked out here. \
-         You run unattended: wherever a skill says to ask or confirm with the user, decide from \
-         the spec and tickets yourself and list each such decision in your report. When everything \
-         is finished, run devlab release (a finished lead must not hold a stack slot or a phone), \
-         then write your final report to {report}."
+         {unattended}When everything is finished, run devlab release (a finished lead must not \
+         hold a stack slot or a phone), then write your final report to {report}."
     )
 }
+
+/// The efforts Claude starts with, as `factory lead spawn --effort` takes them.
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// The arguments Claude starts with: its model and effort, and a settings override that turns
 /// each of `disabled_plugins` (`name@marketplace`) off, so their skills stay out of every request.

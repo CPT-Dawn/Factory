@@ -4,6 +4,7 @@
 //! stdin, asks the rule, and answers in Claude Code's hook protocol. A rule that needs the
 //! outside world, such as the staged diff, hands back what it needs instead of fetching it.
 
+mod guard;
 mod js;
 mod shell;
 
@@ -24,6 +25,8 @@ pub enum PreTool {
     Allow,
     /// Refuse the call; the line says what to do instead.
     Block(String),
+    /// Let the call run, with a line of context for the model beside it.
+    Hint(String),
     /// The call commits or pushes: the caller checks what each adds, the staged diff of a commit
     /// with [`private_address`] and the commits a push sends with [`pushed_address`], and
     /// blocks the call if one leaks.
@@ -108,14 +111,23 @@ pub fn pre_tool(input: &Value, escape: bool) -> PreTool {
             if let Some(reason) = machine_wide_kill(command) {
                 return PreTool::Block(reason);
             }
+            if let Some(reason) = guard::shell_trap(command) {
+                return PreTool::Block(reason);
+            }
             match git_actions(command) {
                 actions if actions.is_empty() => PreTool::Allow,
                 actions => PreTool::Check(actions),
             }
         }
-        Some("REPL") => text("code")
-            .and_then(repl_misuse)
-            .map_or(PreTool::Allow, PreTool::Block),
+        Some("REPL") => {
+            let Some(code) = text("code") else {
+                return PreTool::Allow;
+            };
+            if let Some(reason) = repl_misuse(code).or_else(|| guard::repl_trap(code)) {
+                return PreTool::Block(reason);
+            }
+            guard::repl_hint(code).map_or(PreTool::Allow, PreTool::Hint)
+        }
         _ => PreTool::Allow,
     }
 }

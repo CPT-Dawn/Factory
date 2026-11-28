@@ -39,6 +39,7 @@ use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
+use crate::buildinfo;
 use crate::ledger::Ledger;
 use crate::output::Failure;
 use crate::paths::Paths;
@@ -340,6 +341,7 @@ impl<H: HerdrApi> Leads<H> {
             &params.spec,
             &branch,
             &report.to_string_lossy(),
+            params.attended,
         );
         let plan = spawn::Plan {
             name: &name,
@@ -353,9 +355,14 @@ impl<H: HerdrApi> Leads<H> {
             busy_for: lead::BUSY_TIMEOUT,
         };
         let started = spawn::start(&self.herdr, &plan).await;
-        let (outcome, reason, stalls) = match &started {
-            Ok(started) => ("ok", "", started.stalls),
-            Err(failed) => ("error", failed.message.as_str(), failed.stalls),
+        let (outcome, reason, stalls, busy_retries) = match &started {
+            Ok(started) => ("ok", "", started.stalls, started.busy_retries),
+            Err(failed) => (
+                "error",
+                failed.message.as_str(),
+                failed.stalls,
+                failed.busy_retries,
+            ),
         };
         let pairs = [
             ("repo", params.repo_name.as_str()),
@@ -367,8 +374,11 @@ impl<H: HerdrApi> Leads<H> {
             ("outcome", outcome),
             ("reason", reason),
             ("stalls", &stalls.to_string()),
+            ("busy_retries", &busy_retries.to_string()),
             ("model", params.model.as_str()),
             ("effort", params.effort.as_str()),
+            ("attended", &params.attended.to_string()),
+            ("build", buildinfo::BUILD),
         ]
         .map(|(key, value)| format!("{key}={value}"));
         let event = event::Event::from_args("lead-start", &pairs, params.session.as_deref())

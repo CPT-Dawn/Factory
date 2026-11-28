@@ -1028,6 +1028,8 @@ pub struct Record<'a> {
     pub findings: &'a str,
     /// On a fix round, the head the previous round reviewed, where its diff started.
     pub from: &'a str,
+    /// The build of factory that ran the review, as `factory --version` names it.
+    pub build: &'a str,
     /// The follow-up issue a new round 1 reviews, past another prefix's cap.
     pub follow_up: &'a str,
     /// What the report says, or why the run failed.
@@ -1078,6 +1080,7 @@ impl Record<'_> {
             format!("effort={}", self.effort.unwrap_or_default()),
             format!("report={}", self.report),
             format!("stream={}", self.stream),
+            format!("build={}", self.build),
         ];
         if let Ok(reading) = self.result {
             let Counts {
@@ -1838,6 +1841,7 @@ diff --git a/README.md b/README.md
             stream: "r.jsonl",
             findings: "r.findings.json",
             from: "",
+            build: "ed05528-dirty",
             follow_up: "",
             result,
         }
@@ -1871,6 +1875,7 @@ diff --git a/README.md b/README.md
             "blocking=1",
             "standards_hard=1",
             "tags=x",
+            "build=ed05528-dirty",
         ] {
             assert!(pairs.iter().any(|p| p == pair), "{pair} in {pairs:?}");
         }
