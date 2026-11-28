@@ -98,10 +98,10 @@ pub async fn start<H: HerdrApi>(herdr: &H, plan: &Plan<'_>) -> Result<Started, F
     };
     match launched.how {
         Launch::Up => {}
-        Launch::StayedBusy => {
+        Launch::StayedBusy(last) => {
             return Err(at.failed(
                 &format!(
-                    "could not start Claude: its pane stayed busy for {}s ({BUSY})",
+                    "could not start Claude: its pane stayed busy for {}s ({last})",
                     plan.busy_for.as_secs()
                 ),
                 0,
@@ -123,8 +123,8 @@ pub async fn start<H: HerdrApi>(herdr: &H, plan: &Plan<'_>) -> Result<Started, F
 enum Launch {
     /// Claude is up and ready for its prompt.
     Up,
-    /// The pane stayed busy until `plan.busy_for` ran out.
-    StayedBusy,
+    /// The pane stayed busy until `plan.busy_for` ran out; herdr's last words about it.
+    StayedBusy(String),
     /// herdr answered the start with an error that is not a busy pane: the trust dialog, if the
     /// screen shows it, or else a failure to report with herdr's own words.
     Stopped(HerdrError),
@@ -148,10 +148,10 @@ async fn started<H: HerdrApi>(herdr: &H, pane: &str, plan: &Plan<'_>) -> Launche
             .await
         {
             Ok(()) => break Launch::Up,
-            Err(HerdrError::Refused { code, .. }) if code == BUSY => {
+            Err(refusal) if refused(&refusal, BUSY) => {
                 let waited = began.elapsed();
                 if waited >= plan.busy_for {
-                    break Launch::StayedBusy;
+                    break Launch::StayedBusy(said(&refusal));
                 }
                 let nap = pause.min(plan.busy_for - waited);
                 sleep(nap).await;
@@ -214,61 +214,77 @@ async fn pass_trust_dialog<H: HerdrApi>(
             .wait_agent(at.name, &["idle", "done"], TRUST_TIMEOUT)
             .await
     };
-    answered
-        .await
-        .map_err(|_| at.failed("did not come up after the trust dialog", 0))
+    answered.await.map_err(|e| {
+        at.failed(
+            &format!("did not come up after the trust dialog ({})", said(&e)),
+            0,
+        )
+    })
 }
 
 /// Types the prompt. A lead that stalls with the prompt still typed gets an enter, and one
 /// whose prompt is gone gets it typed again, up to [`TRIES`] times. Returns how many tries it took.
 async fn submit<H: HerdrApi>(herdr: &H, at: &Spot<'_>, plan: &Plan<'_>) -> Result<u32, Failed> {
-    if typed(herdr, at, plan.prompt, 0).await? {
+    let Some(mut last) = typed(herdr, at, plan.prompt, 0).await? else {
         return Ok(0);
-    }
+    };
     let head = flat(&plan.prompt.chars().take(HEAD).collect::<String>());
     for stalls in 1..=TRIES {
         sleep(plan.pause).await;
         let screen = herdr.read_agent(at.name).await.unwrap_or_default();
         if flat(&screen).contains(&head) {
             let pressed = herdr.send_keys(at.name, &["enter"]).await;
-            if pressed.is_ok()
-                && herdr
-                    .wait_agent(at.name, &["working", "blocked"], SUBMIT_TIMEOUT)
-                    .await
-                    .is_ok()
-            {
-                return Ok(stalls);
+            let working = match pressed {
+                Ok(()) => {
+                    herdr
+                        .wait_agent(at.name, &["working", "blocked"], SUBMIT_TIMEOUT)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            match working {
+                Ok(()) => return Ok(stalls),
+                Err(e) => last = said(&e),
             }
-        } else if typed(herdr, at, plan.prompt, stalls).await? {
+        } else if let Some(still) = typed(herdr, at, plan.prompt, stalls).await? {
+            last = still;
+        } else {
             return Ok(stalls);
         }
     }
     Err(at.failed(
-        &format!("took the prompt but never started working ({STALLED}, {TRIES} retries)"),
+        &format!("took the prompt but never started working ({STALLED}, {TRIES} retries: {last})"),
         TRIES,
     ))
 }
 
-/// Types the prompt: true once the lead is working, false when herdr says it stalled.
+/// Types the prompt: none once the lead is working, or herdr's words when it says it stalled.
 async fn typed<H: HerdrApi>(
     herdr: &H,
     at: &Spot<'_>,
     prompt: &str,
     stalls: u32,
-) -> Result<bool, Failed> {
+) -> Result<Option<String>, Failed> {
     match herdr
         .prompt_agent(at.name, prompt, &["working", "blocked"], PROMPT_TIMEOUT)
         .await
     {
-        Ok(()) => Ok(true),
-        Err(HerdrError::Refused { code, .. }) if code == STALLED => Ok(false),
-        Err(e) => {
-            let why = match e {
-                HerdrError::Refused { code, .. } => code,
-                other => other.to_string(),
-            };
-            Err(at.failed(&format!("did not start working ({why})"), stalls))
-        }
+        Ok(()) => Ok(None),
+        Err(refusal) if refused(&refusal, STALLED) => Ok(Some(said(&refusal))),
+        Err(e) => Err(at.failed(&format!("did not start working ({})", said(&e)), stalls)),
+    }
+}
+
+/// Whether herdr refused with the error `code`.
+fn refused(error: &HerdrError, wanted: &str) -> bool {
+    matches!(error, HerdrError::Refused { code, .. } if code == wanted)
+}
+
+/// What herdr said, on one line: its code and message, or what went wrong reaching it.
+fn said(error: &HerdrError) -> String {
+    match error {
+        HerdrError::Refused { code, message } => one_line(&format!("{code}: {message}")),
+        other => one_line(&other.to_string()),
     }
 }
 

@@ -602,6 +602,8 @@ fn a_pane_that_stays_busy_fails_the_spawn_naming_herdrs_code() {
         out.stderr.contains("could not start Claude") && out.stderr.contains("agent_pane_busy"),
         "{out:?}"
     );
+    // herdr's own words for the last refusal ride along with its code.
+    assert!(out.stderr.contains("is not an available shell"), "{out:?}");
     assert!(herdr.count("agent.start") > 4);
     assert_eq!(herdr.count("agent.read"), 0);
     assert_eq!(herdr.count("agent.prompt"), 0);
@@ -680,6 +682,74 @@ fn a_start_herdr_refuses_for_another_reason_carries_herdrs_error() {
             .as_str()
             .is_some_and(|reason| reason.contains("agent_name_taken")),
         "{starts:?}"
+    );
+}
+
+#[test]
+fn a_trust_dialog_that_cannot_be_answered_carries_herdrs_error() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    herdr.blocks_at_startup();
+    herdr.screen(
+        "w1:p1",
+        "Do you trust /worktrees/repo/cart?\n  1. Yes, I trust this folder\n  2. No\n",
+    );
+    herdr.refuse("agent.send_keys", "pane_closed", "pane w1:p1 was closed");
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(
+        out.stderr
+            .contains("did not come up after the trust dialog")
+            && out.stderr.contains("pane_closed")
+            && out.stderr.contains("pane w1:p1 was closed"),
+        "{out:?}"
+    );
+    assert_eq!(out.stderr.lines().count(), 1, "{out:?}");
+}
+
+#[test]
+fn a_prompt_herdr_refuses_carries_herdrs_error() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    herdr.refuse("agent.prompt", "agent_gone", "agent lead-cart has exited");
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(
+        out.stderr.contains("did not start working")
+            && out.stderr.contains("agent_gone")
+            && out.stderr.contains("agent lead-cart has exited"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_prompt_that_stalls_to_the_end_carries_herdrs_last_words() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    configure(&sandbox, "[lead]\nretry_pause = 0\n");
+    for _ in 0..8 {
+        herdr.refuse(
+            "agent.prompt",
+            "agent_prompt_stalled",
+            "the input box never submitted",
+        );
+    }
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert!(
+        out.stderr.contains("never started working")
+            && out.stderr.contains("agent_prompt_stalled")
+            && out.stderr.contains("the input box never submitted"),
+        "{out:?}"
     );
 }
 

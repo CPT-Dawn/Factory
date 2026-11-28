@@ -1,25 +1,52 @@
 //! Names the build by its commit, so `factory --version` and the events it writes say which
-//! binary they came from: the short sha, with `-dirty` after it when the tree had edits that
-//! were not committed, or `unknown` when there is no git to ask (a source tarball).
+//! binary they came from: the short sha, with `-dirty` after it when a file the binary is built
+//! from has uncommitted edits, or `unknown` when there is no git to ask (a source tarball, or a
+//! tree unpacked inside some other repository).
 //!
-//! The sha must not go stale in a worktree, where `.git` is a file: the build reruns when the
-//! worktree's own HEAD or index changes, or the branch HEAD names moves (kept in the common git
-//! dir), and when a source file the dirty flag reads changes.
+//! The name must not go stale, in a worktree too (there `.git` is a file). The build reruns when
+//! a watched source path changes, the worktree's HEAD, index or reflog changes, or a branch ref
+//! is written (the common git dir keeps them, loose or packed).
 
 use std::path::Path;
 use std::process::Command;
 
+/// What the binary is built from, relative to this crate: the dirty flag reads these, and the
+/// build reruns when any of them changes.
+const SOURCES: [&str; 9] = [
+    "build.rs",
+    "Cargo.toml",
+    "src",
+    "../factory-core/Cargo.toml",
+    "../factory-core/src",
+    "../factory-adapters/Cargo.toml",
+    "../factory-adapters/src",
+    "../../Cargo.toml",
+    "../../Cargo.lock",
+];
+
 fn main() {
-    let build = git(&["rev-parse", "--short=7", "HEAD"]).map_or_else(
-        || "unknown".to_owned(),
-        |sha| {
-            let edited = git(&["status", "--porcelain", "--untracked-files=no"])
-                .is_some_and(|status| !status.is_empty());
-            if edited { format!("{sha}-dirty") } else { sha }
-        },
-    );
-    println!("cargo:rustc-env=FACTORY_BUILD={build}");
-    watch();
+    println!("cargo:rustc-env=FACTORY_BUILD={}", build());
+    for source in SOURCES {
+        println!("cargo:rerun-if-changed={source}");
+    }
+    watch_git();
+}
+
+/// `ed05528`, `ed05528-dirty` or `unknown`.
+fn build() -> String {
+    // The repository must be this workspace's own, not one the tree happens to sit inside.
+    if git(&["rev-parse", "--show-prefix"]).as_deref() != Some("crates/factory/") {
+        return "unknown".to_owned();
+    }
+    let Some(sha) = git(&["rev-parse", "--short=7", "HEAD"]) else {
+        return "unknown".to_owned();
+    };
+    let mut status = vec!["status", "--porcelain", "--"];
+    status.extend(SOURCES);
+    match git(&status) {
+        Some(edits) if !edits.is_empty() => format!("{sha}-dirty"),
+        _ => sha,
+    }
 }
 
 /// What `git <args>` prints in this crate's directory, trimmed; none when it fails.
@@ -33,34 +60,27 @@ fn git(args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-/// Tells cargo what the build depends on. A path that does not exist is left out: cargo reads a
-/// missing one as always changed.
-fn watch() {
-    println!("cargo:rerun-if-changed=build.rs");
-    for source in [
-        "src",
-        "Cargo.toml",
-        "../factory-core/src",
-        "../factory-adapters/src",
-        "../../Cargo.lock",
-    ] {
-        println!("cargo:rerun-if-changed={source}");
-    }
+/// Tells cargo to rerun when the commit moves. A path that does not exist is left out: cargo
+/// reads a missing one as always changed.
+fn watch_git() {
     let (Some(git_dir), Some(common)) = (
         git(&["rev-parse", "--path-format=absolute", "--git-dir"]),
         git(&["rev-parse", "--path-format=absolute", "--git-common-dir"]),
     ) else {
         return;
     };
-    let mut paths = vec![
-        Path::new(&git_dir).join("HEAD"),
-        Path::new(&git_dir).join("index"),
-        Path::new(&common).join("packed-refs"),
-    ];
-    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
-        paths.push(Path::new(&common).join(branch));
-    }
-    for path in paths.iter().filter(|path| path.exists()) {
-        println!("cargo:rerun-if-changed={}", path.display());
+    let (git_dir, common) = (Path::new(&git_dir), Path::new(&common));
+    for path in [
+        git_dir.join("HEAD"),
+        git_dir.join("index"),
+        git_dir.join("logs/HEAD"),
+        common.join("packed-refs"),
+        // A directory is watched whole: a branch that was packed gets a loose ref again when
+        // it moves, and that file did not exist to be watched when the build ran.
+        common.join("refs/heads"),
+    ] {
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
     }
 }

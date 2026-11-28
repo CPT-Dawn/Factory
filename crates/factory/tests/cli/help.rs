@@ -67,6 +67,22 @@ fn checkout_sha() -> String {
         )
 }
 
+/// Whether anything tracked or new under the workspace's source differs from its commit.
+fn edited_since_commit() -> bool {
+    Command::new("git")
+        .args([
+            "status",
+            "--porcelain",
+            "--",
+            "../../crates",
+            "../../Cargo.toml",
+            "../../Cargo.lock",
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .map_or(true, |out| !out.stdout.is_empty())
+}
+
 #[test]
 fn version_names_the_build_by_its_commit() {
     let sandbox = Sandbox::new();
@@ -84,10 +100,15 @@ fn version_names_the_build_by_its_commit() {
         .and_then(|rest| rest.strip_suffix(')'))
         .unwrap_or_default()
         .to_owned();
-    // A tree with edits since its commit says so, and a tree without git says unknown.
+    // A tree with edits since its commit may say so; a tree without any must not.
+    let accepted = if edited_since_commit() {
+        vec![sha.clone(), format!("{sha}-dirty")]
+    } else {
+        vec![sha.clone()]
+    };
     assert!(
-        build == sha || build == format!("{sha}-dirty"),
-        "{sha} in {:?}",
+        accepted.contains(&build),
+        "{accepted:?} in {:?}",
         out.stdout
     );
     if sha != "unknown" {
