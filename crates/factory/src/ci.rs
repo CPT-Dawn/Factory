@@ -1,10 +1,12 @@
-//! `factory wait ci`: blocks, silent, until every check on a pull request's head has
-//! finished, on the daemon, which shares one poller per pull request between its waits.
+//! `factory wait ci`: blocks, silent, until every check on a pull request's head, or a
+//! branch's latest head, has finished, on the daemon, which shares one poller per pull request between its waits.
 
 use std::env;
 use std::time::Duration;
 
+use factory_core::ci;
 use factory_core::exit::Exit;
+use factory_core::fleet::MAIN;
 use serde_json::Value;
 
 use crate::client;
@@ -13,6 +15,17 @@ use crate::notify;
 use crate::output::{Done, Failure, LINE_LIMIT};
 use crate::paths::Paths;
 use crate::protocol::{NotifyOn, WAIT_CI, WaitCiParams, WaitCiResult};
+
+/// What the daemon is asked to watch: the branch `branch` names, or main for a `pr` of
+/// `main`, as [`ci::BRANCH_TARGET`] and its name; else the pull request `pr` names.
+pub fn target(pr: Option<&str>, branch: Option<&str>) -> String {
+    match (pr, branch) {
+        (_, Some(branch)) => format!("{}{branch}", ci::BRANCH_TARGET),
+        (Some(MAIN), None) => format!("{}{MAIN}", ci::BRANCH_TARGET),
+        (Some(pr), None) => pr.to_owned(),
+        (None, None) => String::new(),
+    }
+}
 
 pub fn wait(pr: &str, timeout: Duration) -> Result<Done, Failure> {
     let paths = Paths::from_env()?;

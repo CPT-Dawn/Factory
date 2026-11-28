@@ -12,7 +12,7 @@ use std::fs::DirBuilder;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
-use factory_core::ci::PullRequest;
+use factory_core::ci::Watched;
 
 use crate::output::Failure;
 
@@ -110,19 +110,20 @@ impl Paths {
         self.state.join("agy-quota.txt")
     }
 
-    /// The failed checks of a pull request's head, with their URLs and log tails: one file per
-    /// head, so a late read of an old head never overwrites a newer one's.
-    pub fn ci_failures(&self, pr: &PullRequest, head: &str) -> PathBuf {
+    /// The failed checks of a pull request's or branch's head, with their URLs and log tails:
+    /// one file per head, so a late read of an old head never overwrites a newer one's. A
+    /// branch's `/` is a `-` there, as a number never is.
+    pub fn ci_failures(&self, pr: &Watched, head: &str) -> PathBuf {
+        let name = match pr {
+            Watched::Pull(pr) => pr.number.to_string(),
+            Watched::Branch(branch) => branch.name.replace('/', "-"),
+        };
         self.state
             .join("ci")
-            .join(&pr.host)
-            .join(&pr.owner)
-            .join(&pr.repo)
-            .join(format!(
-                "{}-{}.md",
-                pr.number,
-                head.get(..12).unwrap_or(head)
-            ))
+            .join(pr.host())
+            .join(pr.owner())
+            .join(pr.repo())
+            .join(format!("{name}-{}.md", head.get(..12).unwrap_or(head)))
     }
 
     /// Where Claude Code keeps one directory of session logs per working directory.

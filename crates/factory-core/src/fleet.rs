@@ -1,6 +1,6 @@
 //! The CI the factory watches (spec #67, stories 25 to 29 and 42): for each configured repo, its
 //! self-hosted runner fleet, its queued and running workflow jobs, and the latest check state of
-//! each open `factory/*` pull request.
+//! each open `factory/*` pull request and of main's latest head.
 //!
 //! A repo needs watching while its last answer showed an open factory pull request or a job not
 //! yet completed. A read that fails keeps the last good answer, marked with why, so a network

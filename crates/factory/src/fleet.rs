@@ -1,6 +1,7 @@
 //! The daemon's CI watcher (spec #67, stories 25 to 29 and 42): it reads each `[ci]` repo's
-//! self-hosted runners, its queued and running workflow jobs and the checks of its open
-//! `factory/*` pull requests, for the status screen and the bar.
+//! self-hosted runners, its queued and running workflow jobs, the checks of its open
+//! `factory/*` pull requests and those of its main's latest head, for the status screen and the
+//! bar. Main is read with the rest of the repo, so it adds no read while nothing needs watching.
 //!
 //! It reads every repo once as the daemon starts, so the runner fleet shows even when nothing
 //! needs watching (#79). After that it reads only while something needs watching: a
@@ -18,7 +19,7 @@ use std::time::Duration;
 
 use factory_adapters::gh::{Actions, GhActions, GhError, HOST};
 use factory_adapters::git::GitRepo;
-use factory_core::ci::PullRequest;
+use factory_core::ci::Watched;
 use factory_core::fleet::{
     Ci, Job, MAIN, Main, Pull, PullState, RepoCi, github_repo, is_factory_branch,
 };
@@ -100,9 +101,9 @@ impl<A: Actions> Fleet<A> {
     }
 
     /// Whether `pr` is in one of the watched repos.
-    fn watches(&self, pr: &PullRequest) -> bool {
-        let name = format!("{}/{}", pr.owner, pr.repo);
-        pr.host.eq_ignore_ascii_case(HOST)
+    fn watches(&self, pr: &Watched) -> bool {
+        let name = format!("{}/{}", pr.owner(), pr.repo());
+        pr.host().eq_ignore_ascii_case(HOST)
             && self
                 .ci()
                 .repos
@@ -119,7 +120,7 @@ impl<A: Actions> Fleet<A> {
     /// given, the factory has live work in.
     pub async fn run(
         self: Arc<Self>,
-        mut watched: watch::Receiver<Option<PullRequest>>,
+        mut watched: watch::Receiver<Option<Watched>>,
         leads: watch::Receiver<u64>,
         live: LiveWork,
     ) {

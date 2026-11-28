@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use factory_adapters::gh::{Fetched, Gh, Heard, Listener, PullRequests};
-use factory_core::ci::{self, CheckRun, PullRequest, Tally, Verdict};
+use factory_core::ci::{self, Branch, CheckRun, PullRequest, Tally, Verdict, Watched};
 use factory_core::duration;
 use factory_core::exit::Exit;
 use tokio::sync::watch;
@@ -43,9 +43,9 @@ const READ_FAILURES: u32 = 3;
 pub struct Pollers<G: PullRequests = Gh> {
     gh: Arc<G>,
     paths: Paths,
-    running: Mutex<HashMap<PullRequest, Weak<Poller>>>,
-    /// The pull request a wait last joined a poller on, for the CI watcher it wakes.
-    watched: watch::Sender<Option<PullRequest>>,
+    running: Mutex<HashMap<Watched, Weak<Poller>>>,
+    /// The pull request or branch a wait last joined a poller on, for the CI watcher it wakes.
+    watched: watch::Sender<Option<Watched>>,
 }
 
 /// One pull request's poller; it stops when the last wait holding it drops it.
@@ -69,9 +69,9 @@ enum Seen {
     Broken(String),
 }
 
-/// A wait's hold on its pull request's poller.
+/// A wait's hold on its pull request's or branch's poller.
 pub struct Watch {
-    pr: PullRequest,
+    pr: Watched,
     poller: Arc<Poller>,
 }
 
@@ -85,12 +85,13 @@ impl<G: PullRequests> Pollers<G> {
         }
     }
 
-    /// Hears each pull request a wait starts watching.
-    pub fn watched(&self) -> watch::Receiver<Option<PullRequest>> {
+    /// Hears each pull request or branch a wait starts watching.
+    pub fn watched(&self) -> watch::Receiver<Option<Watched>> {
         self.watched.subscribe()
     }
 
-    /// Finds the pull request `pr` names from `cwd`, and joins its poller, starting one that
+    /// Finds the pull request `pr` names from `cwd`, or the branch it names with
+    /// [`ci::BRANCH_TARGET`] in the repo of `cwd`, and joins its poller, starting one that
     /// polls every `interval` when none runs.
     pub async fn watch(
         &self,
@@ -98,18 +99,10 @@ impl<G: PullRequests> Pollers<G> {
         cwd: PathBuf,
         interval: Duration,
     ) -> Result<Watch, Failure> {
-        let gh = Arc::clone(&self.gh);
-        let named = pr.to_owned();
-        let url = blocking(move || gh.url(&named, &cwd))
-            .await?
-            .map_err(|e| {
-                Failure::precondition(format!(
-                    "cannot find pull request {pr}: {e}; name it by number from its repo's checkout, or by URL"
-                ))
-            })?;
-        let pr = PullRequest::from_url(&url).map_err(|e| {
-            Failure::precondition(format!("gh pr view answered {e}; check gh's version"))
-        })?;
+        let pr = match ci::branch_target(pr) {
+            Some(name) => Watched::Branch(self.branch(name, cwd).await?),
+            None => Watched::Pull(self.pull(pr, cwd).await?),
+        };
         self.watched.send_replace(Some(pr.clone()));
         let mut running = self
             .running
@@ -129,10 +122,40 @@ impl<G: PullRequests> Pollers<G> {
         running.insert(pr.clone(), Arc::downgrade(&poller));
         Ok(Watch { pr, poller })
     }
+
+    /// The pull request `pr` names from `cwd`.
+    async fn pull(&self, pr: &str, cwd: PathBuf) -> Result<PullRequest, Failure> {
+        let gh = Arc::clone(&self.gh);
+        let named = pr.to_owned();
+        let url = blocking(move || gh.url(&named, &cwd))
+            .await?
+            .map_err(|e| {
+                Failure::precondition(format!(
+                    "cannot find pull request {pr}: {e}; name it by number from its repo's checkout, or by URL"
+                ))
+            })?;
+        PullRequest::from_url(&url).map_err(|e| {
+            Failure::precondition(format!("gh pr view answered {e}; check gh's version"))
+        })
+    }
+
+    /// The branch `name` of the repo whose checkout is `cwd`.
+    async fn branch(&self, name: &str, cwd: PathBuf) -> Result<Branch, Failure> {
+        let gh = Arc::clone(&self.gh);
+        let url = blocking(move || gh.repo_url(&cwd)).await?.map_err(|e| {
+            Failure::precondition(format!(
+                "cannot find the repo of branch {name}: {e}; wait on it from the repo's checkout"
+            ))
+        })?;
+        Branch::of_repo(&url, name).map_err(|e| {
+            Failure::precondition(format!("gh repo view answered {e}; check gh's version"))
+        })
+    }
 }
 
 impl Watch {
-    pub fn pr(&self) -> &PullRequest {
+    /// The pull request or branch it watches.
+    pub fn pr(&self) -> &Watched {
         &self.pr
     }
 
@@ -168,7 +191,7 @@ impl Watch {
 }
 
 /// What a wait that ran out of time says.
-fn still(pr: &PullRequest, seen: &Seen, limit: Duration) -> String {
+fn still(pr: &Watched, seen: &Seen, limit: Duration) -> String {
     let after = duration::show(limit);
     match seen {
         Seen::Pending { pending: 0 } => {
@@ -191,9 +214,15 @@ async fn run<G: PullRequests>(
     seen: watch::Sender<Seen>,
 ) {
     let pr = reader.pr.clone();
-    let mut listener = match reader.gh.listen(&pr) {
-        Ok(listener) => Some(listener),
-        Err(e) => {
+    // Events come for a pull request only: a branch is polled.
+    let listening = match &pr {
+        Watched::Pull(pull) => Some(reader.gh.listen(pull)),
+        Watched::Branch(_) => None,
+    };
+    let mut listener = match listening {
+        None => None,
+        Some(Ok(listener)) => Some(listener),
+        Some(Err(e)) => {
             eprintln!(
                 "factory: cannot listen for {pr}'s events: {e}; polling it every {}",
                 duration::show(interval)
@@ -337,16 +366,16 @@ fn refreshed<T: Clone>(
     }
 }
 
-/// Reads one pull request's head and checks, remembering each answer's ETag.
+/// Reads one pull request's or branch's head and checks, remembering each answer's ETag.
 struct Reader<G: PullRequests> {
     gh: Arc<G>,
     paths: Paths,
-    pr: PullRequest,
+    pr: Watched,
     cache: Cache,
 }
 
 impl<G: PullRequests> Reader<G> {
-    fn new(gh: Arc<G>, paths: Paths, pr: PullRequest) -> Reader<G> {
+    fn new(gh: Arc<G>, paths: Paths, pr: Watched) -> Reader<G> {
         Reader {
             gh,
             paths,
@@ -373,7 +402,10 @@ impl<G: PullRequests> Reader<G> {
             .map_err(|e| e.0)?;
         let (head, mut changed) = refreshed(fetched, before.head.as_ref());
         let Some(sha) = head.as_ref().map(|head| head.value.clone()) else {
-            return Err("GitHub said the pull request is unchanged before it was read".to_owned());
+            return Err(format!(
+                "GitHub said {} is unchanged before it was read",
+                self.pr
+            ));
         };
         // A new head has checks of its own.
         let same_head = before.head.as_ref().is_some_and(|head| head.value == sha);
@@ -436,7 +468,7 @@ impl<G: PullRequests> Reader<G> {
     }
 
     /// Writes each failed and cancelled run's URL, and the log tail of each job that ran, to
-    /// `<state>/ci/<host>/<owner>/<repo>/<number>-<head>.md`,
+    /// `<state>/ci/<host>/<owner>/<repo>/<number or branch>-<head>.md`,
     /// readable by its owner only: the logs can be a private repo's.
     fn write_failures(&self, head: &str, tally: &Tally) -> Result<PathBuf, String> {
         let path = self.paths.ci_failures(&self.pr, head);

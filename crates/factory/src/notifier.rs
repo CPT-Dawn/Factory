@@ -197,7 +197,7 @@ impl<I: InboxApi> Notifier<I> {
                     Ok((ci::line(&answer), exit))
                 };
                 let on = NotifyOn::Ci {
-                    pr: found.url(),
+                    pr: found.target(),
                     cwd: cwd.clone(),
                     poll_secs: *poll_secs,
                 };

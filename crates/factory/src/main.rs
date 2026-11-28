@@ -151,14 +151,16 @@ fn run(command: Command, json: bool) -> ExitCode {
             command:
                 WaitCommand::Ci {
                     pr,
+                    branch,
                     timeout,
                     notify,
                 },
         } => {
+            let target = ci::target(pr.as_deref(), branch.as_deref());
             if notify {
-                ci::notify(&pr, timeout.unwrap_or(notify::TIMEOUT))
+                ci::notify(&target, timeout.unwrap_or(notify::TIMEOUT))
             } else {
-                ci::wait(&pr, timeout.unwrap_or(WAIT_TIMEOUT))
+                ci::wait(&target, timeout.unwrap_or(WAIT_TIMEOUT))
             }
         }
         Command::Wait {

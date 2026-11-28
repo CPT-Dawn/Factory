@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use factory_core::ci::{CheckRun, PullRequest};
+use factory_core::ci::{CheckRun, PullRequest, Watched};
 use factory_core::fleet::{Job, Runner, RunnerState};
 use factory_core::timestamp::Timestamp;
 use rustix::process::{Pid, Signal, kill_process_group};
@@ -148,13 +148,16 @@ impl Drop for Listener {
 pub trait PullRequests: Send + Sync + 'static {
     /// The URL of the pull request `pr` names (a number, a URL or a branch), seen from `cwd`.
     fn url(&self, pr: &str, cwd: &Path) -> Result<String, GhError>;
-    /// The pull request's head commit, unless it has not changed since `etag`.
-    fn head(&self, pr: &PullRequest, etag: Option<&str>) -> Result<Fetched<String>, GhError>;
+    /// The URL of the repo of the checkout at `cwd`.
+    fn repo_url(&self, cwd: &Path) -> Result<String, GhError>;
+    /// The head commit of the pull request, or the branch's latest, unless it has not changed
+    /// since `etag`.
+    fn head(&self, on: &Watched, etag: Option<&str>) -> Result<Fetched<String>, GhError>;
     /// The check runs on `head`, every page of them, unless they have not changed since `etag`.
     /// Only a single page carries an ETag: one of page 1 says nothing of page 2.
     fn check_runs(
         &self,
-        pr: &PullRequest,
+        on: &Watched,
         head: &str,
         etag: Option<&str>,
     ) -> Result<Fetched<Vec<CheckRun>>, GhError>;
@@ -162,12 +165,12 @@ pub trait PullRequests: Send + Sync + 'static {
     /// changed since `etag`.
     fn statuses(
         &self,
-        pr: &PullRequest,
+        on: &Watched,
         head: &str,
         etag: Option<&str>,
     ) -> Result<Fetched<Vec<CheckRun>>, GhError>;
     /// The log of a GitHub Actions job.
-    fn job_log(&self, pr: &PullRequest, job: u64) -> Result<String, GhError>;
+    fn job_log(&self, on: &Watched, job: u64) -> Result<String, GhError>;
     /// Starts listening for the pull request's check suites and head; call it inside the
     /// daemon's runtime.
     fn listen(&self, pr: &PullRequest) -> Result<Listener, GhError>;
@@ -260,13 +263,40 @@ impl PullRequests for Gh {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 
-    fn head(&self, pr: &PullRequest, etag: Option<&str>) -> Result<Fetched<String>, GhError> {
-        let path = format!("repos/{}/{}/pulls/{}", pr.owner, pr.repo, pr.number);
-        match self.conditional(&pr.host, &path, etag)? {
+    fn repo_url(&self, cwd: &Path) -> Result<String, GhError> {
+        let mut cmd = Command::new("gh");
+        cmd.args(["repo", "view", "--json", "url", "--jq", ".url"])
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = process::run(cmd, TIMEOUT).map_err(|e| GhError(e.to_string()))?;
+        if !output.status.success() {
+            return Err(failed(&output.stderr));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    fn head(&self, on: &Watched, etag: Option<&str>) -> Result<Fetched<String>, GhError> {
+        let (path, sha) = match on {
+            Watched::Pull(pr) => (
+                format!("repos/{}/{}/pulls/{}", pr.owner, pr.repo, pr.number),
+                "/head/sha",
+            ),
+            Watched::Branch(branch) => (
+                format!(
+                    "repos/{}/{}/branches/{}",
+                    branch.owner, branch.repo, branch.name
+                ),
+                "/commit/sha",
+            ),
+        };
+        match self.conditional(on.host(), &path, etag)? {
             Fetched::NotModified => Ok(Fetched::NotModified),
             Fetched::Fresh { etag, value } => {
-                let head = value["head"]["sha"]
-                    .as_str()
+                let head = value
+                    .pointer(sha)
+                    .and_then(Value::as_str)
                     .ok_or_else(|| GhError(format!("GitHub's {path} names no head commit")))?;
                 Ok(Fetched::Fresh {
                     etag,
@@ -278,15 +308,16 @@ impl PullRequests for Gh {
 
     fn check_runs(
         &self,
-        pr: &PullRequest,
+        on: &Watched,
         head: &str,
         etag: Option<&str>,
     ) -> Result<Fetched<Vec<CheckRun>>, GhError> {
         let path = format!(
             "repos/{}/{}/commits/{head}/check-runs?per_page={PAGE}",
-            pr.owner, pr.repo
+            on.owner(),
+            on.repo()
         );
-        Ok(match self.paged(&pr.host, &path, "check_runs", etag)? {
+        Ok(match self.paged(on.host(), &path, "check_runs", etag)? {
             Fetched::NotModified => Fetched::NotModified,
             Fetched::Fresh { etag, value } => Fetched::Fresh {
                 etag,
@@ -297,15 +328,16 @@ impl PullRequests for Gh {
 
     fn statuses(
         &self,
-        pr: &PullRequest,
+        on: &Watched,
         head: &str,
         etag: Option<&str>,
     ) -> Result<Fetched<Vec<CheckRun>>, GhError> {
         let path = format!(
             "repos/{}/{}/commits/{head}/status?per_page={PAGE}",
-            pr.owner, pr.repo
+            on.owner(),
+            on.repo()
         );
-        Ok(match self.paged(&pr.host, &path, "statuses", etag)? {
+        Ok(match self.paged(on.host(), &path, "statuses", etag)? {
             Fetched::NotModified => Fetched::NotModified,
             Fetched::Fresh { etag, value } => Fetched::Fresh {
                 etag,
@@ -314,14 +346,15 @@ impl PullRequests for Gh {
         })
     }
 
-    fn job_log(&self, pr: &PullRequest, job: u64) -> Result<String, GhError> {
+    fn job_log(&self, on: &Watched, job: u64) -> Result<String, GhError> {
         let mut cmd = Command::new("gh");
         // A job's log is full of colour codes, which gh only passes through with the flag; the
         // tail strips them.
-        cmd.args(["api", "--hostname", &pr.host, "--allow-escape-sequences"])
+        cmd.args(["api", "--hostname", on.host(), "--allow-escape-sequences"])
             .arg(format!(
                 "repos/{}/{}/actions/jobs/{job}/logs",
-                pr.owner, pr.repo
+                on.owner(),
+                on.repo()
             ))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -920,14 +953,19 @@ impl PullRequests for FakePullRequests {
             .ok_or_else(|| GhError(format!("no pull request {pr}")))
     }
 
-    fn head(&self, _pr: &PullRequest, etag: Option<&str>) -> Result<Fetched<String>, GhError> {
+    fn repo_url(&self, _cwd: &Path) -> Result<String, GhError> {
+        let url = self.state().url.clone().unwrap_or_default();
+        Ok(url.split("/pull/").next().unwrap_or_default().to_owned())
+    }
+
+    fn head(&self, _on: &Watched, etag: Option<&str>) -> Result<Fetched<String>, GhError> {
         let state = self.state();
         Ok(fresh(&state, etag, state.head.clone()))
     }
 
     fn check_runs(
         &self,
-        _pr: &PullRequest,
+        _on: &Watched,
         _head: &str,
         etag: Option<&str>,
     ) -> Result<Fetched<Vec<CheckRun>>, GhError> {
@@ -938,7 +976,7 @@ impl PullRequests for FakePullRequests {
 
     fn statuses(
         &self,
-        _pr: &PullRequest,
+        _on: &Watched,
         _head: &str,
         etag: Option<&str>,
     ) -> Result<Fetched<Vec<CheckRun>>, GhError> {
@@ -946,7 +984,7 @@ impl PullRequests for FakePullRequests {
         Ok(fresh(&state, etag, state.statuses.clone()))
     }
 
-    fn job_log(&self, _pr: &PullRequest, job: u64) -> Result<String, GhError> {
+    fn job_log(&self, _on: &Watched, job: u64) -> Result<String, GhError> {
         self.state()
             .logs
             .iter()

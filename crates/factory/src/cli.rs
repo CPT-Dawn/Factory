@@ -199,10 +199,16 @@ pub enum WaitCommand {
         #[arg(long)]
         notify: bool,
     },
-    /// Until every check on a PR's head finished: all passed (exit 0) or some failed (exit 10)
+    /// Until every check on a PR's head, or main's latest, finished: all passed (exit 0) or
+    /// some failed (exit 10)
     Ci {
-        /// The PR: its number (from its repo's checkout), URL or branch
-        pr: String,
+        /// The PR: its number (from its repo's checkout), URL or branch; `main` is main's latest
+        /// head, as --branch main
+        #[arg(required_unless_present = "branch", conflicts_with = "branch")]
+        pr: Option<String>,
+        /// A branch of the repo of this checkout, whose latest head it waits on instead
+        #[arg(long)]
+        branch: Option<String>,
         /// Give up after this long with exit 124: seconds, or 90s, 9m or 1h [default: 9m,
         /// or 2h with --notify]
         #[arg(long, value_parser = duration)]
