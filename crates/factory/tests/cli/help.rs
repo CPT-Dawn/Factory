@@ -52,10 +52,21 @@ fn a_bad_command_line_with_json_is_one_object() {
     assert_eq!(shown["exit"], 2);
 }
 
+/// Git as the build script runs it: with no `GIT_DIR` or kin from a hook the tests may run in.
+fn git() -> Command {
+    let mut command = Command::new("git");
+    for (name, _) in
+        std::env::vars_os().filter(|(name, _)| name.to_string_lossy().starts_with("GIT_"))
+    {
+        command.env_remove(name);
+    }
+    command
+}
+
 /// The build's commit, from the checkout the tests were built in: its short sha, or `unknown`
 /// when there is no git to ask, as in a source tarball.
 fn checkout_sha() -> String {
-    Command::new("git")
+    git()
         .args(["rev-parse", "--short=7", "HEAD"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
@@ -69,7 +80,7 @@ fn checkout_sha() -> String {
 
 /// Whether anything tracked or new under the workspace's source differs from its commit.
 fn edited_since_commit() -> bool {
-    Command::new("git")
+    git()
         .args([
             "status",
             "--porcelain",

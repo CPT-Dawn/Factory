@@ -7,6 +7,7 @@
 //! a watched source path changes, the worktree's HEAD, index or reflog changes, or a branch ref
 //! is written (the common git dir keeps them, loose or packed).
 
+use std::env;
 use std::path::Path;
 use std::process::Command;
 
@@ -51,12 +52,14 @@ fn build() -> String {
 
 /// What `git <args>` prints in this crate's directory, trimmed; none when it fails.
 fn git(args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .ok()
-        .filter(|out| out.status.success())?;
+    let mut command = Command::new("git");
+    command.args(args).current_dir(env!("CARGO_MANIFEST_DIR"));
+    // A build run from a git hook (the pre-push verify) inherits GIT_DIR and its kin, which
+    // would make git take this crate's directory for the top of the work tree.
+    for (name, _) in env::vars_os().filter(|(name, _)| name.to_string_lossy().starts_with("GIT_")) {
+        command.env_remove(name);
+    }
+    let out = command.output().ok().filter(|out| out.status.success())?;
     Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
