@@ -1190,7 +1190,7 @@ fn a_label_with_no_round_is_refused_unless_the_review_is_standalone() {
     let repo = sandbox.repo();
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
 
-    for label in ["retro-lab-light2", "t434-r5-light-2"] {
+    for label in ["retro-lab-light2", "t434-r5-light-2", "t1-r02-light"] {
         let out = sandbox.factory_in(&repo, &["review", "main", label]);
         assert_eq!(out.code, 2, "{out:?}");
         assert_eq!(
@@ -1238,6 +1238,10 @@ fn a_new_round_1_on_work_a_prefix_reviewed_to_its_cap_needs_a_follow_up_issue() 
     );
     let empty_commit = sandbox.factory_in(&repo, &["review", "main", "t1again-r1", "none"]);
     refused("t1again-r1", &empty_commit);
+    // So is the same base under another name: the commit main names.
+    let main = sandbox.git(&repo, &["rev-parse", "main"]);
+    let base_sha = sandbox.factory_in(&repo, &["review", main.trim(), "t1sha-r1", "none"]);
+    refused("t1sha-r1", &base_sha);
     assert_eq!(sandbox.calls("codex").len(), 2);
 
     sandbox.fake(
@@ -1249,7 +1253,8 @@ fn a_new_round_1_on_work_a_prefix_reviewed_to_its_cap_needs_a_follow_up_issue() 
         &["review", "main", "t1fix-r1", "none", "--follow-up", "#7"],
     );
     assert_eq!(follow_up.code, 10, "{follow_up:?}");
-    let event: Value = serde_json::from_str(sandbox.ledger_lines().last().unwrap()).unwrap();
+    let waited = sandbox.factory_in(&repo, &["wait", "review", "t1fix-r1", "--json"]);
+    let event: Value = serde_json::from_str(&waited.stdout).unwrap();
     assert_eq!(event["follow_up"], "7", "{event}");
 }
 
@@ -1274,14 +1279,16 @@ fn a_follow_up_gh_cannot_fetch_or_that_is_the_spec_is_refused() {
         ),
         "{missing:?}"
     );
+    // Issue 12 of this repo, under two spellings, is the same issue.
+    sandbox.fake("gh", "printf '# #12 Add a\\n\\nAdd a.txt.\\n'");
     let spec = sandbox.factory_in(
         &repo,
-        &["review", "main", "t1-r1", "#12", "--follow-up", "12"],
+        &["review", "main", "t1-r1", "#12", "--follow-up", "o/r#12"],
     );
     assert_eq!(spec.code, 2, "{spec:?}");
     assert_eq!(
         spec.stderr,
-        "factory: code-review: --follow-up names the new issue filed for what is still open, not the ticket under review (12)\n"
+        "factory: code-review: --follow-up names the new issue filed for what is still open, not the ticket under review (o/r#12)\n"
     );
     let junk = sandbox.factory_in(
         &repo,

@@ -142,6 +142,7 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         label: &args.label,
         round: review::round(&args.label, args.previous.is_some()),
         base: &args.base,
+        base_commit: &run.base_commit,
         head: &run.head,
         spec: &run.spec,
         backend: chosen.map_or("", |chosen| chosen.pool.as_str()),
@@ -261,6 +262,8 @@ struct Run {
     from: String,
     /// The follow-up issue the review is for, as gh is asked for it.
     follow_up: String,
+    /// The commit the base named.
+    base_commit: String,
     reading: Option<Reading>,
 }
 
@@ -285,10 +288,25 @@ fn review(
     })?;
     run.branch = repo.branch().unwrap_or_default();
     let files = Files::new(paths, &run.repo, &args.label)?;
-    run.follow_up = follow_up(args)?.unwrap_or_default();
+    let follow_up = follow_up(args)?;
     held(&repo, args, &run.repo, &files.events)?;
     let previous = previous_report(args, &files)?;
     let inputs = Inputs::gather(&repo, args, previous.as_deref(), &files)?;
+    run.base_commit = inputs.base_commit.clone();
+    if let Some((issue, text)) = follow_up {
+        // The same issue under another spelling (`12`, `owner/repo#12`) reads the same.
+        if inputs
+            .spec
+            .as_ref()
+            .is_some_and(|(_, spec)| spec.trim() == text.trim())
+        {
+            return Err(Failure::usage(format!(
+                "--follow-up names the new issue filed for what is still open, not the ticket under review ({})",
+                args.follow_up.as_deref().unwrap_or_default()
+            )));
+        }
+        run.follow_up = issue;
+    }
     let (tier, source) = tier::tier(&args.label, caller, &inputs.whole);
     run.tier = Some(tier);
     run.tier_source = source.as_str();
@@ -827,9 +845,9 @@ impl Inputs {
     }
 }
 
-/// The follow-up issue the caller named, as gh fetches it: an issue ref other than the
-/// spec's, which gh can view.
-fn follow_up(args: &Args) -> Result<Option<String>, Failure> {
+/// The follow-up issue the caller named, as gh is asked for it, and its text: an issue ref
+/// gh can view.
+fn follow_up(args: &Args) -> Result<Option<(String, String)>, Failure> {
     let Some(named) = args.follow_up.as_deref() else {
         return Ok(None);
     };
@@ -838,23 +856,18 @@ fn follow_up(args: &Args) -> Result<Option<String>, Failure> {
             "--follow-up names an issue (#12, 12, owner/repo#12 or an issue URL), got: {named}"
         ))
     })?;
-    if args.spec.as_deref().and_then(review::issue_ref).as_deref() == Some(issue.as_str()) {
-        return Err(Failure::usage(format!(
-            "--follow-up names the new issue filed for what is still open, not the ticket under review ({issue})"
-        )));
-    }
-    Gh.issue(&issue).map_err(|e| {
+    let text = Gh.issue(&issue).map_err(|e| {
         Failure::usage(format!(
             "could not fetch follow-up issue {named} with gh: {e}; file it first (gh issue create), then name it"
         ))
     })?;
-    Ok(Some(issue))
+    Ok(Some((issue, text)))
 }
 
 /// Holds the review to what the event ledger says of this repo's reviews: an escalation
 /// needs the lead's `escalation` event, and a new round 1 or a standalone review may not
 /// re-review work a prefix reviewed to its cap. The same work is the same head, or the same
-/// tree reviewed from the same base (a commit that changes nothing).
+/// tree reviewed from the same base commit (a commit that changes nothing).
 fn held(repo: &impl Repo, args: &Args, name: &str, events: &Path) -> Result<(), Failure> {
     // A ledger that is no file (a device) holds no reviews, and reading one may never end.
     let text = match fs::metadata(events).map(|meta| meta.is_file()) {
@@ -878,7 +891,7 @@ fn held(repo: &impl Repo, args: &Args, name: &str, events: &Path) -> Result<(), 
         Value::Number(n) => Some(n.to_string()),
         _ => None,
     };
-    let mut reviews: Vec<(String, String, String)> = Vec::new();
+    let mut reviews: Vec<(String, String, String, String)> = Vec::new();
     let mut escalated: Vec<String> = Vec::new();
     for event in text
         .lines()
@@ -892,7 +905,9 @@ fn held(repo: &impl Repo, args: &Args, name: &str, events: &Path) -> Result<(), 
                 if let (Some(label), Some(head)) = (field(&event, "label"), field(&event, "head"))
                     && !head.is_empty()
                 {
-                    reviews.push((label, field(&event, "base").unwrap_or_default(), head));
+                    let base = field(&event, "base").unwrap_or_default();
+                    let base_commit = field(&event, "base_commit").unwrap_or_default();
+                    reviews.push((label, base, base_commit, head));
                 }
             }
             Some("escalation") => escalated.extend(field(&event, "prefix")),
@@ -903,17 +918,27 @@ fn held(repo: &impl Repo, args: &Args, name: &str, events: &Path) -> Result<(), 
         repo: name,
         reviews: reviews
             .iter()
-            .map(|(label, base, head)| Past { label, base, head })
+            .map(|(label, base, base_commit, head)| Past {
+                label,
+                base,
+                base_commit,
+                head,
+            })
             .collect(),
         escalated: escalated.iter().map(String::as_str).collect(),
     };
     let head = repo.commit("HEAD").map_err(git_failed)?.unwrap_or_default();
     let tree = repo.tree("HEAD").map_err(git_failed)?;
+    let base = repo.commit(&args.base).map_err(git_failed)?;
+    // The same base is the same commit, however it is spelled; an event older than
+    // `base_commit` has only the name.
+    let same_base = |past: &Past<'_>| match (&base, past.base_commit) {
+        (Some(base), from) if !from.is_empty() => base.starts_with(from),
+        _ => past.base == args.base,
+    };
     let same = |past: &Past<'_>| {
         head.starts_with(past.head)
-            || (past.base == args.base
-                && tree.is_some()
-                && repo.tree(past.head).ok().flatten() == tree)
+            || (same_base(past) && tree.is_some() && repo.tree(past.head).ok().flatten() == tree)
     };
     review::hold(&args.label, &args.asked(), &history, same).map_err(Failure::usage)
 }

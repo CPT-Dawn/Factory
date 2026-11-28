@@ -66,9 +66,12 @@ impl<'a> Place<'a> {
             Some(rest) => (rest, true),
             None => (label, false),
         };
+        // One spelling per round: a prefix, and a number with no leading zero, so `t1-r02` is
+        // no second `t1-r2`.
         let parsed = rest.rsplit_once("-r").and_then(|(prefix, n)| {
             let digits = !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
-            Some((prefix, n.parse::<u32>().ok().filter(|_| digits)?))
+            let canonical = digits && !prefix.is_empty() && (n == "0" || !n.starts_with('0'));
+            Some((prefix, n.parse::<u32>().ok().filter(|_| canonical)?))
         });
         match parsed {
             Some((prefix, n)) if light => Place::Light { prefix, after: n },
@@ -126,7 +129,9 @@ pub fn admit(label: &str, asked: &Asked<'_>) -> Result<(), String> {
                 "--standalone is for a review outside a ticket's rounds, not {label}"
             ));
         }
-        Place::Round { n: 2.., .. } | Place::Light { .. } if asked.follow_up.is_some() => {
+        Place::Single | Place::Round { n: 2.., .. } | Place::Light { .. }
+            if asked.follow_up.is_some() =>
+        {
             return Err(format!(
                 "--follow-up opens a follow-up issue's first round, <prefix>-r1, not {label}"
             ));
@@ -167,6 +172,8 @@ pub struct Past<'a> {
     pub label: &'a str,
     /// The base it was asked to review from, as the caller named it.
     pub base: &'a str,
+    /// The commit that base named then (short), empty in an event older than the field.
+    pub base_commit: &'a str,
     /// The head it reviewed, as the event has it (short).
     pub head: &'a str,
 }
@@ -205,8 +212,11 @@ pub fn hold(
     same: impl Fn(&Past<'_>) -> bool,
 ) -> Result<(), String> {
     let place = Place::of(label);
-    if let Place::Round { prefix, .. } = place
-        && asked.escalation
+    // Past round `CAP` is an escalation's, whether the caller says so or not.
+    let escalates = asked.escalation
+        || matches!(place, Place::Round { n, .. } | Place::Light { after: n, .. } if n > CAP);
+    if let Some(prefix) = place.prefix()
+        && escalates
         && !history.escalated.contains(&prefix)
     {
         return Err(format!(
@@ -987,6 +997,8 @@ pub struct Record<'a> {
     pub label: &'a str,
     pub round: u32,
     pub base: &'a str,
+    /// The commit the base named when the review ran.
+    pub base_commit: &'a str,
     pub head: &'a str,
     pub spec: &'a str,
     /// The pool that ran the review, logged as `backend` and `pool`.
@@ -1035,6 +1047,7 @@ impl Record<'_> {
             format!("label={}", self.label),
             format!("round={}", self.round),
             format!("base={}", self.base),
+            format!("base_commit={}", short(self.base_commit)),
             format!("from={}", short(self.from)),
             format!("head={}", short(self.head)),
             format!("branch={}", self.branch),
@@ -1183,7 +1196,16 @@ mod tests {
             standalone: true,
             ..Asked::default()
         };
-        for label in ["retro-lab", "t434-r5-light-2", "retro-lab-light2", "t1-r"] {
+        for label in [
+            "retro-lab",
+            "t434-r5-light-2",
+            "retro-lab-light2",
+            "t1-r",
+            "-r1",
+            "-r2-light",
+            "t1-r02",
+            "t1-r02-light",
+        ] {
             assert_eq!(
                 admit(label, &Asked::default()),
                 Err(format!(
@@ -1208,12 +1230,25 @@ mod tests {
             ..Asked::default()
         };
         assert!(admit("retro", &both).is_err());
+        let follow_up = Asked {
+            standalone: true,
+            follow_up: Some("#7"),
+            ..Asked::default()
+        };
+        assert_eq!(
+            admit("retro", &follow_up),
+            Err(
+                "--follow-up opens a follow-up issue's first round, <prefix>-r1, not retro"
+                    .to_owned()
+            )
+        );
     }
 
     fn past<'a>(label: &'a str, head: &'a str) -> Past<'a> {
         Past {
             label,
             base: "main",
+            base_commit: "",
             head,
         }
     }
@@ -1258,9 +1293,29 @@ mod tests {
         );
         let escalated = History {
             escalated: vec!["t1"],
-            ..history
+            ..history.clone()
         };
         assert_eq!(hold("t1-r3", &asked, &escalated, |_| false), Ok(()));
+        // A light review past round 2 is an escalation's too, flag or no flag.
+        for (label, asked) in [
+            ("t1-r2-light", asked),
+            ("t1-r4-light", asked),
+            ("t1-r4-light", Asked::default()),
+        ] {
+            assert!(
+                hold(label, &asked, &history, |_| false).is_err(),
+                "{label} {asked:?}"
+            );
+            assert_eq!(
+                hold(label, &asked, &escalated, |_| false),
+                Ok(()),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            hold("t1-r2-light", &Asked::default(), &history, |_| false),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1763,6 +1818,7 @@ diff --git a/README.md b/README.md
             label: "t1-r1",
             round: 1,
             base: "main",
+            base_commit: "0123456789abcdef",
             head: "abcdef0123456789",
             spec: "none",
             backend: "codex",
@@ -1803,6 +1859,7 @@ diff --git a/README.md b/README.md
             "duration_s=7",
             "skipped=agy",
             "head=abcdef01",
+            "base_commit=01234567",
             "tier=standard",
             "tier_source=default",
             "pool=codex",
