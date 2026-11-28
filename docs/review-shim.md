@@ -37,7 +37,7 @@ factory review [--tier <tier>] [--escalation] --skill <its checkout's codex/code
   escalation, its round 4, or its light review) is refused, with a line saying to file a follow-up issue for
   what is still open. The same work is the same head, or the same tree reviewed from the same base commit,
   however spelled (an empty commit on top). `--follow-up <issue>` names that new issue, which gh must be able
-  to view and whose text must not be the spec's; only a round 1 takes it. Its round 1 then runs, and its `review` event carries `follow_up`.
+  to view and whose URL must not be the spec's; only a round 1 takes it. Its round 1 then runs, and its `review` event carries `follow_up`.
 - Round N > 1 and a light review continue the round before (`<prefix>-r<N-1>`, or round N for `-rN-light`):
   without a previous report, factory takes that round's report from `<state>/reviews/<repo>/`, and refuses with
   exit 2, naming the missing report, when there is none. It never reviews such a round fresh.

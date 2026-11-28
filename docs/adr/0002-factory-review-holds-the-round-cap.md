@@ -31,9 +31,10 @@ escalated. So `factory review` now refuses, each time in one line that says what
 - **A fresh review of capped work.** A prefix has used its cap once it ran its light review, its round 4, or its
   round 2 with no escalation event. A new round 1 (any prefix) or a standalone review of work such a prefix
   reviewed is refused: the line says to file a follow-up issue for what is still open and review it with
-  `--follow-up <issue>`, which must name an issue gh can view whose text is not the spec's, however either is
+  `--follow-up <issue>`, which must name an issue gh can view with a URL other than the spec's, however either is
   spelled; a follow-up names only a round 1. The same work is the same head, or the same tree reviewed from the
-  same base commit, however the base is spelled, so an empty commit does not make it new; a diff moved onto
+  same base commit, however the base is spelled (an event older than `base_commit` reads its base name as the
+  commit it names now), so an empty commit does not make it new; a diff moved onto
   another base is not caught. The follow-up issue lands in the `review` event as `follow_up`.
 
 The ledger is the record because it is what the daemon already keeps per repo and what factory-stats reads; the

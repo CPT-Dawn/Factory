@@ -288,25 +288,11 @@ fn review(
     })?;
     run.branch = repo.branch().unwrap_or_default();
     let files = Files::new(paths, &run.repo, &args.label)?;
-    let follow_up = follow_up(args)?;
+    run.follow_up = follow_up(args)?;
     held(&repo, args, &run.repo, &files.events)?;
     let previous = previous_report(args, &files)?;
     let inputs = Inputs::gather(&repo, args, previous.as_deref(), &files)?;
     run.base_commit = inputs.base_commit.clone();
-    if let Some((issue, text)) = follow_up {
-        // The same issue under another spelling (`12`, `owner/repo#12`) reads the same.
-        if inputs
-            .spec
-            .as_ref()
-            .is_some_and(|(_, spec)| spec.trim() == text.trim())
-        {
-            return Err(Failure::usage(format!(
-                "--follow-up names the new issue filed for what is still open, not the ticket under review ({})",
-                args.follow_up.as_deref().unwrap_or_default()
-            )));
-        }
-        run.follow_up = issue;
-    }
     let (tier, source) = tier::tier(&args.label, caller, &inputs.whole);
     run.tier = Some(tier);
     run.tier_source = source.as_str();
@@ -847,21 +833,34 @@ impl Inputs {
 
 /// The follow-up issue the caller named, as gh is asked for it, and its text: an issue ref
 /// gh can view.
-fn follow_up(args: &Args) -> Result<Option<(String, String)>, Failure> {
+fn follow_up(args: &Args) -> Result<String, Failure> {
     let Some(named) = args.follow_up.as_deref() else {
-        return Ok(None);
+        return Ok(String::new());
     };
     let issue = review::issue_ref(named).ok_or_else(|| {
         Failure::usage(format!(
             "--follow-up names an issue (#12, 12, owner/repo#12 or an issue URL), got: {named}"
         ))
     })?;
-    let text = Gh.issue(&issue).map_err(|e| {
+    let url = Gh.url(&issue).map_err(|e| {
         Failure::usage(format!(
             "could not fetch follow-up issue {named} with gh: {e}; file it first (gh issue create), then name it"
         ))
     })?;
-    Ok(Some((issue, text)))
+    // One issue has one URL, however the follow-up and the spec spell it.
+    if let Some(spec) = args.spec.as_deref().and_then(review::issue_ref) {
+        let spec_url = Gh.url(&spec).map_err(|e| {
+            Failure::usage(format!(
+                "could not fetch the spec's issue {spec} with gh: {e}"
+            ))
+        })?;
+        if spec_url == url {
+            return Err(Failure::usage(format!(
+                "--follow-up names the new issue filed for what is still open, not the ticket under review ({named})"
+            )));
+        }
+    }
+    Ok(issue)
 }
 
 /// Holds the review to what the event ledger says of this repo's reviews: an escalation
@@ -931,10 +930,13 @@ fn held(repo: &impl Repo, args: &Args, name: &str, events: &Path) -> Result<(), 
     let tree = repo.tree("HEAD").map_err(git_failed)?;
     let base = repo.commit(&args.base).map_err(git_failed)?;
     // The same base is the same commit, however it is spelled; an event older than
-    // `base_commit` has only the name.
+    // `base_commit` has only the name, read as the commit it names now.
     let same_base = |past: &Past<'_>| match (&base, past.base_commit) {
         (Some(base), from) if !from.is_empty() => base.starts_with(from),
-        _ => past.base == args.base,
+        (Some(base), _) => {
+            past.base == args.base || repo.commit(past.base).ok().flatten().as_ref() == Some(base)
+        }
+        (None, _) => past.base == args.base,
     };
     let same = |past: &Past<'_>| {
         head.starts_with(past.head)

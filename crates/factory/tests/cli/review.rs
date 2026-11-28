@@ -1259,6 +1259,43 @@ fn a_new_round_1_on_work_a_prefix_reviewed_to_its_cap_needs_a_follow_up_issue() 
 }
 
 #[test]
+fn an_event_from_before_base_commit_reads_its_base_as_the_commit_it_names() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+    let head = sandbox.git(&repo, &["rev-parse", "--short=8", "HEAD"]);
+    let logged = sandbox.factory_in(
+        &repo,
+        &[
+            "log",
+            "review",
+            "repo=repo",
+            "label=old-r2",
+            "round=2",
+            "base=main",
+            &format!("head={}", head.trim()),
+            "outcome=ok",
+        ],
+    );
+    assert_eq!(logged.code, 0, "{logged:?}");
+    sandbox.git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "chore: nothing"],
+    );
+    let main = sandbox.git(&repo, &["rev-parse", "main"]);
+
+    let out = sandbox.factory_in(&repo, &["review", main.trim(), "old2-r1", "none"]);
+
+    assert_eq!(out.code, 2, "{out:?}");
+    assert!(
+        out.stderr
+            .contains("was reviewed as old-r2, and old has used its review cap"),
+        "{out:?}"
+    );
+    assert!(sandbox.calls("codex").is_empty());
+}
+
+#[test]
 fn a_follow_up_gh_cannot_fetch_or_that_is_the_spec_is_refused() {
     let sandbox = Sandbox::new();
     let repo = sandbox.repo();
@@ -1279,8 +1316,15 @@ fn a_follow_up_gh_cannot_fetch_or_that_is_the_spec_is_refused() {
         ),
         "{missing:?}"
     );
-    // Issue 12 of this repo, under two spellings, is the same issue.
-    sandbox.fake("gh", "printf '# #12 Add a\\n\\nAdd a.txt.\\n'");
+    // Issue 12 of this repo, under two spellings, is the same issue, whatever its body
+    // reads from one fetch to the next: one URL.
+    sandbox.fake(
+        "gh",
+        r#"case "$*" in
+  *--jq*) case "$3" in *12) echo https://github.com/o/r/issues/12 ;; *) echo https://github.com/o/r/issues/13 ;; esac ;;
+  *) printf '# #12 Add a\n\nAdd a.txt, fetch %s.\n' "$$" ;;
+esac"#,
+    );
     let spec = sandbox.factory_in(
         &repo,
         &["review", "main", "t1-r1", "#12", "--follow-up", "o/r#12"],
@@ -1300,6 +1344,12 @@ fn a_follow_up_gh_cannot_fetch_or_that_is_the_spec_is_refused() {
         "factory: code-review: --follow-up names an issue (#12, 12, owner/repo#12 or an issue URL), got: soon\n"
     );
     assert!(sandbox.calls("codex").is_empty());
+    // Another issue is a follow-up.
+    let other = sandbox.factory_in(
+        &repo,
+        &["review", "main", "t1-r1", "#12", "--follow-up", "#13"],
+    );
+    assert_eq!(other.code, 0, "{other:?}");
 }
 
 #[test]
