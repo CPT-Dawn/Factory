@@ -159,9 +159,18 @@ pub fn wait_any(leads: &[String], timeout: Duration) -> Result<Done, Failure> {
         let (tx, name) = (tx.clone(), name.clone());
         // Detached: the CLI exits with the first answer, and the others' connections close
         // with it, which the daemon takes as their callers gone.
-        thread::spawn(move || {
-            let _ = tx.send(wait(&name, timeout));
+        let worker = thread::Builder::new().spawn({
+            let name = name.clone();
+            move || {
+                let _ = tx.send(wait(&name, timeout));
+            }
         });
+        if let Err(e) = worker {
+            return Err(Failure::new(
+                Exit::Precondition,
+                format!("could not start the wait on {name}: {e}; wait on fewer leads"),
+            ));
+        }
     }
     drop(tx);
     let mut timed_out = 0;
