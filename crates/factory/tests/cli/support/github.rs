@@ -22,6 +22,8 @@ use super::Sandbox;
 pub const PR_URL: &str = "https://github.com/acme/shop/pull/12";
 /// The head commit of that pull request until a test pushes another.
 pub const HEAD: &str = "c0ffee1234567890c0ffee1234567890c0ffee12";
+/// The latest head of the repo's `main`, whose checks are its own.
+pub const MAIN_HEAD: &str = "42fdcd84aa0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d";
 
 /// What `gh event listen` says on an account without event subscriptions.
 const NOT_ENABLED: &str = "event subscriptions are in preview and not enabled for this account: \
@@ -79,6 +81,7 @@ impl FakeGitHub {
         github.push(HEAD);
         github.checks(&[]);
         github.statuses(&[]);
+        github.main_checks(&[(800, "ci", "completed", Some("success"))]);
         github.runners(&[]);
         github.workflow_runs("queued", &[]);
         github.workflow_runs("in_progress", &[]);
@@ -199,14 +202,51 @@ impl FakeGitHub {
     }
 
     /// Every `gh api` path the fake was asked for that reads the runner fleet, workflow runs,
-    /// jobs or open pull requests: the CI watcher's reads, and no wait's.
+    /// jobs, open pull requests or main's head: the CI watcher's reads, and no wait's on a
+    /// pull request.
     pub fn watcher_reads(&self, sandbox: &Sandbox) -> Vec<String> {
         sandbox
             .calls("gh")
             .into_iter()
             .filter_map(|call| call.into_iter().find(|arg| arg.starts_with("repos/")))
-            .filter(|path| path.contains("/actions/run") || path.contains("/pulls?"))
+            .filter(|path| {
+                path.contains("/actions/run")
+                    || path.contains("/pulls?")
+                    || path.contains("/branches/")
+            })
             .collect()
+    }
+
+    /// Sets the check runs on main's head, [`MAIN_HEAD`], each `(id, name, status,
+    /// conclusion)` from GitHub Actions; its commit statuses are none.
+    pub fn main_checks(&self, runs: &[(u64, &str, &str, Option<&str>)]) {
+        let runs: Vec<Value> = runs
+            .iter()
+            .map(|&(id, name, status, conclusion)| {
+                let url = format!("https://github.com/acme/shop/actions/runs/8/job/{id}");
+                json!({
+                    "id": id,
+                    "name": name,
+                    "status": status,
+                    "conclusion": conclusion,
+                    "html_url": url,
+                    "details_url": url,
+                    "app": {"slug": "github-actions"},
+                })
+            })
+            .collect();
+        self.put(
+            "main-checks.json",
+            &json!({"total_count": runs.len(), "check_runs": runs}),
+        );
+        self.put(
+            "main-status.json",
+            &json!({"state": "pending", "total_count": 0, "statuses": []}),
+        );
+        self.put(
+            "main.json",
+            &json!({"name": "main", "commit": {"sha": MAIN_HEAD}}),
+        );
     }
 
     /// Moves the pull request's head to `sha`.
@@ -352,6 +392,8 @@ case "$1" in
 pr)
     while [ -f "$G/hold" ]; do sleep 0.05; done
     if [ -f "$G/url" ]; then cat "$G/url"; else echo 'no pull requests found for branch "work"' >&2; exit 1; fi ;;
+repo)
+    echo 'https://github.com/acme/shop' ;;
 api)
     shift
     etag_in=''; path=''; escapes=''
@@ -381,6 +423,9 @@ api)
     repos/acme/shop/actions/runs/*/jobs*)
         id="${{path#repos/acme/shop/actions/runs/}}"; id="${{id%%/*}}"
         file="$G/jobs-$id.json"; [ -f "$file" ] || file="$G/no-jobs.json" ;;
+    repos/acme/shop/branches/main) file="$G/main.json" ;;
+    repos/acme/shop/commits/{main}/check-runs*) file="$G/main-checks.json" ;;
+    repos/acme/shop/commits/{main}/status\?*) file="$G/main-status.json" ;;
     repos/acme/shop/commits/*/check-runs*'&page='*) file="$G/checks-${{path##*&page=}}.json" ;;
     repos/acme/shop/commits/*/check-runs*) file="$G/checks.json" ;;
     repos/acme/shop/commits/*/status\?*) file="$G/status.json" ;;
@@ -423,6 +468,7 @@ event)
     echo "fake gh: no script for: $*" >&2
     exit 127 ;;
 esac"#,
-        dir = dir.display()
+        dir = dir.display(),
+        main = MAIN_HEAD,
     )
 }

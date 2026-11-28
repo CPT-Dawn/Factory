@@ -204,6 +204,7 @@ pub fn feed(snapshot: &Snapshot) -> Feed {
 fn ci_mark_text(ci: &Ci) -> &'static str {
     match ci.mark() {
         Mark::Unknown => "?",
+        Mark::MainFailing => "main ✗",
         Mark::Failing => "✗",
         Mark::Busy => "busy",
         Mark::Passing => "✓",
@@ -218,7 +219,7 @@ fn ci_chip(snapshot: &Snapshot) -> Option<Chip> {
     let mark = ci.mark();
     let (glyph, tone) = match mark {
         Mark::Unknown => (glyph::CI_PASSING, Tone::Muted),
-        Mark::Failing => (glyph::CI_FAILING, Tone::Critical),
+        Mark::MainFailing | Mark::Failing => (glyph::CI_FAILING, Tone::Critical),
         Mark::Busy => (glyph::CI_PASSING, Tone::Busy),
         Mark::Passing => (glyph::CI_PASSING, Tone::Ok),
     };
@@ -283,10 +284,36 @@ fn ci_section(snapshot: &Snapshot) -> Option<Section> {
                 })
             })
             .collect();
+        // A red main leads the pull requests; a green or pending one follows them.
+        let mut mains: Vec<(bool, Row)> = ci
+            .repos
+            .iter()
+            .filter_map(|repo| {
+                let main = repo.main.as_ref()?;
+                let name = repo.repo.rsplit('/').next().unwrap_or(&repo.repo);
+                let red = main.state == PullState::Failing;
+                Some((
+                    red,
+                    Row::Text {
+                        label: format!("{name} main"),
+                        text: format!("{} {}", main.word(), main.short()),
+                        tone: Some(match main.state {
+                            PullState::Passing => Tone::Ok,
+                            PullState::Failing => Tone::Critical,
+                            PullState::Pending => Tone::Busy,
+                        }),
+                        url: Some(main.url(&repo.repo)),
+                    },
+                ))
+            })
+            .collect();
+        let (red, other): (Vec<_>, Vec<_>) = mains.drain(..).partition(|(red, _)| *red);
+        rows.extend(red.into_iter().map(|(_, row)| row));
         if pulls.is_empty() {
             rows.push(text("PRs", "no open factory PRs".to_owned(), Tone::Muted));
         }
         rows.extend(pulls);
+        rows.extend(other.into_iter().map(|(_, row)| row));
     }
     Some(Section {
         id: "ci".to_owned(),

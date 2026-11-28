@@ -19,7 +19,9 @@ use std::time::Duration;
 use factory_adapters::gh::{Actions, GhActions, GhError, HOST};
 use factory_adapters::git::GitRepo;
 use factory_core::ci::PullRequest;
-use factory_core::fleet::{Ci, Job, Pull, PullState, RepoCi, github_repo, is_factory_branch};
+use factory_core::fleet::{
+    Ci, Job, MAIN, Main, Pull, PullState, RepoCi, github_repo, is_factory_branch,
+};
 use tokio::sync::watch;
 
 use crate::clock;
@@ -237,7 +239,7 @@ impl<A: Actions> Fleet<A> {
 /// One read of `before`'s repo: its runners, the jobs of its active runs, of the latest runs
 /// updated since the last good answer (one that queued and completed between two reads, or a
 /// re-run, among them) and of the runs whose jobs `before` still waited on, and its open
-/// factory pull requests' checks. Also every job read, completed ones too, for the times the
+/// factory pull requests' checks and its main's latest head's. Also every job read, completed ones too, for the times the
 /// database keeps.
 fn read<A: Actions>(actions: &A, before: &RepoCi) -> Result<(RepoCi, Vec<Job>), GhError> {
     let repo = before.repo.as_str();
@@ -260,7 +262,7 @@ fn read<A: Actions>(actions: &A, before: &RepoCi) -> Result<(RepoCi, Vec<Job>), 
         if !is_factory_branch(&open.branch) {
             continue;
         }
-        let state = PullState::of(&actions.checks(repo, &open)?);
+        let state = PullState::of(&actions.checks(repo, &open.head)?);
         pulls.push(Pull {
             number: open.number,
             branch: open.branch,
@@ -269,6 +271,9 @@ fn read<A: Actions>(actions: &A, before: &RepoCi) -> Result<(RepoCi, Vec<Job>), 
         });
     }
     pulls.sort_by_key(|pull| pull.number);
+    let sha = actions.branch_head(repo, MAIN)?;
+    let state = PullState::of(&actions.checks(repo, &sha)?);
+    let main = Some(Main { sha, state });
     let mut jobs: Vec<Job> = read
         .iter()
         .filter(|job| !job.completed())
@@ -284,6 +289,7 @@ fn read<A: Actions>(actions: &A, before: &RepoCi) -> Result<(RepoCi, Vec<Job>), 
             jobs,
             pulls,
             finished: Vec::new(),
+            main,
         },
         read,
     ))

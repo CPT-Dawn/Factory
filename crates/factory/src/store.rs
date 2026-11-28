@@ -11,7 +11,7 @@ use std::path::Path;
 
 use factory_core::claude::{ClaudeQuota, Limit};
 use factory_core::codex::CodexQuota;
-use factory_core::fleet::{Job, Pull, PullState, RepoCi, Runner, RunnerState};
+use factory_core::fleet::{Job, Main, Pull, PullState, RepoCi, Runner, RunnerState};
 use factory_core::history::{self, HistoryRow};
 use factory_core::quota::Quota;
 use factory_core::timestamp::Timestamp;
@@ -170,6 +170,12 @@ impl Store {
                  state TEXT NOT NULL,
                  seen_ms INTEGER NOT NULL,
                  PRIMARY KEY (repo, number)
+             );
+             CREATE TABLE IF NOT EXISTS ci_main (
+                 repo TEXT PRIMARY KEY,
+                 sha TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 seen_ms INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS ci_seen (
                  repo TEXT PRIMARY KEY,
@@ -551,6 +557,13 @@ impl Store {
                 ],
             )?;
         }
+        tx.execute("DELETE FROM ci_main WHERE repo = ?1", params![ci.repo])?;
+        if let Some(main) = &ci.main {
+            tx.execute(
+                "INSERT INTO ci_main (repo, sha, state, seen_ms) VALUES (?1, ?2, ?3, ?4)",
+                params![ci.repo, main.sha, main.state.word(), seen],
+            )?;
+        }
         tx.execute(
             "INSERT INTO ci_seen (repo, seen_ms) VALUES (?1, ?2)
              ON CONFLICT (repo) DO UPDATE SET seen_ms = ?2",
@@ -560,7 +573,7 @@ impl Store {
     }
 
     /// A repo's CI as last recorded: its runners, its jobs not yet completed, its open factory
-    /// pull requests and its latest completed jobs; nothing, and never seen, before the first
+    /// pull requests, its main's latest head and its latest completed jobs; nothing, and never seen, before the first
     /// answer.
     pub fn ci(&self, repo: &str) -> rusqlite::Result<RepoCi> {
         let seen = self
@@ -604,6 +617,20 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
+        let main = self
+            .db
+            .query_row(
+                "SELECT sha, state FROM ci_main WHERE repo = ?1",
+                params![repo],
+                |row| {
+                    let state: String = row.get(1)?;
+                    Ok(Main {
+                        sha: row.get(0)?,
+                        state: PullState::parse(&state),
+                    })
+                },
+            )
+            .optional()?;
         Ok(RepoCi {
             repo: repo.to_owned(),
             seen,
@@ -612,6 +639,7 @@ impl Store {
             jobs,
             pulls,
             finished,
+            main,
         })
     }
 

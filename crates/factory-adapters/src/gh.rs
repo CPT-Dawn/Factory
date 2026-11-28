@@ -484,7 +484,7 @@ pub struct OpenPull {
 }
 
 /// What the CI watcher reads of a repo (`owner/name` on [`HOST`]): its self-hosted runners,
-/// its workflow runs and their jobs, and its open pull requests' checks.
+/// its workflow runs and their jobs, its open pull requests' checks and its main's.
 pub trait Actions: Send + Sync + 'static {
     fn runners(&self, repo: &str) -> Result<Vec<Runner>, GhError>;
     /// The ids of the workflow runs queued or in progress.
@@ -500,8 +500,11 @@ pub trait Actions: Send + Sync + 'static {
     /// their times.
     fn jobs(&self, repo: &str, run: u64) -> Result<Vec<Job>, GhError>;
     fn open_pulls(&self, repo: &str) -> Result<Vec<OpenPull>, GhError>;
-    /// The check runs and commit statuses on the pull request's head.
-    fn checks(&self, repo: &str, pull: &OpenPull) -> Result<Vec<CheckRun>, GhError>;
+    /// The latest head commit of `branch`.
+    fn branch_head(&self, repo: &str, branch: &str) -> Result<String, GhError>;
+    /// The check runs and commit statuses on the commit `head`: a pull request's head, or a
+    /// branch's.
+    fn checks(&self, repo: &str, head: &str) -> Result<Vec<CheckRun>, GhError>;
     /// Called after each round of reads: forgets what that round didn't read again.
     fn sweep(&self) {}
 }
@@ -659,13 +662,20 @@ impl Actions for GhActions {
         Ok(self.list(&path, "")?.iter().filter_map(open_pull).collect())
     }
 
-    fn checks(&self, repo: &str, pull: &OpenPull) -> Result<Vec<CheckRun>, GhError> {
+    fn branch_head(&self, repo: &str, branch: &str) -> Result<String, GhError> {
+        let path = format!("repos/{repo}/branches/{branch}");
+        self.page(&path)?["commit"]["sha"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| GhError(format!("GitHub's {path} names no head commit")))
+    }
+
+    fn checks(&self, repo: &str, head: &str) -> Result<Vec<CheckRun>, GhError> {
         if !factory_core::fleet::is_repo(repo) {
             return Err(GhError(format!(
                 "{repo:?} is not owner/name; fix [ci] repos in the config"
             )));
         }
-        let head = &pull.head;
         let runs = format!("repos/{repo}/commits/{head}/check-runs?per_page={PAGE}");
         let statuses = format!("repos/{repo}/commits/{head}/status?per_page={PAGE}");
         let mut checks: Vec<CheckRun> = self
@@ -780,6 +790,8 @@ pub struct FakeFleet {
     pub runs: Vec<(u64, Vec<Job>)>,
     /// Each open pull request and the runs on its head.
     pub pulls: Vec<(OpenPull, Vec<CheckRun>)>,
+    /// Each branch's latest head and the runs on it.
+    pub branches: Vec<(String, String, Vec<CheckRun>)>,
     /// What every read fails with, while set.
     pub failing: Option<String>,
     /// How many reads were made.
@@ -844,14 +856,28 @@ impl Actions for FakeActions {
             .collect())
     }
 
-    fn checks(&self, _repo: &str, pull: &OpenPull) -> Result<Vec<CheckRun>, GhError> {
-        Ok(self
-            .read()?
+    fn branch_head(&self, _repo: &str, branch: &str) -> Result<String, GhError> {
+        self.read()?
+            .branches
+            .iter()
+            .find(|(name, _, _)| name == branch)
+            .map(|(_, head, _)| head.clone())
+            .ok_or_else(|| GhError(format!("gh: Branch not found (HTTP 404): {branch}")))
+    }
+
+    fn checks(&self, _repo: &str, head: &str) -> Result<Vec<CheckRun>, GhError> {
+        let state = self.read()?;
+        let pulls = state
             .pulls
             .iter()
-            .find(|(open, _)| open.number == pull.number)
-            .map(|(_, runs)| runs.clone())
-            .unwrap_or_default())
+            .filter(|(open, _)| open.head == head)
+            .map(|(_, runs)| runs);
+        let branches = state
+            .branches
+            .iter()
+            .filter(|(_, at, _)| at == head)
+            .map(|(_, _, runs)| runs);
+        Ok(pulls.chain(branches).next().cloned().unwrap_or_default())
     }
 }
 
