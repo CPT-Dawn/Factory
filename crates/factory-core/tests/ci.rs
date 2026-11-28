@@ -140,6 +140,21 @@ fn only_the_newest_run_of_each_check_counts() {
 }
 
 #[test]
+fn a_newer_run_of_one_name_from_another_app_replaces_the_older() {
+    let mut buildkite = with_id(1, "test", "completed", Some("failure"));
+    buildkite.app = Some("buildkite".to_owned());
+    let Verdict::Finished(tally) =
+        ci::verdict(&[buildkite, with_id(2, "test", "completed", Some("success"))])
+    else {
+        panic!("every run finished");
+    };
+    assert_eq!((tally.passed, tally.failed.len()), (1, 0));
+    assert_eq!(tally.exit(), Exit::Ok);
+}
+
+/// A commit status's id counts in a sequence of its own, so it says nothing of which came
+/// first, a status or a check run of the same name.
+#[test]
 fn a_commit_status_and_a_check_run_of_one_name_are_two_checks() {
     let mut status = with_id(1, "ci", "completed", Some("failure"));
     status.app = None;
@@ -194,6 +209,27 @@ fn only_an_actions_job_that_ran_has_a_log_to_fetch() {
         let mut check = run("x", "completed", conclusion);
         check.app = app.map(str::to_owned);
         assert_eq!(check.has_log(), want, "{app:?} {conclusion:?}");
+    }
+}
+
+#[test]
+fn a_tail_drops_every_kind_of_escape_sequence() {
+    let table = [
+        ("csi colour", "\u{1b}[31merror\u{1b}[0m: boom"),
+        ("csi private mode", "\u{1b}[?25lerror: boom\u{1b}[?25h"),
+        (
+            "osc link by bel",
+            "\u{1b}]8;;https://x\u{7}error: boom\u{1b}]8;;\u{7}",
+        ),
+        ("osc title by st", "\u{1b}]0;title\u{1b}\\error: boom"),
+        ("dcs by st", "\u{1b}Pq#0\u{1b}\\error: boom"),
+        ("apc by st", "\u{1b}_G;x\u{1b}\\error: boom"),
+        ("charset", "\u{1b}(Berror: boom"),
+        ("two-byte", "\u{1b}=\u{1b}7error: boom\u{1b}8"),
+        ("keypad", "error: \u{1b}>boom"),
+    ];
+    for (kind, line) in table {
+        assert_eq!(ci::tail(line, 1), ["error: boom"], "{kind}");
     }
 }
 

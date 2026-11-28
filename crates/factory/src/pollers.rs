@@ -458,9 +458,12 @@ impl<G: PullRequests> Reader<G> {
             ));
             match run.app.as_deref() {
                 Some(ci::ACTIONS) if !run.has_log() => {
-                    text.push_str(&format!(
-                        "No log: the job was {conclusion} before it ran.\n"
-                    ));
+                    text.push_str(&if conclusion == "cancelled" {
+                        "No log: GitHub keeps none for a cancelled job; it may have run a while.\n"
+                            .to_owned()
+                    } else {
+                        format!("No log: the job never started ({conclusion}).\n")
+                    })
                 }
                 Some(ci::ACTIONS) => match self.gh.job_log(&self.pr, run.id) {
                     Ok(log) => {

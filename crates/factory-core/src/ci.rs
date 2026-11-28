@@ -3,8 +3,10 @@
 //!
 //! Only the newest run of each check counts: a re-run, or a workflow run that a newer one on the
 //! same head cancelled, leaves older runs of the same name behind, and those say nothing about
-//! the head any more. The newest is the one with the highest id (GitHub's ids only grow); a
-//! check is its name and the app that reports it, so a commit status never replaces a check run.
+//! the head any more. The newest is the one with the highest id (GitHub's ids only grow): a
+//! check run of one app can replace another app's of the same name, as check runs share one
+//! sequence of ids, but a commit status never replaces a check run, nor one a status, as their
+//! ids are two sequences that say nothing of which came first.
 //!
 //! A run is pending until it completes. A completed run passed on `success`, was skipped on
 //! `skipped` or `neutral`, was cancelled on `cancelled`, and failed on any other conclusion
@@ -141,21 +143,22 @@ pub const ACTIONS: &str = "github-actions";
 
 /// The newest run of each check, in the order GitHub listed them.
 pub fn latest(runs: &[CheckRun]) -> Vec<CheckRun> {
-    let mut newest: HashMap<(Option<&str>, &str), u64> = HashMap::new();
+    let mut newest: HashMap<(bool, &str), u64> = HashMap::new();
     for run in runs {
-        let id = newest
-            .entry((run.app.as_deref(), &run.name))
-            .or_insert(run.id);
+        let id = newest.entry(check(run)).or_insert(run.id);
         *id = (*id).max(run.id);
     }
     let mut kept = HashSet::new();
     runs.iter()
-        .filter(|run| {
-            let key = (run.app.as_deref(), run.name.as_str());
-            newest[&key] == run.id && kept.insert(key)
-        })
+        .filter(|run| newest[&check(run)] == run.id && kept.insert(check(run)))
         .cloned()
         .collect()
+}
+
+/// What makes runs one check: the name, and whether it is a commit status, as check runs of
+/// every app share one sequence of ids and commit statuses have one of their own.
+fn check(run: &CheckRun) -> (bool, &str) {
+    (run.app.is_none(), run.name.as_str())
 }
 
 /// Where a pull request's checks stand.
@@ -225,8 +228,10 @@ pub fn tail(log: &str, lines: usize) -> Vec<String> {
     all[end.saturating_sub(lines)..end].to_vec()
 }
 
-/// A line without its escape sequences: CSI (`ESC [ … final`), OSC (`ESC ] … BEL` or
-/// `ESC ] … ESC \`) and the two-byte ones (`ESC x`).
+/// A line without its escape sequences (ECMA-48): CSI (`ESC [` up to a final byte in `@..=~`),
+/// the strings OSC, DCS, SOS, PM and APC (`ESC ]`, `P`, `X`, `^`, `_` up to BEL or
+/// `ESC \`), and the rest (`ESC`, any intermediates in ` ../`, then a final byte, such as
+/// `ESC ( B` or `ESC 7`).
 fn plain(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
@@ -237,14 +242,13 @@ fn plain(line: &str) -> String {
         }
         match chars.next() {
             Some('[') => {
-                // Parameters and intermediates, up to the final byte in @..=~.
                 for c in chars.by_ref() {
                     if ('@'..='~').contains(&c) {
                         break;
                     }
                 }
             }
-            Some(']') => {
+            Some(']' | 'P' | 'X' | '^' | '_') => {
                 while let Some(c) = chars.next() {
                     if c == '\u{7}' {
                         break;
@@ -255,6 +259,15 @@ fn plain(line: &str) -> String {
                     }
                 }
             }
+            Some(' '..='/') => {
+                // Intermediates, then the final byte.
+                for c in chars.by_ref() {
+                    if !(' '..='/').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // A final byte straight after ESC, or a line that ends on it.
             _ => {}
         }
     }

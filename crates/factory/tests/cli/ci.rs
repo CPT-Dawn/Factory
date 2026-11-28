@@ -132,6 +132,15 @@ fn cancelled_checks_count_apart_and_their_logs_are_not_fetched() {
     assert!(text.contains("2 failed, 2 cancelled\n"), "{text}");
     assert!(text.contains("## e2e (cancelled)\n"), "{text}");
     assert!(text.contains("## build (cancelled)\n"), "{text}");
+    assert!(
+        text.contains("No log: GitHub keeps none for a cancelled job; it may have run a while.\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("No log: the job never started (startup_failure).\n"),
+        "{text}"
+    );
+    assert!(!text.contains("before it ran"), "{text}");
     assert!(text.contains("error: 1 test failed\n"), "{text}");
     assert!(!text.contains("Not Found"), "{text}");
 }
