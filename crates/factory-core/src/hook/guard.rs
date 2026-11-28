@@ -27,6 +27,26 @@ pub fn repl_trap(code: &str) -> Option<String> {
     })
 }
 
+/// The time a `git push` needs in this repository's REPL calls: the pre-push hook runs verify.
+const PUSH_TIME_MS: u64 = 590_000;
+
+/// The context for a REPL script that pushes with a `.timeout` the pre-push verify outlasts.
+pub fn repl_hint(code: &str) -> Option<String> {
+    let short = |call: &&js::ShellCall| call.timeout.is_some_and(|ms| ms < PUSH_TIME_MS);
+    let pushes = |call: &&js::ShellCall| {
+        super::git_actions(&call.text)
+            .iter()
+            .any(|action| action.push.is_some())
+    };
+    let call = js::shell_calls(code)
+        .into_iter()
+        .find(|call| short(&call) && pushes(&call))?;
+    Some(format!(
+        "REPL line {}: the pre-push hook runs verify (212-290 s); give the push .timeout(590000) and read its output file if it moves to the background.",
+        call.line
+    ))
+}
+
 /// The refusal for a script that runs `factory wait` more than once: from a loop, a callback or a
 /// timer, or twice in its text. A wait outlives the REPL call's own time, and the script's
 /// result reaches nobody while it waits.
@@ -88,7 +108,7 @@ fn trap_in(command: &str, in_script: bool) -> Option<String> {
         if let Some(what) = burner(&call, backgrounded(parts, at)) {
             return Some(burns(what));
         }
-        if call.program == "rm" && (in_script || rm_targets(call.args).any(non_literal)) {
+        if call.program == "rm" && (in_script || rm_targets(call.args).any(|w| non_literal(w))) {
             return Some(RM_BAIT.to_owned());
         }
         let quoted = |word: usize| line.quoted_dollar(at, word);
@@ -115,7 +135,7 @@ fn rm_targets(args: &[String]) -> impl Iterator<Item = &String> {
 }
 
 /// Whether a word is only known when it runs: a variable, a command substitution or a glob.
-fn non_literal(word: &String) -> bool {
+fn non_literal(word: &str) -> bool {
     word.contains(['$', '`', '*', '?', '['])
 }
 

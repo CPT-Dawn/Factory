@@ -4,6 +4,8 @@
 //! every agent on the machine.
 
 use factory_core::hook::{PreTool, pre_tool};
+
+const PUSH_HINT: &str = "the pre-push hook runs verify (212-290 s); give the push .timeout(590000) and read its output file if it moves to the background";
 use serde_json::{Value, json};
 
 fn bash(command: &str) -> Value {
@@ -258,6 +260,47 @@ fn one_awaited_wait_and_mere_mentions_pass() {
     ];
     let calls: Vec<Value> = codes.iter().map(|c| repl(c)).collect();
     assert_passes(&calls);
+}
+
+#[test]
+fn a_repl_push_with_a_short_timeout_gets_the_verify_hint() {
+    for code in [
+        "await $`git push -u origin HEAD`.timeout(300000)",
+        "const r = await $`cd /tmp/w && git push`.nothrow().timeout(120000);",
+        "await $('git push origin main', 300000)",
+        "await $`git -C /tmp/w push`.timeout(5_000).nothrow()",
+        "await $`git fetch && git push`.quiet().timeout(589999)",
+    ] {
+        match pre_tool(&repl(code), false) {
+            PreTool::Hint(hint) => {
+                assert!(hint.contains(PUSH_HINT), "{code:?}: {hint}");
+                assert!(!hint.contains('\n'), "{hint}");
+            }
+            other => panic!("{code:?} should get the hint: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_push_given_its_time_or_no_push_gets_no_hint() {
+    for code in [
+        "await $`git push -u origin HEAD`.timeout(590000)",
+        "await $`git push`.timeout(600000)",
+        "await $`git push`",
+        "await $`git push`.nothrow()",
+        "await $`git status`.timeout(1000)",
+        "await $`echo git push`.timeout(1000)",
+        "const s = 'git push'; await $`ls`.timeout(1000);",
+        "await $`git log`.timeout(1000);\nawait $`git push`.timeout(590000);",
+    ] {
+        assert_eq!(pre_tool(&repl(code), false), PreTool::Allow, "{code:?}");
+    }
+}
+
+#[test]
+fn a_deny_wins_over_the_push_hint() {
+    let code = "await $`git push && rm -rf $X`.timeout(1000)";
+    assert!(denied(&repl(code)).is_some(), "{code:?}");
 }
 
 const CAP: &str = "systemd-run --user --scope -p CPUQuota=200% -- <cmd>";
