@@ -156,6 +156,12 @@ pub fn running(project_id: &str) -> bool {
     Docker.running(&format!("supabase_db_{project_id}"))
 }
 
+/// Sets the stack's containers to restart never: docker's `unless-stopped` would bring a stack
+/// back after a reboot with no lease on it.
+pub fn keep_down_after_reboot(project_id: &str) {
+    Docker.no_restart(project_id);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Up {
     Started,
@@ -185,6 +191,7 @@ pub fn up(
         ));
     };
     if running(&info.project_id) {
+        keep_down_after_reboot(&info.project_id);
         return Ok(Up::Running);
     }
     let memory = host::memory(&cfg.ci_slice);
@@ -203,7 +210,11 @@ pub fn up(
     fs::create_dir_all(&logs).map_err(|e| io_failure(&logs, &e))?;
     let log = logs.join(format!("stack-{}-{slot}.log", p.name));
     let cli = p.supabase.as_ref().map_or(DEFAULT_CLI, |s| s.cli.as_str());
-    let ran = SupabaseCli.start(cli, Path::new(worktree), env);
+    let exclude = p
+        .supabase
+        .as_ref()
+        .map_or(&[][..], |s| s.exclude.as_slice());
+    let ran = SupabaseCli.start(cli, Path::new(worktree), env, exclude);
     fs::write(&log, format!("{}{}", ran.out, ran.err)).map_err(|e| io_failure(&log, &e))?;
     if ran.code != 0 {
         return Err(Failure::new(
@@ -215,12 +226,33 @@ pub fn up(
             ),
         ));
     }
+    keep_down_after_reboot(&info.project_id);
     Ok(Up::Started)
 }
 
 pub fn down(p: &ProjectConfig, project_id: &str, cwd: &str) -> Result<(), Failure> {
     let cli = p.supabase.as_ref().map_or(DEFAULT_CLI, |s| s.cli.as_str());
-    let ran = SupabaseCli.stop(cli, project_id, Path::new(cwd));
+    stop(cli, project_id, Path::new(cwd))
+}
+
+/// Stops slot `slot` of `project`'s stack by its project id, as the idle timer does: with the
+/// CLI of the worktree it last ran when that worktree's devlab.json is still there, else the
+/// default CLI from devlab's own directory, as the CLI needs a directory that exists.
+pub fn down_slot(project: &str, slot: u32, last_worktree: Option<&str>) -> Result<(), Failure> {
+    let project_id = slot_stack_id(project, slot, last_worktree);
+    let config = last_worktree.and_then(|wt| project_config(wt).ok().flatten().map(|p| (wt, p)));
+    match config {
+        Some((worktree, p)) if Path::new(worktree).is_dir() => down(&p, &project_id, worktree),
+        _ => {
+            let cwd = devlab_state();
+            fs::create_dir_all(&cwd).map_err(|e| io_failure(&cwd, &e))?;
+            stop(DEFAULT_CLI, &project_id, &cwd)
+        }
+    }
+}
+
+fn stop(cli: &str, project_id: &str, cwd: &Path) -> Result<(), Failure> {
+    let ran = SupabaseCli.stop(cli, project_id, cwd);
     if ran.code != 0 {
         let said = if ran.err.is_empty() {
             &ran.out

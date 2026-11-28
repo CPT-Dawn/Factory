@@ -850,6 +850,26 @@ pub fn clear_dead_stoppers(
     Ok(cleared)
 }
 
+/// Makes the slot's running stack devlab's, idle since `now` unless it already was: whether
+/// it wasn't devlab's before.
+pub fn adopt_stack(c: &Connection, project: &str, slot: u32, now: i64) -> rusqlite::Result<bool> {
+    let changed = c.execute(
+        "UPDATE slots SET stack_ours = 1, idle_since = COALESCE(idle_since, ?3)
+         WHERE project = ?1 AND slot = ?2 AND stack_ours = 0",
+        params![project, slot, now],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Counts the free slot as idle from `now` again, as when a stop of its stack failed.
+pub fn idle_again(c: &Connection, project: &str, slot: u32, now: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE slots SET idle_since = ?3 WHERE project = ?1 AND slot = ?2 AND idle_since IS NOT NULL",
+        params![project, slot, now],
+    )?;
+    Ok(())
+}
+
 /// Marks the slot's stack as devlab's to stop, or not. A stack devlab starts runs the schema
 /// of the worktree whose lease holds the slot: that worktree is recorded as the slot's schema
 /// (see [`slot_schema`]), and stays so when the stack stops or another lease holds the slot.

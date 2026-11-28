@@ -446,9 +446,7 @@ pub(super) fn stack(ctx: &Ctx, sub: &str) -> Result<Stack, Failure> {
         "up" => {
             let env = lease::lease_env(&held, Some(project))?;
             let how = stack::up(project, &ctx.worktree, slot, &env, &ctx.cfg)?;
-            if how == stack::Up::Started {
-                lease::stack_ours(&project.name, slot, true)?;
-            }
+            lease::stack_ours(&project.name, slot, true)?;
             Stack::Up { id, slot, how }
         }
         "down" => {

@@ -2526,6 +2526,145 @@ fn a_stack_devlab_started_is_stopped_once_idle_and_one_started_outside_devlab_ne
     );
 }
 
+/// Whether the stack `project_id`'s db container runs.
+fn stack_up(sandbox: &Sandbox, project_id: &str) -> bool {
+    fs::read_to_string(sandbox.path("world/containers"))
+        .unwrap_or_default()
+        .lines()
+        .any(|c| c == format!("supabase_db_{project_id}"))
+}
+
+#[test]
+fn a_lease_that_finds_its_stack_running_claims_it_and_keeps_it_down_after_a_reboot() {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""stackIdleMin": 0.02"#);
+    // Docker brought the stack back after a reboot, with no lease on it.
+    world.apply("container supabase_db_demo").unwrap();
+    let wt = world.worktree("demo-claim");
+
+    let held = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--quiet"],
+    );
+
+    assert_eq!(held.code, 0, "{held:?}");
+    let shown = status(&sandbox, &wt);
+    assert!(shown.contains("  demo 0   up (demo, devlab's) "), "{shown}");
+    let update = ["update", "--restart=no", "supabase_db_demo"].map(str::to_owned);
+    assert!(
+        sandbox.calls("docker").contains(&update.to_vec()),
+        "{:?}",
+        sandbox.calls("docker")
+    );
+    assert_eq!(owned(&sandbox, &wt, &["release"]).code, 0);
+    let stopped = poll_until(|| stack_stops(&sandbox, "demo") == 1 && !stack_up(&sandbox, "demo"));
+    assert!(stopped, "{:?}", sandbox.calls("supabase"));
+}
+
+#[test]
+fn a_stack_that_fails_to_stop_stays_devlabs_and_is_stopped_on_a_later_try() {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""stackIdleMin": 0.02"#);
+    let wt = world.worktree("demo-stubborn");
+    let held = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--quiet"],
+    );
+    assert_eq!(held.code, 0, "{held:?}");
+    world.apply("break supabase stop").unwrap();
+
+    assert_eq!(owned(&sandbox, &wt, &["release"]).code, 0);
+
+    assert!(poll_until(|| stack_stops(&sandbox, "demo") >= 1));
+    assert!(stack_up(&sandbox, "demo"));
+    world.apply("mend supabase stop").unwrap();
+    let stopped = poll_until(|| !stack_up(&sandbox, "demo"));
+    assert!(stopped, "{:?}", sandbox.calls("supabase"));
+    assert!(stack_stops(&sandbox, "demo") >= 2);
+}
+
+#[test]
+fn a_stack_whose_worktree_is_gone_is_stopped_by_its_project_id_from_devlabs_own_directory() {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""stackIdleMin": 0.02"#);
+    // The default CLI, `bunx supabase`, as the fake supabase.
+    sandbox.fake("bunx", "shift; exec supabase \"$@\"");
+    let wt = world.worktree("demo-gone");
+    let held = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--quiet"],
+    );
+    assert_eq!(held.code, 0, "{held:?}");
+    // The lease ends with its worktree removed, before the stack idles out.
+    fs::remove_dir_all(&wt).expect("remove the worktree");
+    let other = world.worktree("demo-elsewhere");
+    assert_eq!(
+        owned(&sandbox, &other, &["release", "--lease", &lease_id(&held)]).code,
+        0
+    );
+
+    let stopped = poll_until(|| !stack_up(&sandbox, "demo"));
+    assert!(
+        stopped,
+        "{:?} {}",
+        sandbox.calls("supabase"),
+        daemon_log(&sandbox)
+    );
+}
+
+#[test]
+fn a_new_daemon_adopts_a_stack_running_on_a_free_slot_and_stops_it_once_idle() {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""stackIdleMin": 0.02"#);
+    // A lease used a stack it didn't start: it isn't devlab's yet.
+    world.apply("container supabase_db_demo").unwrap();
+    let wt = world.worktree("demo-adopt");
+    let held = owned(&sandbox, &wt, &["acquire", "--no-device", "--quiet"]);
+    assert_eq!(held.code, 0, "{held:?}");
+    assert_eq!(owned(&sandbox, &wt, &["release"]).code, 0);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(stack_up(&sandbox, "demo"));
+
+    stop_daemon(&sandbox);
+    let text = status(&sandbox, &wt);
+
+    let stopped = poll_until(|| !stack_up(&sandbox, "demo"));
+    assert!(stopped, "{text} {:?}", sandbox.calls("supabase"));
+    let update = ["update", "--restart=no", "supabase_db_demo"].map(str::to_owned);
+    assert!(sandbox.calls("docker").contains(&update.to_vec()));
+}
+
+#[test]
+fn a_stack_start_leaves_out_the_services_devlab_json_excludes() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-lean");
+    let config = wt.join("devlab.json");
+    let text = fs::read_to_string(&config).expect("read devlab.json");
+    let lean = text.replace(
+        r#""cli": "supabase""#,
+        r#""cli": "supabase", "exclude": ["studio", "edge-runtime"]"#,
+    );
+    assert_ne!(lean, text);
+    fs::write(&config, lean).expect("write devlab.json");
+
+    let held = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--quiet"],
+    );
+
+    assert_eq!(held.code, 0, "{held:?}");
+    let start = ["start", "-x", "studio,edge-runtime"].map(str::to_owned);
+    assert!(
+        sandbox.calls("supabase").contains(&start.to_vec()),
+        "{:?}",
+        sandbox.calls("supabase")
+    );
+}
+
 #[test]
 fn status_names_the_daemon_as_the_watcher_and_devlab_watch_starts_no_poller() {
     let (sandbox, world) = lab();

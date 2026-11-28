@@ -20,8 +20,9 @@ pub struct Ran {
 }
 
 pub trait Stacks {
-    /// `<cli> start` in `cwd`, with `env` added to the environment.
-    fn start(&self, cli: &str, cwd: &Path, env: &[(String, String)]) -> Ran;
+    /// `<cli> start` in `cwd`, with `env` added to the environment, leaving out the services
+    /// `exclude` names (`-x a,b`).
+    fn start(&self, cli: &str, cwd: &Path, env: &[(String, String)], exclude: &[String]) -> Ran;
     /// `<cli> stop --project-id <project_id>` in `cwd`.
     fn stop(&self, cli: &str, project_id: &str, cwd: &Path) -> Ran;
 }
@@ -30,11 +31,11 @@ pub trait Stacks {
 pub struct SupabaseCli;
 
 impl Stacks for SupabaseCli {
-    fn start(&self, cli: &str, cwd: &Path, env: &[(String, String)]) -> Ran {
+    fn start(&self, cli: &str, cwd: &Path, env: &[(String, String)], exclude: &[String]) -> Ran {
         let Some(mut cmd) = command(cli, cwd) else {
             return refused(cli);
         };
-        cmd.arg("start")
+        cmd.args(start_args(exclude))
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         ran(cmd, START_TIMEOUT)
     }
@@ -46,6 +47,16 @@ impl Stacks for SupabaseCli {
         cmd.args(["stop", "--project-id", project_id]);
         ran(cmd, STOP_TIMEOUT)
     }
+}
+
+/// The words after the CLI that start a stack: `start`, with `-x a,b` when it leaves services out.
+pub fn start_args(exclude: &[String]) -> Vec<String> {
+    let mut args = vec!["start".to_owned()];
+    if !exclude.is_empty() {
+        args.push("-x".to_owned());
+        args.push(exclude.join(","));
+    }
+    args
 }
 
 fn command(cli: &str, cwd: &Path) -> Option<Command> {
@@ -82,6 +93,21 @@ fn ran(cmd: Command, timeout: Duration) -> Ran {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_start_leaves_out_the_excluded_services_with_one_x() {
+        assert_eq!(start_args(&[]), vec!["start"]);
+        let exclude = ["studio".to_owned(), "edge-runtime".to_owned()];
+        assert_eq!(
+            start_args(&exclude),
+            vec!["start", "-x", "studio,edge-runtime"]
+        );
+    }
+}
+
 /// Stacks that answer with the scripted result, recording each call as its words.
 #[derive(Debug)]
 pub struct FakeStacks {
@@ -90,10 +116,10 @@ pub struct FakeStacks {
 }
 
 impl Stacks for FakeStacks {
-    fn start(&self, cli: &str, _cwd: &Path, _env: &[(String, String)]) -> Ran {
-        self.calls
-            .borrow_mut()
-            .push(vec![cli.to_owned(), "start".to_owned()]);
+    fn start(&self, cli: &str, _cwd: &Path, _env: &[(String, String)], exclude: &[String]) -> Ran {
+        let mut call = vec![cli.to_owned()];
+        call.extend(start_args(exclude));
+        self.calls.borrow_mut().push(call);
         self.answer.clone()
     }
 

@@ -77,7 +77,8 @@ impl Default for MachineConfig {
             prep_stay_awake: true,
             prep_animations_off: true,
             emulator_idle_min: 10.0,
-            stack_idle_min: 45.0,
+            // A lean stack starts in about 12 s: an idle one isn't worth its memory for long.
+            stack_idle_min: 10.0,
             device_idle_min: 10.0,
             notify: true,
             readiness_check_sec: 120.0,
@@ -91,6 +92,8 @@ impl Default for MachineConfig {
 pub struct Supabase {
     pub dir: String,
     pub cli: String,
+    /// Services `supabase start` leaves out (`-x`), for a leaner stack (#84).
+    pub exclude: Vec<String>,
 }
 
 /// A project's `devlab.json`. Maps keep the order the file wrote them in, which is the order
@@ -259,6 +262,7 @@ pub fn project_config(file: &str, text: &str) -> Result<ProjectConfig, ConfigErr
         Some(Value::String(dir)) => Some(Supabase {
             dir: dir.clone(),
             cli: "bunx supabase".to_owned(),
+            exclude: Vec::new(),
         }),
         Some(Value::Object(o)) => {
             let text = |key: &str, default: &str| -> Result<String, ConfigError> {
@@ -270,9 +274,26 @@ pub fn project_config(file: &str, text: &str) -> Result<ProjectConfig, ConfigErr
                     ))),
                 }
             };
+            let exclude = match o.get("exclude") {
+                None => Vec::new(),
+                Some(v) => v
+                    .as_array()
+                    .and_then(|names| {
+                        names
+                            .iter()
+                            .map(|n| n.as_str().filter(|s| valid_service(s)).map(str::to_owned))
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .ok_or_else(|| {
+                        ConfigError(format!(
+                            "{file}: \"supabase.exclude\" must be a list of service names"
+                        ))
+                    })?,
+            };
             Some(Supabase {
                 dir: text("dir", "supabase")?,
                 cli: text("cli", "bunx supabase")?,
+                exclude,
             })
         }
         Some(_) => {
@@ -352,6 +373,14 @@ fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|c| c.is_ascii_lowercase())
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// A service `supabase start -x` names: `studio`, `edge-runtime`, ...
+fn valid_service(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 fn cap(raw: &Map<String, Value>, file: &str, key: &str) -> Result<Option<u32>, ConfigError> {
@@ -463,7 +492,8 @@ mod tests {
             p.supabase,
             Some(Supabase {
                 dir: "db".to_owned(),
-                cli: "bunx supabase".to_owned()
+                cli: "bunx supabase".to_owned(),
+                exclude: Vec::new(),
             })
         );
         let object =
@@ -472,7 +502,8 @@ mod tests {
             object.supabase,
             Some(Supabase {
                 dir: "supabase".to_owned(),
-                cli: "supabase".to_owned()
+                cli: "supabase".to_owned(),
+                exclude: Vec::new(),
             })
         );
     }
@@ -565,9 +596,9 @@ mod tests {
     }
 
     #[test]
-    fn the_idle_timers_are_minutes_from_the_config_defaulting_to_ten_and_forty_five() {
+    fn the_idle_timers_are_minutes_from_the_config_defaulting_to_ten() {
         let cfg = machine_config("m", "{}").unwrap();
-        assert_eq!((cfg.emulator_idle_min, cfg.stack_idle_min), (10.0, 45.0));
+        assert_eq!((cfg.emulator_idle_min, cfg.stack_idle_min), (10.0, 10.0));
         let cfg = machine_config("m", r#"{"emulatorIdleMin":0.5,"stackIdleMin":90}"#).unwrap();
         assert_eq!((cfg.emulator_idle_min, cfg.stack_idle_min), (0.5, 90.0));
         assert_eq!(
@@ -576,6 +607,26 @@ mod tests {
                 "m: \"stackIdleMin\" must be a number of minutes".to_owned()
             ))
         );
+    }
+
+    #[test]
+    fn a_stack_leaves_out_the_services_devlab_json_excludes_and_ignores_keys_it_doesnt_know() {
+        let p = project_config(
+            "f",
+            r#"{"name":"demo","supabase":{"exclude":["studio","edge-runtime"],"lean":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p.supabase.map(|s| s.exclude),
+            Some(vec!["studio".to_owned(), "edge-runtime".to_owned()])
+        );
+        assert_eq!(
+            project_config("f", r#"{"name":"demo","supabase":{"exclude":"studio"}}"#),
+            Err(ConfigError(
+                "f: \"supabase.exclude\" must be a list of service names".to_owned()
+            ))
+        );
+        assert!(project_config("f", r#"{"name":"demo","supabase":{"exclude":["a,b"]}}"#).is_err());
     }
 
     #[test]

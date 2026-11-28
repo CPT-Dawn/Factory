@@ -139,9 +139,9 @@ pub fn take(
         }
         if opts.stack && info.is_some() {
             let env = lease_env(&lease, Some(p))?;
-            if stack::up(p, &ctx.worktree, slot, &env, &ctx.cfg)? == stack::Up::Started {
-                stack_ours(&p.name, slot, true)?;
-            }
+            // One it finds running is devlab's too: else nothing ever stops it (#84).
+            stack::up(p, &ctx.worktree, slot, &env, &ctx.cfg)?;
+            stack_ours(&p.name, slot, true)?;
         }
     }
     clear_reverses(&lease, warn);

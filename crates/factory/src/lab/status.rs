@@ -212,7 +212,10 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
             SlotLine {
                 project: s.project.clone(),
                 slot: s.slot,
-                stack: if stack::running(&id) {
+                // One devlab owns is one its idle timer stops (#84).
+                stack: if stack::running(&id) && s.stack_ours {
+                    format!("up ({id}, devlab's)")
+                } else if stack::running(&id) {
                     format!("up ({id})")
                 } else {
                     "down".to_owned()
