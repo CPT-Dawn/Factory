@@ -4,6 +4,7 @@
 //! stdin, asks the rule, and answers in Claude Code's hook protocol. A rule that needs the
 //! outside world, such as the staged diff, hands back what it needs instead of fetching it.
 
+mod guard;
 mod js;
 mod shell;
 
@@ -106,6 +107,9 @@ pub fn pre_tool(input: &Value, escape: bool) -> PreTool {
                 return PreTool::Block(reason);
             }
             if let Some(reason) = machine_wide_kill(command) {
+                return PreTool::Block(reason);
+            }
+            if let Some(reason) = guard::shell_trap(command) {
                 return PreTool::Block(reason);
             }
             match git_actions(command) {
