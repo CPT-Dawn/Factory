@@ -249,6 +249,17 @@ impl FakeGitHub {
         );
     }
 
+    /// Moves main's head to `sha` as the next job log is read, as a push landing while a
+    /// wait collects a failed head's logs; `sha`'s checks are [`checks`].
+    ///
+    /// [`checks`]: FakeGitHub::checks
+    pub fn push_main_on_next_log_read(&self, sha: &str) {
+        self.put(
+            "main-on-log.json",
+            &json!({"name": "main", "commit": {"sha": sha}}),
+        );
+    }
+
     /// Makes `gh repo view` fail, as it does once the checkout it ran in is gone.
     pub fn lose_checkout(&self) {
         fs::write(self.dir.join("no-repo"), "").expect("write the no-repo marker");
@@ -455,6 +466,7 @@ api)
     repos/acme/shop/actions/jobs/*/logs)
         id="${{path%/logs}}"; id="${{id##*/}}"
         echo "$id" >> "$G/log-reads"
+        if [ -f "$G/main-on-log.json" ]; then mv "$G/main-on-log.json" "$G/main.json"; fi
         if [ -z "$escapes" ] && [ -f "$G/logs/$id" ] && grep -q "$(printf '\033')" "$G/logs/$id"; then
             echo 'fake gh: this log has escape sequences and no --allow-escape-sequences' >&2; exit 1
         fi

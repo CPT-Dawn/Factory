@@ -132,9 +132,10 @@ impl<A: Actions> Fleet<A> {
         // Every repo is read once as the daemon starts, so its runner fleet shows even on a
         // night with nothing to watch (#79); after that, only what needs watching is read.
         let mut asked = true;
-        // A wait woke the read: main is read too, as it is while a repo needs watching or is
-        // busy, but not on the read at start of a factory with nothing to watch.
-        let mut woken = false;
+        // The repos a wait woke the read for: their main is read too, as it is while a repo
+        // needs watching or is busy, but not on the read at start of a factory with nothing
+        // to watch, nor for a repo nothing watches.
+        let mut woken: Vec<String> = Vec::new();
         let mut last: Option<i64> = None;
         // The repos with live work, as last looked; looked at again once `look` is set.
         let mut busy: Vec<String> = Vec::new();
@@ -160,7 +161,7 @@ impl<A: Actions> Fleet<A> {
                 last = Some(clock::lab_now_ms());
                 let (fleet, only) = (Arc::clone(&self), busy.clone());
                 let _ =
-                    tokio::task::spawn_blocking(move || fleet.read_all(all, woken, &only)).await;
+                    tokio::task::spawn_blocking(move || fleet.read_all(all, &woken, &only)).await;
                 let next = (self.needs_watching() || !busy.is_empty())
                     .then(|| last.map(|at| at + INTERVAL_MS));
                 self.ci().next = next.flatten();
@@ -176,9 +177,9 @@ impl<A: Actions> Fleet<A> {
                         return;
                     }
                     let pr = watched.borrow_and_update().clone();
-                    if pr.is_some_and(|pr| self.watches(&pr)) {
+                    if let Some(pr) = pr.filter(|pr| self.watches(pr)) {
                         asked = true;
-                        woken = true;
+                        woken.push(format!("{}/{}", pr.owner(), pr.repo()));
                     }
                 }
             }
@@ -187,8 +188,8 @@ impl<A: Actions> Fleet<A> {
 
     /// Reads the repos once, keeping each answer, or the last good one marked with why: every
     /// repo with `all`, else each one that needs watching or is named in `busy`. Main is read
-    /// only when a wait `woke` the read, or the repo is busy or needs watching.
-    fn read_all(&self, all: bool, woken: bool, busy: &[String]) {
+    /// only for a repo named in `woken` (a wait woke the read for it), busy or needing watching.
+    fn read_all(&self, all: bool, woken: &[String], busy: &[String]) {
         let count = self.ci().repos.len();
         for index in 0..count {
             let Some(before) = self.ci().repos.get(index).cloned() else {
@@ -201,7 +202,10 @@ impl<A: Actions> Fleet<A> {
             if !all && !watched {
                 continue;
             }
-            let read = read(&*self.actions, &before, woken || watched);
+            let woke = woken
+                .iter()
+                .any(|repo| repo.eq_ignore_ascii_case(&before.repo));
+            let read = read(&*self.actions, &before, woke || watched);
             let after = match read {
                 Ok((mut after, jobs)) => {
                     after.seen = Some(clock::now().unix_millis());

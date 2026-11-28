@@ -884,3 +884,33 @@ fn wait_ci_main_waits_for_the_head_main_moved_to_while_it_read_the_last_ones_che
         "the head main moved to, not {MAIN_HEAD}: {answer}"
     );
 }
+
+#[test]
+fn wait_ci_main_does_not_answer_for_a_red_head_main_left_while_its_logs_were_read() {
+    const PUSHED: &str = "bbdac5fb00112233445566778899aabbccddeeff";
+    let sandbox = polling_every(1);
+    let github = FakeGitHub::install(&sandbox);
+    github.log(802, "error: migrations out of order\n");
+    github.main_checks(&[(802, "ci", "completed", Some("failure"))]);
+    github.checks(&[(901, "ci", "in_progress", None)]);
+    github.push_main_on_next_log_read(PUSHED);
+    let child = spawn(sandbox.factory_command(&["--json", "wait", "ci", "main"]));
+    let read_pushed = || {
+        sandbox.calls("gh").iter().any(|call| {
+            call.iter()
+                .any(|arg| arg.starts_with(&format!("repos/acme/shop/commits/{PUSHED}/check-runs")))
+        })
+    };
+    assert!(
+        poll_until(read_pushed),
+        "never read the pushed head's checks"
+    );
+
+    github.checks(&[(901, "ci", "completed", Some("success"))]);
+    let out = finish(child);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let answer: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    assert_eq!(answer["head"], PUSHED, "{answer}");
+    assert_eq!(github.log_reads(), vec![802]);
+}

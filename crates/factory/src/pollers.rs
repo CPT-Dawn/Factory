@@ -444,8 +444,10 @@ impl<G: PullRequests> Reader<G> {
         let seen = match ci::verdict(&all) {
             Verdict::Pending { pending } => Seen::Pending { pending },
             Verdict::Finished(tally) => {
-                // A branch can move on while its checks are read: a verdict is the latest
-                // head's, so a head that moved is read again on the next poll instead.
+                let finished = self.finished(&sha, &tally)?;
+                // A branch can move on while its checks and logs are read: a verdict is the
+                // latest head's, so the head is read again last, just before the verdict is
+                // published, and a head that moved is polled again instead.
                 if let Some(moved) = self.moved(cache.head.as_ref())? {
                     let cache = Cache {
                         head: Some(moved),
@@ -454,7 +456,7 @@ impl<G: PullRequests> Reader<G> {
                     };
                     return Ok((cache, None));
                 }
-                Seen::Finished(Arc::new(self.finished(&sha, &tally)?))
+                Seen::Finished(Arc::new(finished))
             }
         };
         Ok((cache, Some(seen)))
