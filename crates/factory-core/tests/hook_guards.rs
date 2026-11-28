@@ -211,6 +211,55 @@ fn an_interpolation_is_one_literal_word_and_raw_text_is_unknown() {
     assert_passes(&calls);
 }
 
+const WAIT_FIX: &str = "one wait per REPL call, or factory wait lead --any";
+
+#[test]
+fn a_repl_script_that_waits_more_than_once_is_denied() {
+    let codes = [
+        "for (const pr of prs) { await $`factory wait ci ${pr} > out.txt`.timeout(600000); }",
+        "for (const pr of prs) await $`factory wait ci ${pr}`;",
+        "for (let i = 0; i < 3; i++)\n  await $`factory wait ci 1`.nothrow();",
+        "while (true) {\n  const r = await $`factory wait review t1-r1`.nothrow();\n  if (r.exitCode === 0) break;\n}",
+        "do { await $`factory wait lead x`; } while (more);",
+        "for await (const x of xs) { await $`factory wait ci 1` }",
+        "$`bun test`.then(() => $`factory wait ci 3`)",
+        "p.catch(async () => { await $`factory wait ci 3` })",
+        "p.finally(() => $('factory wait ci 3'))",
+        "setInterval(() => $`factory wait ci 3`, 1000)",
+        "setTimeout(async () => { await $('factory wait lead x', 600000) }, 10)",
+        "prs.forEach(pr => $`factory wait ci ${pr}`)",
+        "await Promise.all(prs.map(pr => $`factory wait ci ${pr}`))",
+        "await $`factory wait ci 1`;\nawait $`factory wait ci 2`;",
+        "await $`factory wait ci 1 && factory wait ci 2`",
+        "for (const x of xs) { await $`cd /tmp && bash -c 'factory wait ci 1'` }",
+    ];
+    let calls: Vec<Value> = codes.iter().map(|c| repl(c)).collect();
+    assert_denied_with(&calls, WAIT_FIX);
+}
+
+#[test]
+fn one_awaited_wait_and_mere_mentions_pass() {
+    let codes = [
+        "await $`factory wait ci 12 > out.txt`.timeout(600000)",
+        "const r = await $`factory wait review t1-r1 > /tmp/w 2>&1`.nothrow().timeout(600000);\nif (r.exitCode === 124) log('again');",
+        "for (const f of files) { await $`rg -n x ${f}`; }\nawait $`factory wait ci 3`;",
+        "for (const f of files) await $`rg x ${f}`;\nawait $`factory wait ci 3`;",
+        "for (const f of files)\n  await $`rg x ${f}`;\nawait $`factory wait ci 3`;",
+        "const s = 'factory wait ci 1';\nfor (;;) { log('factory wait ci 2'); break; }",
+        "// for (;;) await $`factory wait ci 1`\nawait $`factory wait ci 2`",
+        "await $`factory wait ci 3`.then(r => log(r.exitCode))",
+        "if (ok) { await $`factory wait ci 3` }",
+        "while (more()) { await $`echo factory wait ci 1` }",
+        "async function f() { await $`factory wait ci 1` }\nawait f();",
+        "const out = await $`factory status`.text();\nwhile (x) { y(); }",
+        "xs.map(x => x * 2);\nawait $`factory wait lead --any`;",
+        "const t = `for (;;) { factory wait ci 1 }`;",
+        "do { x(); } while (more)\nawait $`factory wait ci 1`",
+    ];
+    let calls: Vec<Value> = codes.iter().map(|c| repl(c)).collect();
+    assert_passes(&calls);
+}
+
 const CAP: &str = "systemd-run --user --scope -p CPUQuota=200% -- <cmd>";
 
 #[test]

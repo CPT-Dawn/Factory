@@ -197,17 +197,32 @@ const TIMERS: &[&str] = &["setTimeout", "setInterval"];
 /// The brackets open at a token, and which of them hold what may run more than once.
 #[derive(Default)]
 struct Nesting {
-    /// Each open bracket: whether what it holds repeats, and whether it holds a loop's head.
-    open: Vec<(bool, bool)>,
+    open: Vec<Bracket>,
     /// A loop's head just closed, or a `do` was read: its body comes next.
     body_next: bool,
+    /// A `do` body just closed: the `while` after it ends the loop and starts no other.
+    after_do: bool,
     /// The loop bodies without braces being read: the depth each started at, and its line.
     bare_bodies: Vec<(usize, usize)>,
 }
 
+/// An open bracket: whether what it holds may run more than once, and what it is.
+#[derive(Clone, Copy)]
+struct Bracket {
+    repeats: bool,
+    holds: Holds,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Holds {
+    LoopHead,
+    DoBody,
+    Other,
+}
+
 impl Nesting {
     fn repeats(&self) -> bool {
-        !self.bare_bodies.is_empty() || self.open.last().is_some_and(|(repeats, _)| *repeats)
+        !self.bare_bodies.is_empty() || self.open.last().is_some_and(|open| open.repeats)
     }
 
     /// Takes in the token at `at`, before the caller looks at it.
@@ -226,10 +241,19 @@ impl Nesting {
             }
             self.bare_bodies.pop();
         }
+        let after_do = std::mem::take(&mut self.after_do);
         if std::mem::take(&mut self.body_next) {
             match token.tok {
                 Tok::Punct('{') => {
-                    self.open.push((true, false));
+                    let holds = if word(at.checked_sub(1)) == Some("do") {
+                        Holds::DoBody
+                    } else {
+                        Holds::Other
+                    };
+                    self.open.push(Bracket {
+                        repeats: true,
+                        holds,
+                    });
                     return;
                 }
                 Tok::Punct(';') => return,
@@ -242,21 +266,35 @@ impl Nesting {
                 let before = at.checked_sub(1);
                 let two_before = before.and_then(|b| b.checked_sub(1));
                 let head = match word(before) {
-                    Some("while" | "for") => true,
+                    Some("for") => true,
+                    // A `do` loop's `while` is its end.
+                    Some("while") => !after_do,
                     Some("await") => word(two_before) == Some("for"),
                     _ => false,
                 };
                 let after_dot = two_before.is_some_and(|b| tokens[b].tok == Tok::Punct('.'));
                 let callback = word(before)
                     .is_some_and(|w| TIMERS.contains(&w) || (after_dot && CALLBACKS.contains(&w)));
-                self.open.push((inherited || callback, head));
+                self.open.push(Bracket {
+                    repeats: inherited || callback,
+                    holds: if head { Holds::LoopHead } else { Holds::Other },
+                });
             }
-            Tok::Punct('{' | '[') | Tok::HoleOpen => self.open.push((inherited, false)),
-            Tok::Punct(')' | '}' | ']') | Tok::HoleClose => {
-                if let Some((_, true)) = self.open.pop() {
-                    self.body_next = true;
-                }
-            }
+            Tok::Punct('{' | '[') | Tok::HoleOpen => self.open.push(Bracket {
+                repeats: inherited,
+                holds: Holds::Other,
+            }),
+            Tok::Punct(')' | '}' | ']') | Tok::HoleClose => match self.open.pop() {
+                Some(Bracket {
+                    holds: Holds::LoopHead,
+                    ..
+                }) => self.body_next = true,
+                Some(Bracket {
+                    holds: Holds::DoBody,
+                    ..
+                }) => self.after_do = true,
+                _ => {}
+            },
             Tok::Punct(';') => {
                 if self
                     .bare_bodies
@@ -266,6 +304,8 @@ impl Nesting {
                     self.bare_bodies.pop();
                 }
             }
+            // The `while` that ends a `do` loop keeps the mark for its `(`.
+            Tok::Word(word) if word == "while" => self.after_do = after_do,
             Tok::Word(word) if word == "do" => self.body_next = true,
             _ => {}
         }

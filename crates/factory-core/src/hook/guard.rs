@@ -17,13 +17,49 @@ pub fn shell_trap(command: &str) -> Option<String> {
 /// The refusal for a REPL script whose shell text one of the guards stops, naming its line. Text
 /// the script doesn't say, such as a `${{raw: s}}` splice, is let through.
 pub fn repl_trap(code: &str) -> Option<String> {
-    js::shell_calls(code)
+    let calls = js::shell_calls(code);
+    if let Some(reason) = repl_waits(&calls) {
+        return Some(reason);
+    }
+    calls.iter().filter(|call| call.exact).find_map(|call| {
+        let reason = shell_trap(&call.text)?;
+        Some(format!("REPL line {}: {reason}", call.line))
+    })
+}
+
+/// The refusal for a script that runs `factory wait` more than once: from a loop, a callback or a
+/// timer, or twice in its text. A wait outlives the REPL call's own time, and the script's
+/// result reaches nobody while it waits.
+fn repl_waits(calls: &[js::ShellCall]) -> Option<String> {
+    let mut seen = 0;
+    for call in calls {
+        let waits = waits_in(&call.text);
+        seen += waits;
+        let why = if waits > 0 && call.repeated {
+            "runs factory wait from a loop, a callback or a timer"
+        } else if seen > 1 {
+            "runs a second factory wait"
+        } else {
+            continue;
+        };
+        return Some(format!(
+            "REPL line {}: this script {why}; one wait per REPL call, or factory wait lead --any.",
+            call.line
+        ));
+    }
+    None
+}
+
+/// How many `factory wait` commands a command line runs.
+fn waits_in(command: &str) -> usize {
+    super::commands(command)
         .iter()
-        .filter(|call| call.exact)
-        .find_map(|call| {
-            let reason = shell_trap(&call.text)?;
-            Some(format!("REPL line {}: {reason}", call.line))
+        .filter(|words| {
+            shell::invocation(words).is_some_and(|call| {
+                call.program == "factory" && call.args.first().is_some_and(|a| a == "wait")
+            })
         })
+        .count()
 }
 
 /// [`shell_trap`] over `command`, which is the script of a `bash -c` when `in_script`.
