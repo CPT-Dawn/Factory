@@ -1,6 +1,6 @@
 //! What the daemon stops because nothing used it for long enough (#18): a ready emulator no lease
-//! holds, after the emulator timer; a stack devlab started on a slot no lease holds, after the
-//! stack timer; never a stack started outside devlab.
+//! holds, after the emulator timer; a stack devlab owns on a slot no lease holds, after the stack
+//! timer; never a stack that isn't devlab's.
 
 use factory_core::lab::devices::Mode;
 use factory_core::lab::idle::{
@@ -29,7 +29,6 @@ fn slot(slot: u32, idle_since: Option<i64>) -> IdleSlot {
         slot,
         stack_ours: true,
         held: false,
-        last_worktree: Some("/w/demo-a".to_owned()),
         idle_since,
     }
 }
@@ -100,7 +99,7 @@ fn a_stack_devlab_started_is_stopped_after_its_own_timer() {
 }
 
 #[test]
-fn a_stack_started_outside_devlab_or_on_a_held_slot_is_never_stopped() {
+fn a_stack_that_isnt_devlabs_or_on_a_held_slot_is_never_stopped() {
     let long_ago = Some(0);
     let outside = IdleSlot {
         stack_ours: false,
@@ -111,19 +110,8 @@ fn a_stack_started_outside_devlab_or_on_a_held_slot_is_never_stopped() {
         ..slot(1, long_ago)
     };
     let never_idle = slot(2, None);
-    let no_worktree = IdleSlot {
-        last_worktree: None,
-        ..slot(3, long_ago)
-    };
 
-    let due = sweep(
-        &[],
-        &[outside, held, never_idle, no_worktree],
-        &[],
-        &[],
-        timers(),
-        NOW,
-    );
+    let due = sweep(&[], &[outside, held, never_idle], &[], &[], timers(), NOW);
 
     assert_eq!(due, Sweep::default());
 }

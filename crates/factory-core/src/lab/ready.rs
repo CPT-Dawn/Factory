@@ -6,7 +6,8 @@
 pub const STAY_ON_PROBE: &str = "settings get global stay_on_while_plugged_in";
 /// The shell line that prints which power sources the phone is on.
 /// It ends in `head` so that naming no source is an answer, not a failure.
-pub const BATTERY_PROBE: &str = "dumpsys battery | grep -E 'powered: ' | head -8";
+/// A battery a test faked (`dumpsys battery unplug`, `set`) shows `UPDATES STOPPED` first (#84).
+pub const BATTERY_PROBE: &str = "dumpsys battery | grep -E 'powered: |UPDATES STOPPED' | head -8";
 /// The shell line that prints whether the screen is awake.
 pub const POWER_PROBE: &str = "dumpsys power | grep -E 'mWakefulness=' | head -1";
 /// The shell line that prints adb's authorization timeout; `0` when it is off.
@@ -83,6 +84,10 @@ pub enum Readiness {
     /// `stay_on_while_plugged_in` doesn't cover the power source it is on.
     #[serde(rename = "stay-awake off")]
     StayAwakeOff,
+    /// A test faked its battery (`dumpsys battery unplug`) and never reset it: it says it is
+    /// on no power, so the screen sleeps whatever stay-awake says (#84).
+    #[serde(rename = "battery faked")]
+    BatteryFaked,
     /// adb lists it, but the phone hasn't allowed this computer's USB debugging.
     Unauthorized,
     /// adb lists it but can't reach it.
@@ -100,6 +105,7 @@ impl Readiness {
             Readiness::Locked => "locked",
             Readiness::Asleep => "asleep",
             Readiness::StayAwakeOff => "stay-awake off",
+            Readiness::BatteryFaked => "battery faked",
             Readiness::Unauthorized => "unauthorized",
             Readiness::Offline => "offline",
             Readiness::UsbDebuggingOff => "usb-debugging-off",
@@ -112,6 +118,7 @@ impl Readiness {
             Readiness::Locked,
             Readiness::Asleep,
             Readiness::StayAwakeOff,
+            Readiness::BatteryFaked,
             Readiness::Unauthorized,
             Readiness::Offline,
             Readiness::UsbDebuggingOff,
@@ -153,6 +160,10 @@ pub fn judge(p: &Probe) -> Readiness {
     ) else {
         return Readiness::Offline;
     };
+    // A faked battery is why it reads as on no power: that is what to undo.
+    if battery.contains("UPDATES STOPPED") {
+        return Readiness::BatteryFaked;
+    }
     let stay_on: u32 = stay_on.trim().parse().unwrap_or(0);
     // A phone on no power at all sleeps whatever stay-awake says.
     let sources = power_sources(battery);
@@ -289,6 +300,11 @@ pub fn notice(name: &str, before: Option<Known>, now: Readiness) -> Option<Notic
             "Stay-awake is off for the power it is on: replug it, or run devlab prep.",
             Urgency::Normal,
         ),
+        Readiness::BatteryFaked => (
+            format!("{name}'s battery is faked"),
+            "A test left dumpsys battery faking its power, so it sleeps: run devlab prep to reset it.",
+            Urgency::Normal,
+        ),
         Readiness::Unauthorized => (
             format!("{name}: allow USB debugging"),
             "Unlock the phone and tap Allow (tick Always allow from this computer).",
@@ -356,6 +372,9 @@ pub fn check_line(
         Some(Readiness::StayAwakeOff) => {
             format!("stay-awake off: replug it, or run devlab prep {serial}")
         }
+        Some(Readiness::BatteryFaked) => format!(
+            "battery faked: a test left dumpsys battery faking its power; run devlab prep {serial}"
+        ),
         Some(Readiness::Unauthorized) => {
             "unauthorized: unlock it and tap Allow on the USB debugging prompt (tick Always allow)"
                 .to_owned()

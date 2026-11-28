@@ -81,6 +81,11 @@ impl Lab {
                 slots,
                 reservations,
                 queue,
+                mem_after_ci_mb: {
+                    let cfg = crate::lab::context::machine_config().unwrap_or_default();
+                    let memory = crate::lab::host::memory(&cfg.ci_slice);
+                    Some(memory.free_mb())
+                },
             })
         })
     }

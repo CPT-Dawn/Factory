@@ -240,6 +240,36 @@ fn a_daemon_restart_resumes_the_wait_and_still_posts_its_line() {
 }
 
 #[test]
+fn a_restart_resumes_a_wait_on_main_without_the_checkout_it_came_from() {
+    let sandbox = delivery(true);
+    let github = FakeGitHub::install(&sandbox);
+    github.main_checks(&[(801, "ci", "in_progress", None)]);
+    let _herdr = shop(&sandbox);
+    let inbox = FakeInbox::start(&sandbox, "lead");
+    let out = notify(&sandbox, &inbox, &["ci", "main"]);
+    assert_eq!(
+        (out.code, out.stdout.as_str()),
+        (
+            0,
+            "wait #1 on ci acme/shop@main registered; its line comes to this session when it ends\n"
+        ),
+        "{out:?}"
+    );
+
+    github.lose_checkout();
+    restart(&sandbox);
+
+    assert_eq!(status(&sandbox), "lead-a waiting: ci acme/shop@main\n");
+    github.main_checks(&[(801, "ci", "completed", Some("success"))]);
+    assert_eq!(
+        inbox.await_posts(1),
+        vec![posted(
+            "factory wait #1 ended (exit 0): acme/shop@main: 1 passed, 0 failed"
+        )]
+    );
+}
+
+#[test]
 fn wait_lead_notify_posts_the_line_once_the_lead_settles() {
     let sandbox = delivery(true);
     let herdr = shop(&sandbox);

@@ -21,6 +21,7 @@ pub mod emulator;
 pub mod events;
 pub mod grant;
 pub mod idle;
+pub mod memory;
 pub mod queue;
 pub mod ready;
 pub mod reserve;

@@ -22,6 +22,8 @@ use super::Sandbox;
 pub const PR_URL: &str = "https://github.com/acme/shop/pull/12";
 /// The head commit of that pull request until a test pushes another.
 pub const HEAD: &str = "c0ffee1234567890c0ffee1234567890c0ffee12";
+/// The latest head of the repo's `main`, whose checks are its own.
+pub const MAIN_HEAD: &str = "42fdcd84aa0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d";
 
 /// What `gh event listen` says on an account without event subscriptions.
 const NOT_ENABLED: &str = "event subscriptions are in preview and not enabled for this account: \
@@ -79,6 +81,7 @@ impl FakeGitHub {
         github.push(HEAD);
         github.checks(&[]);
         github.statuses(&[]);
+        github.main_checks(&[(800, "ci", "completed", Some("success"))]);
         github.runners(&[]);
         github.workflow_runs("queued", &[]);
         github.workflow_runs("in_progress", &[]);
@@ -199,14 +202,78 @@ impl FakeGitHub {
     }
 
     /// Every `gh api` path the fake was asked for that reads the runner fleet, workflow runs,
-    /// jobs or open pull requests: the CI watcher's reads, and no wait's.
+    /// jobs, open pull requests or main's head: the CI watcher's reads, and no wait's on a
+    /// pull request.
     pub fn watcher_reads(&self, sandbox: &Sandbox) -> Vec<String> {
         sandbox
             .calls("gh")
             .into_iter()
             .filter_map(|call| call.into_iter().find(|arg| arg.starts_with("repos/")))
-            .filter(|path| path.contains("/actions/run") || path.contains("/pulls?"))
+            .filter(|path| {
+                path.contains("/actions/run")
+                    || path.contains("/pulls?")
+                    || path.contains("/branches/")
+            })
             .collect()
+    }
+
+    /// Sets the check runs on main's head, [`MAIN_HEAD`], each `(id, name, status,
+    /// conclusion)` from GitHub Actions; its commit statuses are none.
+    pub fn main_checks(&self, runs: &[(u64, &str, &str, Option<&str>)]) {
+        let runs: Vec<Value> = runs
+            .iter()
+            .map(|&(id, name, status, conclusion)| {
+                let url = format!("https://github.com/acme/shop/actions/runs/8/job/{id}");
+                json!({
+                    "id": id,
+                    "name": name,
+                    "status": status,
+                    "conclusion": conclusion,
+                    "html_url": url,
+                    "details_url": url,
+                    "app": {"slug": "github-actions"},
+                })
+            })
+            .collect();
+        self.put(
+            "main-checks.json",
+            &json!({"total_count": runs.len(), "check_runs": runs}),
+        );
+        self.put(
+            "main-status.json",
+            &json!({"state": "pending", "total_count": 0, "statuses": []}),
+        );
+        self.put(
+            "main.json",
+            &json!({"name": "main", "commit": {"sha": MAIN_HEAD}}),
+        );
+    }
+
+    /// Moves main's head to `sha` as the next job log is read, as a push landing while a
+    /// wait collects a failed head's logs; `sha`'s checks are [`checks`].
+    ///
+    /// [`checks`]: FakeGitHub::checks
+    pub fn push_main_on_next_log_read(&self, sha: &str) {
+        self.put(
+            "main-on-log.json",
+            &json!({"name": "main", "commit": {"sha": sha}}),
+        );
+    }
+
+    /// Makes `gh repo view` fail, as it does once the checkout it ran in is gone.
+    pub fn lose_checkout(&self) {
+        fs::write(self.dir.join("no-repo"), "").expect("write the no-repo marker");
+    }
+
+    /// Moves main's head to `sha` right after its next read is served, as a push landing
+    /// while a wait reads the checks of the head before it; `sha`'s checks are [`checks`].
+    ///
+    /// [`checks`]: FakeGitHub::checks
+    pub fn push_main_after_next_read(&self, sha: &str) {
+        self.put(
+            "main-next.json",
+            &json!({"name": "main", "commit": {"sha": sha}}),
+        );
     }
 
     /// Moves the pull request's head to `sha`.
@@ -302,6 +369,15 @@ impl FakeGitHub {
         fs::write(self.dir.join("logs").join(id.to_string()), text).expect("write a job log");
     }
 
+    /// The jobs whose logs were read so far, oldest first.
+    pub fn log_reads(&self) -> Vec<u64> {
+        fs::read_to_string(self.dir.join("log-reads"))
+            .unwrap_or_default()
+            .lines()
+            .map(|id| id.parse().expect("a job id"))
+            .collect()
+    }
+
     /// Scripts `gh event listen`: `body` is shell run in place of the refusal, with the fake's
     /// dir in `$G`.
     pub fn listen(&self, body: &str) {
@@ -343,14 +419,18 @@ case "$1" in
 pr)
     while [ -f "$G/hold" ]; do sleep 0.05; done
     if [ -f "$G/url" ]; then cat "$G/url"; else echo 'no pull requests found for branch "work"' >&2; exit 1; fi ;;
+repo)
+    if [ -f "$G/no-repo" ]; then echo 'failed to run git: not a git repository' >&2; exit 1; fi
+    echo 'https://github.com/acme/shop' ;;
 api)
     shift
-    etag_in=''; path=''
+    etag_in=''; path=''; escapes=''
     while [ $# -gt 0 ]; do
         case "$1" in
         -H) shift; case "$1" in "If-None-Match: "*) etag_in="${{1#If-None-Match: }}" ;; esac ;;
         --hostname) shift ;;
         -i) ;;
+        --allow-escape-sequences) escapes=1 ;;
         *) path="$1" ;;
         esac
         shift
@@ -371,11 +451,25 @@ api)
     repos/acme/shop/actions/runs/*/jobs*)
         id="${{path#repos/acme/shop/actions/runs/}}"; id="${{id%%/*}}"
         file="$G/jobs-$id.json"; [ -f "$file" ] || file="$G/no-jobs.json" ;;
+    repos/acme/shop/branches/main)
+        file="$G/main.json"
+        # A push to main lands right after this read is served.
+        if [ -f "$G/main-next.json" ]; then
+            cp "$G/main.json" "$G/main-served.json"; mv "$G/main-next.json" "$G/main.json"
+            file="$G/main-served.json"
+        fi ;;
+    repos/acme/shop/commits/{main}/check-runs*) file="$G/main-checks.json" ;;
+    repos/acme/shop/commits/{main}/status\?*) file="$G/main-status.json" ;;
     repos/acme/shop/commits/*/check-runs*'&page='*) file="$G/checks-${{path##*&page=}}.json" ;;
     repos/acme/shop/commits/*/check-runs*) file="$G/checks.json" ;;
     repos/acme/shop/commits/*/status\?*) file="$G/status.json" ;;
     repos/acme/shop/actions/jobs/*/logs)
         id="${{path%/logs}}"; id="${{id##*/}}"
+        echo "$id" >> "$G/log-reads"
+        if [ -f "$G/main-on-log.json" ]; then mv "$G/main-on-log.json" "$G/main.json"; fi
+        if [ -z "$escapes" ] && [ -f "$G/logs/$id" ] && grep -q "$(printf '\033')" "$G/logs/$id"; then
+            echo 'fake gh: this log has escape sequences and no --allow-escape-sequences' >&2; exit 1
+        fi
         if [ -f "$G/logs/$id" ]; then cat "$G/logs/$id"; exit 0; fi
         echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
     *) echo "fake gh: no route for $path" >&2; exit 1 ;;
@@ -409,6 +503,7 @@ event)
     echo "fake gh: no script for: $*" >&2
     exit 127 ;;
 esac"#,
-        dir = dir.display()
+        dir = dir.display(),
+        main = MAIN_HEAD,
     )
 }

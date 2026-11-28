@@ -136,6 +136,66 @@ fn check_exits_10_naming_a_locked_phone_and_what_to_do_and_0_once_it_is_unlocked
 }
 
 #[test]
+fn check_names_a_battery_a_test_faked_and_devlab_prep_resets_it() {
+    let (sandbox, world, wt) = watching();
+    world.apply(PIXEL).unwrap();
+    assert!(poll_until(
+        || check(&sandbox, &wt, &["FAKEPHONE01"]).code == 0
+    ));
+
+    // A battery-measuring run faked it unplugged and never reset it.
+    world.apply("fake-battery FAKEPHONE01").unwrap();
+
+    let faked = "FAKEPHONE01 (Pixel 8): battery faked: a test left dumpsys battery faking its power; run devlab prep FAKEPHONE01\n";
+    assert!(
+        poll_until(|| check(&sandbox, &wt, &["FAKEPHONE01"]).stdout == faked),
+        "{:?}",
+        check(&sandbox, &wt, &["FAKEPHONE01"])
+    );
+    assert_eq!(check(&sandbox, &wt, &["FAKEPHONE01"]).code, 10);
+    let prep = run(devlab(&sandbox, &wt, &["prep", "FAKEPHONE01"]));
+    assert_eq!(prep.code, 0, "{prep:?}");
+    assert!(
+        poll_until(|| check(&sandbox, &wt, &["FAKEPHONE01"]).code == 0),
+        "{:?}",
+        check(&sandbox, &wt, &["FAKEPHONE01"])
+    );
+}
+
+#[test]
+fn a_lease_ending_puts_its_phones_real_battery_back() {
+    let (sandbox, world, wt) = watching();
+    world.apply(PIXEL).unwrap();
+    assert!(poll_until(
+        || check(&sandbox, &wt, &["FAKEPHONE01"]).code == 0
+    ));
+    let mut acquire = devlab(&sandbox, &wt, &["acquire", "--phone", "--quiet"]);
+    acquire.env("DEVLAB_OWNER_PID", std::process::id().to_string());
+    let held = run(acquire);
+    assert_eq!(held.code, 0, "{held:?}");
+    world.apply("fake-battery FAKEPHONE01").unwrap();
+
+    let mut release = devlab(&sandbox, &wt, &["release"]);
+    release.env("DEVLAB_OWNER_PID", std::process::id().to_string());
+    assert_eq!(run(release).code, 0);
+
+    let restore = "dumpsys battery reset; dumpsys deviceidle unforce";
+    assert!(
+        poll_until(|| sandbox
+            .calls("adb")
+            .iter()
+            .any(|c| c.last().is_some_and(|cmd| cmd == restore))),
+        "{:?}",
+        sandbox.calls("adb")
+    );
+    assert!(
+        poll_until(|| check(&sandbox, &wt, &["FAKEPHONE01"]).code == 0),
+        "{:?}",
+        check(&sandbox, &wt, &["FAKEPHONE01"])
+    );
+}
+
+#[test]
 fn a_replug_runs_the_prep_again() {
     let (sandbox, world, wt) = watching();
     world.apply(PIXEL).unwrap();

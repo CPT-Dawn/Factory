@@ -60,7 +60,13 @@ fn an_idle_factory_says_so_in_every_section() {
         ],
         "{out:?}"
     );
-    assert!(lines.contains(&"lab: idle"), "{out:?}");
+    // The lab counts what is free after CI's headroom, all of it with no CI slice (#84).
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("lab: idle, ") && line.ends_with(" GB free after CI")),
+        "{out:?}"
+    );
     assert!(lines.contains(&"waits: none"), "{out:?}");
     // No Codex to ask is no 0%: the row says it could not read.
     assert!(
@@ -104,7 +110,13 @@ fn json_gives_every_field_of_every_section() {
     assert_eq!(shown["claude"]["verdict"], "unknown", "{shown}");
     assert_eq!(
         keys(&shown["lab"]),
-        ["leases", "queue", "reservations", "slots"]
+        [
+            "leases",
+            "mem_after_ci_mb",
+            "queue",
+            "reservations",
+            "slots"
+        ]
     );
     assert_eq!(keys(&shown["leads"]), ["error", "leads", "monitor"]);
     assert!(
@@ -333,10 +345,7 @@ fn leases_slots_and_the_queue_come_from_the_lab() {
     let out = status(&sandbox);
 
     let lines = out.stdout_lines();
-    assert!(
-        lines.contains(&"lab: 2 leased, 0 free, 1 queued"),
-        "{out:?}"
-    );
+    assert!(shows_lab(&lines, "2 leased, 0 free, 1 queued"), "{out:?}");
     let leases: Vec<&&str> = lines.iter().filter(|l| l.starts_with("  lease ")).collect();
     assert_eq!(leases.len(), 2, "{out:?}");
     assert!(
@@ -380,9 +389,7 @@ fn leases_slots_and_the_queue_come_from_the_lab() {
     assert_eq!(finish(queued).code, 0);
     let after = status(&sandbox);
     assert!(
-        after
-            .stdout_lines()
-            .contains(&"lab: 2 leased, 0 free, 0 queued"),
+        shows_lab(&after.stdout_lines(), "2 leased, 0 free, 0 queued"),
         "{after:?}"
     );
 }
@@ -405,8 +412,7 @@ fn a_freed_slot_shows_as_free_with_the_worktree_that_had_it() {
     let out = status(&sandbox);
 
     assert!(
-        out.stdout_lines()
-            .contains(&"lab: 0 leased, 1 free, 0 queued"),
+        shows_lab(&out.stdout_lines(), "0 leased, 1 free, 0 queued"),
         "{out:?}"
     );
     assert!(out.stdout.contains("/0 free, last demo-a\n"), "{out:?}");
@@ -555,7 +561,7 @@ fn a_reserved_slot_is_the_leads_and_not_free() {
 
     let lines = out.stdout_lines();
     assert!(
-        lines.contains(&"lab: 1 leased, 1 reserved, 0 free, 0 queued"),
+        shows_lab(&lines, "1 leased, 1 reserved, 0 free, 0 queued"),
         "{out:?}"
     );
     let row = lines.iter().find(|l| l.starts_with("  reserved ")).unwrap();
@@ -571,4 +577,13 @@ fn a_reserved_slot_is_the_leads_and_not_free() {
         Value::Null,
         "{shown}"
     );
+}
+
+/// Whether `lines` hold the lab's line with `counts`, which ends on the memory left after CI.
+fn shows_lab(lines: &[&str], counts: &str) -> bool {
+    lines.iter().any(|line| {
+        line.strip_prefix("lab: ")
+            .and_then(|rest| rest.strip_prefix(counts))
+            .is_some_and(|rest| rest.starts_with(", ") && rest.ends_with(" GB free after CI"))
+    })
 }

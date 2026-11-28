@@ -21,7 +21,7 @@ pub enum Shown {
 }
 
 /// The one table of what each phone's row asks of the owner, and its tone.
-pub const WORDS: [(Shown, &str, Tone); 8] = [
+pub const WORDS: [(Shown, &str, Tone); 9] = [
     (Shown::Free(Readiness::Ready), "ready", Tone::Ok),
     (Shown::Leased, "leased to", Tone::Busy),
     (Shown::Free(Readiness::Locked), "unlock it", Tone::Warn),
@@ -29,6 +29,11 @@ pub const WORDS: [(Shown, &str, Tone); 8] = [
     (
         Shown::Free(Readiness::StayAwakeOff),
         "turn on Stay awake",
+        Tone::Warn,
+    ),
+    (
+        Shown::Free(Readiness::BatteryFaked),
+        "run devlab prep",
         Tone::Warn,
     ),
     (
@@ -84,6 +89,10 @@ pub struct Lab {
     pub max_emulators: u32,
     /// `MemAvailable`, in MB.
     pub mem_available_mb: i64,
+    /// What is free after the CI slice's headroom (none without a slice), in MB (#84); none from a
+    /// daemon from before it was counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_after_ci_mb: Option<i64>,
     /// Why the lab couldn't be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -335,12 +344,14 @@ pub fn section(lab: &Lab) -> Section {
         } else {
             text("queue", format!("{} waiting", lab.queue), Tone::Busy)
         });
-        #[allow(clippy::cast_precision_loss)]
-        let gb = lab.mem_available_mb as f64 / 1024.0;
+        let free = lab.mem_after_ci_mb.map_or_else(
+            || format!("{} GB free", crate::lab::memory::gb(lab.mem_available_mb)),
+            |mb| format!("{} GB free after CI", crate::lab::memory::gb(mb)),
+        );
         rows.push(text(
             "room",
             format!(
-                "emulators {} of {} · {gb:.1} GB free",
+                "emulators {} of {} · {free}",
                 lab.emulators.len(),
                 lab.max_emulators
             ),
