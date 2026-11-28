@@ -12,7 +12,9 @@ page together.
 review.sh [--tier hard|standard|trivial] [--escalation] <base> <label> [<spec>] [<previous-report>]
 ```
 
-(`--escalation` is passed through to factory; a review.sh older than the round cap, docs/adr/0002, lacks it.)
+(`--escalation` is passed through to factory; a review.sh older than the round cap, docs/adr/0002, lacks it.
+`factory review` also takes `--standalone` and `--follow-up <issue>`, below; a review.sh that does not pass
+them through cannot run a retro's review or a follow-up's.)
 
 The shim checks the label (letters, digits, `_`, `-`) and the tier before it calls factory, and exits 2 with a
 `code-review: ` line on stderr when either is wrong. It runs:
@@ -26,7 +28,16 @@ factory review [--tier <tier>] [--escalation] --skill <its checkout's codex/code
   light review, `<prefix>-rN-light`, reviews only the last fix, from round N's head, once. Any other round
   (`-r3` without `--escalation`, `-r5`, a light review after round 1 or 3, a second light review) is refused
   with exit 2 and one line saying to report what is still open; `--escalation` on rounds 1 and 2 is refused too.
-  A label with no `-rN` suffix is held to no cap.
+- A label that names no round (`t1`, `retro-lab-light2`, `t1-r5-light-2`, a zero-padded `t1-r02`, an empty
+  prefix `-r1`) is refused unless the review is
+  `--standalone`, a review outside a ticket such as a retro's; `--standalone` with a `-rN` label is refused.
+- `--escalation` needs an `escalation` event naming the prefix in this repo's ledger, which the lead logs when it
+  re-dispatches the ticket: `factory log escalation repo=<repo> prefix=<prefix>`. Without one it is refused.
+- A new round 1, or a standalone review, of work a prefix has reviewed to its cap (its round 2 with no
+  escalation, its round 4, or its light review) is refused, with a line saying to file a follow-up issue for
+  what is still open. The same work is the same head, or the same tree reviewed from the same base commit,
+  however spelled (an empty commit on top). `--follow-up <issue>` names that new issue, which gh must be able
+  to view and whose URL must not be the spec's; only a round 1 takes it. Its round 1 then runs, and its `review` event carries `follow_up`.
 - Round N > 1 and a light review continue the round before (`<prefix>-r<N-1>`, or round N for `-rN-light`):
   without a previous report, factory takes that round's report from `<state>/reviews/<repo>/`, and refuses with
   exit 2, naming the missing report, when there is none. It never reviews such a round fresh.

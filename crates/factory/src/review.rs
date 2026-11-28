@@ -3,8 +3,10 @@
 //! grants a slot, and one line back.
 //!
 //! The label's round is held to the cap (docs/adr/0002): rounds 1 and 2, 3 and 4 for an
-//! escalation, then one light review (`-rN-light`). A later round finds the round before it
-//! among this repo's reviews when the caller names no previous report.
+//! escalation the lead logged, then one light review (`-rN-light`); a label with no round runs
+//! only `--standalone`, and work a prefix reviewed to its cap gets a new round 1 only for a
+//! `--follow-up` issue. A later round finds the round before it among this repo's reviews when
+//! the caller names no previous report.
 //!
 //! The tier picks the chain (spec review spec, on a chain of its own; small or docs-only diff trivial; else the
 //! caller's, or standard), and each step names a pool, a model and an effort. The daemon holds
@@ -35,7 +37,8 @@ use factory_adapters::reviewer::{Agy, Claude, Codex, Job, Reviewer, ReviewerErro
 use factory_core::exit::Exit;
 use factory_core::quota::{Reset, WhenBusy};
 use factory_core::review::{
-    self, Bundle, Doc, Finding, Fix, Part, Place, Previous, Reading, Record, Verdict,
+    self, Asked, Bundle, Doc, Finding, Fix, History, Part, Past, Place, Previous, Reading, Record,
+    Verdict,
 };
 use factory_core::tier::{self, Tier};
 use factory_core::timestamp::Timestamp;
@@ -84,11 +87,25 @@ pub struct Args {
     pub skill: Option<PathBuf>,
     /// The review is an escalation's, which may run rounds 3 and 4.
     pub escalation: bool,
+    /// The review is outside a ticket's rounds, its label naming none.
+    pub standalone: bool,
+    /// The follow-up issue a new round 1 reviews, past another prefix's cap.
+    pub follow_up: Option<String>,
+}
+
+impl Args {
+    fn asked(&self) -> Asked<'_> {
+        Asked {
+            escalation: self.escalation,
+            standalone: self.standalone,
+            follow_up: self.follow_up.as_deref(),
+        }
+    }
 }
 
 pub fn run(args: &Args) -> Result<Done, Failure> {
     review::check_label(&args.label).map_err(|e| Failure::usage(e.to_string()))?;
-    review::admit(&args.label, args.escalation).map_err(Failure::usage)?;
+    review::admit(&args.label, &args.asked()).map_err(Failure::usage)?;
     let caller = args
         .tier
         .as_deref()
@@ -125,6 +142,7 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         label: &args.label,
         round: review::round(&args.label, args.previous.is_some()),
         base: &args.base,
+        base_commit: &run.base_commit,
         head: &run.head,
         spec: &run.spec,
         backend: chosen.map_or("", |chosen| chosen.pool.as_str()),
@@ -147,6 +165,7 @@ pub fn run(args: &Args) -> Result<Done, Failure> {
         stream: &run.stream,
         findings: &run.findings,
         from: &run.from,
+        follow_up: &run.follow_up,
         result: match (&run.reading, &failed) {
             (Some(reading), None) => Ok(reading),
             _ => Err(failed
@@ -241,6 +260,10 @@ struct Run {
     findings: String,
     /// On a fix round, the head the previous round reviewed.
     from: String,
+    /// The follow-up issue the review is for, as gh is asked for it.
+    follow_up: String,
+    /// The commit the base named.
+    base_commit: String,
     reading: Option<Reading>,
 }
 
@@ -265,8 +288,11 @@ fn review(
     })?;
     run.branch = repo.branch().unwrap_or_default();
     let files = Files::new(paths, &run.repo, &args.label)?;
+    run.follow_up = follow_up(args)?;
+    held(&repo, args, &run.repo, &files.events)?;
     let previous = previous_report(args, &files)?;
     let inputs = Inputs::gather(&repo, args, previous.as_deref(), &files)?;
+    run.base_commit = inputs.base_commit.clone();
     let (tier, source) = tier::tier(&args.label, caller, &inputs.whole);
     run.tier = Some(tier);
     run.tier_source = source.as_str();
@@ -803,6 +829,120 @@ impl Inputs {
             evidence: self.evidence.as_ref().map(part),
         }
     }
+}
+
+/// The follow-up issue the caller named, as gh is asked for it, and its text: an issue ref
+/// gh can view.
+fn follow_up(args: &Args) -> Result<String, Failure> {
+    let Some(named) = args.follow_up.as_deref() else {
+        return Ok(String::new());
+    };
+    let issue = review::issue_ref(named).ok_or_else(|| {
+        Failure::usage(format!(
+            "--follow-up names an issue (#12, 12, owner/repo#12 or an issue URL), got: {named}"
+        ))
+    })?;
+    let url = Gh.url(&issue).map_err(|e| {
+        Failure::usage(format!(
+            "could not fetch follow-up issue {named} with gh: {e}; file it first (gh issue create), then name it"
+        ))
+    })?;
+    // One issue has one URL, however the follow-up and the spec spell it.
+    if let Some(spec) = args.spec.as_deref().and_then(review::issue_ref) {
+        let spec_url = Gh.url(&spec).map_err(|e| {
+            Failure::usage(format!(
+                "could not fetch the spec's issue {spec} with gh: {e}; check gh auth status and the spec's issue ref, then run the review again"
+            ))
+        })?;
+        if spec_url == url {
+            return Err(Failure::usage(format!(
+                "--follow-up names the new issue filed for what is still open, not the ticket under review ({named})"
+            )));
+        }
+    }
+    Ok(issue)
+}
+
+/// Holds the review to what the event ledger says of this repo's reviews: an escalation
+/// needs the lead's `escalation` event, and a new round 1 or a standalone review may not
+/// re-review work a prefix reviewed to its cap. The same work is the same head, or the same
+/// tree reviewed from the same base commit (a commit that changes nothing).
+fn held(repo: &impl Repo, args: &Args, name: &str, events: &Path) -> Result<(), Failure> {
+    // A ledger that is no file (a device) holds no reviews, and reading one may never end.
+    let text = match fs::metadata(events).map(|meta| meta.is_file()) {
+        Ok(true) => fs::read_to_string(events),
+        Ok(false) => Ok(String::new()),
+        Err(e) => Err(e),
+    };
+    let text = match text {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(Failure::precondition(format!(
+                "cannot read the event ledger {}: {e}; check FACTORY_STATE",
+                events.display()
+            )));
+        }
+    };
+    // The ledger logs a value of digits (a repo, a prefix, a short sha) as a number.
+    let field = |event: &Value, key: &str| match &event[key] {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    let mut reviews: Vec<(String, String, String, String)> = Vec::new();
+    let mut escalated: Vec<String> = Vec::new();
+    for event in text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        if field(&event, "repo").as_deref() != Some(name) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("review") if event["outcome"] == "ok" => {
+                if let (Some(label), Some(head)) = (field(&event, "label"), field(&event, "head"))
+                    && !head.is_empty()
+                {
+                    let base = field(&event, "base").unwrap_or_default();
+                    let base_commit = field(&event, "base_commit").unwrap_or_default();
+                    reviews.push((label, base, base_commit, head));
+                }
+            }
+            Some("escalation") => escalated.extend(field(&event, "prefix")),
+            _ => {}
+        }
+    }
+    let history = History {
+        repo: name,
+        reviews: reviews
+            .iter()
+            .map(|(label, base, base_commit, head)| Past {
+                label,
+                base,
+                base_commit,
+                head,
+            })
+            .collect(),
+        escalated: escalated.iter().map(String::as_str).collect(),
+    };
+    let head = repo.commit("HEAD").map_err(git_failed)?.unwrap_or_default();
+    let tree = repo.tree("HEAD").map_err(git_failed)?;
+    let base = repo.commit(&args.base).map_err(git_failed)?;
+    // The same base is the same commit, however it is spelled; an event older than
+    // `base_commit` has only the name, read as the commit it names now.
+    let same_base = |past: &Past<'_>| match (&base, past.base_commit) {
+        (Some(base), from) if !from.is_empty() => base.starts_with(from),
+        (Some(base), _) => {
+            past.base == args.base || repo.commit(past.base).ok().flatten().as_ref() == Some(base)
+        }
+        (None, _) => past.base == args.base,
+    };
+    let same = |past: &Past<'_>| {
+        head.starts_with(past.head)
+            || (same_base(past) && tree.is_some() && repo.tree(past.head).ok().flatten() == tree)
+    };
+    review::hold(&args.label, &args.asked(), &history, same).map_err(Failure::usage)
 }
 
 /// The report a fix round continues: the caller's, else, for round N > 1 and the light review,
