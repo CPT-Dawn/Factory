@@ -4,8 +4,8 @@
 use factory_core::bar::{self, Snapshot};
 use factory_core::ci::CheckRun;
 use factory_core::fleet::{
-    Ci, Job, Mark, Pull, PullState, RepoCi, Runner, RunnerState, github_repo, is_factory_branch,
-    is_repo,
+    Ci, Job, Main, Mark, Pull, PullState, RepoCi, Runner, RunnerState, github_repo,
+    is_factory_branch, is_repo,
 };
 use factory_core::status::{self, Claude, Leads, Status};
 use factory_core::timestamp::Timestamp;
@@ -76,6 +76,7 @@ fn shop() -> RepoCi {
         jobs: Vec::new(),
         pulls: Vec::new(),
         finished: Vec::new(),
+        main: None,
     }
 }
 
@@ -331,4 +332,82 @@ fn a_remote_on_github_names_its_repo_in_each_way_git_writes_one() {
     ] {
         assert_eq!(github_repo(url), None, "{url}");
     }
+}
+
+/// acme/shop with main's latest head at `42fdcd84…` in `state`.
+fn shop_main(state: PullState) -> RepoCi {
+    RepoCi {
+        main: Some(Main {
+            sha: "42fdcd84aa0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d".to_owned(),
+            state,
+        }),
+        ..shop()
+    }
+}
+
+#[test]
+fn a_red_main_is_loud_on_the_chip_the_card_the_line_and_the_status_screen() {
+    let mut repo = shop_main(PullState::Failing);
+    repo.pulls = vec![pull(12, PullState::Passing)];
+    let snapshot = snapshot(ci(repo.clone()));
+    let feed = serde_json::to_value(bar::feed(&snapshot)).unwrap_or(Value::Null);
+
+    let chip = find(&feed, "glance", "ci");
+    assert_eq!(
+        (&chip["text"], &chip["tone"]),
+        (&json!("main ✗"), &json!("critical"))
+    );
+    assert_eq!(ci(repo.clone()).mark(), Mark::MainFailing);
+    assert!(
+        chip["tooltip"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("CI: main red shop@42fdcd8 · PRs 1 passing"),
+        "a red main leads: {chip}"
+    );
+    let card = find(&feed, "sections", "ci");
+    let row = card["rows"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["label"] == "shop main"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        row,
+        json!({
+            "kind": "text",
+            "label": "shop main",
+            "text": "red 42fdcd8",
+            "tone": "critical",
+            "url": "https://github.com/acme/shop/commit/42fdcd84aa0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d",
+        }),
+        "{card}"
+    );
+    assert_eq!(
+        bar::line(&snapshot),
+        "claude ?/? · codex ?/? · agy ?/? · 0 leads · lab 0/0 · CI main ✗"
+    );
+}
+
+#[test]
+fn a_green_or_pending_main_shows_its_sha_after_the_prs_and_leaves_the_mark_alone() {
+    let green = ci(shop_main(PullState::Passing));
+    assert_eq!(green.mark(), Mark::Passing);
+    assert_eq!(
+        green.summary(now()),
+        "no open PRs · main green shop@42fdcd8 · 2/4 busy, 1 offline, 1 missing · none queued"
+    );
+    let pending = ci(shop_main(PullState::Pending));
+    assert_eq!(pending.mark(), Mark::Busy, "main's CI still runs");
+    assert!(
+        pending
+            .summary(now())
+            .contains(" · main pending shop@42fdcd8 · "),
+        "{}",
+        pending.summary(now())
+    );
+    assert_eq!(
+        ci(shop()).summary(now()),
+        "no open PRs · 2/4 busy, 1 offline, 1 missing · none queued",
+        "a repo whose main was never read shows none"
+    );
 }

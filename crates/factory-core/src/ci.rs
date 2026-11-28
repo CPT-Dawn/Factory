@@ -18,7 +18,7 @@
 //! through) is a run too: pending until it is `success`, `failure` or `error`.
 //!
 //! None of it knows about pull requests beyond [`PullRequest`]: [`verdict`] reads the runs of
-//! any head, a branch's as well as a pull request's.
+//! any head, a branch's ([`Branch`]) as well as a pull request's.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -67,6 +67,158 @@ impl PullRequest {
 impl fmt::Display for PullRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}#{}", self.owner, self.repo, self.number)
+    }
+}
+
+/// A branch of a repo on a GitHub host, whose latest head a wait on CI watches.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Branch {
+    pub host: String,
+    pub owner: String,
+    pub repo: String,
+    pub name: String,
+}
+
+impl Branch {
+    /// The branch `name` of the repo at `https://<host>/<owner>/<repo>`, as
+    /// `gh repo view --json url` gives it.
+    pub fn of_repo(url: &str, name: &str) -> Result<Branch, BadRepo> {
+        let bad = || BadRepo(url.to_owned());
+        let rest = url.trim().strip_prefix("https://").ok_or_else(bad)?;
+        let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
+        let [host, owner, repo] = parts.as_slice() else {
+            return Err(bad());
+        };
+        if [host, owner, repo].iter().any(|part| part.is_empty()) {
+            return Err(bad());
+        }
+        Ok(Branch {
+            host: (*host).to_owned(),
+            owner: (*owner).to_owned(),
+            repo: (*repo).to_owned(),
+            name: name.to_owned(),
+        })
+    }
+
+    /// The branch a URL like `https://<host>/<owner>/<repo>/tree/<name>` (its [`url`]) names;
+    /// none for any other URL.
+    ///
+    /// [`url`]: Branch::url
+    pub fn from_url(url: &str) -> Option<Branch> {
+        let rest = url.trim().strip_prefix("https://")?;
+        let mut parts = rest.splitn(5, '/');
+        let (host, owner, repo, tree, name) = (
+            parts.next()?,
+            parts.next()?,
+            parts.next()?,
+            parts.next()?,
+            parts.next()?,
+        );
+        let name = name.trim_end_matches('/');
+        if tree != "tree" || [host, owner, repo, name].iter().any(|part| part.is_empty()) {
+            return None;
+        }
+        Some(Branch {
+            host: host.to_owned(),
+            owner: owner.to_owned(),
+            repo: repo.to_owned(),
+            name: name.to_owned(),
+        })
+    }
+
+    pub fn url(&self) -> String {
+        format!(
+            "https://{}/{}/{}/tree/{}",
+            self.host, self.owner, self.repo, self.name
+        )
+    }
+}
+
+/// `<owner>/<repo>@<branch>`.
+impl fmt::Display for Branch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}@{}", self.owner, self.repo, self.name)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BadRepo(pub String);
+
+impl fmt::Display for BadRepo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:?} is not a repo URL like https://github.com/<owner>/<repo>",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for BadRepo {}
+
+/// How a wait names a branch rather than a pull request: `branch:<name>`. Git allows no `:`
+/// in a branch's name, so it never names a pull request by its branch.
+pub const BRANCH_TARGET: &str = "branch:";
+
+/// The branch `named` names with [`BRANCH_TARGET`]; none for a pull request.
+pub fn branch_target(named: &str) -> Option<&str> {
+    named.strip_prefix(BRANCH_TARGET)
+}
+
+/// What a wait on CI watches: a pull request's head, or a branch's latest head.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Watched {
+    Pull(PullRequest),
+    Branch(Branch),
+}
+
+impl Watched {
+    /// The pull request or branch its [`url`] names; none for any other text.
+    ///
+    /// [`url`]: Watched::url
+    pub fn from_url(url: &str) -> Option<Watched> {
+        Branch::from_url(url)
+            .map(Watched::Branch)
+            .or_else(|| PullRequest::from_url(url).ok().map(Watched::Pull))
+    }
+
+    pub fn host(&self) -> &str {
+        match self {
+            Watched::Pull(pr) => &pr.host,
+            Watched::Branch(branch) => &branch.host,
+        }
+    }
+
+    pub fn owner(&self) -> &str {
+        match self {
+            Watched::Pull(pr) => &pr.owner,
+            Watched::Branch(branch) => &branch.owner,
+        }
+    }
+
+    pub fn repo(&self) -> &str {
+        match self {
+            Watched::Pull(pr) => &pr.repo,
+            Watched::Branch(branch) => &branch.repo,
+        }
+    }
+
+    /// Where a person reads it.
+    pub fn url(&self) -> String {
+        match self {
+            Watched::Pull(pr) => pr.url(),
+            Watched::Branch(branch) => branch.url(),
+        }
+    }
+}
+
+/// `<owner>/<repo>#<number>` or `<owner>/<repo>@<branch>`.
+impl fmt::Display for Watched {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Watched::Pull(pr) => pr.fmt(f),
+            Watched::Branch(branch) => branch.fmt(f),
+        }
     }
 }
 

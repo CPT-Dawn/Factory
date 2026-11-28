@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use factory_adapters::herdr::Herdr;
 use factory_adapters::inbox::{Address, Inbox, InboxApi, InboxError};
-use factory_core::ci::PullRequest;
+use factory_core::ci::Watched;
 use factory_core::exit::Exit;
 use factory_core::wait::{Wait, WaitOn};
 use rustix::event::{EventfdFlags, PollFd, PollFlags, eventfd, poll};
@@ -197,6 +197,8 @@ impl<I: InboxApi> Notifier<I> {
                     Ok((ci::line(&answer), exit))
                 };
                 let on = NotifyOn::Ci {
+                    // Its URL names the repo as well, so a restart finds it again even
+                    // when its checkout moved.
                     pr: found.url(),
                     cwd: cwd.clone(),
                     poll_secs: *poll_secs,
@@ -317,7 +319,7 @@ fn ended_line(id: i64, ended: Result<(String, Exit), Failure>) -> String {
 fn wait_on(on: &NotifyOn) -> WaitOn {
     match on {
         NotifyOn::Ci { pr, .. } => {
-            WaitOn::Ci(PullRequest::from_url(pr).map_or_else(|_| pr.clone(), |pr| pr.to_string()))
+            WaitOn::Ci(Watched::from_url(pr).map_or_else(|| pr.clone(), |pr| pr.to_string()))
         }
         NotifyOn::Lead { lead } => WaitOn::Lead(lead.clone()),
     }

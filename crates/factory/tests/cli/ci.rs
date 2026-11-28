@@ -4,7 +4,7 @@ use std::fs;
 
 use std::os::unix::fs::PermissionsExt;
 
-use crate::support::github::{FakeGitHub, HEAD, PR_URL};
+use crate::support::github::{FakeGitHub, HEAD, MAIN_HEAD, PR_URL};
 use crate::support::herdr::FakeHerdr;
 use crate::support::world::poll_until;
 use crate::support::{Sandbox, finish, freeze, spawn, stop_daemon, thaw};
@@ -760,4 +760,157 @@ fn a_failures_file_that_cannot_be_written_is_retried_on_the_next_read() {
             .path("state/factory/ci/github.com/acme/shop/12-c0ffee123456.md")
             .exists()
     );
+}
+
+/// Whether the fake was asked for the check runs on main's head.
+fn read_main(sandbox: &Sandbox) -> bool {
+    sandbox.calls("gh").iter().any(|call| {
+        call.iter()
+            .any(|arg| arg.starts_with(&format!("repos/acme/shop/commits/{MAIN_HEAD}/check-runs")))
+    })
+}
+
+#[test]
+fn wait_ci_main_waits_for_mains_latest_head_and_exits_0_when_all_pass() {
+    let sandbox = polling_every(1);
+    let github = FakeGitHub::install(&sandbox);
+    github.main_checks(&[(801, "ci", "in_progress", None)]);
+    let child = spawn(sandbox.factory_command(&["wait", "ci", "main"]));
+    assert!(poll_until(|| read_main(&sandbox)), "never read main");
+
+    github.main_checks(&[(801, "ci", "completed", Some("success"))]);
+    let out = finish(child);
+
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "acme/shop@main: 1 passed, 0 failed\n", ""),
+        "{out:?}"
+    );
+    assert!(
+        sandbox
+            .calls("gh")
+            .iter()
+            .all(|call| call.first().map(String::as_str) != Some("pr")),
+        "main is a branch, not a pull request: {:?}",
+        sandbox.calls("gh")
+    );
+}
+
+#[test]
+fn wait_ci_branch_main_exits_10_on_a_red_main_with_its_logs_and_the_json_names_its_head() {
+    let sandbox = polling_every(1);
+    let github = FakeGitHub::install(&sandbox);
+    github.log(802, "error: migrations out of order\n");
+    github.main_checks(&[
+        (801, "ci", "completed", Some("failure")),
+        (802, "ci", "completed", Some("failure")),
+        (803, "lint", "completed", Some("success")),
+    ]);
+
+    let out = sandbox.factory(&["wait", "ci", "--branch", "main"]);
+
+    let file = sandbox.path("state/factory/ci/github.com/acme/shop/main-42fdcd84aa0b.md");
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (
+            10,
+            format!(
+                "acme/shop@main: 1 passed, 1 failed; logs in {}; failed: ci\n",
+                file.display()
+            )
+            .as_str(),
+            ""
+        ),
+        "{out:?}"
+    );
+    let text = fs::read_to_string(&file).expect("read the failures file");
+    assert!(text.contains("error: migrations out of order"), "{text}");
+    assert_eq!(github.log_reads(), vec![802], "only the newest run's log");
+
+    let json = sandbox.factory(&["--json", "wait", "ci", "main"]);
+    let answer: serde_json::Value = serde_json::from_str(&json.stdout).expect("json");
+    assert_eq!(
+        (&answer["pr"], &answer["head"], &answer["url"]),
+        (
+            &serde_json::json!("acme/shop@main"),
+            &serde_json::json!(MAIN_HEAD),
+            &serde_json::json!("https://github.com/acme/shop/tree/main")
+        ),
+        "{answer}"
+    );
+}
+
+#[test]
+fn wait_ci_takes_a_pull_request_or_a_branch_but_not_both_or_neither() {
+    let sandbox = polling_every(1);
+    FakeGitHub::install(&sandbox);
+    for args in [
+        &["wait", "ci"][..],
+        &["wait", "ci", "12", "--branch", "main"],
+    ] {
+        let out = sandbox.factory(args);
+        assert_eq!(out.code, 2, "{args:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+    }
+}
+
+#[test]
+fn wait_ci_main_waits_for_the_head_main_moved_to_while_it_read_the_last_ones_checks() {
+    const PUSHED: &str = "bbdac5fb00112233445566778899aabbccddeeff";
+    let sandbox = polling_every(1);
+    let github = FakeGitHub::install(&sandbox);
+    github.main_checks(&[(801, "ci", "completed", Some("success"))]);
+    github.checks(&[(901, "ci", "in_progress", None)]);
+    github.push_main_after_next_read(PUSHED);
+    let child = spawn(sandbox.factory_command(&["--json", "wait", "ci", "main"]));
+    let read_pushed = || {
+        sandbox.calls("gh").iter().any(|call| {
+            call.iter()
+                .any(|arg| arg.starts_with(&format!("repos/acme/shop/commits/{PUSHED}/check-runs")))
+        })
+    };
+    assert!(
+        poll_until(read_pushed),
+        "never read the pushed head's checks"
+    );
+
+    github.checks(&[(901, "ci", "completed", Some("success"))]);
+    let out = finish(child);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let answer: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    assert_eq!(
+        answer["head"], PUSHED,
+        "the head main moved to, not {MAIN_HEAD}: {answer}"
+    );
+}
+
+#[test]
+fn wait_ci_main_does_not_answer_for_a_red_head_main_left_while_its_logs_were_read() {
+    const PUSHED: &str = "bbdac5fb00112233445566778899aabbccddeeff";
+    let sandbox = polling_every(1);
+    let github = FakeGitHub::install(&sandbox);
+    github.log(802, "error: migrations out of order\n");
+    github.main_checks(&[(802, "ci", "completed", Some("failure"))]);
+    github.checks(&[(901, "ci", "in_progress", None)]);
+    github.push_main_on_next_log_read(PUSHED);
+    let child = spawn(sandbox.factory_command(&["--json", "wait", "ci", "main"]));
+    let read_pushed = || {
+        sandbox.calls("gh").iter().any(|call| {
+            call.iter()
+                .any(|arg| arg.starts_with(&format!("repos/acme/shop/commits/{PUSHED}/check-runs")))
+        })
+    };
+    assert!(
+        poll_until(read_pushed),
+        "never read the pushed head's checks"
+    );
+
+    github.checks(&[(901, "ci", "completed", Some("success"))]);
+    let out = finish(child);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let answer: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    assert_eq!(answer["head"], PUSHED, "{answer}");
+    assert_eq!(github.log_reads(), vec![802]);
 }

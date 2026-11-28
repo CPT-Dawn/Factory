@@ -1,7 +1,7 @@
 //! Which check runs pass, skip, fail or are pending, and when a wait on them is over (spec #1,
 //! user story 3).
 
-use factory_core::ci::{self, Bucket, CheckRun, PullRequest, Verdict};
+use factory_core::ci::{self, Branch, Bucket, CheckRun, PullRequest, Verdict, Watched};
 use factory_core::exit::Exit;
 
 fn run(name: &str, status: &str, conclusion: Option<&str>) -> CheckRun {
@@ -237,4 +237,30 @@ fn a_tail_drops_every_kind_of_escape_sequence() {
 fn a_tail_drops_terminal_escape_sequences() {
     let log = "\u{1b}[36;1mstep\u{1b}[0m 1\n\u{1b}]8;;https://x\u{7}link\u{1b}]8;;\u{7}\n\u{1b}[31merror\u{1b}[0m: boom\n";
     assert_eq!(ci::tail(log, 3), ["step 1", "link", "error: boom"]);
+}
+
+#[test]
+fn a_watched_branch_or_pull_request_reads_back_from_its_url_alone() {
+    let main = Branch::of_repo("https://github.com/acme/shop", "main").unwrap();
+    assert_eq!(main.url(), "https://github.com/acme/shop/tree/main");
+    let nested = Branch::of_repo("https://github.com/acme/shop/", "release/2.x").unwrap();
+    for branch in [main, nested] {
+        let watched = Watched::Branch(branch.clone());
+        assert_eq!(Watched::from_url(&watched.url()), Some(watched));
+        assert_eq!(Branch::from_url(&branch.url()), Some(branch));
+    }
+    let pr = PullRequest::from_url("https://github.com/acme/shop/pull/12").unwrap();
+    assert_eq!(
+        Watched::from_url("https://github.com/acme/shop/pull/12"),
+        Some(Watched::Pull(pr))
+    );
+    for not in [
+        "branch:main",
+        "12",
+        "https://github.com/acme/shop",
+        "https://github.com/acme/shop/tree/",
+        "https://github.com/acme/shop/blob/main",
+    ] {
+        assert_eq!(Watched::from_url(not), None, "{not}");
+    }
 }
