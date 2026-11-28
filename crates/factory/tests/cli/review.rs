@@ -458,6 +458,13 @@ fn each_run_logs_one_review_event_with_backend_model_round_outcome_and_counts() 
         assert_eq!(event[key], expected, "{key} in {event}");
     }
     assert!(event["duration_s"].is_u64(), "{event}");
+    // The event names the build that ran the review, as `factory --version` does.
+    let version = sandbox.factory(&["--version"]).stdout;
+    let build = event["build"].as_str().unwrap();
+    assert!(
+        version.trim_end().ends_with(&format!("({build})")),
+        "{build} in {version}"
+    );
 }
 
 #[test]

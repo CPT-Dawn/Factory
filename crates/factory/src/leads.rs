@@ -355,9 +355,14 @@ impl<H: HerdrApi> Leads<H> {
             busy_for: lead::BUSY_TIMEOUT,
         };
         let started = spawn::start(&self.herdr, &plan).await;
-        let (outcome, reason, stalls) = match &started {
-            Ok(started) => ("ok", "", started.stalls),
-            Err(failed) => ("error", failed.message.as_str(), failed.stalls),
+        let (outcome, reason, stalls, busy_retries) = match &started {
+            Ok(started) => ("ok", "", started.stalls, started.busy_retries),
+            Err(failed) => (
+                "error",
+                failed.message.as_str(),
+                failed.stalls,
+                failed.busy_retries,
+            ),
         };
         let pairs = [
             ("repo", params.repo_name.as_str()),
@@ -369,6 +374,7 @@ impl<H: HerdrApi> Leads<H> {
             ("outcome", outcome),
             ("reason", reason),
             ("stalls", &stalls.to_string()),
+            ("busy_retries", &busy_retries.to_string()),
             ("model", params.model.as_str()),
             ("effort", params.effort.as_str()),
             ("attended", &params.attended.to_string()),

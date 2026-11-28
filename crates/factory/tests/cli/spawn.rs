@@ -314,6 +314,13 @@ fn a_lead_start_event_lands_in_the_ledger() {
         assert_eq!(start[field], value, "{field} in {start}");
     }
     assert_eq!(start["stalls"], 0, "{start}");
+    // The build names itself the way `--version` does: a short sha, maybe dirty, or unknown.
+    let build = start["build"].as_str().expect("build in the start event");
+    let sha = build.strip_suffix("-dirty").unwrap_or(build);
+    assert!(
+        sha == "unknown" || (sha.len() == 7 && sha.bytes().all(|b| b.is_ascii_hexdigit())),
+        "{start}"
+    );
     assert!(start.get("reason").is_none(), "{start}");
 }
 
@@ -558,6 +565,20 @@ fn a_pane_still_busy_with_its_shell_is_retried_until_it_takes_the_agent() {
     assert_eq!(herdr.count("agent.start"), 4);
     assert_eq!(herdr.count("agent.send_keys"), 0);
     assert_eq!(herdr.count("agent.prompt"), 1);
+    // Three asks were refused, so three retries, and the event keeps the count.
+    assert_eq!(events(&sandbox, "lead-start")[0]["busy_retries"], 3);
+}
+
+#[test]
+fn a_pane_that_is_never_busy_records_no_retries() {
+    let sandbox = Sandbox::new();
+    let _herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert_eq!(events(&sandbox, "lead-start")[0]["busy_retries"], 0);
 }
 
 #[test]
@@ -584,6 +605,11 @@ fn a_pane_that_stays_busy_fails_the_spawn_naming_herdrs_code() {
     assert!(herdr.count("agent.start") > 4);
     assert_eq!(herdr.count("agent.read"), 0);
     assert_eq!(herdr.count("agent.prompt"), 0);
+    // The failed start still says how long it pushed: one retry per refusal but the last.
+    let starts = events(&sandbox, "lead-start");
+    assert_eq!(starts[0]["outcome"], "error", "{starts:?}");
+    let retries = starts[0]["busy_retries"].as_u64().expect("busy_retries");
+    assert_eq!(retries, herdr.count("agent.start") as u64 - 1, "{starts:?}");
 }
 
 #[test]
@@ -591,7 +617,11 @@ fn a_start_that_fails_off_the_trust_dialog_is_reported() {
     let sandbox = Sandbox::new();
     let herdr = FakeHerdr::start(&sandbox);
     let repo = sandbox.repo();
-    herdr.refuse("agent.start", "timeout", "agent did not become ready");
+    herdr.refuse(
+        "agent.start",
+        "agent_not_ready",
+        "agent lead-cart is blocked during startup",
+    );
     herdr.agent(Some("lead-cart"), "w1:p1", "idle");
     herdr.screen("w1:p1", "something else entirely\n");
 
@@ -605,10 +635,69 @@ fn a_start_that_fails_off_the_trust_dialog_is_reported() {
         ),
         "{out:?}"
     );
+    // herdr's own words ride along, in the same one line.
+    assert!(
+        out.stderr.contains("agent_not_ready") && out.stderr.contains("blocked during startup"),
+        "{out:?}"
+    );
+    assert_eq!(out.stderr.lines().count(), 1, "{out:?}");
     assert_eq!(herdr.count("agent.prompt"), 0);
     let starts = events(&sandbox, "lead-start");
     assert_eq!(starts.len(), 1, "{starts:?}");
     assert_eq!(starts[0]["outcome"], "error");
+}
+
+/// A start that herdr refuses for any other reason is not a stop at startup: the line carries
+/// herdr's own error, and nothing says the lead is stuck on a dialog.
+#[test]
+fn a_start_herdr_refuses_for_another_reason_carries_herdrs_error() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    herdr.refuse(
+        "agent.start",
+        "agent_name_taken",
+        "an agent named lead-cart already exists",
+    );
+    herdr.screen("w1:p1", "something else entirely\n");
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr.starts_with("factory: lead.sh: lead-cart could not start Claude: herdr refused (agent_name_taken): an agent named lead-cart already exists"),
+        "{out:?}"
+    );
+    assert!(!out.stderr.contains("stuck at startup"), "{out:?}");
+    assert_eq!(out.stderr.lines().count(), 1, "{out:?}");
+    assert!(out.stderr.len() < 400, "{out:?}");
+    assert_eq!(herdr.count("agent.prompt"), 0);
+    let starts = events(&sandbox, "lead-start");
+    assert_eq!(starts[0]["outcome"], "error", "{starts:?}");
+    assert!(
+        starts[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("agent_name_taken")),
+        "{starts:?}"
+    );
+}
+
+#[test]
+fn a_long_multi_line_herdr_error_still_fits_one_line() {
+    let sandbox = Sandbox::new();
+    let herdr = FakeHerdr::start(&sandbox);
+    let repo = sandbox.repo();
+    let message = format!("first line\nsecond line {}", "x".repeat(600));
+    herdr.refuse("agent.start", "agent_name_taken", &message);
+    herdr.screen("w1:p1", "something else entirely\n");
+
+    let out = sandbox.factory_in(&repo, &["lead", "spawn", "cart", "#12"]);
+
+    assert_eq!(out.code, 3, "{out:?}");
+    assert_eq!(out.stderr.lines().count(), 1, "{out:?}");
+    assert!(out.stderr.contains("first line second line xxx"), "{out:?}");
+    assert!(out.stderr.chars().count() < 400, "{out:?}");
 }
 
 #[test]

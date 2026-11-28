@@ -22,6 +22,11 @@ const HEAD: usize = 60;
 const STALLED: &str = "agent_prompt_stalled";
 /// What herdr answers `agent.start` while the pane's shell is still running its rc.
 const BUSY: &str = "agent_pane_busy";
+/// What the herdr adapter answers a start whose agent never became ready, or is blocked on a
+/// dialog: the one error that means Claude is up but stuck, not that herdr refused it.
+const NOT_READY: &str = "agent_not_ready";
+/// How many characters of herdr's own message a failure line carries.
+const MESSAGE_MAX: usize = 160;
 const TRUST_TEXT: &str = "Yes, I trust this folder";
 
 /// What to start.
@@ -49,17 +54,24 @@ pub struct Started {
     pub worktree: String,
     /// How many times the prompt had to be pressed or typed again.
     pub stalls: u32,
+    /// How many times a busy pane was asked again before it took the agent.
+    pub busy_retries: u32,
 }
 
 /// Why a lead did not start, in one line, and how far it got.
 pub struct Failed {
     pub message: String,
     pub stalls: u32,
+    pub busy_retries: u32,
 }
 
 impl Failed {
-    fn at(message: String, stalls: u32) -> Failed {
-        Failed { message, stalls }
+    fn at(message: String, stalls: u32, busy_retries: u32) -> Failed {
+        Failed {
+            message,
+            stalls,
+            busy_retries,
+        }
     }
 }
 
@@ -75,64 +87,89 @@ pub async fn start<H: HerdrApi>(herdr: &H, plan: &Plan<'_>) -> Result<Started, F
                     plan.branch
                 ),
                 0,
+                0,
             )
         })?;
+    let launched = started(herdr, &made.pane_id, plan).await;
     let at = Spot {
         name: plan.name,
         workspace: &made.workspace_id,
+        busy_retries: launched.busy_retries,
     };
-    if !started(herdr, &at, &made.pane_id, plan).await? {
-        pass_trust_dialog(herdr, &at, &made.path).await?;
+    match launched.how {
+        Launch::Up => {}
+        Launch::StayedBusy => {
+            return Err(at.failed(
+                &format!(
+                    "could not start Claude: its pane stayed busy for {}s ({BUSY})",
+                    plan.busy_for.as_secs()
+                ),
+                0,
+            ));
+        }
+        Launch::Stopped(why) => pass_trust_dialog(herdr, &at, &made.path, &why).await?,
     }
     let stalls = submit(herdr, &at, plan).await?;
+    let busy_retries = at.busy_retries;
     Ok(Started {
         workspace: made.workspace_id,
         worktree: made.path,
         stalls,
+        busy_retries,
     })
 }
 
-/// Starts Claude in the pane: true once it is up, false when it stopped on something that may be
-/// the trust dialog. A pane whose shell is busy is asked again, with a doubling pause, until
-/// `plan.busy_for` has gone by.
-async fn started<H: HerdrApi>(
-    herdr: &H,
-    at: &Spot<'_>,
-    pane: &str,
-    plan: &Plan<'_>,
-) -> Result<bool, Failed> {
+/// How Claude's start ended.
+enum Launch {
+    /// Claude is up and ready for its prompt.
+    Up,
+    /// The pane stayed busy until `plan.busy_for` ran out.
+    StayedBusy,
+    /// herdr answered the start with an error that is not a busy pane: the trust dialog, if the
+    /// screen shows it, or else a failure to report with herdr's own words.
+    Stopped(HerdrError),
+}
+
+struct Launched {
+    /// How many times a busy pane was asked again.
+    busy_retries: u32,
+    how: Launch,
+}
+
+/// Starts Claude in the pane. A pane whose shell is busy is asked again, with a doubling pause,
+/// until `plan.busy_for` has gone by; the asks are counted.
+async fn started<H: HerdrApi>(herdr: &H, pane: &str, plan: &Plan<'_>) -> Launched {
     let began = Instant::now();
     let mut pause = BUSY_PAUSE;
-    loop {
+    let mut busy_retries = 0;
+    let how = loop {
         match herdr
             .start_agent(plan.name, pane, plan.claude_args, START_TIMEOUT)
             .await
         {
-            Ok(()) => return Ok(true),
+            Ok(()) => break Launch::Up,
             Err(HerdrError::Refused { code, .. }) if code == BUSY => {
                 let waited = began.elapsed();
                 if waited >= plan.busy_for {
-                    return Err(at.failed(
-                        &format!(
-                            "could not start Claude: its pane stayed busy for {}s ({BUSY})",
-                            plan.busy_for.as_secs()
-                        ),
-                        0,
-                    ));
+                    break Launch::StayedBusy;
                 }
                 let nap = pause.min(plan.busy_for - waited);
                 sleep(nap).await;
                 pause = (pause * 2).min(BUSY_PAUSE_MAX);
+                busy_retries += 1;
             }
-            Err(_) => return Ok(false),
+            Err(why) => break Launch::Stopped(why),
         }
-    }
+    };
+    Launched { busy_retries, how }
 }
 
 /// Where a lead is, for the lines that say what went wrong.
 struct Spot<'a> {
     name: &'a str,
     workspace: &'a str,
+    /// How many times a busy pane was asked again, carried on every failure.
+    busy_retries: u32,
 }
 
 impl Spot<'_> {
@@ -140,6 +177,7 @@ impl Spot<'_> {
         Failed::at(
             format!("{} {what}; see workspace {}", self.name, self.workspace),
             stalls,
+            self.busy_retries,
         )
     }
 }
@@ -150,13 +188,23 @@ async fn pass_trust_dialog<H: HerdrApi>(
     herdr: &H,
     at: &Spot<'_>,
     worktree: &str,
+    stopped: &HerdrError,
 ) -> Result<(), Failed> {
     let screen = herdr.read_agent(at.name).await.unwrap_or_default();
     if !(screen.contains(worktree) && screen.contains(TRUST_TEXT)) {
-        return Err(at.failed(
-            "is stuck at startup on something other than folder trust",
-            0,
-        ));
+        return Err(match stopped {
+            HerdrError::Refused { code, message } if code == NOT_READY => at.failed(
+                &format!(
+                    "is stuck at startup on something other than folder trust ({code}: {})",
+                    one_line(message)
+                ),
+                0,
+            ),
+            other => at.failed(
+                &format!("could not start Claude: {}", one_line(&other.to_string())),
+                0,
+            ),
+        });
     }
     let answered = async {
         herdr.send_keys(at.name, &["down"]).await?;
@@ -222,6 +270,16 @@ async fn typed<H: HerdrApi>(
             Err(at.failed(&format!("did not start working ({why})"), stalls))
         }
     }
+}
+
+/// herdr's words on one line, cut to [`MESSAGE_MAX`] characters.
+fn one_line(text: &str) -> String {
+    let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if words.chars().count() <= MESSAGE_MAX {
+        return words;
+    }
+    let cut: String = words.chars().take(MESSAGE_MAX).collect();
+    format!("{cut}…")
 }
 
 /// The text with its whitespace removed: Claude wraps its input box anywhere, even inside a path.
