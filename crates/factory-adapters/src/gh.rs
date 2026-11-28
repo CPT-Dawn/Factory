@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use factory_core::ci::{CheckRun, PullRequest};
+use factory_core::ci::{CheckRun, PullRequest, Watched};
 use factory_core::fleet::{Job, Runner, RunnerState};
 use factory_core::timestamp::Timestamp;
 use rustix::process::{Pid, Signal, kill_process_group};
@@ -39,6 +39,8 @@ pub trait Issues {
     /// The issue `issue` names (a number, or an issue URL) as Markdown: `# #<number> <title>`,
     /// a blank line, then its body.
     fn issue(&self, issue: &str) -> Result<String, GhError>;
+    /// The URL of the issue `issue` names: one issue under any spelling.
+    fn url(&self, issue: &str) -> Result<String, GhError>;
 }
 
 /// The issues `gh` on PATH sees from the working directory.
@@ -46,25 +48,37 @@ pub struct Gh;
 
 impl Issues for Gh {
     fn issue(&self, issue: &str) -> Result<String, GhError> {
-        let mut cmd = Command::new("gh");
-        cmd.args(["issue", "view", issue])
-            .args(["--json", "number,title,body", "--template", TEMPLATE])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let output = process::run(cmd, TIMEOUT).map_err(|e| GhError(e.to_string()))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GhError(
-                stderr
-                    .lines()
-                    .next()
-                    .unwrap_or("it failed and said nothing")
-                    .to_owned(),
-            ));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        view(
+            issue,
+            &["--json", "number,title,body", "--template", TEMPLATE],
+        )
     }
+
+    fn url(&self, issue: &str) -> Result<String, GhError> {
+        view(issue, &["--json", "url", "--jq", ".url"]).map(|url| url.trim().to_owned())
+    }
+}
+
+/// What `gh issue view <issue> <fields…>` prints, or the first line of its complaint.
+fn view(issue: &str, fields: &[&str]) -> Result<String, GhError> {
+    let mut cmd = Command::new("gh");
+    cmd.args(["issue", "view", issue])
+        .args(fields)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = process::run(cmd, TIMEOUT).map_err(|e| GhError(e.to_string()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(GhError(
+            stderr
+                .lines()
+                .next()
+                .unwrap_or("it failed and said nothing")
+                .to_owned(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Issues held in memory, for tests of code that fetches them.
@@ -72,6 +86,8 @@ impl Issues for Gh {
 pub struct FakeIssues {
     /// Each known issue, as the caller names it, and its Markdown.
     pub issues: Vec<(String, String)>,
+    /// Each known issue, as the caller names it, and its URL.
+    pub urls: Vec<(String, String)>,
 }
 
 impl Issues for FakeIssues {
@@ -80,6 +96,14 @@ impl Issues for FakeIssues {
             .iter()
             .find(|(known, _)| known == issue)
             .map(|(_, text)| text.clone())
+            .ok_or_else(|| GhError(format!("no issue {issue}")))
+    }
+
+    fn url(&self, issue: &str) -> Result<String, GhError> {
+        self.urls
+            .iter()
+            .find(|(known, _)| known == issue)
+            .map(|(_, url)| url.clone())
             .ok_or_else(|| GhError(format!("no issue {issue}")))
     }
 }
@@ -148,13 +172,16 @@ impl Drop for Listener {
 pub trait PullRequests: Send + Sync + 'static {
     /// The URL of the pull request `pr` names (a number, a URL or a branch), seen from `cwd`.
     fn url(&self, pr: &str, cwd: &Path) -> Result<String, GhError>;
-    /// The pull request's head commit, unless it has not changed since `etag`.
-    fn head(&self, pr: &PullRequest, etag: Option<&str>) -> Result<Fetched<String>, GhError>;
+    /// The URL of the repo of the checkout at `cwd`.
+    fn repo_url(&self, cwd: &Path) -> Result<String, GhError>;
+    /// The head commit of the pull request, or the branch's latest, unless it has not changed
+    /// since `etag`.
+    fn head(&self, on: &Watched, etag: Option<&str>) -> Result<Fetched<String>, GhError>;
     /// The check runs on `head`, every page of them, unless they have not changed since `etag`.
     /// Only a single page carries an ETag: one of page 1 says nothing of page 2.
     fn check_runs(
         &self,
-        pr: &PullRequest,
+        on: &Watched,
         head: &str,
         etag: Option<&str>,
     ) -> Result<Fetched<Vec<CheckRun>>, GhError>;
@@ -162,12 +189,12 @@ pub trait PullRequests: Send + Sync + 'static {
     /// changed since `etag`.
     fn statuses(
         &self,
-        pr: &PullRequest,
+        on: &Watched,
         head: &str,
         etag: Option<&str>,
     ) -> Result<Fetched<Vec<CheckRun>>, GhError>;
     /// The log of a GitHub Actions job.
-    fn job_log(&self, pr: &PullRequest, job: u64) -> Result<String, GhError>;
+    fn job_log(&self, on: &Watched, job: u64) -> Result<String, GhError>;
     /// Starts listening for the pull request's check suites and head; call it inside the
     /// daemon's runtime.
     fn listen(&self, pr: &PullRequest) -> Result<Listener, GhError>;
@@ -260,13 +287,40 @@ impl PullRequests for Gh {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 
-    fn head(&self, pr: &PullRequest, etag: Option<&str>) -> Result<Fetched<String>, GhError> {
-        let path = format!("repos/{}/{}/pulls/{}", pr.owner, pr.repo, pr.number);
-        match self.conditional(&pr.host, &path, etag)? {
+    fn repo_url(&self, cwd: &Path) -> Result<String, GhError> {
+        let mut cmd = Command::new("gh");
+        cmd.args(["repo", "view", "--json", "url", "--jq", ".url"])
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = process::run(cmd, TIMEOUT).map_err(|e| GhError(e.to_string()))?;
+        if !output.status.success() {
+            return Err(failed(&output.stderr));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    fn head(&self, on: &Watched, etag: Option<&str>) -> Result<Fetched<String>, GhError> {
+        let (path, sha) = match on {
+            Watched::Pull(pr) => (
+                format!("repos/{}/{}/pulls/{}", pr.owner, pr.repo, pr.number),
+                "/head/sha",
+            ),
+            Watched::Branch(branch) => (
+                format!(
+                    "repos/{}/{}/branches/{}",
+                    branch.owner, branch.repo, branch.name
+                ),
+                "/commit/sha",
+            ),
+        };
+        match self.conditional(on.host(), &path, etag)? {
             Fetched::NotModified => Ok(Fetched::NotModified),
             Fetched::Fresh { etag, value } => {
-                let head = value["head"]["sha"]
-                    .as_str()
+                let head = value
+                    .pointer(sha)
+                    .and_then(Value::as_str)
                     .ok_or_else(|| GhError(format!("GitHub's {path} names no head commit")))?;
                 Ok(Fetched::Fresh {
                     etag,
@@ -278,15 +332,16 @@ impl PullRequests for Gh {
 
     fn check_runs(
         &self,
-        pr: &PullRequest,
+        on: &Watched,
         head: &str,
         etag: Option<&str>,
     ) -> Result<Fetched<Vec<CheckRun>>, GhError> {
         let path = format!(
             "repos/{}/{}/commits/{head}/check-runs?per_page={PAGE}",
-            pr.owner, pr.repo
+            on.owner(),
+            on.repo()
         );
-        Ok(match self.paged(&pr.host, &path, "check_runs", etag)? {
+        Ok(match self.paged(on.host(), &path, "check_runs", etag)? {
             Fetched::NotModified => Fetched::NotModified,
             Fetched::Fresh { etag, value } => Fetched::Fresh {
                 etag,
@@ -297,15 +352,16 @@ impl PullRequests for Gh {
 
     fn statuses(
         &self,
-        pr: &PullRequest,
+        on: &Watched,
         head: &str,
         etag: Option<&str>,
     ) -> Result<Fetched<Vec<CheckRun>>, GhError> {
         let path = format!(
             "repos/{}/{}/commits/{head}/status?per_page={PAGE}",
-            pr.owner, pr.repo
+            on.owner(),
+            on.repo()
         );
-        Ok(match self.paged(&pr.host, &path, "statuses", etag)? {
+        Ok(match self.paged(on.host(), &path, "statuses", etag)? {
             Fetched::NotModified => Fetched::NotModified,
             Fetched::Fresh { etag, value } => Fetched::Fresh {
                 etag,
@@ -314,12 +370,15 @@ impl PullRequests for Gh {
         })
     }
 
-    fn job_log(&self, pr: &PullRequest, job: u64) -> Result<String, GhError> {
+    fn job_log(&self, on: &Watched, job: u64) -> Result<String, GhError> {
         let mut cmd = Command::new("gh");
-        cmd.args(["api", "--hostname", &pr.host])
+        // A job's log is full of colour codes, which gh only passes through with the flag; the
+        // tail strips them.
+        cmd.args(["api", "--hostname", on.host(), "--allow-escape-sequences"])
             .arg(format!(
                 "repos/{}/{}/actions/jobs/{job}/logs",
-                pr.owner, pr.repo
+                on.owner(),
+                on.repo()
             ))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -482,7 +541,7 @@ pub struct OpenPull {
 }
 
 /// What the CI watcher reads of a repo (`owner/name` on [`HOST`]): its self-hosted runners,
-/// its workflow runs and their jobs, and its open pull requests' checks.
+/// its workflow runs and their jobs, its open pull requests' checks and its main's.
 pub trait Actions: Send + Sync + 'static {
     fn runners(&self, repo: &str) -> Result<Vec<Runner>, GhError>;
     /// The ids of the workflow runs queued or in progress.
@@ -498,8 +557,11 @@ pub trait Actions: Send + Sync + 'static {
     /// their times.
     fn jobs(&self, repo: &str, run: u64) -> Result<Vec<Job>, GhError>;
     fn open_pulls(&self, repo: &str) -> Result<Vec<OpenPull>, GhError>;
-    /// The check runs and commit statuses on the pull request's head.
-    fn checks(&self, repo: &str, pull: &OpenPull) -> Result<Vec<CheckRun>, GhError>;
+    /// The latest head commit of `branch`.
+    fn branch_head(&self, repo: &str, branch: &str) -> Result<String, GhError>;
+    /// The check runs and commit statuses on the commit `head`: a pull request's head, or a
+    /// branch's.
+    fn checks(&self, repo: &str, head: &str) -> Result<Vec<CheckRun>, GhError>;
     /// Called after each round of reads: forgets what that round didn't read again.
     fn sweep(&self) {}
 }
@@ -657,13 +719,20 @@ impl Actions for GhActions {
         Ok(self.list(&path, "")?.iter().filter_map(open_pull).collect())
     }
 
-    fn checks(&self, repo: &str, pull: &OpenPull) -> Result<Vec<CheckRun>, GhError> {
+    fn branch_head(&self, repo: &str, branch: &str) -> Result<String, GhError> {
+        let path = format!("repos/{repo}/branches/{branch}");
+        self.page(&path)?["commit"]["sha"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| GhError(format!("GitHub's {path} names no head commit")))
+    }
+
+    fn checks(&self, repo: &str, head: &str) -> Result<Vec<CheckRun>, GhError> {
         if !factory_core::fleet::is_repo(repo) {
             return Err(GhError(format!(
                 "{repo:?} is not owner/name; fix [ci] repos in the config"
             )));
         }
-        let head = &pull.head;
         let runs = format!("repos/{repo}/commits/{head}/check-runs?per_page={PAGE}");
         let statuses = format!("repos/{repo}/commits/{head}/status?per_page={PAGE}");
         let mut checks: Vec<CheckRun> = self
@@ -778,6 +847,8 @@ pub struct FakeFleet {
     pub runs: Vec<(u64, Vec<Job>)>,
     /// Each open pull request and the runs on its head.
     pub pulls: Vec<(OpenPull, Vec<CheckRun>)>,
+    /// Each branch's latest head and the runs on it.
+    pub branches: Vec<(String, String, Vec<CheckRun>)>,
     /// What every read fails with, while set.
     pub failing: Option<String>,
     /// How many reads were made.
@@ -842,14 +913,28 @@ impl Actions for FakeActions {
             .collect())
     }
 
-    fn checks(&self, _repo: &str, pull: &OpenPull) -> Result<Vec<CheckRun>, GhError> {
-        Ok(self
-            .read()?
+    fn branch_head(&self, _repo: &str, branch: &str) -> Result<String, GhError> {
+        self.read()?
+            .branches
+            .iter()
+            .find(|(name, _, _)| name == branch)
+            .map(|(_, head, _)| head.clone())
+            .ok_or_else(|| GhError(format!("gh: Branch not found (HTTP 404): {branch}")))
+    }
+
+    fn checks(&self, _repo: &str, head: &str) -> Result<Vec<CheckRun>, GhError> {
+        let state = self.read()?;
+        let pulls = state
             .pulls
             .iter()
-            .find(|(open, _)| open.number == pull.number)
-            .map(|(_, runs)| runs.clone())
-            .unwrap_or_default())
+            .filter(|(open, _)| open.head == head)
+            .map(|(_, runs)| runs);
+        let branches = state
+            .branches
+            .iter()
+            .filter(|(_, at, _)| at == head)
+            .map(|(_, _, runs)| runs);
+        Ok(pulls.chain(branches).next().cloned().unwrap_or_default())
     }
 }
 
@@ -892,14 +977,19 @@ impl PullRequests for FakePullRequests {
             .ok_or_else(|| GhError(format!("no pull request {pr}")))
     }
 
-    fn head(&self, _pr: &PullRequest, etag: Option<&str>) -> Result<Fetched<String>, GhError> {
+    fn repo_url(&self, _cwd: &Path) -> Result<String, GhError> {
+        let url = self.state().url.clone().unwrap_or_default();
+        Ok(url.split("/pull/").next().unwrap_or_default().to_owned())
+    }
+
+    fn head(&self, _on: &Watched, etag: Option<&str>) -> Result<Fetched<String>, GhError> {
         let state = self.state();
         Ok(fresh(&state, etag, state.head.clone()))
     }
 
     fn check_runs(
         &self,
-        _pr: &PullRequest,
+        _on: &Watched,
         _head: &str,
         etag: Option<&str>,
     ) -> Result<Fetched<Vec<CheckRun>>, GhError> {
@@ -910,7 +1000,7 @@ impl PullRequests for FakePullRequests {
 
     fn statuses(
         &self,
-        _pr: &PullRequest,
+        _on: &Watched,
         _head: &str,
         etag: Option<&str>,
     ) -> Result<Fetched<Vec<CheckRun>>, GhError> {
@@ -918,7 +1008,7 @@ impl PullRequests for FakePullRequests {
         Ok(fresh(&state, etag, state.statuses.clone()))
     }
 
-    fn job_log(&self, _pr: &PullRequest, job: u64) -> Result<String, GhError> {
+    fn job_log(&self, _on: &Watched, job: u64) -> Result<String, GhError> {
         self.state()
             .logs
             .iter()

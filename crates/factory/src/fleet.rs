@@ -1,6 +1,7 @@
 //! The daemon's CI watcher (spec #67, stories 25 to 29 and 42): it reads each `[ci]` repo's
-//! self-hosted runners, its queued and running workflow jobs and the checks of its open
-//! `factory/*` pull requests, for the status screen and the bar.
+//! self-hosted runners, its queued and running workflow jobs, the checks of its open
+//! `factory/*` pull requests and those of its main's latest head, for the status screen and the
+//! bar. Main is read with the rest of the repo, so it adds no read while nothing needs watching.
 //!
 //! It reads every repo once as the daemon starts, so the runner fleet shows even when nothing
 //! needs watching (#79). After that it reads only while something needs watching: a
@@ -18,8 +19,10 @@ use std::time::Duration;
 
 use factory_adapters::gh::{Actions, GhActions, GhError, HOST};
 use factory_adapters::git::GitRepo;
-use factory_core::ci::PullRequest;
-use factory_core::fleet::{Ci, Job, Pull, PullState, RepoCi, github_repo, is_factory_branch};
+use factory_core::ci::Watched;
+use factory_core::fleet::{
+    Ci, Job, MAIN, Main, Pull, PullState, RepoCi, github_repo, is_factory_branch,
+};
 use tokio::sync::watch;
 
 use crate::clock;
@@ -98,9 +101,9 @@ impl<A: Actions> Fleet<A> {
     }
 
     /// Whether `pr` is in one of the watched repos.
-    fn watches(&self, pr: &PullRequest) -> bool {
-        let name = format!("{}/{}", pr.owner, pr.repo);
-        pr.host.eq_ignore_ascii_case(HOST)
+    fn watches(&self, pr: &Watched) -> bool {
+        let name = format!("{}/{}", pr.owner(), pr.repo());
+        pr.host().eq_ignore_ascii_case(HOST)
             && self
                 .ci()
                 .repos
@@ -117,7 +120,7 @@ impl<A: Actions> Fleet<A> {
     /// given, the factory has live work in.
     pub async fn run(
         self: Arc<Self>,
-        mut watched: watch::Receiver<Option<PullRequest>>,
+        mut watched: watch::Receiver<Option<Watched>>,
         leads: watch::Receiver<u64>,
         live: LiveWork,
     ) {
@@ -129,6 +132,10 @@ impl<A: Actions> Fleet<A> {
         // Every repo is read once as the daemon starts, so its runner fleet shows even on a
         // night with nothing to watch (#79); after that, only what needs watching is read.
         let mut asked = true;
+        // The repos a wait woke the read for: their main is read too, as it is while a repo
+        // needs watching or is busy, but not on the read at start of a factory with nothing
+        // to watch, nor for a repo nothing watches.
+        let mut woken: Vec<String> = Vec::new();
         let mut last: Option<i64> = None;
         // The repos with live work, as last looked; looked at again once `look` is set.
         let mut busy: Vec<String> = Vec::new();
@@ -150,9 +157,11 @@ impl<A: Actions> Fleet<A> {
             let due = last.is_none_or(|at| clock::lab_now_ms().saturating_sub(at) >= INTERVAL_MS);
             if wanted && due {
                 let all = std::mem::take(&mut asked);
+                let woken = std::mem::take(&mut woken);
                 last = Some(clock::lab_now_ms());
                 let (fleet, only) = (Arc::clone(&self), busy.clone());
-                let _ = tokio::task::spawn_blocking(move || fleet.read_all(all, &only)).await;
+                let _ =
+                    tokio::task::spawn_blocking(move || fleet.read_all(all, &woken, &only)).await;
                 let next = (self.needs_watching() || !busy.is_empty())
                     .then(|| last.map(|at| at + INTERVAL_MS));
                 self.ci().next = next.flatten();
@@ -168,29 +177,35 @@ impl<A: Actions> Fleet<A> {
                         return;
                     }
                     let pr = watched.borrow_and_update().clone();
-                    asked |= pr.is_some_and(|pr| self.watches(&pr));
+                    if let Some(pr) = pr.filter(|pr| self.watches(pr)) {
+                        asked = true;
+                        woken.push(format!("{}/{}", pr.owner(), pr.repo()));
+                    }
                 }
             }
         }
     }
 
     /// Reads the repos once, keeping each answer, or the last good one marked with why: every
-    /// repo with `all`, else each one that needs watching or is named in `busy`.
-    fn read_all(&self, all: bool, busy: &[String]) {
+    /// repo with `all`, else each one that needs watching or is named in `busy`. Main is read
+    /// only for a repo named in `woken` (a wait woke the read for it), busy or needing watching.
+    fn read_all(&self, all: bool, woken: &[String], busy: &[String]) {
         let count = self.ci().repos.len();
         for index in 0..count {
             let Some(before) = self.ci().repos.get(index).cloned() else {
                 return;
             };
-            if !all
-                && !before.needs_watching()
-                && !busy
+            let watched = before.needs_watching()
+                || busy
                     .iter()
-                    .any(|repo| repo.eq_ignore_ascii_case(&before.repo))
-            {
+                    .any(|repo| repo.eq_ignore_ascii_case(&before.repo));
+            if !all && !watched {
                 continue;
             }
-            let read = read(&*self.actions, &before);
+            let woke = woken
+                .iter()
+                .any(|repo| repo.eq_ignore_ascii_case(&before.repo));
+            let read = read(&*self.actions, &before, woke || watched);
             let after = match read {
                 Ok((mut after, jobs)) => {
                     after.seen = Some(clock::now().unix_millis());
@@ -237,9 +252,15 @@ impl<A: Actions> Fleet<A> {
 /// One read of `before`'s repo: its runners, the jobs of its active runs, of the latest runs
 /// updated since the last good answer (one that queued and completed between two reads, or a
 /// re-run, among them) and of the runs whose jobs `before` still waited on, and its open
-/// factory pull requests' checks. Also every job read, completed ones too, for the times the
-/// database keeps.
-fn read<A: Actions>(actions: &A, before: &RepoCi) -> Result<(RepoCi, Vec<Job>), GhError> {
+/// factory pull requests' checks, and its main's latest head's when the repo is `watched` or
+/// the read finds it needs watching (else main stays as `before` saw it, so an idle factory
+/// asks nothing of main). Also every job read, completed ones too, for the times the database
+/// keeps.
+fn read<A: Actions>(
+    actions: &A,
+    before: &RepoCi,
+    watched: bool,
+) -> Result<(RepoCi, Vec<Job>), GhError> {
     let repo = before.repo.as_str();
     let runners = actions.runners(repo)?;
     let now = clock::now().unix_millis();
@@ -260,7 +281,7 @@ fn read<A: Actions>(actions: &A, before: &RepoCi) -> Result<(RepoCi, Vec<Job>), 
         if !is_factory_branch(&open.branch) {
             continue;
         }
-        let state = PullState::of(&actions.checks(repo, &open)?);
+        let state = PullState::of(&actions.checks(repo, &open.head)?);
         pulls.push(Pull {
             number: open.number,
             branch: open.branch,
@@ -275,6 +296,13 @@ fn read<A: Actions>(actions: &A, before: &RepoCi) -> Result<(RepoCi, Vec<Job>), 
         .cloned()
         .collect();
     jobs.sort_by_key(|job| job.id);
+    let main = if watched || !pulls.is_empty() || !jobs.is_empty() {
+        let sha = actions.branch_head(repo, MAIN)?;
+        let state = PullState::of(&actions.checks(repo, &sha)?);
+        Some(Main { sha, state })
+    } else {
+        before.main.clone()
+    };
     Ok((
         RepoCi {
             repo: before.repo.clone(),
@@ -284,6 +312,7 @@ fn read<A: Actions>(actions: &A, before: &RepoCi) -> Result<(RepoCi, Vec<Job>), 
             jobs,
             pulls,
             finished: Vec::new(),
+            main,
         },
         read,
     ))

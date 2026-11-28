@@ -1,6 +1,6 @@
 //! The CI the factory watches (spec #67, stories 25 to 29 and 42): for each configured repo, its
 //! self-hosted runner fleet, its queued and running workflow jobs, and the latest check state of
-//! each open `factory/*` pull request.
+//! each open `factory/*` pull request and of main's latest head.
 //!
 //! A repo needs watching while its last answer showed an open factory pull request or a job not
 //! yet completed. A read that fails keeps the last good answer, marked with why, so a network
@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ci::{self, CheckRun, Verdict};
+use crate::exit::Exit;
 
 /// The branches whose pull requests the factory opened.
 pub const BRANCH_PREFIX: &str = "factory/";
@@ -47,6 +48,42 @@ pub struct RepoCi {
     /// The latest completed jobs, newest first, with the times the database keeps.
     #[serde(default)]
     pub finished: Vec<Job>,
+    /// Where [`MAIN`]'s latest head stands; none before it was ever read.
+    #[serde(default)]
+    pub main: Option<Main>,
+}
+
+/// The branch whose latest head the watcher reads in each repo: with lean CI, its runs are the
+/// only signal that what merged works together.
+pub const MAIN: &str = "main";
+
+/// A repo's [`MAIN`]: its latest head, and where that head's checks stand, by the newest run
+/// of each.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Main {
+    pub sha: String,
+    pub state: PullState,
+}
+
+impl Main {
+    /// `red`, `green` or `pending`.
+    pub fn word(&self) -> &'static str {
+        match self.state {
+            PullState::Failing => "red",
+            PullState::Passing => "green",
+            PullState::Pending => "pending",
+        }
+    }
+
+    /// The head's first 7 characters, as git abbreviates it.
+    pub fn short(&self) -> &str {
+        self.sha.get(..7).unwrap_or(&self.sha)
+    }
+
+    /// Where a person reads the head of `repo` (`owner/name`).
+    pub fn url(&self, repo: &str) -> String {
+        format!("https://github.com/{repo}/commit/{}", self.sha)
+    }
 }
 
 /// One self-hosted runner.
@@ -141,14 +178,19 @@ pub enum PullState {
 }
 
 impl PullState {
-    /// Where a head's runs stand: failing as soon as one failed, even while others run.
+    /// Where a head's runs stand, by the newest run of each check: failing as soon as one
+    /// failed, even while others run, and once all finished with one cancelled.
     pub fn of(runs: &[CheckRun]) -> PullState {
-        if runs.iter().any(|run| run.bucket() == ci::Bucket::Failed) {
+        if ci::latest(runs)
+            .iter()
+            .any(|run| run.bucket() == ci::Bucket::Failed)
+        {
             return PullState::Failing;
         }
         match ci::verdict(runs) {
             Verdict::Pending { .. } => PullState::Pending,
-            Verdict::Finished(_) => PullState::Passing,
+            Verdict::Finished(tally) if tally.exit() == Exit::Ok => PullState::Passing,
+            Verdict::Finished(_) => PullState::Failing,
         }
     }
 
@@ -235,6 +277,10 @@ pub struct Tally {
     pub running: usize,
     pub failing: usize,
     pub pending: usize,
+    /// Repos whose main's latest head failed.
+    pub main_failing: usize,
+    /// Repos whose main's latest head is still checked.
+    pub main_pending: usize,
 }
 
 /// Where the watched CI stands, as the bar's chip shows it.
@@ -242,9 +288,12 @@ pub struct Tally {
 pub enum Mark {
     /// No repo has answered yet.
     Unknown,
+    /// A repo's main failed on its latest head: louder than a pull request, as everything
+    /// merged after it lands on red.
+    MainFailing,
     /// An open factory pull request has a failed check.
     Failing,
-    /// A pull request's checks or a job are still going.
+    /// A pull request's or main's checks or a job are still going.
     Busy,
     /// Nothing failing and nothing going.
     Passing,
@@ -287,9 +336,11 @@ impl Ci {
             return Mark::Unknown;
         }
         let tally = self.tally();
-        if tally.failing > 0 {
+        if tally.main_failing > 0 {
+            Mark::MainFailing
+        } else if tally.failing > 0 {
             Mark::Failing
-        } else if tally.pending + tally.queued + tally.running > 0 {
+        } else if tally.pending + tally.main_pending + tally.queued + tally.running > 0 {
             Mark::Busy
         } else {
             Mark::Passing
@@ -324,9 +375,10 @@ impl Ci {
         !self.repos.is_empty() || self.error.is_some()
     }
 
-    /// `stale 4m · PRs 1 failing, 1 pending · 2/7 busy, 1 offline · 3 queued, oldest 12m`:
-    /// how old the numbers are while a read fails, then the open factory pull requests, the
-    /// runners and the queue, the least needed last where a screen cuts it.
+    /// `stale 4m · main red shop@42fdcd8 · PRs 1 failing, 1 pending · main green web@0b1c2d3 ·
+    /// 2/7 busy, 1 offline · 3 queued, oldest 12m`: how old the numbers are while a read
+    /// fails, each red main, the open factory pull requests, each other main, the runners and
+    /// the queue, the least needed last where a screen cuts it.
     pub fn summary(&self, now: i64) -> String {
         if !self.answered() {
             return match self.error() {
@@ -342,6 +394,15 @@ impl Ci {
                 crate::lab::ago(now / 1000, since / 1000)
             ));
         }
+        let mains = |red: bool| {
+            self.repos.iter().filter_map(move |repo| {
+                let main = repo.main.as_ref()?;
+                let name = repo.repo.rsplit('/').next().unwrap_or(&repo.repo);
+                ((main.state == PullState::Failing) == red)
+                    .then(|| format!("main {} {name}@{}", main.word(), main.short()))
+            })
+        };
+        parts.extend(mains(true));
         let pulls: usize = self.repos.iter().map(|repo| repo.pulls.len()).sum();
         let passing = pulls - tally.failing - tally.pending;
         let states: Vec<String> = [
@@ -358,6 +419,7 @@ impl Ci {
         } else {
             format!("PRs {}", states.join(", "))
         });
+        parts.extend(mains(false));
         parts.push(tally.runners_text());
         parts.push(tally.queue_text(now));
         parts.join(" · ")
@@ -390,6 +452,11 @@ impl Ci {
                     PullState::Pending => tally.pending += 1,
                     PullState::Passing => {}
                 }
+            }
+            match repo.main.as_ref().map(|main| main.state) {
+                Some(PullState::Failing) => tally.main_failing += 1,
+                Some(PullState::Pending) => tally.main_pending += 1,
+                Some(PullState::Passing) | None => {}
             }
         }
         let listed = tally.busy + tally.idle + tally.offline;

@@ -4,7 +4,7 @@
 
 use serde_json::{Value, json};
 
-use crate::support::github::{FORBIDDEN, FakeGitHub, Job, RATE_LIMITED, TIMED_OUT};
+use crate::support::github::{FORBIDDEN, FakeGitHub, Job, MAIN_HEAD, RATE_LIMITED, TIMED_OUT};
 use crate::support::herdr::FakeHerdr;
 use crate::support::world::poll_until;
 use crate::support::{Sandbox, stop_daemon};
@@ -151,12 +151,32 @@ fn conditional_runner_reads(sandbox: &Sandbox) -> usize {
         .count()
 }
 
-/// Waits until the watcher has listed the open pull requests `count` times.
-fn await_reads(github: &FakeGitHub, sandbox: &Sandbox, count: usize) {
+/// When the watcher last ended a read of acme/shop, as `factory status --json` shows it.
+fn seen(sandbox: &Sandbox) -> Value {
+    status(sandbox)["ci"]["repos"][0]["seen"].clone()
+}
+
+/// Waits until a read that ended after `before` was seen has ended whole: the repo's `seen`
+/// moves only once all of its read is done, main's head last, while counting paths can stop
+/// short of it.
+fn await_whole_read(sandbox: &Sandbox, before: &Value) {
     assert!(
-        poll_until(|| pull_reads(github, sandbox) >= count),
-        "the watcher read {} times, not {count}",
-        pull_reads(github, sandbox)
+        poll_until(|| seen(sandbox) != *before),
+        "no read ended after {before}"
+    );
+}
+
+/// Moves the daemon's clock `secs` seconds past the system's, then waits until the read that
+/// wakes has ended whole and the watcher has listed the open pull requests `count` times.
+fn reads_again_after(github: &FakeGitHub, sandbox: &Sandbox, secs: u64, count: usize) {
+    let before = seen(sandbox);
+    move_clock(sandbox, secs);
+    await_whole_read(sandbox, &before);
+    assert_eq!(
+        pull_reads(github, sandbox),
+        count,
+        "{:?}",
+        github.watcher_reads(sandbox)
     );
 }
 
@@ -198,6 +218,11 @@ fn an_idle_factory_reads_github_once_at_start_and_then_nothing_across_minutes() 
     assert_eq!(card["rows"][0]["text"], "0/2 busy", "{card}");
     let at_start = github.watcher_reads(&sandbox);
     assert!(!at_start.is_empty());
+    assert!(
+        at_start.iter().all(|path| !path.contains("/branches/")),
+        "an idle factory asks nothing of main at start: {at_start:?}"
+    );
+    assert!(first["repos"][0]["main"].is_null(), "{first}");
 
     // With no wait, no open factory pull request and no job, no read is due after that.
     for minutes in [1, 3, 10] {
@@ -209,12 +234,16 @@ fn an_idle_factory_reads_github_once_at_start_and_then_nothing_across_minutes() 
     // A wait on a pull request no longer open wakes one read, which finds nothing to watch.
     github.checks(&[(1, "test", "completed", Some("success"))]);
     assert_eq!(sandbox.factory(&["wait", "ci", "12"]).code, 0);
-    assert!(
-        poll_until(|| github.watcher_reads(&sandbox).len() > at_start.len()),
-        "the wait woke no read"
-    );
+    // One whole read, main's head last: a wait reads main too.
+    await_whole_read(&sandbox, &first["repos"][0]["seen"]);
     idle(&sandbox);
     let reads = github.watcher_reads(&sandbox);
+    assert_eq!(reads[..at_start.len()], at_start[..], "{reads:?}");
+    assert_eq!(
+        reads[at_start.len()..].last().map(String::as_str),
+        Some("repos/acme/shop/branches/main"),
+        "{reads:?}"
+    );
     for minutes in [13, 20, 60] {
         move_clock(&sandbox, minutes * 60);
         assert!(status(&sandbox)["ci"]["next"].is_null());
@@ -242,8 +271,7 @@ fn the_watcher_reads_each_minute_while_a_factory_pr_is_open_and_stops_once_none_
         "nothing to send back yet"
     );
 
-    move_clock(&sandbox, 61);
-    await_reads(&github, &sandbox, 2);
+    reads_again_after(&github, &sandbox, 61, 2);
     assert_eq!(
         conditional_runner_reads(&sandbox),
         1,
@@ -300,8 +328,7 @@ fn every_page_of_a_long_list_is_asked_again_with_its_own_etag() {
     assert_eq!(sandbox.factory(&["wait", "ci", "12"]).code, 0);
     awaits_next_read(&sandbox);
     let before = second_pages();
-    move_clock(&sandbox, 61);
-    await_reads(&github, &sandbox, 2);
+    reads_again_after(&github, &sandbox, 61, 2);
     assert!(
         poll_until(|| second_pages() > before),
         "the second page went out with no ETag"
@@ -359,8 +386,7 @@ fn each_jobs_queued_started_and_finished_times_are_stored() {
         ..queued
     };
     github.jobs(7, &[running]);
-    move_clock(&sandbox, 61);
-    await_reads(&github, &sandbox, 2);
+    reads_again_after(&github, &sandbox, 61, 2);
 
     // The run is no longer active, but its job was: its end is still read.
     github.workflow_runs("in_progress", &[]);
@@ -678,4 +704,53 @@ fn a_lead_on_another_repo_or_off_the_factory_branches_wakes_no_read_past_the_one
         assert!(status(&sandbox)["ci"]["next"].is_null());
     }
     assert_eq!(github.watcher_reads(&sandbox), at_start);
+}
+
+#[test]
+fn the_watcher_reads_mains_latest_head_and_a_red_main_is_loud_on_status_and_the_bar() {
+    let sandbox = watching(2);
+    let github = FakeGitHub::install(&sandbox);
+    github.main_checks(&[
+        (801, "ci", "completed", Some("failure")),
+        (802, "ci", "completed", Some("success")),
+        (803, "e2e", "completed", Some("failure")),
+    ]);
+
+    // A wait on main wakes a read of it, once one is due (the read at start of an idle
+    // factory leaves main be).
+    assert!(idle(&sandbox)["repos"][0]["main"].is_null());
+    move_clock(&sandbox, 60);
+    assert_eq!(sandbox.factory(&["wait", "ci", "main"]).code, 10);
+    let shop = shop_when(&sandbox, |shop| !shop["main"].is_null());
+    assert_eq!(
+        shop["main"],
+        json!({"sha": MAIN_HEAD, "state": "failing"}),
+        "the newest run of each check counts: {shop}"
+    );
+    let line = sandbox.factory(&["status"]);
+    assert!(
+        line.stdout
+            .contains("ci: main red shop@42fdcd8 · no open PRs"),
+        "{line:?}"
+    );
+    let (chip, card) = bar_ci(&sandbox);
+    assert_eq!(
+        (&chip["text"], &chip["tone"]),
+        (&json!("main ✗"), &json!("critical")),
+        "{chip}"
+    );
+    assert!(
+        card["rows"].as_array().is_some_and(|rows| rows
+            .iter()
+            .any(|row| row["label"] == "shop main" && row["text"] == "red 42fdcd8")),
+        "{card}"
+    );
+
+    // A restarted daemon shows the main it kept before it reads again.
+    stop_daemon(&sandbox);
+    github.fail_actions(FORBIDDEN);
+    assert_eq!(
+        status(&sandbox)["ci"]["repos"][0]["main"]["state"],
+        "failing"
+    );
 }

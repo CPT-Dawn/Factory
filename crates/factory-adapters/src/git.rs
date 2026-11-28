@@ -36,6 +36,9 @@ pub trait Repo {
     fn name(&self) -> Result<String, GitError>;
     /// The commit `rev` names; none when it names no commit.
     fn commit(&self, rev: &str) -> Result<Option<String>, GitError>;
+    /// The tree of the commit `rev` names: what it holds, whatever its history; none when
+    /// it names no commit.
+    fn tree(&self, rev: &str) -> Result<Option<String>, GitError>;
     /// The full diff of `base...HEAD`, with `context` lines around each change. Lockfiles are
     /// left out: they show in the diff stat only.
     fn diff(&self, base: &str, context: u32) -> Result<String, GitError>;
@@ -152,6 +155,22 @@ impl GitRepo {
     }
 
     /// Runs git and returns its stdout, failing when it exits non-zero.
+    /// The object `rev` names, full; none when it names none.
+    fn object(&self, rev: &str) -> Result<Option<String>, GitError> {
+        let args = ["rev-parse", "-q", "--verify", rev];
+        let output = self.output(&args)?;
+        match output.status.code() {
+            Some(0) => Ok(Some(
+                String::from_utf8_lossy(&output.stdout)
+                    .trim_end()
+                    .to_owned(),
+            )),
+            // `--verify -q` exits 1, silently, for a rev that names no object.
+            Some(1) => Ok(None),
+            _ => Err(failed(&args, &output)),
+        }
+    }
+
     fn git(&self, args: &[&str]) -> Result<String, GitError> {
         let output = self.output(args)?;
         if !output.status.success() {
@@ -246,18 +265,11 @@ impl Repo for GitRepo {
     }
 
     fn commit(&self, rev: &str) -> Result<Option<String>, GitError> {
-        let args = ["rev-parse", "-q", "--verify", &format!("{rev}^{{commit}}")];
-        let output = self.output(&args)?;
-        match output.status.code() {
-            Some(0) => Ok(Some(
-                String::from_utf8_lossy(&output.stdout)
-                    .trim_end()
-                    .to_owned(),
-            )),
-            // `--verify -q` exits 1, silently, for a rev that names no commit.
-            Some(1) => Ok(None),
-            _ => Err(failed(&args, &output)),
-        }
+        self.object(&format!("{rev}^{{commit}}"))
+    }
+
+    fn tree(&self, rev: &str) -> Result<Option<String>, GitError> {
+        self.object(&format!("{rev}^{{commit}}^{{tree}}"))
     }
 
     fn diff(&self, base: &str, context: u32) -> Result<String, GitError> {
@@ -628,6 +640,8 @@ pub struct FakeRepo {
     pub name: String,
     /// Each known rev and the commit it names.
     pub revs: Vec<(String, String)>,
+    /// Each known rev and the tree of its commit.
+    pub trees: Vec<(String, String)>,
     pub diff: String,
     pub diff_stat: String,
     /// The revs that are ancestors of HEAD.
@@ -683,6 +697,14 @@ impl Repo for FakeRepo {
             .iter()
             .find(|(known, _)| known == rev)
             .map(|(_, sha)| sha.clone()))
+    }
+
+    fn tree(&self, rev: &str) -> Result<Option<String>, GitError> {
+        Ok(self
+            .trees
+            .iter()
+            .find(|(known, _)| known == rev)
+            .map(|(_, tree)| tree.clone()))
     }
 
     fn diff(&self, _base: &str, _context: u32) -> Result<String, GitError> {
