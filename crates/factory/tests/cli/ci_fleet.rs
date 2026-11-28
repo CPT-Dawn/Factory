@@ -151,12 +151,32 @@ fn conditional_runner_reads(sandbox: &Sandbox) -> usize {
         .count()
 }
 
-/// Waits until the watcher has listed the open pull requests `count` times.
-fn await_reads(github: &FakeGitHub, sandbox: &Sandbox, count: usize) {
+/// When the watcher last ended a read of acme/shop, as `factory status --json` shows it.
+fn seen(sandbox: &Sandbox) -> Value {
+    status(sandbox)["ci"]["repos"][0]["seen"].clone()
+}
+
+/// Waits until a read that ended after `before` was seen has ended whole: the repo's `seen`
+/// moves only once all of its read is done, main's head last, while counting paths can stop
+/// short of it.
+fn await_whole_read(sandbox: &Sandbox, before: &Value) {
     assert!(
-        poll_until(|| pull_reads(github, sandbox) >= count),
-        "the watcher read {} times, not {count}",
-        pull_reads(github, sandbox)
+        poll_until(|| seen(sandbox) != *before),
+        "no read ended after {before}"
+    );
+}
+
+/// Moves the daemon's clock `secs` seconds past the system's, then waits until the read that
+/// wakes has ended whole and the watcher has listed the open pull requests `count` times.
+fn reads_again_after(github: &FakeGitHub, sandbox: &Sandbox, secs: u64, count: usize) {
+    let before = seen(sandbox);
+    move_clock(sandbox, secs);
+    await_whole_read(sandbox, &before);
+    assert_eq!(
+        pull_reads(github, sandbox),
+        count,
+        "{:?}",
+        github.watcher_reads(sandbox)
     );
 }
 
@@ -214,13 +234,16 @@ fn an_idle_factory_reads_github_once_at_start_and_then_nothing_across_minutes() 
     // A wait on a pull request no longer open wakes one read, which finds nothing to watch.
     github.checks(&[(1, "test", "completed", Some("success"))]);
     assert_eq!(sandbox.factory(&["wait", "ci", "12"]).code, 0);
-    // One whole read, as many paths as the one at start.
-    assert!(
-        poll_until(|| github.watcher_reads(&sandbox).len() >= 2 * at_start.len()),
-        "the wait woke no read"
-    );
+    // One whole read, main's head last: a wait reads main too.
+    await_whole_read(&sandbox, &first["repos"][0]["seen"]);
     idle(&sandbox);
     let reads = github.watcher_reads(&sandbox);
+    assert_eq!(reads[..at_start.len()], at_start[..], "{reads:?}");
+    assert_eq!(
+        reads[at_start.len()..].last().map(String::as_str),
+        Some("repos/acme/shop/branches/main"),
+        "{reads:?}"
+    );
     for minutes in [13, 20, 60] {
         move_clock(&sandbox, minutes * 60);
         assert!(status(&sandbox)["ci"]["next"].is_null());
@@ -248,8 +271,7 @@ fn the_watcher_reads_each_minute_while_a_factory_pr_is_open_and_stops_once_none_
         "nothing to send back yet"
     );
 
-    move_clock(&sandbox, 61);
-    await_reads(&github, &sandbox, 2);
+    reads_again_after(&github, &sandbox, 61, 2);
     assert_eq!(
         conditional_runner_reads(&sandbox),
         1,
@@ -306,8 +328,7 @@ fn every_page_of_a_long_list_is_asked_again_with_its_own_etag() {
     assert_eq!(sandbox.factory(&["wait", "ci", "12"]).code, 0);
     awaits_next_read(&sandbox);
     let before = second_pages();
-    move_clock(&sandbox, 61);
-    await_reads(&github, &sandbox, 2);
+    reads_again_after(&github, &sandbox, 61, 2);
     assert!(
         poll_until(|| second_pages() > before),
         "the second page went out with no ETag"
@@ -365,8 +386,7 @@ fn each_jobs_queued_started_and_finished_times_are_stored() {
         ..queued
     };
     github.jobs(7, &[running]);
-    move_clock(&sandbox, 61);
-    await_reads(&github, &sandbox, 2);
+    reads_again_after(&github, &sandbox, 61, 2);
 
     // The run is no longer active, but its job was: its end is still read.
     github.workflow_runs("in_progress", &[]);
