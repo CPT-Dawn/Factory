@@ -298,6 +298,39 @@ fn a_running_stack_devlab_has_no_schema_record_of_warns_of_the_slots_last_worktr
 }
 
 #[test]
+fn a_lease_that_claims_a_running_stack_with_stack_leaves_its_schema_to_the_starter() {
+    let (sandbox, world) = lab();
+    let (a, b, c) = (
+        world.worktree("demo-a"),
+        world.worktree("demo-b"),
+        world.worktree("demo-c"),
+    );
+    assert_eq!(
+        owned(&sandbox, &a, &["acquire", "--no-device", "--stack"]).code,
+        0
+    );
+    assert_eq!(owned(&sandbox, &a, &["release"]).code, 0);
+    // B's --stack finds A's stack running: B takes it to stop, but it still runs A's schema.
+    let claimed = owned(&sandbox, &b, &["acquire", "--no-device", "--stack"]);
+    assert!(
+        claimed
+            .stderr
+            .contains("slot 0's stack last ran demo-a's schema:"),
+        "{claimed:?}"
+    );
+    assert_eq!(owned(&sandbox, &b, &["release"]).code, 0);
+
+    let out = owned(&sandbox, &c, &["acquire", "--no-device"]);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(
+        out.stderr
+            .contains("slot 0's stack last ran demo-a's schema:"),
+        "{out:?}"
+    );
+}
+
+#[test]
 fn a_lease_that_holds_a_running_stack_it_did_not_start_leaves_its_schema_to_the_starter() {
     let (sandbox, world) = lab();
     let (a, b, c) = (

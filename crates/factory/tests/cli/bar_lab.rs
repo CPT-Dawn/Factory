@@ -203,10 +203,10 @@ fn emulators_show_their_state_and_holder_and_the_card_its_room() {
         .as_str()
         .unwrap_or_default()
         .to_owned();
-    // One running of a cap of one, and the host's free memory.
+    // One running of a cap of one, and the host's memory free after CI's headroom (#84).
     let free = room
         .strip_prefix("emulators 1 of 1 · ")
-        .and_then(|rest| rest.strip_suffix(" GB free"));
+        .and_then(|rest| rest.strip_suffix(" GB free after CI"));
     assert!(free.is_some_and(|gb| gb.parse::<f64>().is_ok()), "{last}");
     let chip = by_id(&last["glance"], "lab");
     assert!(

@@ -183,6 +183,8 @@ impl Sandbox {
             .env("HOME", self.path("home"))
             .env("XDG_STATE_HOME", self.path("state"))
             .env("XDG_CONFIG_HOME", self.path("config"))
+            // The CI slice's memory files are the sandbox's: none until a test writes them.
+            .env("DEVLAB_CGROUP_ROOT", self.path("cgroup"))
             .env("XDG_RUNTIME_DIR", self.path("run"))
             // The USB bus of the sandbox, empty unless a test lays one out: the machine's own is
             // never read (#73). A test that removes it has a bus that can't be read.

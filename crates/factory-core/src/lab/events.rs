@@ -178,13 +178,14 @@ pub fn wait_gave_up(waiter: i64, asked: &Asked, seconds: u64, why: &str) -> Fiel
 }
 
 /// The counts a wait on phones names (#56), by the field that keeps each.
-static COUNTS: LazyLock<[(&str, Regex); 6]> = LazyLock::new(|| {
+static COUNTS: LazyLock<[(&str, Regex); 7]> = LazyLock::new(|| {
     let count = |pattern: &str| Regex::new(pattern).unwrap_or_else(|_| unreachable!());
     [
         ("busy", count(r"(\d+) phone\(s\) busy")),
         ("locked", count(r", (\d+) locked")),
         ("asleep", count(r", (\d+) asleep")),
         ("stay_awake_off", count(r", (\d+) stay-awake off")),
+        ("battery_faked", count(r", (\d+) battery faked")),
         ("offline", count(r", (\d+) offline")),
         ("unauthorized", count(r", (\d+) unauthorized")),
     ]
@@ -262,6 +263,7 @@ pub fn reclaim(lease: i64, kind: &str, model: &str, idle_minutes: i64) -> Fields
 fn readiness_word(r: Readiness) -> &'static str {
     match r {
         Readiness::StayAwakeOff => "stay-awake-off",
+        Readiness::BatteryFaked => "battery-faked",
         other => other.word(),
     }
 }

@@ -431,8 +431,12 @@ pub struct SlotRow {
     pub project: String,
     pub slot: u32,
     pub last_worktree: Option<String>,
-    /// devlab started its stack, so the idle timer may stop it (#18).
+    /// Its stack is devlab's: a lease started or claimed it, or a daemon adopted it, so the idle
+    /// timer may stop it (#18, #84).
     pub stack_ours: bool,
+    /// The Supabase project id of its stack, from when it last became devlab's (#84).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_id: Option<String>,
     pub idle_since: Option<i64>,
     /// A `release --stop-stack` is stopping its stack: the slot is held until it is done.
     #[serde(default)]
@@ -453,6 +457,7 @@ pub fn slot_inventory(slots: &[SlotRow], reservations: &[Reservation]) -> Vec<Sl
                 slot: r.slot,
                 last_worktree: None,
                 stack_ours: false,
+                stack_id: None,
                 idle_since: None,
                 stopping: false,
             });
@@ -554,4 +559,12 @@ pub struct SlotParams {
     pub project: String,
     pub slot: u32,
     pub stack_ours: bool,
+    /// The stack's Supabase project id, kept with the slot as it becomes devlab's, so its stop
+    /// finds it with the worktree gone (#84); none from an older client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_id: Option<String>,
+    /// The lease found the stack running rather than starting it: it becomes devlab's without
+    /// the lease's worktree recorded as its schema (#84). An older client claims nothing.
+    #[serde(default)]
+    pub claimed: bool,
 }

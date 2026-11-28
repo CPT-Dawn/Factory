@@ -128,9 +128,9 @@ pub struct EmulatorRow {
 }
 /// The schema's version, in `PRAGMA user_version`. Version 0 kept waiters only while the
 /// daemon that queued them ran, so their table is rebuilt; `stoppers` is new. Version 2 adds
-/// `runs`. `run_leases` (#53), `lease_stacks` (#63) and `phone_grants` need no new version: `SCHEMA` makes them
+/// `runs`. Version 3 adds `slots.stack_id`, the Supabase project id of the slot's stack (#84). `run_leases` (#53), `lease_stacks` (#63) and `phone_grants` need no new version: `SCHEMA` makes them
 /// on every open.
-const VERSION: i64 = 2;
+const VERSION: i64 = 3;
 
 pub struct Store {
     conn: Connection,
@@ -151,6 +151,9 @@ impl Store {
         conn.execute_batch(readiness::SCHEMA)?;
         conn.execute_batch(activity::SCHEMA)?;
         conn.execute_batch(events::SCHEMA)?;
+        if version < 3 && !has_column(&conn, "slots", "stack_id")? {
+            conn.execute_batch("ALTER TABLE slots ADD COLUMN stack_id TEXT")?;
+        }
         if version < VERSION {
             conn.pragma_update(None, "user_version", VERSION)?;
         }
@@ -169,6 +172,15 @@ impl Store {
         tx.commit()?;
         Ok(out)
     }
+}
+
+/// Whether `table` has the column `column`.
+fn has_column(c: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    c.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+        params![table, column],
+        |row| row.get(0),
+    )
 }
 
 /// A connection of the store's own that only reads: in WAL mode a read neither waits for a
@@ -418,6 +430,7 @@ pub fn slots(c: &Connection) -> rusqlite::Result<Vec<SlotRow>> {
             slot: row.get("slot")?,
             last_worktree: row.get("last_worktree")?,
             stack_ours: row.get("stack_ours")?,
+            stack_id: row.get("stack_id")?,
             idle_since: row.get("idle_since")?,
             stopping: row.get("stopping")?,
         })
@@ -850,18 +863,58 @@ pub fn clear_dead_stoppers(
     Ok(cleared)
 }
 
-/// Marks the slot's stack as devlab's to stop, or not. A stack devlab starts runs the schema
-/// of the worktree whose lease holds the slot: that worktree is recorded as the slot's schema
-/// (see [`slot_schema`]), and stays so when the stack stops or another lease holds the slot.
-pub fn set_stack_ours(
+/// Makes the slot's running stack, Supabase project `stack_id`, devlab's, idle since `now`
+/// unless it already was: whether it wasn't devlab's before. Its schema is no lease's.
+pub fn adopt_stack(
     c: &Connection,
     project: &str,
     slot: u32,
-    ours: bool,
+    stack_id: &str,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    let changed = c.execute(
+        "UPDATE slots SET stack_ours = 1, stack_id = ?3, idle_since = COALESCE(idle_since, ?4)
+         WHERE project = ?1 AND slot = ?2 AND stack_ours = 0",
+        params![project, slot, stack_id, now],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Counts the free slot as idle from `now` again, as when a stop of its stack failed.
+pub fn idle_again(c: &Connection, project: &str, slot: u32, now: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE slots SET idle_since = ?3 WHERE project = ?1 AND slot = ?2 AND idle_since IS NOT NULL",
+        params![project, slot, now],
+    )?;
+    Ok(())
+}
+
+/// How a slot's stack became devlab's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owned {
+    /// The lease holding the slot started it.
+    Started,
+    /// The lease holding the slot found it running: started outside devlab, or by an earlier
+    /// lease.
+    Claimed,
+}
+
+/// Marks the slot's stack, Supabase project `stack_id` (none from an older client), as devlab's
+/// to stop. A stack devlab starts runs the schema of the worktree whose lease holds the slot:
+/// that worktree is recorded as the slot's schema (see [`slot_schema`]), and stays so when the
+/// stack stops or another lease holds the slot. A claimed stack runs whatever schema it ran
+/// before, so its claim records none (#84).
+pub fn own_stack(
+    c: &Connection,
+    project: &str,
+    slot: u32,
+    stack_id: Option<&str>,
+    how: Owned,
 ) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE slots SET stack_ours = ?3 WHERE project = ?1 AND slot = ?2",
-        params![project, slot, ours],
+        "UPDATE slots SET stack_ours = 1, stack_id = COALESCE(?3, stack_id)
+         WHERE project = ?1 AND slot = ?2",
+        params![project, slot, stack_id],
     )?;
     let holder: Option<String> = c
         .query_row(
@@ -870,9 +923,19 @@ pub fn set_stack_ours(
             |row| row.get(0),
         )
         .optional()?;
-    if let Some(worktree) = holder.filter(|_| ours) {
+    if let Some(worktree) = holder.filter(|_| how == Owned::Started) {
         record_schema(c, project, slot, &worktree)?;
     }
+    Ok(())
+}
+
+/// Marks the slot's stack as no longer devlab's to stop: it stopped. Its project id stays on
+/// record for the slot's next stop.
+pub fn disown_stack(c: &Connection, project: &str, slot: u32) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE slots SET stack_ours = 0 WHERE project = ?1 AND slot = ?2",
+        params![project, slot],
+    )?;
     Ok(())
 }
 

@@ -271,6 +271,7 @@ fn the_counts_are_read_from_the_wait_text_the_planner_writes() {
             locked: 1,
             asleep: 1,
             stay_awake_off: 1,
+            battery_faked: 1,
             offline: 1,
             unauthorized: 1,
         },
@@ -279,7 +280,7 @@ fn the_counts_are_read_from_the_wait_text_the_planner_writes() {
     let why = plan_devices(&input).expect_err("no phone is free");
     assert_eq!(
         object(&wait_reason(&why)),
-        json!({"wait": "phones", "busy": 2, "locked": 1, "asleep": 1, "stay_awake_off": 1, "offline": 1, "unauthorized": 1})
+        json!({"wait": "phones", "busy": 2, "locked": 1, "asleep": 1, "stay_awake_off": 1, "battery_faked": 1, "offline": 1, "unauthorized": 1})
     );
     let capped = PlanInput {
         mode: Mode::Any,

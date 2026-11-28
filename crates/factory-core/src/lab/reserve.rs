@@ -253,6 +253,7 @@ mod tests {
                 .collect(),
             listening: std::collections::BTreeSet::new(),
             mem_available_mb: 0,
+            ci_headroom_mb: 0,
         }
     }
 

@@ -142,6 +142,7 @@ fn busy_lab() -> Lab {
         queue: 1,
         max_emulators: 2,
         mem_available_mb: 8192,
+        mem_after_ci_mb: None,
         error: None,
         usb_error: None,
     }

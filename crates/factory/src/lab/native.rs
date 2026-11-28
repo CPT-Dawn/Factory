@@ -125,10 +125,15 @@ fn dispatch(argv: &[String]) -> Result<Verb, Failure> {
             }
             release_done(&released, target)?
         }
-        "stack" => stack_done(&cli::stack(
-            &context()?,
-            args.first().map_or("status", String::as_str),
-        )?),
+        "stack" => {
+            let mut warnings = Vec::new();
+            let done = cli::stack(
+                &context()?,
+                args.first().map_or("status", String::as_str),
+                &mut |warning| warnings.push(warning.to_owned()),
+            )?;
+            stack_done(&done, &warnings)
+        }
         "reserve" if args.iter().any(|a| a == "-h" || a == "--help") => {
             let file = save("reserve-help.txt", reserve::USAGE)?;
             Done::new(
@@ -306,7 +311,8 @@ fn ran_done(argv: &[String], code: u8, lease: Option<i64>, file: Option<&Path>) 
     Verb::Ran(Done::new(line, json), code)
 }
 
-fn stack_done(done: &Stack) -> Done {
+/// What `stack` did in one line, its warnings after it.
+fn stack_done(done: &Stack, warnings: &[String]) -> Done {
     let (id, slot, state) = match done {
         Stack::Up { id, slot, .. } => (id, slot, "up"),
         Stack::Down { id, slot } => (id, slot, "down"),
@@ -317,7 +323,11 @@ fn stack_done(done: &Stack) -> Done {
         Stack::Down { .. } => format!("stack {id} on slot {slot} stopped"),
         Stack::State { .. } => format!("stack {id} on slot {slot} is {state}"),
     };
-    Done::new(line, json!({ "stack": id, "slot": slot, "state": state }))
+    let warned: String = warnings.iter().map(|w| format!("; warning: {w}")).collect();
+    Done::new(
+        format!("{line}{warned}"),
+        json!({ "stack": id, "slot": slot, "state": state, "warnings": warnings }),
+    )
 }
 
 /// What a release says in one line: what it ended and what the caller still holds, or when that
