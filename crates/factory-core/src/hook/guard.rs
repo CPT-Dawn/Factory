@@ -87,7 +87,7 @@ fn trap_in(command: &str, in_script: bool) -> Option<String> {
     let line = shell::line(command);
     let parts = &line.parts;
     if endless_empty_loop(parts) {
-        return Some(burns("an endless empty loop"));
+        return Some(burns("an endless loop that never waits"));
     }
     for (at, part) in parts.iter().enumerate() {
         let Part::Command(words) = part else {
@@ -108,11 +108,14 @@ fn trap_in(command: &str, in_script: bool) -> Option<String> {
         if let Some(what) = burner(&call, backgrounded(parts, at)) {
             return Some(burns(what));
         }
-        if call.program == "rm" && (in_script || rm_targets(call.args).any(|w| non_literal(w))) {
+        // The word index of the first argument, as the line's marks count words.
+        let first = words.len() - call.args.len();
+        if call.program == "rm"
+            && (in_script || rm_targets(call.args).any(|i| line.expands(at, first + i)))
+        {
             return Some(RM_BAIT.to_owned());
         }
-        let quoted = |word: usize| line.quoted_dollar(at, word);
-        if quoted_anchor(&call, words.len(), quoted) {
+        if quoted_anchor(&call, |i| line.quoted_dollar(at, words.len() - i)) {
             return Some(QUOTED_ANCHOR.to_owned());
         }
     }
@@ -122,21 +125,16 @@ fn trap_in(command: &str, in_script: bool) -> Option<String> {
 /// The refusal for an rm that stops on an approval dialog, which bypass mode can't skip.
 const RM_BAIT: &str = "An rm on a variable, glob or $(…), or inside bash -c, stops on an approval dialog nobody answers: run rm on a literal absolute path, as a command of its own.";
 
-/// What an rm removes: its words that are no options.
-fn rm_targets(args: &[String]) -> impl Iterator<Item = &String> {
+/// Which of an rm's arguments it removes: those that are no options.
+fn rm_targets(args: &[String]) -> impl Iterator<Item = usize> + '_ {
     let end = args.iter().position(|a| a == "--");
     args.iter()
         .enumerate()
         .filter_map(move |(at, arg)| match end {
-            Some(end) if at > end => Some(arg),
+            Some(end) if at > end => Some(at),
             Some(end) if at == end => None,
-            _ => (!arg.starts_with('-')).then_some(arg),
+            _ => (!arg.starts_with('-')).then_some(at),
         })
-}
-
-/// Whether a word is only known when it runs: a variable, a command substitution or a glob.
-fn non_literal(word: &str) -> bool {
-    word.contains(['$', '`', '*', '?', '['])
 }
 
 /// The refusal for a command that is a JS object's `[object Object]`.
@@ -145,38 +143,128 @@ const OBJECT: &str = "A JS object was interpolated into the command; pass a stri
 /// The refusal for a grep pattern whose `$` sits inside shell quotes.
 const QUOTED_ANCHOR: &str = "A $ inside a quoted grep or rg pattern stops on an approval dialog nobody answers: use rg -F 'text' for a fixed string, or rg -e foo$ with the anchor outside shell quoting.";
 
-/// Whether a grep, egrep, rg or git grep call has a pattern with a quoted `$` (`quoted` says
-/// which of the command's `words` do), unless it matches fixed strings. Its patterns are the
-/// values of `-e` and `--regexp` and the words that are no options.
-fn quoted_anchor(call: &Invocation<'_>, words: usize, quoted: impl Fn(usize) -> bool) -> bool {
-    let args = match call.program {
-        "grep" | "egrep" | "rg" => call.args,
+/// The short options that take a value, attached or as the next word, of grep, rg and git grep.
+const GREP_SHORT_VALUES: &str = "efmABCdD";
+const RG_SHORT_VALUES: &str = "efgmtTjMABCErd";
+const GIT_GREP_SHORT_VALUES: &str = "efmABC";
+
+/// Their long options that take the next word as their value when no `=` gives it.
+const GREP_LONG_VALUES: &[&str] = &[
+    "after-context",
+    "before-context",
+    "binary-files",
+    "color",
+    "colors",
+    "context",
+    "context-separator",
+    "devices",
+    "dfa-size-limit",
+    "directories",
+    "encoding",
+    "engine",
+    "exclude",
+    "exclude-dir",
+    "exclude-from",
+    "field-context-separator",
+    "field-match-separator",
+    "glob",
+    "group-separator",
+    "hostname-bin",
+    "hyperlink-format",
+    "iglob",
+    "ignore-file",
+    "include",
+    "label",
+    "max-columns",
+    "max-count",
+    "max-depth",
+    "max-filesize",
+    "path-separator",
+    "pre",
+    "pre-glob",
+    "regex-size-limit",
+    "replace",
+    "sort",
+    "sortr",
+    "threads",
+    "type",
+    "type-add",
+    "type-clear",
+    "type-not",
+];
+
+/// Whether a grep, egrep, rg or git grep call has a pattern with a quoted `$`, unless it matches
+/// fixed strings. `quoted` says it of the argument that many words from the command's end.
+fn quoted_anchor(call: &Invocation<'_>, quoted: impl Fn(usize) -> bool) -> bool {
+    let (args, short_values) = match call.program {
+        "grep" | "egrep" => (call.args, GREP_SHORT_VALUES),
+        "rg" => (call.args, RG_SHORT_VALUES),
         "git" => match super::GitGlobals::of(call, None).rest.split_first() {
-            Some((sub, rest)) if sub == "grep" => rest,
+            Some((sub, rest)) if sub == "grep" => (rest, GIT_GREP_SHORT_VALUES),
             _ => return false,
         },
         _ => return false,
     };
-    // The word index of the first of `args`, which end the command.
-    let first = words - args.len();
-    let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
-    let fixed = args[..end].iter().any(|arg| {
-        arg == "--fixed-strings"
-            || (!arg.starts_with("--") && arg.starts_with('-') && arg.contains('F'))
-    });
-    if fixed {
-        return false;
-    }
-    let mut value_of_e = false;
-    args.iter().enumerate().any(|(at, arg)| {
-        let pattern = std::mem::take(&mut value_of_e)
-            || at > end
-            || !arg.starts_with('-')
-            || arg.starts_with("--regexp=")
-            || (arg.starts_with("-e") && arg.len() > 2);
-        value_of_e = at < end && (arg == "-e" || arg == "--regexp");
-        pattern && quoted(first + at)
+    patterns(args, short_values).is_some_and(|patterns| {
+        patterns
+            .into_iter()
+            .any(|at| at < args.len() && quoted(args.len() - at))
     })
+}
+
+/// Which of a grep's `args` are patterns: the values of `-e` and `--regexp`, or else its first
+/// word that is no option nor an option's value. None when it matches fixed strings.
+fn patterns(args: &[String], short_values: &str) -> Option<Vec<usize>> {
+    let mut patterns = Vec::new();
+    let mut positional = None;
+    // Patterns come from `-e` or `-f`, so the words that are no options are all paths.
+    let mut given = false;
+    let mut fixed = false;
+    let mut options_end = false;
+    let mut at = 0;
+    while let Some(arg) = args.get(at) {
+        at += 1;
+        if options_end || !arg.starts_with('-') || arg == "-" {
+            positional.get_or_insert(at - 1);
+        } else if arg == "--" {
+            options_end = true;
+        } else if let Some(long) = arg.strip_prefix("--") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            fixed |= name == "fixed-strings";
+            given |= matches!(name, "regexp" | "file");
+            let takes = matches!(name, "regexp" | "file") || GREP_LONG_VALUES.contains(&name);
+            match (name, value) {
+                ("regexp", Some(_)) => patterns.push(at - 1),
+                ("regexp", None) => patterns.push(at),
+                _ => {}
+            }
+            at += usize::from(takes && value.is_none());
+        } else {
+            let group = &arg[1..];
+            for (pos, flag) in group.char_indices() {
+                fixed |= flag == 'F';
+                if !short_values.contains(flag) {
+                    continue;
+                }
+                let attached = pos + flag.len_utf8() < group.len();
+                given |= matches!(flag, 'e' | 'f');
+                if flag == 'e' {
+                    patterns.push(if attached { at - 1 } else { at });
+                }
+                at += usize::from(!attached);
+                break;
+            }
+        }
+    }
+    if fixed {
+        return None;
+    }
+    if !given {
+        patterns.extend(positional);
+    }
+    Some(patterns)
 }
 
 fn burns(what: &str) -> String {
@@ -190,8 +278,8 @@ fn burner(call: &Invocation<'_>, backgrounded: bool) -> Option<&'static str> {
     let args = call.args;
     match call.program {
         "systemd-run" => {
-            let (options, command) = scoped(args);
-            if capped(options) {
+            let (capped, command) = scoped(args);
+            if capped {
                 return None;
             }
             burner(&shell::invocation(command)?, backgrounded)
@@ -254,46 +342,45 @@ const SYSTEMD_RUN_VALUES: &[&str] = &[
     "--working-directory",
 ];
 
-/// systemd-run's own options, and the command it runs.
-fn scoped(args: &[String]) -> (&[String], &[String]) {
+/// Whether systemd-run's options set a CPU quota on what it runs, and the command it runs. An
+/// option's value, such as a `--description`, sets nothing.
+fn scoped(args: &[String]) -> (bool, &[String]) {
+    let quota = |value: &str| value.starts_with("CPUQuota=");
+    let mut capped = false;
     let mut at = 0;
     while let Some(arg) = args.get(at) {
         if arg == "--" {
-            return (&args[..at], &args[at + 1..]);
+            return (capped, &args[at + 1..]);
         }
         if !arg.starts_with('-') {
             break;
         }
+        let value = args.get(at + 1);
+        capped |= match arg.as_str() {
+            "-p" | "--property" => value.is_some_and(|v| quota(v)),
+            other => other
+                .strip_prefix("--property=")
+                .or_else(|| other.strip_prefix("-p"))
+                .is_some_and(quota),
+        };
         at += if SYSTEMD_RUN_VALUES.contains(&arg.as_str()) {
             2
         } else {
             1
         };
     }
-    let at = at.min(args.len());
-    (&args[..at], &args[at..])
+    (capped, &args[at.min(args.len())..])
 }
 
-/// Whether systemd-run's options set a CPU quota on what it runs.
-fn capped(options: &[String]) -> bool {
-    let quota = |value: &str| value.starts_with("CPUQuota=");
-    options.iter().enumerate().any(|(at, option)| {
-        let next = || options.get(at + 1).is_some_and(|v| quota(v));
-        match option.as_str() {
-            "-p" | "--property" => next(),
-            other => other
-                .strip_prefix("--property=")
-                .or_else(|| other.strip_prefix("-p"))
-                .is_some_and(quota),
-        }
-    })
-}
+/// A word of the line, and whether it starts its command; the operators between commands are
+/// words too.
+type Token<'a> = (&'a str, bool);
 
-/// Whether the line runs a loop that never ends and does nothing in its body:
-/// `while :; do :; done`, `while true`, `until false` or `for ((;;))`.
+/// Whether the line runs a loop that never ends and never waits: `while :`, `while true`,
+/// `while ((1))`, `until false` or `for ((;;))`, whose body does only `:`, `true`, `let` or
+/// `((…))` arithmetic.
 fn endless_empty_loop(parts: &[Part]) -> bool {
-    // Each word, and whether it starts its command; the operators between commands as words.
-    let mut tokens: Vec<(&str, bool)> = Vec::new();
+    let mut tokens: Vec<Token<'_>> = Vec::new();
     for part in parts {
         let operator = match part {
             Part::Command(words) => {
@@ -308,33 +395,62 @@ fn endless_empty_loop(parts: &[Part]) -> bool {
         };
         tokens.push((operator, false));
     }
-    (0..tokens.len()).any(|at| {
-        let words: Vec<&str> = tokens[at..].iter().map(|(word, _)| *word).collect();
-        tokens[at].1 && endless_empty_at(&words)
-    })
+    (0..tokens.len()).any(|at| endless_loop_at(&tokens[at..]))
 }
 
-fn endless_empty_at(words: &[&str]) -> bool {
-    let rest = match words {
-        ["while", ":" | "true", ";", rest @ ..] | ["until", "false", ";", rest @ ..] => rest,
-        ["for", "(", "(", ";", ";", ")", ")", rest @ ..] => {
-            rest.strip_prefix(&[";"]).unwrap_or(rest)
-        }
-        _ => return false,
-    };
-    let Some(body) = rest.strip_prefix(&["do"]) else {
+/// `tokens` after its first `n` when they read `words` (`*` standing for any one word).
+fn after<'t, 'a>(tokens: &'t [Token<'a>], words: &[&str]) -> Option<&'t [Token<'a>]> {
+    let head = tokens.get(..words.len())?;
+    let matches = head
+        .iter()
+        .zip(words)
+        .all(|((word, _), want)| *want == "*" || word == want);
+    matches.then(|| &tokens[words.len()..])
+}
+
+fn endless_loop_at(tokens: &[Token<'_>]) -> bool {
+    if !tokens.first().is_some_and(|(_, starts)| *starts) {
+        return false;
+    }
+    const HEADS: &[&[&str]] = &[
+        &["while", ":", ";"],
+        &["while", "true", ";"],
+        &["until", "false", ";"],
+        &["while", "(", "(", "1", ")", ")", ";"],
+        &["for", "(", "(", ";", ";", ")", ")", ";"],
+        &["for", "(", "(", ";", ";", ")", ")"],
+    ];
+    let Some(rest) = HEADS.iter().find_map(|head| after(tokens, head)) else {
         return false;
     };
-    let mut body = body.strip_prefix(&[";"]).unwrap_or(body);
-    let mut empty = false;
+    let Some(body) = after(rest, &["do"]) else {
+        return false;
+    };
+    let mut body = after(body, &[";"]).unwrap_or(body);
+    let mut idle = false;
     loop {
-        match body {
-            [":" | "true", ";", more @ ..] => {
-                empty = true;
-                body = more;
-            }
-            ["done", ..] => return empty,
-            _ => return false,
+        if after(body, &["done"]).is_some() {
+            return idle;
         }
+        let Some(more) = idle_step(body) else {
+            return false;
+        };
+        (body, idle) = (more, true);
     }
+}
+
+/// What follows one command of a loop body that does no more than spin, with its `;`: `:`,
+/// `true`, `let …` or `((…))`.
+fn idle_step<'t, 'a>(body: &'t [Token<'a>]) -> Option<&'t [Token<'a>]> {
+    let end = body.iter().position(|(word, _)| *word == ";")?;
+    let (command, rest) = (&body[..end], &body[end + 1..]);
+    let idle = match command {
+        [(":" | "true", _)] => true,
+        [("let", _), args @ ..] => !args.is_empty(),
+        [("(", _), ("(", _), inner @ .., (")", _), (")", _)] => {
+            !inner.is_empty() && inner.iter().all(|(word, _)| !matches!(*word, "(" | ")"))
+        }
+        _ => false,
+    };
+    idle.then_some(rest)
 }

@@ -54,6 +54,10 @@ fn an_rm_that_stops_on_an_approval_dialog_is_denied() {
     let commands = [
         "rm $FILE",
         "rm -rf \"$DIR\"",
+        "rm \"/tmp/$name\"",
+        "rm /tmp/\"a\"*",
+        "rm \"$(ls /tmp/x)\"",
+        "rm \"`ls`\"",
         "rm -f \"${TMP}/x\"",
         "rm -rf /tmp/build/*",
         "rm *.log",
@@ -81,6 +85,11 @@ fn an_rm_on_literal_paths_passes() {
         "rm -f /tmp/a.txt /tmp/b.txt",
         "rm -rf ~/scratch/t12",
         "rm 'my file.txt'",
+        "rm -- '/tmp/report[1].txt'",
+        "rm '/tmp/a*b'",
+        "rm \"/tmp/what?.txt\"",
+        "rm '/tmp/$HOME'",
+        "rm /tmp/x\\*",
         "rm -- -weird-name",
         "git rm -r --cached $DIR",
         "rmdir /tmp/x",
@@ -113,6 +122,13 @@ fn a_dollar_inside_a_quoted_grep_pattern_is_denied() {
         "cd src && rg 'a$'",
         "rg -A 3 'end$' src",
         "bash -c \"rg 'x$' src\"",
+        "rg -e '-F$'",
+        "grep -e '-F$' f",
+        "grep -m1 'x$' f",
+        "grep -rne 'x$' .",
+        "rg -t rust 'fn$'",
+        "git grep -n -e 'x$'",
+        "rg --max-count 2 'x$' src",
     ];
     let calls: Vec<Value> = commands.iter().map(|c| bash(c)).collect();
     assert_denied_with(&calls, ANCHOR_FIX);
@@ -143,6 +159,12 @@ fn an_unquoted_or_fixed_string_dollar_passes() {
         "sed 's/a$/b/' f",
         "awk '{print $1}' f",
         "rg foo -g '!*.lock'",
+        "rg foo 'report$.txt'",
+        "grep -A 3 x 'a$b.txt'",
+        "rg -g '*.rs$' foo",
+        "grep -e foo 'dir$'",
+        "rg -f pats.txt 'dir$'",
+        "rg -iF 'a$' src",
     ];
     let calls: Vec<Value> = commands.iter().map(|c| bash(c)).collect();
     assert_passes(&calls);
@@ -234,6 +256,10 @@ fn a_repl_script_that_waits_more_than_once_is_denied() {
         "await $`factory wait ci 1`;\nawait $`factory wait ci 2`;",
         "await $`factory wait ci 1 && factory wait ci 2`",
         "for (const x of xs) { await $`cd /tmp && bash -c 'factory wait ci 1'` }",
+        "for (const x of xs) await\n  $`factory wait ci 1`;",
+        "for (const x of xs)\n  await $`factory wait ci ${x}`\n    .timeout(600000);",
+        "p.then(function () { return $`factory wait ci 1` })",
+        "p.then(r => r.ok ? $`factory wait ci 1` : null)",
     ];
     let calls: Vec<Value> = codes.iter().map(|c| repl(c)).collect();
     assert_denied_with(&calls, WAIT_FIX);
@@ -257,6 +283,10 @@ fn one_awaited_wait_and_mere_mentions_pass() {
         "xs.map(x => x * 2);\nawait $`factory wait lead --any`;",
         "const t = `for (;;) { factory wait ci 1 }`;",
         "do { x(); } while (more)\nawait $`factory wait ci 1`",
+        "for (const f of fs) log(f)\nawait $`factory wait ci 1`",
+        "p.then((await $`factory wait ci 1`, handler))",
+        "p.then(handler, (await $`factory wait ci 1`).text())",
+        "await x.then(r => r.text());\nawait $`factory wait ci 1`",
     ];
     let calls: Vec<Value> = codes.iter().map(|c| repl(c)).collect();
     assert_passes(&calls);
@@ -270,6 +300,9 @@ fn a_repl_push_with_a_short_timeout_gets_the_verify_hint() {
         "await $('git push origin main', 300000)",
         "await $`git -C /tmp/w push`.timeout(5_000).nothrow()",
         "await $`git fetch && git push`.quiet().timeout(589999)",
+        "await $`git push`.timeout(0x493e0)",
+        "await $`git push`.timeout(3e5)",
+        "await $`git push`.timeout(0b1111)",
     ] {
         match pre_tool(&repl(code), false) {
             PreTool::Hint(hint) => {
@@ -286,6 +319,8 @@ fn a_push_given_its_time_or_no_push_gets_no_hint() {
     for code in [
         "await $`git push -u origin HEAD`.timeout(590000)",
         "await $`git push`.timeout(600000)",
+        "await $`git push`.timeout(0x927C0)",
+        "await $`git push`.timeout(6e5)",
         "await $`git push`",
         "await $`git push`.nothrow()",
         "await $`git status`.timeout(1000)",
@@ -324,6 +359,11 @@ fn a_cpu_burner_on_the_bare_host_is_denied_with_the_capped_scope() {
         "for ((;;)); do :; done",
         "while :; do :; done &",
         "while true\ndo\n  :\ndone",
+        "while :; do ((i+=1)); done",
+        "while true; do let i++; done",
+        "for ((;;)); do ((n++)); done",
+        "while ((1)); do :; done",
+        "while :; do ((i+=1)); :; done",
         "cd /tmp && while :; do :; done",
         "stress --cpu 8",
         "stress-ng --cpu 0 --timeout 60s",
@@ -336,6 +376,8 @@ fn a_cpu_burner_on_the_bare_host_is_denied_with_the_capped_scope() {
         "sh -c \"while :; do :; done\"",
         "systemd-run --user --scope -- stress -c 4",
         "systemd-run --user -p MemoryMax=1G -- yes > /dev/null",
+        "systemd-run --user --scope --description '-pCPUQuota=50%' -- stress -c 1",
+        "systemd-run --user --unit --property=CPUQuota=5% -- stress -c 1",
     ];
     let calls: Vec<Value> = commands.iter().map(|c| bash(c)).collect();
     assert_denied_with(&calls, CAP);
@@ -364,6 +406,9 @@ fn a_burner_inside_a_cpu_capped_scope_and_finite_lookalikes_pass() {
         "while :; do date; sleep 1; done",
         "for i in 1 2 3; do :; done",
         "for ((i=0; i<3; i++)); do :; done",
+        "while :; do ((i+=1)); sleep 1; done",
+        "while ((i < 3)); do ((i++)); done",
+        "while true; do let i++; wait_for x; done",
         "rg stress src",
         "git commit -m 'no more yes > /dev/null'",
         "cargo test stress",

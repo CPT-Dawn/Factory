@@ -4,7 +4,7 @@
 //! backslashes, and leaves expansions alone. That is enough for a hook that must tell
 //! `npm install` from `git commit -m "no npm here"`.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 /// One simple command: its words, with quotes and escapes resolved.
 pub type Words = Vec<String>;
@@ -28,12 +28,20 @@ pub enum Part {
 /// What a word holds in place of a command substitution's output, which the line does not say.
 const SUBSTITUTION: &str = "$(…)";
 
-/// A command line read into its parts, with which words hold a `$` that quotes keep from the
-/// shell, such as the anchor in `rg 'foo$'`.
+/// A command line read into its parts, with what the quoting of each word said.
 pub struct Line {
     pub parts: Vec<Part>,
-    /// (part, word) for each word of a [`Part::Command`] with such a `$`.
-    quoted_dollars: BTreeSet<(usize, usize)>,
+    /// The marks of each word of a [`Part::Command`] that has any, by (part, word).
+    marks: BTreeMap<(usize, usize), Marks>,
+}
+
+/// What quoting says about a word, which its text after quote removal no longer does.
+#[derive(Clone, Copy, Default)]
+struct Marks {
+    /// It holds a `$` that quotes keep from the shell, such as the anchor in `rg 'foo$'`.
+    quoted_dollar: bool,
+    /// The shell expands part of it: a variable, a command substitution or a glob outside quotes.
+    expands: bool,
 }
 
 impl Line {
@@ -41,7 +49,15 @@ impl Line {
     /// in single quotes, and one in double quotes that starts no expansion. One escaped with a
     /// backslash is not counted.
     pub fn quoted_dollar(&self, part: usize, word: usize) -> bool {
-        self.quoted_dollars.contains(&(part, word))
+        self.marks
+            .get(&(part, word))
+            .is_some_and(|m| m.quoted_dollar)
+    }
+
+    /// Whether the shell expands part of that word, so it is only known when it runs: a `$name`,
+    /// `${…}` or `$(…)` outside single quotes, a backquote, or a `*`, `?` or `[` outside quotes.
+    pub fn expands(&self, part: usize, word: usize) -> bool {
+        self.marks.get(&(part, word)).is_some_and(|m| m.expands)
     }
 }
 
@@ -80,7 +96,7 @@ pub fn line(text: &str) -> Line {
                 out.open_word();
                 while at < chars.len() && chars[at] != '\'' {
                     if chars[at] == '$' && !out.word.ends_with('\\') {
-                        out.dollar = true;
+                        out.word_marks.quoted_dollar = true;
                     }
                     out.word.push(chars[at]);
                     at += 1;
@@ -93,9 +109,15 @@ pub fn line(text: &str) -> Line {
                     let c = chars[at];
                     at += 1;
                     if c != '\\' {
-                        if c == '$' && !starts_expansion(chars.get(at)) && !out.word.ends_with('\\')
-                        {
-                            out.dollar = true;
+                        match c {
+                            '$' if starts_expansion(chars.get(at)) => {
+                                out.word_marks.expands = true;
+                            }
+                            '$' if !out.word.ends_with('\\') => {
+                                out.word_marks.quoted_dollar = true;
+                            }
+                            '`' => out.word_marks.expands = true,
+                            _ => {}
                         }
                         out.word.push(c);
                         continue;
@@ -183,17 +205,25 @@ pub fn line(text: &str) -> Line {
                 at += 1;
                 out.substitute();
             }
-            c => out.push(c),
+            c => {
+                let expands = match c {
+                    '*' | '?' | '[' => true,
+                    '$' => starts_expansion(chars.get(at)),
+                    _ => false,
+                };
+                out.push(c);
+                out.word_marks.expands |= expands;
+            }
         }
     }
     out.end_command();
     Line {
         parts: out.parts,
-        quoted_dollars: out.quoted_dollars,
+        marks: out.marks,
     }
 }
 
-/// Whether a `$` before `next` inside double quotes starts an expansion: a name, `${`, `$(`, a
+/// Whether a `$` before `next` starts an expansion: a name, `${`, `$(`, a
 /// positional or a special parameter.
 fn starts_expansion(next: Option<&char>) -> bool {
     next.is_some_and(|c| c.is_alphanumeric() || "_{(?!#@*-$".contains(*c))
@@ -233,19 +263,18 @@ struct Lexer {
     /// What each open `(`, `$(` or backquote interrupted: for a command substitution, the
     /// command it is part of, which goes on once it closes; none for a subshell.
     open: Vec<Option<Interrupted>>,
-    /// The word being read holds a quoted `$` (see [`Line::quoted_dollar`]).
-    dollar: bool,
-    /// The same for each word of the command so far.
-    dollars: Vec<bool>,
-    quoted_dollars: BTreeSet<(usize, usize)>,
+    /// The marks of the word being read, of each word of the command so far, and of the line.
+    word_marks: Marks,
+    words_marks: Vec<Marks>,
+    marks: BTreeMap<(usize, usize), Marks>,
 }
 
 /// The command a command substitution interrupted, with the word it is part of.
 struct Interrupted {
     words: Words,
-    dollars: Vec<bool>,
+    words_marks: Vec<Marks>,
     word: String,
-    dollar: bool,
+    word_marks: Marks,
 }
 
 impl Lexer {
@@ -266,7 +295,7 @@ impl Lexer {
     fn end_word(&mut self) {
         if self.in_word {
             self.words.push(std::mem::take(&mut self.word));
-            self.dollars.push(std::mem::take(&mut self.dollar));
+            self.words_marks.push(std::mem::take(&mut self.word_marks));
             self.in_word = false;
         }
     }
@@ -274,8 +303,10 @@ impl Lexer {
     fn end_command(&mut self) {
         self.end_word();
         let part = self.parts.len();
-        for (word, _) in self.dollars.drain(..).enumerate().filter(|(_, d)| *d) {
-            self.quoted_dollars.insert((part, word));
+        for (word, marks) in self.words_marks.drain(..).enumerate() {
+            if marks.quoted_dollar || marks.expands {
+                self.marks.insert((part, word), marks);
+            }
         }
         if !self.words.is_empty() {
             self.parts
@@ -288,9 +319,9 @@ impl Lexer {
     fn substitute(&mut self) {
         let interrupted = Interrupted {
             words: std::mem::take(&mut self.words),
-            dollars: std::mem::take(&mut self.dollars),
+            words_marks: std::mem::take(&mut self.words_marks),
             word: std::mem::take(&mut self.word),
-            dollar: std::mem::take(&mut self.dollar),
+            word_marks: std::mem::take(&mut self.word_marks),
         };
         self.in_word = false;
         self.open.push(Some(interrupted));
@@ -302,9 +333,10 @@ impl Lexer {
     fn close(&mut self) {
         self.mark(Part::Leave);
         if let Some(Some(was)) = self.open.pop() {
-            (self.words, self.dollars) = (was.words, was.dollars);
-            (self.word, self.dollar) = (was.word, was.dollar);
+            (self.words, self.words_marks) = (was.words, was.words_marks);
+            (self.word, self.word_marks) = (was.word, was.word_marks);
             self.push_str(SUBSTITUTION);
+            self.word_marks.expands = true;
         }
     }
 

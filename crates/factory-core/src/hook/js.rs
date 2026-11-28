@@ -181,13 +181,19 @@ fn closing(tokens: &[Token], open: usize) -> Option<usize> {
     None
 }
 
-/// A numeric literal's value, such as `590_000` or `6e5`.
+/// A numeric literal's value: `590_000`, `0x493e0`, `0o7`, `0b11`, `6e5` or `3.0e5`.
 fn number(literal: &str) -> Option<u64> {
-    let digits = literal.replace('_', "");
-    digits
-        .parse()
-        .ok()
-        .or_else(|| digits.parse::<f64>().ok().map(|n| n as u64))
+    let digits = literal.replace('_', "").to_ascii_lowercase();
+    let radix = [("0x", 16), ("0o", 8), ("0b", 2)]
+        .into_iter()
+        .find_map(|(prefix, radix)| Some((digits.strip_prefix(prefix)?, radix)));
+    match radix {
+        Some((rest, radix)) => u64::from_str_radix(rest.trim_end_matches('n'), radix).ok(),
+        None => digits.trim_end_matches('n').parse().ok().or_else(|| {
+            let value = digits.parse::<f64>().ok()?;
+            (value.is_finite() && value >= 0.0).then_some(value as u64)
+        }),
+    }
 }
 
 /// The callbacks that may run more than once, or after the statement that hands them over.
@@ -202,14 +208,14 @@ struct Nesting {
     body_next: bool,
     /// A `do` body just closed: the `while` after it ends the loop and starts no other.
     after_do: bool,
-    /// The loop bodies without braces being read: the depth each started at, and its line.
-    bare_bodies: Vec<(usize, usize)>,
+    /// The loop bodies without braces being read: the depth each started at.
+    bare_bodies: Vec<usize>,
 }
 
-/// An open bracket: whether what it holds may run more than once, and what it is.
+/// An open bracket: whether it is a loop's body, and what else it is.
 #[derive(Clone, Copy)]
 struct Bracket {
-    repeats: bool,
+    loop_body: bool,
     holds: Holds,
 }
 
@@ -217,26 +223,55 @@ struct Bracket {
 enum Holds {
     LoopHead,
     DoBody,
+    /// The arguments of a `.then` or a timer. Only a function among them runs later, maybe
+    /// more than once: `armed` from its `=>` or `function` to the next argument.
+    Callback {
+        armed: bool,
+    },
     Other,
 }
 
+/// The words after which a statement goes on past the end of its line.
+const GOES_ON: &[&str] = &[
+    "await",
+    "new",
+    "typeof",
+    "void",
+    "delete",
+    "yield",
+    "in",
+    "of",
+    "instanceof",
+    "else",
+    "do",
+    "case",
+];
+
 impl Nesting {
     fn repeats(&self) -> bool {
-        !self.bare_bodies.is_empty() || self.open.last().is_some_and(|open| open.repeats)
+        !self.bare_bodies.is_empty()
+            || self
+                .open
+                .iter()
+                .any(|open| open.loop_body || open.holds == Holds::Callback { armed: true })
     }
 
     /// Takes in the token at `at`, before the caller looks at it.
     fn take(&mut self, tokens: &[Token], at: usize) {
         let token = &tokens[at];
+        let before = at.checked_sub(1).map(|b| &tokens[b]);
         let word = |i: Option<usize>| match i.and_then(|i| tokens.get(i)).map(|t| &t.tok) {
             Some(Tok::Word(word)) => Some(word.as_str()),
             _ => None,
         };
-        // A body without braces ends at a new line at its depth, or with the block it is in.
+        // A body without braces ends with the block it is in, or at the end of a line where its
+        // statement can end and the next line does not carry it on.
         let depth = self.open.len();
-        while let Some(&(started, line)) = self.bare_bodies.last() {
-            let closes = matches!(token.tok, Tok::Punct('}' | ')' | ']') | Tok::HoleClose);
-            if depth > started || (depth == started && token.line == line && !closes) {
+        let closes = matches!(token.tok, Tok::Punct('}' | ')' | ']') | Tok::HoleClose);
+        let line_ends = before.is_some_and(|b| b.line < token.line && ends_statement(&b.tok))
+            && !carries_on(&token.tok);
+        while let Some(&started) = self.bare_bodies.last() {
+            if depth > started || (depth == started && !closes && !line_ends) {
                 break;
             }
             self.bare_bodies.pop();
@@ -251,16 +286,15 @@ impl Nesting {
                         Holds::Other
                     };
                     self.open.push(Bracket {
-                        repeats: true,
+                        loop_body: true,
                         holds,
                     });
                     return;
                 }
                 Tok::Punct(';') => return,
-                _ => self.bare_bodies.push((depth, token.line)),
+                _ => self.bare_bodies.push(depth),
             }
         }
-        let inherited = self.repeats();
         match &token.tok {
             Tok::Punct('(') => {
                 let before = at.checked_sub(1);
@@ -275,13 +309,18 @@ impl Nesting {
                 let after_dot = two_before.is_some_and(|b| tokens[b].tok == Tok::Punct('.'));
                 let callback = word(before)
                     .is_some_and(|w| TIMERS.contains(&w) || (after_dot && CALLBACKS.contains(&w)));
+                let holds = match (head, callback) {
+                    (true, _) => Holds::LoopHead,
+                    (_, true) => Holds::Callback { armed: false },
+                    _ => Holds::Other,
+                };
                 self.open.push(Bracket {
-                    repeats: inherited || callback,
-                    holds: if head { Holds::LoopHead } else { Holds::Other },
+                    loop_body: false,
+                    holds,
                 });
             }
             Tok::Punct('{' | '[') | Tok::HoleOpen => self.open.push(Bracket {
-                repeats: inherited,
+                loop_body: false,
                 holds: Holds::Other,
             }),
             Tok::Punct(')' | '}' | ']') | Tok::HoleClose => match self.open.pop() {
@@ -296,19 +335,49 @@ impl Nesting {
                 _ => {}
             },
             Tok::Punct(';') => {
-                if self
-                    .bare_bodies
-                    .last()
-                    .is_some_and(|(started, _)| *started == depth)
-                {
+                if self.bare_bodies.last() == Some(&depth) {
                     self.bare_bodies.pop();
                 }
             }
+            // A function among a callback's arguments: `x => …` or `function () {…}`.
+            Tok::Punct('>') if before.is_some_and(|b| b.tok == Tok::Punct('=')) => self.arm(true),
+            Tok::Word(word) if word == "function" => self.arm(true),
+            Tok::Punct(',') => self.arm(false),
             // The `while` that ends a `do` loop keeps the mark for its `(`.
             Tok::Word(word) if word == "while" => self.after_do = after_do,
             Tok::Word(word) if word == "do" => self.body_next = true,
             _ => {}
         }
+    }
+
+    /// Marks whether the callback arguments being read are a function.
+    fn arm(&mut self, function: bool) {
+        if let Some(Bracket {
+            holds: Holds::Callback { armed },
+            ..
+        }) = self.open.last_mut()
+        {
+            *armed = function;
+        }
+    }
+}
+
+/// Whether a statement can end after this token.
+fn ends_statement(tok: &Tok) -> bool {
+    match tok {
+        Tok::Word(word) => !GOES_ON.contains(&word.as_str()),
+        Tok::Num(_) | Tok::Str(_) | Tok::Regex | Tok::TemplateClose => true,
+        Tok::Punct(c) => matches!(c, ')' | ']' | '}'),
+        _ => false,
+    }
+}
+
+/// Whether a line that starts with this token carries on the statement before it.
+fn carries_on(tok: &Tok) -> bool {
+    match tok {
+        Tok::Punct(c) => ".?,:+-*/%&|^=<>([".contains(*c),
+        Tok::TemplateOpen => true,
+        _ => false,
     }
 }
 
