@@ -316,7 +316,9 @@ impl PullRequests for Gh {
 
     fn job_log(&self, pr: &PullRequest, job: u64) -> Result<String, GhError> {
         let mut cmd = Command::new("gh");
-        cmd.args(["api", "--hostname", &pr.host])
+        // A job's log is full of colour codes, which gh only passes through with the flag; the
+        // tail strips them.
+        cmd.args(["api", "--hostname", &pr.host, "--allow-escape-sequences"])
             .arg(format!(
                 "repos/{}/{}/actions/jobs/{job}/logs",
                 pr.owner, pr.repo

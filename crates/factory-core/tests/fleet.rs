@@ -151,6 +151,18 @@ fn a_pull_request_fails_as_soon_as_one_check_failed_even_while_others_run() {
 }
 
 #[test]
+fn a_pull_request_whose_failed_runs_were_rerun_is_read_by_the_reruns() {
+    let numbered = |id, conclusion| CheckRun {
+        id,
+        ..run("test", "completed", Some(conclusion))
+    };
+    let rerun = [numbered(1, "failure"), numbered(2, "success")];
+    assert_eq!(PullState::of(&rerun), PullState::Passing);
+    let superseded = [numbered(3, "cancelled"), numbered(4, "success")];
+    assert_eq!(PullState::of(&superseded), PullState::Passing);
+}
+
+#[test]
 fn runners_are_busy_idle_or_offline() {
     assert_eq!(RunnerState::of("online", true), RunnerState::Busy);
     assert_eq!(RunnerState::of("online", false), RunnerState::Idle);
