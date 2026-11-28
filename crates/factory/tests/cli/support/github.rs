@@ -249,6 +249,22 @@ impl FakeGitHub {
         );
     }
 
+    /// Makes `gh repo view` fail, as it does once the checkout it ran in is gone.
+    pub fn lose_checkout(&self) {
+        fs::write(self.dir.join("no-repo"), "").expect("write the no-repo marker");
+    }
+
+    /// Moves main's head to `sha` right after its next read is served, as a push landing
+    /// while a wait reads the checks of the head before it; `sha`'s checks are [`checks`].
+    ///
+    /// [`checks`]: FakeGitHub::checks
+    pub fn push_main_after_next_read(&self, sha: &str) {
+        self.put(
+            "main-next.json",
+            &json!({"name": "main", "commit": {"sha": sha}}),
+        );
+    }
+
     /// Moves the pull request's head to `sha`.
     pub fn push(&self, sha: &str) {
         self.put(
@@ -393,6 +409,7 @@ pr)
     while [ -f "$G/hold" ]; do sleep 0.05; done
     if [ -f "$G/url" ]; then cat "$G/url"; else echo 'no pull requests found for branch "work"' >&2; exit 1; fi ;;
 repo)
+    if [ -f "$G/no-repo" ]; then echo 'failed to run git: not a git repository' >&2; exit 1; fi
     echo 'https://github.com/acme/shop' ;;
 api)
     shift
@@ -423,7 +440,13 @@ api)
     repos/acme/shop/actions/runs/*/jobs*)
         id="${{path#repos/acme/shop/actions/runs/}}"; id="${{id%%/*}}"
         file="$G/jobs-$id.json"; [ -f "$file" ] || file="$G/no-jobs.json" ;;
-    repos/acme/shop/branches/main) file="$G/main.json" ;;
+    repos/acme/shop/branches/main)
+        file="$G/main.json"
+        # A push to main lands right after this read is served.
+        if [ -f "$G/main-next.json" ]; then
+            cp "$G/main.json" "$G/main-served.json"; mv "$G/main-next.json" "$G/main.json"
+            file="$G/main-served.json"
+        fi ;;
     repos/acme/shop/commits/{main}/check-runs*) file="$G/main-checks.json" ;;
     repos/acme/shop/commits/{main}/status\?*) file="$G/main-status.json" ;;
     repos/acme/shop/commits/*/check-runs*'&page='*) file="$G/checks-${{path##*&page=}}.json" ;;

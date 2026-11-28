@@ -198,6 +198,11 @@ fn an_idle_factory_reads_github_once_at_start_and_then_nothing_across_minutes() 
     assert_eq!(card["rows"][0]["text"], "0/2 busy", "{card}");
     let at_start = github.watcher_reads(&sandbox);
     assert!(!at_start.is_empty());
+    assert!(
+        at_start.iter().all(|path| !path.contains("/branches/")),
+        "an idle factory asks nothing of main at start: {at_start:?}"
+    );
+    assert!(first["repos"][0]["main"].is_null(), "{first}");
 
     // With no wait, no open factory pull request and no job, no read is due after that.
     for minutes in [1, 3, 10] {
@@ -691,8 +696,12 @@ fn the_watcher_reads_mains_latest_head_and_a_red_main_is_loud_on_status_and_the_
         (803, "e2e", "completed", Some("failure")),
     ]);
 
-    // The read at start reads main too.
-    let shop = shop(&sandbox);
+    // A wait on main wakes a read of it, once one is due (the read at start of an idle
+    // factory leaves main be).
+    assert!(idle(&sandbox)["repos"][0]["main"].is_null());
+    move_clock(&sandbox, 60);
+    assert_eq!(sandbox.factory(&["wait", "ci", "main"]).code, 10);
+    let shop = shop_when(&sandbox, |shop| !shop["main"].is_null());
     assert_eq!(
         shop["main"],
         json!({"sha": MAIN_HEAD, "state": "failing"}),

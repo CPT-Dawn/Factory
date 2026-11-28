@@ -100,6 +100,32 @@ impl Branch {
         })
     }
 
+    /// The branch a URL like `https://<host>/<owner>/<repo>/tree/<name>` (its [`url`]) names;
+    /// none for any other URL.
+    ///
+    /// [`url`]: Branch::url
+    pub fn from_url(url: &str) -> Option<Branch> {
+        let rest = url.trim().strip_prefix("https://")?;
+        let mut parts = rest.splitn(5, '/');
+        let (host, owner, repo, tree, name) = (
+            parts.next()?,
+            parts.next()?,
+            parts.next()?,
+            parts.next()?,
+            parts.next()?,
+        );
+        let name = name.trim_end_matches('/');
+        if tree != "tree" || [host, owner, repo, name].iter().any(|part| part.is_empty()) {
+            return None;
+        }
+        Some(Branch {
+            host: host.to_owned(),
+            owner: owner.to_owned(),
+            repo: repo.to_owned(),
+            name: name.to_owned(),
+        })
+    }
+
     pub fn url(&self) -> String {
         format!(
             "https://{}/{}/{}/tree/{}",
@@ -147,6 +173,15 @@ pub enum Watched {
 }
 
 impl Watched {
+    /// The pull request or branch its [`url`] names; none for any other text.
+    ///
+    /// [`url`]: Watched::url
+    pub fn from_url(url: &str) -> Option<Watched> {
+        Branch::from_url(url)
+            .map(Watched::Branch)
+            .or_else(|| PullRequest::from_url(url).ok().map(Watched::Pull))
+    }
+
     pub fn host(&self) -> &str {
         match self {
             Watched::Pull(pr) => &pr.host,
@@ -173,15 +208,6 @@ impl Watched {
         match self {
             Watched::Pull(pr) => pr.url(),
             Watched::Branch(branch) => branch.url(),
-        }
-    }
-
-    /// How a wait names it again from the repo's checkout: a pull request's URL, or
-    /// [`BRANCH_TARGET`] and the branch.
-    pub fn target(&self) -> String {
-        match self {
-            Watched::Pull(pr) => pr.url(),
-            Watched::Branch(branch) => format!("{BRANCH_TARGET}{}", branch.name),
         }
     }
 }

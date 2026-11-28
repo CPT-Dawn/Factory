@@ -90,8 +90,9 @@ impl<G: PullRequests> Pollers<G> {
         self.watched.subscribe()
     }
 
-    /// Finds the pull request `pr` names from `cwd`, or the branch it names with
-    /// [`ci::BRANCH_TARGET`] in the repo of `cwd`, and joins its poller, starting one that
+    /// Finds the pull request `pr` names from `cwd`, the branch it names with
+    /// [`ci::BRANCH_TARGET`] in the repo of `cwd`, or the branch its URL names (asking gh
+    /// nothing, wherever `cwd` is), and joins its poller, starting one that
     /// polls every `interval` when none runs.
     pub async fn watch(
         &self,
@@ -99,9 +100,10 @@ impl<G: PullRequests> Pollers<G> {
         cwd: PathBuf,
         interval: Duration,
     ) -> Result<Watch, Failure> {
-        let pr = match ci::branch_target(pr) {
-            Some(name) => Watched::Branch(self.branch(name, cwd).await?),
-            None => Watched::Pull(self.pull(pr, cwd).await?),
+        let pr = match (Branch::from_url(pr), ci::branch_target(pr)) {
+            (Some(branch), _) => Watched::Branch(branch),
+            (None, Some(name)) => Watched::Branch(self.branch(name, cwd).await?),
+            (None, None) => Watched::Pull(self.pull(pr, cwd).await?),
         };
         self.watched.send_replace(Some(pr.clone()));
         let mut running = self
@@ -441,9 +443,33 @@ impl<G: PullRequests> Reader<G> {
             .collect();
         let seen = match ci::verdict(&all) {
             Verdict::Pending { pending } => Seen::Pending { pending },
-            Verdict::Finished(tally) => Seen::Finished(Arc::new(self.finished(&sha, &tally)?)),
+            Verdict::Finished(tally) => {
+                // A branch can move on while its checks are read: a verdict is the latest
+                // head's, so a head that moved is read again on the next poll instead.
+                if let Some(moved) = self.moved(cache.head.as_ref())? {
+                    let cache = Cache {
+                        head: Some(moved),
+                        runs: None,
+                        statuses: None,
+                    };
+                    return Ok((cache, None));
+                }
+                Seen::Finished(Arc::new(self.finished(&sha, &tally)?))
+            }
         };
         Ok((cache, Some(seen)))
+    }
+
+    /// A branch's head read again, when it is no longer `read`; never for a pull request,
+    /// whose head the checks were read for stays its head until it is read again. Costs no
+    /// rate limit while the head stays put, as GitHub answers 304.
+    fn moved(&self, read: Option<&Cached<String>>) -> Result<Option<Cached<String>>, String> {
+        if !matches!(self.pr, Watched::Branch(_)) {
+            return Ok(None);
+        }
+        let fetched = self.gh.head(&self.pr, etag(read)).map_err(|e| e.0)?;
+        let (head, _) = refreshed(fetched, read);
+        Ok(head.filter(|head| read.is_none_or(|read| read.value != head.value)))
     }
 
     /// The answer for a head whose checks all finished, writing the failures' file.

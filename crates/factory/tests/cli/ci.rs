@@ -853,3 +853,34 @@ fn wait_ci_takes_a_pull_request_or_a_branch_but_not_both_or_neither() {
         assert!(out.stdout.is_empty(), "{out:?}");
     }
 }
+
+#[test]
+fn wait_ci_main_waits_for_the_head_main_moved_to_while_it_read_the_last_ones_checks() {
+    const PUSHED: &str = "bbdac5fb00112233445566778899aabbccddeeff";
+    let sandbox = polling_every(1);
+    let github = FakeGitHub::install(&sandbox);
+    github.main_checks(&[(801, "ci", "completed", Some("success"))]);
+    github.checks(&[(901, "ci", "in_progress", None)]);
+    github.push_main_after_next_read(PUSHED);
+    let child = spawn(sandbox.factory_command(&["--json", "wait", "ci", "main"]));
+    let read_pushed = || {
+        sandbox.calls("gh").iter().any(|call| {
+            call.iter()
+                .any(|arg| arg.starts_with(&format!("repos/acme/shop/commits/{PUSHED}/check-runs")))
+        })
+    };
+    assert!(
+        poll_until(read_pushed),
+        "never read the pushed head's checks"
+    );
+
+    github.checks(&[(901, "ci", "completed", Some("success"))]);
+    let out = finish(child);
+
+    assert_eq!(out.code, 0, "{out:?}");
+    let answer: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    assert_eq!(
+        answer["head"], PUSHED,
+        "the head main moved to, not {MAIN_HEAD}: {answer}"
+    );
+}
