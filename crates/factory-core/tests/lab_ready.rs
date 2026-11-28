@@ -33,6 +33,30 @@ fn a_phone_awake_unlocked_and_kept_awake_on_its_power_source_is_ready() {
 }
 
 #[test]
+fn a_battery_a_test_faked_is_named_as_the_cause_not_stay_awake() {
+    // `dumpsys battery unplug` stops its updates and says each source is off.
+    let faked = Probe {
+        battery: Some(
+            "  (UPDATES STOPPED -- use 'reset' to restart)\n  AC powered: false\n  USB powered: false\n"
+                .to_owned(),
+        ),
+        ..ready_phone()
+    };
+    assert_eq!(judge(&faked), Readiness::BatteryFaked);
+    assert_eq!(Readiness::BatteryFaked.word(), "battery faked");
+    assert_eq!(
+        Readiness::from_word("battery faked"),
+        Some(Readiness::BatteryFaked)
+    );
+    assert_eq!(
+        check_line("FAKEPHONE01", "", Some(Readiness::BatteryFaked), None),
+        "FAKEPHONE01: battery faked: a test left dumpsys battery faking its power; run devlab prep FAKEPHONE01"
+    );
+    let told = notice("Pixel 8", None, Readiness::BatteryFaked).unwrap();
+    assert_eq!(told.summary, "Pixel 8's battery is faked");
+}
+
+#[test]
 fn a_keyguard_makes_it_locked_and_a_screen_not_awake_makes_it_asleep() {
     let locked = Probe {
         lock: Some("  mDreamingLockscreen=true\n".to_owned()),

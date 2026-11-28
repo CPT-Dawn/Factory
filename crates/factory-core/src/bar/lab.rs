@@ -21,7 +21,7 @@ pub enum Shown {
 }
 
 /// The one table of what each phone's row asks of the owner, and its tone.
-pub const WORDS: [(Shown, &str, Tone); 8] = [
+pub const WORDS: [(Shown, &str, Tone); 9] = [
     (Shown::Free(Readiness::Ready), "ready", Tone::Ok),
     (Shown::Leased, "leased to", Tone::Busy),
     (Shown::Free(Readiness::Locked), "unlock it", Tone::Warn),
@@ -29,6 +29,11 @@ pub const WORDS: [(Shown, &str, Tone); 8] = [
     (
         Shown::Free(Readiness::StayAwakeOff),
         "turn on Stay awake",
+        Tone::Warn,
+    ),
+    (
+        Shown::Free(Readiness::BatteryFaked),
+        "run devlab prep",
         Tone::Warn,
     ),
     (

@@ -243,6 +243,7 @@ pub struct Unready {
     pub locked: u32,
     pub asleep: u32,
     pub stay_awake_off: u32,
+    pub battery_faked: u32,
     pub offline: u32,
     pub unauthorized: u32,
 }
@@ -254,6 +255,7 @@ impl Unready {
             (self.locked, "locked (unlock it once)"),
             (self.asleep, "asleep (wake it)"),
             (self.stay_awake_off, "stay-awake off (replug it)"),
+            (self.battery_faked, "battery faked (run devlab prep)"),
             (self.offline, "offline"),
             (self.unauthorized, "unauthorized (tap Allow on the phone)"),
         ]
@@ -403,7 +405,8 @@ pub fn lost(held: &[Held]) -> Option<String> {
 /// power, animations off when asked, adb's authorization timeout off where the phone allows
 /// it, then it is woken and a non-secure keyguard lifted. Nothing in it turns a screen off.
 pub fn prep_command(stay_awake: bool, animations_off: bool) -> String {
-    let mut cmds: Vec<String> = Vec::new();
+    // A battery a test faked says the phone is on no power: real power first (#84).
+    let mut cmds: Vec<String> = vec!["dumpsys battery reset".to_owned()];
     if stay_awake {
         cmds.push("settings put global stay_on_while_plugged_in 7".to_owned());
     }
@@ -420,6 +423,10 @@ pub fn prep_command(stay_awake: bool, animations_off: bool) -> String {
     cmds.push(WAKE.to_owned());
     cmds.join("; ")
 }
+
+/// The shell line that undoes what a battery-measuring run faked, as a lease ends: the real
+/// battery back, and doze no longer forced (#84).
+pub const RESTORE_POWER: &str = "dumpsys battery reset; dumpsys deviceidle unforce";
 
 /// Wakes a device and lifts a non-secure keyguard.
 pub const WAKE: &str = "input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard";
@@ -667,6 +674,7 @@ mod tests {
                     locked: 1,
                     asleep: 2,
                     stay_awake_off: 1,
+                    battery_faked: 1,
                     offline: 1,
                     unauthorized: 1,
                 },
@@ -674,7 +682,8 @@ mod tests {
             }),
             Err(
                 "no free phone: 1 phone(s) busy, 1 locked (unlock it once), 2 asleep (wake it), \
-                 1 stay-awake off (replug it), 1 offline, 1 unauthorized (tap Allow on the phone)"
+                 1 stay-awake off (replug it), 1 battery faked (run devlab prep), 1 offline, \
+                 1 unauthorized (tap Allow on the phone)"
                     .into()
             )
         );
@@ -874,12 +883,12 @@ mod tests {
     fn prep_lifts_the_keyguard_and_reads_the_lock_screen() {
         assert_eq!(
             prep_command(true, false),
-            "settings put global stay_on_while_plugged_in 7; settings put global adb_allowed_connection_time 0; input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard"
+            "dumpsys battery reset; settings put global stay_on_while_plugged_in 7; settings put global adb_allowed_connection_time 0; input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard"
         );
         // adb's authorization timeout goes off whether or not the screen is kept on.
         assert_eq!(
             prep_command(false, false),
-            "settings put global adb_allowed_connection_time 0; input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard"
+            "dumpsys battery reset; settings put global adb_allowed_connection_time 0; input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard"
         );
         assert!(!prep_command(true, true).contains("KEYCODE_POWER"));
         assert_eq!(lock_warning("\n"), None);

@@ -77,6 +77,12 @@ fn the_wording_and_tones_come_from_one_table_as_the_spec_words_them() {
             "turn on Stay awake",
             "warn",
         ),
+        // A test faked its battery: the prep resets it (#84).
+        (
+            Shown::Free(Readiness::BatteryFaked),
+            "run devlab prep",
+            "warn",
+        ),
         (
             Shown::Free(Readiness::Unauthorized),
             "allow USB debugging",

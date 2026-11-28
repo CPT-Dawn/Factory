@@ -1059,6 +1059,7 @@ fn plan(
             Some(Readiness::Locked) => unready.locked += 1,
             Some(Readiness::Asleep) => unready.asleep += 1,
             Some(Readiness::StayAwakeOff) => unready.stay_awake_off += 1,
+            Some(Readiness::BatteryFaked) => unready.battery_faked += 1,
             Some(Readiness::Unauthorized) => unready.unauthorized += 1,
             // A ready probe too old that was not made again in time: not known to be anything.
             // (No phone adb lists is found with its USB debugging off: that is one adb doesn't.)

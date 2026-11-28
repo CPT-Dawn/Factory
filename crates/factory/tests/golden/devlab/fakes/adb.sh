@@ -77,11 +77,19 @@ track-devices)
         grep -qxF "$serial" "$w/locked" && echo "  mDreamingLockscreen=true" ;;
       *dumpsys\ power*)
         if grep -qxF "$serial" "$w/asleep"; then echo "  mWakefulness=Asleep"; else echo "  mWakefulness=Awake"; fi ;;
+      *dumpsys\ battery\ reset*)
+        # A battery world/faked names reads as real again.
+        grep -vxF "$serial" "$w/faked" > "$w/faked.new.$$"; mv "$w/faked.new.$$" "$w/faked" ;;
       *dumpsys\ battery*)
-        on=$(awk -v s="$serial" '$1 == s { p = $2 } END { print (p == "" ? "USB" : p) }' "$w/power")
-        for p in AC USB Wireless; do
-          if [ "$p" = "$on" ]; then echo "  $p powered: true"; else echo "  $p powered: false"; fi
-        done ;;
+        if grep -qxF "$serial" "$w/faked"; then
+          echo "  (UPDATES STOPPED -- use 'reset' to restart)"
+          for p in AC USB Wireless; do echo "  $p powered: false"; done
+        else
+          on=$(awk -v s="$serial" '$1 == s { p = $2 } END { print (p == "" ? "USB" : p) }' "$w/power")
+          for p in AC USB Wireless; do
+            if [ "$p" = "$on" ]; then echo "  $p powered: true"; else echo "  $p powered: false"; fi
+          done
+        fi ;;
       *settings\ put\ global\ *)
         # The daemon readies a phone as it is plugged in while a grant readies it too: one
         # put at a time, so neither loses the other's.

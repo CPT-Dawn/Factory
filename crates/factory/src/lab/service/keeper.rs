@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use factory_adapters::adb::{Adb, AdbCli};
 use factory_adapters::emulator::{Emulators, SystemdEmulators};
-use factory_core::lab::devices::{Attached, Mode};
+use factory_core::lab::devices::{Attached, Mode, RESTORE_POWER};
 use factory_core::lab::emulator::{State, unit_name};
 use factory_core::lab::events as event;
 use factory_core::lab::idle::{self, IdleDevice, IdleEmulator, IdleSlot, Need, Timers};
@@ -454,21 +454,21 @@ pub fn take_back_reverses_on_thread(attached: Option<Vec<Attached>>, leases: Vec
 }
 
 /// Takes back the reverses of each lease's project on its devices that adb lists as usable
-/// (all of them before adb's first list), as devlab's release did.
+/// (all of them before adb's first list), as devlab's release did, and undoes what a
+/// battery-measuring run faked on them ([RESTORE_POWER], #84).
 pub fn take_back_reverses(attached: Option<&[Attached]>, leases: &[Lease]) {
     for lease in leases.iter().filter(|l| !l.devices.is_empty()) {
-        let Ok(Some(p)) = context::project_config(&lease.worktree) else {
-            continue;
+        let ports: Vec<u32> = match context::project_config(&lease.worktree) {
+            Ok(Some(p)) => {
+                let env = lease::lease_env(lease, Some(&p)).unwrap_or_default();
+                lease::reverse_ports(&p, &env)
+                    .into_iter()
+                    .map(|(on_device, _)| on_device)
+                    .filter(|port| *port > 0)
+                    .collect()
+            }
+            _ => Vec::new(),
         };
-        if p.reverse.is_empty() {
-            continue;
-        }
-        let env = lease::lease_env(lease, Some(&p)).unwrap_or_default();
-        let ports: Vec<u32> = lease::reverse_ports(&p, &env)
-            .into_iter()
-            .map(|(on_device, _)| on_device)
-            .filter(|port| *port > 0)
-            .collect();
         for d in &lease.devices {
             let usable = attached.is_none_or(|list| {
                 list.iter()
@@ -478,9 +478,16 @@ pub fn take_back_reverses(attached: Option<&[Attached]>, leases: &[Lease]) {
                 for port in &ports {
                     AdbCli.unreverse(&d.serial, *port);
                 }
+                restore_power(&d.serial);
             }
         }
     }
+}
+
+/// Puts the device's real battery back and stops forcing doze, as a lease that may have faked
+/// them for a measurement ends: a phone left on a faked "unplugged" battery sleeps.
+fn restore_power(serial: &str) {
+    AdbCli.shell(serial, RESTORE_POWER);
 }
 
 /// Runs `work` on a thread of its own, named `name`.

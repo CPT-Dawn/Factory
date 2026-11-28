@@ -35,6 +35,7 @@ const WORLD_TOOLS: &[&str] = &[
 /// The files that hold a world's state, one entry per line.
 const STATE_FILES: &[&str] = &[
     "devices",
+    "faked",
     "containers",
     "units",
     "unit-ports",
@@ -91,6 +92,8 @@ impl World {
     /// - `setting <serial> <key> <value>`: a global setting of the phone, such as
     ///   `stay_on_while_plugged_in`, is changed on it,
     /// - `power <serial> AC|USB|Wireless`: the power source it is on,
+    /// - `fake-battery <serial>`: a test faked its battery unplugged (`dumpsys battery unplug`)
+    ///   until `dumpsys battery reset`,
     /// - `stall <serial>`: the emulator never finishes booting,
     /// - `yank <serial>`: the phone is unplugged when it is next asked its ABI, as a grant of it
     ///   settles: between the grant and the prep,
@@ -127,6 +130,7 @@ impl World {
             }),
             ["power", serial, source] => self.append("power", &format!("{serial} {source}")),
             ["stall", serial] => self.append("stalled", serial),
+            ["fake-battery", serial] => self.append("faked", serial),
             ["yank", serial] => self.append("yanked", serial),
             ["container", name] => self.append("containers", name),
             ["break", what @ ..] if !what.is_empty() => self.append("broken", &what.join(" ")),
