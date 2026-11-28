@@ -1344,6 +1344,27 @@ esac"#,
         "factory: code-review: --follow-up names an issue (#12, 12, owner/repo#12 or an issue URL), got: soon\n"
     );
     assert!(sandbox.calls("codex").is_empty());
+    // A spec gh cannot fetch says what to check.
+    sandbox.fake(
+        "gh",
+        r#"case "$3" in *12) echo 'GraphQL: Could not resolve to an issue' >&2; exit 1 ;; *) echo https://github.com/o/r/issues/13 ;; esac"#,
+    );
+    let lost_spec = sandbox.factory_in(
+        &repo,
+        &["review", "main", "t1-r1", "#12", "--follow-up", "#13"],
+    );
+    assert_eq!(lost_spec.code, 2, "{lost_spec:?}");
+    assert_eq!(
+        lost_spec.stderr,
+        "factory: code-review: could not fetch the spec's issue 12 with gh: GraphQL: Could not resolve to an issue; check gh auth status and the spec's issue ref, then run the review again\n"
+    );
+    sandbox.fake(
+        "gh",
+        r#"case "$*" in
+  *--jq*) case "$3" in *12) echo https://github.com/o/r/issues/12 ;; *) echo https://github.com/o/r/issues/13 ;; esac ;;
+  *) printf '# #12 Add a\n\nAdd a.txt.\n' ;;
+esac"#,
+    );
     // Another issue is a follow-up.
     let other = sandbox.factory_in(
         &repo,

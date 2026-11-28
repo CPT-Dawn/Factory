@@ -851,7 +851,7 @@ fn follow_up(args: &Args) -> Result<String, Failure> {
     if let Some(spec) = args.spec.as_deref().and_then(review::issue_ref) {
         let spec_url = Gh.url(&spec).map_err(|e| {
             Failure::usage(format!(
-                "could not fetch the spec's issue {spec} with gh: {e}"
+                "could not fetch the spec's issue {spec} with gh: {e}; check gh auth status and the spec's issue ref, then run the review again"
             ))
         })?;
         if spec_url == url {
