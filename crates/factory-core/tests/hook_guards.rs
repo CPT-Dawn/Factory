@@ -171,6 +171,46 @@ fn a_mention_of_an_object_or_a_test_bracket_passes() {
     assert_passes(&calls);
 }
 
+#[test]
+fn the_shell_denies_reach_the_text_of_each_repl_template() {
+    for (code, fix) in [
+        ("await $`yes > /dev/null &`;", CAP),
+        ("const r = await $`while :; do :; done`.nothrow();", CAP),
+        ("await $`rm -rf $HOME/x/*`;", RM_FIX),
+        ("await $`bash -c 'rm /tmp/a'`;", RM_FIX),
+        ("await $`rg 'foo$' src`.text();", ANCHOR_FIX),
+        ("await $`[object Object] > out`;", "pass a string or array"),
+        ("await $('rm -f *.log');", RM_FIX),
+        ("const a = 1;\nawait $`stress -c 4`;", "line 2"),
+        ("await $`echo \\`rm $x\\``;", RM_FIX),
+        ("$`cd ${dir} && rm \\${name}`", RM_FIX),
+    ] {
+        let reason = denied(&repl(code)).unwrap_or_else(|| panic!("{code:?} should be denied"));
+        assert!(reason.contains(fix), "{code:?}: {reason}");
+        assert!(reason.chars().count() <= 200, "{reason}");
+    }
+}
+
+#[test]
+fn an_interpolation_is_one_literal_word_and_raw_text_is_unknown() {
+    let codes = [
+        "await $`rm ${path}`;",
+        "await $`rm -f ${dir}/a.txt ${other}`;",
+        "await $`rg ${'foo$'} src`;",
+        "await $`rm ${{raw: x}}`;",
+        "await $`rm ${ {raw: '*.log'} }`;",
+        "const cmd = 'rm *.log'; await $(cmd);",
+        "const s = `rm $x`;",
+        "self.log('rm $x, yes > /dev/null');",
+        "// await $`rm $x`\nconst a = 1;",
+        "await $`git rm -r --cached ${dir}`;",
+        "await $`echo \\${HOME}`;",
+        "x.$`rm $y`;",
+    ];
+    let calls: Vec<Value> = codes.iter().map(|c| repl(c)).collect();
+    assert_passes(&calls);
+}
+
 const CAP: &str = "systemd-run --user --scope -p CPUQuota=200% -- <cmd>";
 
 #[test]

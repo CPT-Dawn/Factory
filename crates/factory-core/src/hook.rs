@@ -118,7 +118,7 @@ pub fn pre_tool(input: &Value, escape: bool) -> PreTool {
             }
         }
         Some("REPL") => text("code")
-            .and_then(repl_misuse)
+            .and_then(|code| repl_misuse(code).or_else(|| guard::repl_trap(code)))
             .map_or(PreTool::Allow, PreTool::Block),
         _ => PreTool::Allow,
     }

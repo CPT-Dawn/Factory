@@ -3,6 +3,7 @@
 //! command. Each looks at what the line says and lets through what it cannot read: a false
 //! positive stops every agent on the machine.
 
+use super::js;
 use super::shell::{self, Invocation, Part};
 
 /// The capped scope a CPU-heavy command runs in on this host.
@@ -11,6 +12,18 @@ const CAPPED: &str = "systemd-run --user --scope -p CPUQuota=200% -- <cmd>";
 /// The refusal for a command line one of the guards stops, with the fix in it.
 pub fn shell_trap(command: &str) -> Option<String> {
     trap_in(command, false)
+}
+
+/// The refusal for a REPL script whose shell text one of the guards stops, naming its line. Text
+/// the script doesn't say, such as a `${{raw: s}}` splice, is let through.
+pub fn repl_trap(code: &str) -> Option<String> {
+    js::shell_calls(code)
+        .iter()
+        .filter(|call| call.exact)
+        .find_map(|call| {
+            let reason = shell_trap(&call.text)?;
+            Some(format!("REPL line {}: {reason}", call.line))
+        })
 }
 
 /// [`shell_trap`] over `command`, which is the script of a `bash -c` when `in_script`.
