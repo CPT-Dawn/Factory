@@ -141,6 +141,32 @@ fn the_lab_counts_leases_free_slots_and_the_queue_and_lists_each() {
 }
 
 #[test]
+fn the_lab_says_what_is_free_after_ci_and_which_free_stack_devlab_owns() {
+    let mut status = idle();
+    status.lab = Lab {
+        mem_after_ci_mb: Some(10 * 1024),
+        ..Lab::default()
+    };
+    assert_eq!(rows(&status)[1], "lab: idle, 10.0 GB free after CI");
+
+    let mut ours = slot(1, None, Some("demo-c"));
+    ours.stack_ours = true;
+    status.lab = Lab {
+        slots: vec![slot(0, None, None), ours],
+        mem_after_ci_mb: Some(10 * 1024),
+        ..Lab::default()
+    };
+    assert_eq!(
+        &rows(&status)[1..4],
+        [
+            "lab: 0 leased, 2 free, 0 queued, 10.0 GB free after CI",
+            "  demo/0 free",
+            "  demo/1 free, last demo-c, stack devlab's",
+        ]
+    );
+}
+
+#[test]
 fn a_lease_names_the_devices_it_holds() {
     let mut status = idle();
     let mut held = lease(1, Some(0), "demo-a", "claude:123", 4);

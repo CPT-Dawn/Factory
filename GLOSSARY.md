@@ -29,8 +29,12 @@ This PC's phones, emulators and local stack slots, which the factory lends to on
 _Avoid_: devices, devlab (that is the command)
 
 **Readiness**:
-Whether a plugged-in phone can run unattended: ready, locked, asleep, stay-awake off, unauthorized, offline, or USB debugging off.
+Whether a plugged-in phone can run unattended: ready, locked, asleep, stay-awake off, battery faked (a test's `dumpsys battery` fake left on), unauthorized, offline, or USB debugging off.
 _Avoid_: phone state, health
+
+**CI headroom**:
+What the CI runners' systemd slice may still grow by: its `memory.max` less its `memory.current`. A grant counts only the memory free after it.
+_Avoid_: CI reserve, runner memory
 
 ### Display
 

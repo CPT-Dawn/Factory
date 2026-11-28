@@ -106,7 +106,11 @@ fn dispatch(argv: &[String]) -> Result<u8, Failure> {
             stop_failed.map_or(Ok(0), Err)
         }
         "stack" => {
-            let done = stack(&context()?, args.first().map_or("status", String::as_str))?;
+            let done = stack(
+                &context()?,
+                args.first().map_or("status", String::as_str),
+                &mut |w| note(w),
+            )?;
             if let Stack::State { .. } = done {
                 println!("{}", done.devlab_line());
             } else {
@@ -394,7 +398,7 @@ fn stop(held: &str, worktree: &str, slot: u32, granted: Option<&str>) -> Result<
     if stack::running(id) {
         stack::down(&project, id, worktree)?;
     }
-    lease::stack_ours(&project.name, slot, false)
+    lease::disown_stack(&project.name, slot)
 }
 
 /// What `stack up`, `down` or `status` did to the lease's stack, by its project id.
@@ -426,7 +430,8 @@ impl Stack {
     }
 }
 
-pub(super) fn stack(ctx: &Ctx, sub: &str) -> Result<Stack, Failure> {
+/// `stack up`, `down` or `status` on the lease's stack; a warning about it goes to `warn`.
+pub(super) fn stack(ctx: &Ctx, sub: &str, warn: &mut dyn FnMut(&str)) -> Result<Stack, Failure> {
     let held = lease::live(ctx)?;
     let (Some(project), Some(slot)) = (
         ctx.project.as_ref().filter(|p| p.supabase.is_some()),
@@ -445,15 +450,13 @@ pub(super) fn stack(ctx: &Ctx, sub: &str) -> Result<Stack, Failure> {
     Ok(match sub {
         "up" => {
             let env = lease::lease_env(&held, Some(project))?;
-            let how = stack::up(project, &ctx.worktree, slot, &env, &ctx.cfg)?;
-            if how == stack::Up::Started {
-                lease::stack_ours(&project.name, slot, true)?;
-            }
+            let how = stack::up(project, &ctx.worktree, slot, &env, &ctx.cfg, warn)?;
+            lease::own_stack(&project.name, slot, &id, how)?;
             Stack::Up { id, slot, how }
         }
         "down" => {
             stack::down(project, &id, &ctx.worktree)?;
-            lease::stack_ours(&project.name, slot, false)?;
+            lease::disown_stack(&project.name, slot)?;
             Stack::Down { id, slot }
         }
         _ => {

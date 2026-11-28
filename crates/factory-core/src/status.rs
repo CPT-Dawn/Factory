@@ -46,6 +46,10 @@ pub struct Lab {
     pub reservations: Vec<Reservation>,
     /// Oldest first.
     pub queue: Vec<Queued>,
+    /// What is free after the CI slice's headroom (none without a slice), in MB (#84); none from a
+    /// daemon from before it was counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_after_ci_mb: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,12 +357,15 @@ fn ci(status: &Status, rows: &mut Vec<String>) {
 
 fn lab(status: &Status, rows: &mut Vec<String>) {
     let lab = &status.lab;
+    let after_ci = lab.mem_after_ci_mb.map_or_else(String::new, |mb| {
+        format!(", {} GB free after CI", crate::lab::memory::gb(mb))
+    });
     if lab.leases.is_empty()
         && lab.slots.is_empty()
         && lab.reservations.is_empty()
         && lab.queue.is_empty()
     {
-        rows.push("lab: idle".to_owned());
+        rows.push(format!("lab: idle{after_ci}"));
         return;
     }
     let free = lab
@@ -371,7 +378,7 @@ fn lab(status: &Status, rows: &mut Vec<String>) {
         n => format!(", {n} reserved"),
     };
     rows.push(format!(
-        "lab: {} leased{reserved}, {free} free, {} queued",
+        "lab: {} leased{reserved}, {free} free, {} queued{after_ci}",
         lab.leases.len(),
         lab.queue.len()
     ));
@@ -418,7 +425,13 @@ fn lab(status: &Status, rows: &mut Vec<String>) {
                     .last_worktree
                     .as_deref()
                     .map_or_else(String::new, |wt| format!(", last {}", base_name(wt)));
-                format!("  {}/{} {state}{last}", slot.project, slot.slot)
+                // A stack devlab owns is one its idle timer stops (#84).
+                let ours = if slot.stack_ours {
+                    ", stack devlab's"
+                } else {
+                    ""
+                };
+                format!("  {}/{} {state}{last}{ours}", slot.project, slot.slot)
             }),
     );
     listed(rows, held, LAB_ROWS, "in the lab");

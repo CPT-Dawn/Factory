@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use factory_core::lab::config::MachineConfig;
 use factory_core::lab::devices::{DeviceRow, device_line};
+use factory_core::lab::memory::gb;
 use factory_core::lab::queue::{Holding, held_by, live_queue, owner_slot_counts, waiter_capped};
 use factory_core::lab::ready::{Readiness, USB_DEBUGGING_OFF_WORDS};
 use factory_core::lab::reserve::lapses_at;
@@ -11,7 +12,7 @@ use factory_core::lab::{ago, js_round};
 use serde::Serialize;
 
 use super::context::{self, project_config};
-use super::host::mem_available_mb;
+use super::host;
 use super::stack;
 use super::wire::{Board, DeviceLine, Lease, Reservation, STATUS, Waiter, slot_inventory};
 use crate::client;
@@ -32,6 +33,9 @@ struct Report {
     watcher: &'static str,
     #[serde(rename = "memAvailableMB")]
     mem_available_mb: i64,
+    /// What is free after the CI slice's headroom; none without a CI slice (#84).
+    #[serde(rename = "memAfterCiMB", skip_serializing_if = "Option::is_none")]
+    mem_after_ci_mb: Option<i64>,
 }
 
 /// One lease: how old it is, how long it has run nothing, and what it runs (#57).
@@ -180,16 +184,19 @@ pub fn screen(board: &Board) -> Result<String, Failure> {
     if !report.waiting.is_empty() {
         out.push(format!("waiting: {}", report.waiting.join("; ")));
     }
-    #[allow(clippy::cast_precision_loss)]
-    let gb = report.mem_available_mb as f64 / 1024.0;
+    let after_ci = report
+        .mem_after_ci_mb
+        .map_or_else(String::new, |mb| format!(", {} GB free after CI", gb(mb)));
     out.push(format!(
-        "memory {gb:.1} GB free; watcher {}",
+        "memory {} GB free{after_ci}; watcher {}",
+        gb(report.mem_available_mb),
         report.watcher
     ));
     Ok(out.join("\n"))
 }
 
 fn report(board: &Board, cfg: &MachineConfig) -> Report {
+    let memory = host::memory(&cfg.ci_slice);
     let rows = slot_inventory(&board.slots, &board.reservations);
     let slots = rows
         .iter()
@@ -201,11 +208,14 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
                 .reservations
                 .iter()
                 .find(|r| r.project == s.project && r.slot == s.slot);
-            let id = stack::slot_stack_id(&s.project, s.slot, s.last_worktree.as_deref());
+            let id = stack::slot_stack_id(s);
             SlotLine {
                 project: s.project.clone(),
                 slot: s.slot,
-                stack: if stack::running(&id) {
+                // One devlab owns is one its idle timer stops (#84).
+                stack: if stack::running(&id) && s.stack_ours {
+                    format!("up ({id}, devlab's)")
+                } else if stack::running(&id) {
                     format!("up ({id})")
                 } else {
                     "down".to_owned()
@@ -318,7 +328,8 @@ fn report(board: &Board, cfg: &MachineConfig) -> Report {
         owners,
         waiting,
         watcher: "active",
-        mem_available_mb: mem_available_mb(),
+        mem_available_mb: memory.available_mb,
+        mem_after_ci_mb: memory.ci_headroom_mb.map(|_| memory.free_mb()),
     }
 }
 

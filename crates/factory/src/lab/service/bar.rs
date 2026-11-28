@@ -31,6 +31,7 @@ impl Lab {
 
     fn bar_now(&self) -> Answer<BarLab> {
         let cfg = context::machine_config().unwrap_or_default();
+        let memory = host::memory(&cfg.ci_slice);
         let shown = self.attached.borrow().shown.clone();
         let stacks_seen = lock_ignoring_poison(&self.stacks).clone();
         let hidden = self.hidden_phones(shown.as_deref().unwrap_or_default());
@@ -130,7 +131,8 @@ impl Lab {
                 stacks,
                 queue: store::waiters(c)?.len(),
                 max_emulators: cfg.max_emulators,
-                mem_available_mb: host::mem_available_mb(),
+                mem_available_mb: memory.available_mb,
+                mem_after_ci_mb: Some(memory.free_mb()),
                 error: None,
                 usb_error,
             })
@@ -156,11 +158,7 @@ impl Lab {
                         let seen: BTreeMap<(String, u32), bool> = slots
                             .into_iter()
                             .map(|row| {
-                                let id = stack::slot_stack_id(
-                                    &row.project,
-                                    row.slot,
-                                    row.last_worktree.as_deref(),
-                                );
+                                let id = stack::slot_stack_id(&row);
                                 ((row.project, row.slot), stack::running(&id))
                             })
                             .collect();
@@ -220,6 +218,7 @@ fn unrecorded(project: &str, slot: u32) -> SlotRow {
         slot,
         last_worktree: None,
         stack_ours: false,
+        stack_id: None,
         idle_since: None,
         stopping: false,
     }

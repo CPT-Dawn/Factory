@@ -77,6 +77,12 @@ fn the_wording_and_tones_come_from_one_table_as_the_spec_words_them() {
             "turn on Stay awake",
             "warn",
         ),
+        // A test faked its battery: the prep resets it (#84).
+        (
+            Shown::Free(Readiness::BatteryFaked),
+            "run devlab prep",
+            "warn",
+        ),
         (
             Shown::Free(Readiness::Unauthorized),
             "allow USB debugging",
@@ -274,6 +280,19 @@ fn the_card_lists_emulators_stacks_the_queue_and_the_room_left() {
             text("room", "emulators 2 of 2 · 12.0 GB free", "muted"),
         ]
     );
+}
+
+#[test]
+fn the_room_row_says_what_is_free_after_ci_when_the_daemon_counts_it() {
+    let card = Lab {
+        mem_after_ci_mb: Some(9 * 1024 + 512),
+        ..lab(vec![])
+    };
+    let room = rows(&card)
+        .into_iter()
+        .find(|r| r["label"] == "room")
+        .unwrap_or(Value::Null);
+    assert_eq!(room["text"], "emulators 0 of 2 · 9.5 GB free after CI");
 }
 
 #[test]

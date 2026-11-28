@@ -49,8 +49,10 @@ pub struct Board {
     pub slots: Vec<SlotView>,
     /// TCP ports something listens on.
     pub listening: BTreeSet<u32>,
-    /// The memory available to start a stack with.
+    /// The memory available to start a stack with, after CI's headroom.
     pub mem_available_mb: i64,
+    /// The CI headroom already taken from `mem_available_mb`, in MB, to explain a wait.
+    pub ci_headroom_mb: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,8 +142,9 @@ pub fn decide(ask: &Ask, board: &Board, now: i64) -> Decision {
         .filter(|need| board.mem_available_mb < *need)
         .map(|need| {
             format!(
-                "too little memory to start a stack ({} MB free, need {need})",
-                board.mem_available_mb
+                "too little memory to start a stack ({} MB free, need {need}){}",
+                board.mem_available_mb,
+                crate::lab::memory::after_ci(board.ci_headroom_mb)
             )
         });
     match pick_slot(
@@ -236,6 +239,7 @@ mod tests {
                 .collect(),
             listening: BTreeSet::new(),
             mem_available_mb: 0,
+            ci_headroom_mb: 0,
         }
     }
 
@@ -257,7 +261,16 @@ mod tests {
         // Once memory is back, or when a slot's stack already runs, it is granted.
         b.mem_available_mb = 7168;
         assert!(matches!(decide(&a, &b, 0), Decision::Grant { .. }));
+        // CI's headroom is already taken from the free memory a wait names.
         b.mem_available_mb = 3400;
+        b.ci_headroom_mb = 2048;
+        assert_eq!(
+            decide(&a, &b, 0),
+            Decision::Wait(
+                "too little memory to start a stack (3400 MB free, need 7168): too little memory after CI's headroom (2048 MB)".to_owned()
+            )
+        );
+        b.ci_headroom_mb = 0;
         b.slots[1].stack_running = true;
         assert_eq!(
             decide(&a, &b, 0),

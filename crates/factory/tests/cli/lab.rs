@@ -2318,6 +2318,64 @@ fn a_running_stack_is_granted_below_the_memory_floor_as_it_starts_nothing() {
     assert!(out.stdout.contains("export DEVLAB_SLOT=0\n"), "{out:?}");
 }
 
+/// Writes the CI slice's cgroup files as the sandbox's user manager keeps them, nested under
+/// its parent slice as systemd puts it: it may grow to `max_mb` and uses `current_mb`.
+pub(super) fn ci_slice(sandbox: &Sandbox, max_mb: i64, current_mb: i64) {
+    let uid = rustix::process::getuid().as_raw();
+    let dir = sandbox.path(format!(
+        "cgroup/user.slice/user-{uid}.slice/user@{uid}.service/peekabus.slice/peekabus-ci.slice"
+    ));
+    fs::create_dir_all(&dir).expect("make the CI slice");
+    let mb = 1024 * 1024;
+    fs::write(dir.join("memory.max"), format!("{}\n", max_mb * mb)).expect("write memory.max");
+    fs::write(dir.join("memory.current"), format!("{}\n", current_mb * mb))
+        .expect("write memory.current");
+}
+
+#[test]
+fn a_stack_start_counts_the_memory_ci_may_still_take_and_says_so() {
+    let (sandbox, world) = lab();
+    // The CI runners may still grow by more memory than any host has.
+    ci_slice(&sandbox, 100_000_000, 0);
+    let wt = world.worktree("demo-ci");
+
+    let out = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--wait", "1"],
+    );
+
+    assert_eq!(out.code, 75, "{out:?}");
+    assert!(
+        out.stderr.contains("too little memory to start a stack ("),
+        "{out:?}"
+    );
+    assert!(
+        out.stderr
+            .contains(": too little memory after CI's headroom (100000000 MB)"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn status_shows_the_memory_free_after_ci_only_when_there_is_a_ci_slice() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-ci-status");
+    let before = status(&sandbox, &wt);
+    assert!(!before.contains("after CI"), "{before}");
+
+    ci_slice(&sandbox, 4096, 1024);
+
+    let after = status(&sandbox, &wt);
+    let line = after.lines().last().unwrap_or_default();
+    assert!(line.starts_with("memory "), "{after}");
+    assert!(line.contains(" GB free, "), "{after}");
+    assert!(
+        line.ends_with(" GB free after CI; watcher active"),
+        "{after}"
+    );
+}
+
 /// The reverses `serial` keeps, as `adb reverse --list` shows them.
 fn reverses(sandbox: &Sandbox, serial: &str) -> String {
     let out = run(sandbox.command("adb", &["-s", serial, "reverse", "--list"]));
@@ -2415,7 +2473,7 @@ fn stack_stops(sandbox: &Sandbox, project_id: &str) -> usize {
 }
 
 #[test]
-fn a_stack_devlab_started_is_stopped_once_idle_and_one_started_outside_devlab_never_is() {
+fn a_stack_devlab_started_and_one_a_lease_found_running_are_both_stopped_once_idle() {
     let (sandbox, world) = lab();
     // 0.02 minutes: about a second.
     write_machine_config(&sandbox, r#""stackIdleMin": 0.02"#);
@@ -2426,11 +2484,9 @@ fn a_stack_devlab_started_is_stopped_once_idle_and_one_started_outside_devlab_ne
         &["acquire", "--no-device", "--stack", "--quiet"],
     );
     assert_eq!(held.code, 0, "{held:?}");
-    // Slot 1's stack was started outside devlab; a lease that doesn't start it uses it.
-    let containers = sandbox.path("world/containers");
-    let mut listed = fs::read_to_string(&containers).unwrap_or_default();
-    listed.push_str("supabase_db_demo_s1\n");
-    fs::write(&containers, listed).expect("start a stack outside devlab");
+    // Slot 1's stack was started outside devlab; a lease that finds it running claims it,
+    // though it didn't ask for --stack (#84).
+    world.apply("container supabase_db_demo_s1").unwrap();
     let other = owner_process();
     let outside = world.worktree("demo-outside");
     let held = owned_by(
@@ -2441,7 +2497,6 @@ fn a_stack_devlab_started_is_stopped_once_idle_and_one_started_outside_devlab_ne
     );
     assert!(held.stdout.contains("export DEVLAB_SLOT=1\n"), "{held:?}");
 
-    // The outside stack idles first, so a look that stops ours had it due too.
     assert_eq!(
         owned_by(&sandbox, &outside, other.id(), &["release"]).code,
         0
@@ -2451,18 +2506,189 @@ fn a_stack_devlab_started_is_stopped_once_idle_and_one_started_outside_devlab_ne
     // The fake records the stop before it takes the container down.
     let stopped = poll_until(|| {
         stack_stops(&sandbox, "demo") == 1
-            && !fs::read_to_string(&containers)
-                .unwrap_or_default()
-                .lines()
-                .any(|c| c == "supabase_db_demo")
+            && stack_stops(&sandbox, "demo_s1") == 1
+            && !stack_up(&sandbox, "demo")
+            && !stack_up(&sandbox, "demo_s1")
     });
     kill_owner(other);
+    assert!(
+        stopped,
+        "{:?} {:?}",
+        sandbox.calls("supabase"),
+        world.read("containers")
+    );
+}
+
+/// Whether the stack `project_id`'s db container runs, as `docker inspect` tells it.
+fn stack_up(sandbox: &Sandbox, project_id: &str) -> bool {
+    let out = run(sandbox.command(
+        "docker",
+        &[
+            "inspect",
+            "-f",
+            "{{.State.Running}}",
+            &format!("supabase_db_{project_id}"),
+        ],
+    ));
+    out.code == 0 && out.stdout.trim() == "true"
+}
+
+#[test]
+fn a_lease_that_finds_its_stack_running_claims_it_and_keeps_it_down_after_a_reboot() {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""stackIdleMin": 0.02"#);
+    // Docker brought the stack back after a reboot, with no lease on it.
+    world.apply("container supabase_db_demo").unwrap();
+    let wt = world.worktree("demo-claim");
+
+    let held = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--quiet"],
+    );
+
+    assert_eq!(held.code, 0, "{held:?}");
+    let shown = status(&sandbox, &wt);
+    assert!(shown.contains("  demo 0   up (demo, devlab's) "), "{shown}");
+    let update = ["update", "--restart=no", "supabase_db_demo"].map(str::to_owned);
+    assert!(
+        sandbox.calls("docker").contains(&update.to_vec()),
+        "{:?}",
+        sandbox.calls("docker")
+    );
+    assert_eq!(owned(&sandbox, &wt, &["release"]).code, 0);
+    let stopped = poll_until(|| stack_stops(&sandbox, "demo") == 1 && !stack_up(&sandbox, "demo"));
     assert!(stopped, "{:?}", sandbox.calls("supabase"));
-    let up = fs::read_to_string(&containers).unwrap_or_default();
-    assert!(up.lines().any(|c| c == "supabase_db_demo_s1"), "{up}");
+}
+
+#[test]
+fn a_stack_docker_wont_keep_down_after_a_reboot_is_warned_of_by_acquire_and_stack_up() {
+    let (sandbox, world) = lab();
+    world.apply("break docker update").unwrap();
+    let wt = world.worktree("demo-revive");
+    let warning = "docker update --restart=no failed on stack demo: a reboot may start it again with no lease";
+
+    let held = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--quiet"],
+    );
+    assert_eq!(held.code, 0, "{held:?}");
+    assert!(held.stderr.contains(warning), "{held:?}");
+    assert_eq!(owned(&sandbox, &wt, &["stack", "down"]).code, 0);
+    let up = owned(&sandbox, &wt, &["stack", "up"]);
+
+    assert_eq!(up.code, 0, "{up:?}");
+    assert!(up.stderr.contains(warning), "{up:?}");
+}
+
+#[test]
+fn a_stack_that_fails_to_stop_stays_devlabs_and_is_stopped_on_a_later_try() {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""stackIdleMin": 0.02"#);
+    let wt = world.worktree("demo-stubborn");
+    let held = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--quiet"],
+    );
+    assert_eq!(held.code, 0, "{held:?}");
+    world.apply("break supabase stop").unwrap();
+
+    assert_eq!(owned(&sandbox, &wt, &["release"]).code, 0);
+
+    assert!(poll_until(|| stack_stops(&sandbox, "demo") >= 1));
+    assert!(stack_up(&sandbox, "demo"));
+    world.apply("mend supabase stop").unwrap();
+    let stopped = poll_until(|| !stack_up(&sandbox, "demo"));
+    assert!(stopped, "{:?}", sandbox.calls("supabase"));
+    assert!(stack_stops(&sandbox, "demo") >= 2);
+}
+
+#[test]
+fn a_stack_whose_worktree_is_gone_is_stopped_by_its_project_id_from_devlabs_own_directory() {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""stackIdleMin": 0.02"#);
+    // The default CLI, `bunx supabase`, as the fake supabase.
+    sandbox.fake("bunx", "shift; exec supabase \"$@\"");
+    let wt = world.worktree("demo-gone");
+    // Its supabase project id isn't the devlab project's name: only the slot remembers it.
+    let config = wt.join("supabase/config.toml");
+    let toml = fs::read_to_string(&config).expect("read config.toml");
+    fs::write(
+        &config,
+        toml.replace(r#"project_id = "demo""#, r#"project_id = "local-db""#),
+    )
+    .expect("write config.toml");
+    let held = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--quiet"],
+    );
+    assert_eq!(held.code, 0, "{held:?}");
+    // The lease ends with its worktree removed, before the stack idles out.
+    fs::remove_dir_all(&wt).expect("remove the worktree");
+    let other = world.worktree("demo-elsewhere");
     assert_eq!(
-        stack_stops(&sandbox, "demo_s1"),
-        0,
+        owned(&sandbox, &other, &["release", "--lease", &lease_id(&held)]).code,
+        0
+    );
+
+    assert!(stack_up(&sandbox, "local-db"));
+    let stopped = poll_until(|| !stack_up(&sandbox, "local-db"));
+    assert!(
+        stopped,
+        "{:?} {}",
+        sandbox.calls("supabase"),
+        daemon_log(&sandbox)
+    );
+}
+
+#[test]
+fn a_new_daemon_adopts_a_stack_running_on_a_free_slot_and_stops_it_once_idle() {
+    let (sandbox, world) = lab();
+    write_machine_config(&sandbox, r#""stackIdleMin": 0.02"#);
+    // The slot's lease ended with no stack running, so the slot's stack isn't devlab's.
+    let wt = world.worktree("demo-adopt");
+    let held = owned(&sandbox, &wt, &["acquire", "--no-device", "--quiet"]);
+    assert_eq!(held.code, 0, "{held:?}");
+    assert_eq!(owned(&sandbox, &wt, &["release"]).code, 0);
+    // Then docker brought the stack back, as after a reboot, with no lease on it.
+    world.apply("container supabase_db_demo").unwrap();
+    assert!(stack_up(&sandbox, "demo"));
+
+    stop_daemon(&sandbox);
+    let text = status(&sandbox, &wt);
+
+    let stopped = poll_until(|| !stack_up(&sandbox, "demo"));
+    assert!(stopped, "{text} {:?}", sandbox.calls("supabase"));
+    let update = ["update", "--restart=no", "supabase_db_demo"].map(str::to_owned);
+    assert!(sandbox.calls("docker").contains(&update.to_vec()));
+}
+
+#[test]
+fn a_stack_start_leaves_out_the_services_devlab_json_excludes() {
+    let (sandbox, world) = lab();
+    let wt = world.worktree("demo-lean");
+    let config = wt.join("devlab.json");
+    let text = fs::read_to_string(&config).expect("read devlab.json");
+    let lean = text.replace(
+        r#""cli": "supabase""#,
+        r#""cli": "supabase", "exclude": ["studio", "edge-runtime"]"#,
+    );
+    assert_ne!(lean, text);
+    fs::write(&config, lean).expect("write devlab.json");
+
+    let held = owned(
+        &sandbox,
+        &wt,
+        &["acquire", "--no-device", "--stack", "--quiet"],
+    );
+
+    assert_eq!(held.code, 0, "{held:?}");
+    let start = ["start", "-x", "studio,edge-runtime"].map(str::to_owned);
+    assert!(
+        sandbox.calls("supabase").contains(&start.to_vec()),
         "{:?}",
         sandbox.calls("supabase")
     );

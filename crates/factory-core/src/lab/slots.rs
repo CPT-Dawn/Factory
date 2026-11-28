@@ -448,6 +448,7 @@ port = 54327
             supabase: Some(Supabase {
                 dir: "supabase".to_owned(),
                 cli: "bunx supabase".to_owned(),
+                exclude: Vec::new(),
             }),
             env: vec![(
                 "EXPO_PUBLIC_API_URL".to_owned(),

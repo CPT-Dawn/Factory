@@ -1,7 +1,9 @@
 //! What devlab's watcher did, inside the daemon (#18): an owner's leases are freed the moment
 //! the owner exits, watched through a pidfd rather than polled; a ready emulator no lease holds
-//! is stopped after `emulatorIdleMin`, and a stack devlab started on a slot no lease holds after
-//! `stackIdleMin`. A stack started outside devlab is never stopped. A device whose lease ran
+//! is stopped after `emulatorIdleMin`, and a stack devlab owns on a slot no lease holds after
+//! `stackIdleMin`. A stack is devlab's once a lease starts it or finds it running, with or
+//! without `--stack`, or once a new daemon finds it running on a slot nothing holds (#84); one
+//! no lease or daemon has seen run is never stopped. A device whose lease ran
 //! nothing for `deviceIdleMin` is taken from it while a waiter needs that kind of device (#57).
 //! The machine config is read again on each look, so a changed timer counts from the next one.
 
@@ -11,12 +13,11 @@ use std::time::Duration;
 
 use factory_adapters::adb::{Adb, AdbCli};
 use factory_adapters::emulator::{Emulators, SystemdEmulators};
-use factory_core::lab::devices::{Attached, Mode};
+use factory_core::lab::devices::{Attached, Mode, RESTORE_POWER};
 use factory_core::lab::emulator::{State, unit_name};
 use factory_core::lab::events as event;
 use factory_core::lab::idle::{self, IdleDevice, IdleEmulator, IdleSlot, Need, Timers};
 use factory_core::lab::js_number;
-use factory_core::lab::slots::slot_project_id;
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno;
 use rustix::process::{Pid, PidfdFlags, pidfd_open};
@@ -45,7 +46,54 @@ impl Lab {
                 self.watch_owner(lease);
             }
         }
+        let lab = Arc::clone(self);
+        on_thread("lab-adopt", move || lab.adopt_stacks());
         tokio::spawn(idle_loop(Arc::clone(self)));
+    }
+
+    /// Makes devlab's each stack that runs on a slot it knows while nothing holds the slot: one
+    /// an earlier daemon left, or that docker started again after a reboot. The idle timer then
+    /// stops it like any other (#84).
+    fn adopt_stacks(self: &Arc<Self>) {
+        let Ok(unheld) = self.write(|c, _| {
+            let leases = store::leases(c)?;
+            let mut holdings: Vec<_> = leases.iter().map(Lease::holding).collect();
+            holdings.extend(reservations::all(c)?.iter().map(|r| r.holding()));
+            Ok(store::slots(c)?
+                .into_iter()
+                .filter(|s| !s.stack_ours && !s.stopping)
+                .filter(|s| {
+                    !holdings.iter().any(|h| {
+                        h.project.as_deref() == Some(s.project.as_str()) && h.slot == Some(s.slot)
+                    })
+                })
+                .collect::<Vec<SlotRow>>())
+        }) else {
+            return;
+        };
+        // Docker is asked outside the store's transaction.
+        let running: Vec<(SlotRow, String)> = unheld
+            .into_iter()
+            .filter_map(|s| {
+                let id = stack::slot_stack_id(&s);
+                stack::running(&id).then_some((s, id))
+            })
+            .collect();
+        if running.is_empty() {
+            return;
+        }
+        let now = now_ms() / 1000;
+        for (row, id) in &running {
+            stack::keep_down_after_reboot(id, &mut |warning| eprintln!("factory: lab: {warning}"));
+            let adopted = self.write(|c, _| store::adopt_stack(c, &row.project, row.slot, id, now));
+            if adopted.is_ok_and(|took| took) {
+                eprintln!(
+                    "factory: lab: the stack of {} slot {} runs with no lease: devlab's now, stopped once idle",
+                    row.project, row.slot
+                );
+            }
+        }
+        self.notify();
     }
 
     /// Watches the owner of `lease`, once per owner: when it exits, its leases are dropped.
@@ -122,7 +170,6 @@ impl Lab {
                                 h.project.as_deref() == Some(s.project.as_str())
                                     && h.slot == Some(s.slot)
                             }),
-                        last_worktree: s.last_worktree.clone(),
                         idle_since: s.idle_since,
                     })
                     .collect();
@@ -187,7 +234,11 @@ impl Lab {
         let (emulators, slots, reclaimed, next) = claimed;
         if !reclaimed.is_empty() {
             self.notify();
-            take_back_reverses_on_thread(self.attached.borrow().shown.clone(), reclaimed);
+            take_back_reverses_on_thread(
+                self.attached.borrow().shown.clone(),
+                reclaimed,
+                Power::Leave,
+            );
         }
         for row in emulators {
             let lab = Arc::clone(self);
@@ -218,22 +269,19 @@ impl Lab {
         );
     }
 
-    /// Stops a claimed slot's stack with the config of the worktree it last ran, and stops
-    /// counting it as devlab's whether or not that worked, as the watcher did.
+    /// Stops a claimed slot's stack by its project id, and stops counting it as devlab's once
+    /// that worked: one that failed to stop is still devlab's, and the next look tries again
+    /// (#84).
     fn stop_stack(&self, row: &SlotRow, minutes: &str) {
-        let worktree = row.last_worktree.clone().unwrap_or_default();
-        let stopped = match context::project_config(&worktree) {
-            Ok(Some(p)) => {
-                let project_id = match stack::info(&p, &worktree, row.slot) {
-                    Ok(Some(info)) => info.project_id,
-                    _ => slot_project_id(&row.project, row.slot),
-                };
-                stack::down(&p, &project_id, &worktree).map_err(|f| f.message)
+        let stopped = stack::down_slot(row).map_err(|f| f.message);
+        let _ = self.write(|c, _| {
+            if stopped.is_ok() {
+                store::disown_stack(c, &row.project, row.slot)
+            } else {
+                // Tried again after another idle span, not at once on every look.
+                store::idle_again(c, &row.project, row.slot, now_ms() / 1000)
             }
-            Ok(None) => Err(format!("{worktree}/devlab.json is gone")),
-            Err(f) => Err(f.message),
-        };
-        let _ = self.write(|c, _| store::set_stack_ours(c, &row.project, row.slot, false));
+        });
         lock_ignoring_poison(&self.stopping)
             .slots
             .remove(&(row.project.clone(), row.slot));
@@ -397,32 +445,46 @@ fn owner_exit(pid: i64, start: &str) -> bool {
     }
 }
 
+/// What a device's power gets as a lease lets go of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Power {
+    /// The lease ended: what a battery-measuring run of it faked is undone ([RESTORE_POWER]).
+    Restore,
+    /// The device was reclaimed for a waiter and may be granted again already: its power is
+    /// left alone, as the next grant's prep resets the battery itself (#84).
+    Leave,
+}
+
 /// Takes back the reverses dropped leases' devices were given, beside the caller.
-pub fn take_back_reverses_on_thread(attached: Option<Vec<Attached>>, leases: Vec<Lease>) {
+pub fn take_back_reverses_on_thread(
+    attached: Option<Vec<Attached>>,
+    leases: Vec<Lease>,
+    power: Power,
+) {
     if leases.iter().all(|l| l.devices.is_empty()) {
         return;
     }
     on_thread("lab-unreverse", move || {
-        take_back_reverses(attached.as_deref(), &leases);
+        take_back_reverses(attached.as_deref(), &leases, power);
     });
 }
 
 /// Takes back the reverses of each lease's project on its devices that adb lists as usable
-/// (all of them before adb's first list), as devlab's release did.
-pub fn take_back_reverses(attached: Option<&[Attached]>, leases: &[Lease]) {
+/// (all of them before adb's first list), as devlab's release did, and with [`Power::Restore`]
+/// undoes what a battery-measuring run faked on them (#84).
+pub fn take_back_reverses(attached: Option<&[Attached]>, leases: &[Lease], power: Power) {
     for lease in leases.iter().filter(|l| !l.devices.is_empty()) {
-        let Ok(Some(p)) = context::project_config(&lease.worktree) else {
-            continue;
+        let ports: Vec<u32> = match context::project_config(&lease.worktree) {
+            Ok(Some(p)) => {
+                let env = lease::lease_env(lease, Some(&p)).unwrap_or_default();
+                lease::reverse_ports(&p, &env)
+                    .into_iter()
+                    .map(|(on_device, _)| on_device)
+                    .filter(|port| *port > 0)
+                    .collect()
+            }
+            _ => Vec::new(),
         };
-        if p.reverse.is_empty() {
-            continue;
-        }
-        let env = lease::lease_env(lease, Some(&p)).unwrap_or_default();
-        let ports: Vec<u32> = lease::reverse_ports(&p, &env)
-            .into_iter()
-            .map(|(on_device, _)| on_device)
-            .filter(|port| *port > 0)
-            .collect();
         for d in &lease.devices {
             let usable = attached.is_none_or(|list| {
                 list.iter()
@@ -432,9 +494,18 @@ pub fn take_back_reverses(attached: Option<&[Attached]>, leases: &[Lease]) {
                 for port in &ports {
                     AdbCli.unreverse(&d.serial, *port);
                 }
+                if power == Power::Restore {
+                    restore_power(&d.serial);
+                }
             }
         }
     }
+}
+
+/// Puts the device's real battery back and stops forcing doze, as a lease that may have faked
+/// them for a measurement ends: a phone left on a faked "unplugged" battery sleeps.
+fn restore_power(serial: &str) {
+    AdbCli.shell(serial, RESTORE_POWER);
 }
 
 /// Runs `work` on a thread of its own, named `name`.

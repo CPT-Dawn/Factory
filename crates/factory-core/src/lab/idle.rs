@@ -1,7 +1,6 @@
 //! What the daemon stops because nothing used it for long enough, as devlab's watcher did
-//! (#18): a ready emulator no lease holds, after the emulator timer, and a stack devlab started
-//! on a slot no lease holds, after the stack timer. A stack started outside devlab is never
-//! stopped. And what it takes back (#57): a device whose lease ran nothing for the device timer,
+//! (#18): a ready emulator no lease holds, after the emulator timer, and a stack devlab owns on
+//! a slot no lease holds, after the stack timer. A stack that isn't devlab's is never stopped. And what it takes back (#57): a device whose lease ran nothing for the device timer,
 //! only while a waiter needs that kind of device.
 
 use super::devices::Mode;
@@ -43,12 +42,10 @@ pub struct IdleEmulator {
 pub struct IdleSlot {
     pub project: String,
     pub slot: u32,
-    /// devlab started its stack.
+    /// Its stack is devlab's: a lease started or claimed it, or a daemon adopted it (#84).
     pub stack_ours: bool,
     /// A lease holds the slot.
     pub held: bool,
-    /// The worktree it last ran, whose config its stack is stopped with.
-    pub last_worktree: Option<String>,
     /// Since when no lease holds it, in seconds since the epoch.
     pub idle_since: Option<i64>,
 }
@@ -137,7 +134,8 @@ pub fn sweep(
             }
         }
     }
-    let stoppable = |s: &&IdleSlot| s.stack_ours && !s.held && s.last_worktree.is_some();
+    // One with no worktree on record is stopped by its project id all the same (#84).
+    let stoppable = |s: &&IdleSlot| s.stack_ours && !s.held;
     for s in slots.iter().filter(stoppable) {
         if let Some(at) = falls_due(s.idle_since, timers.stack_sec) {
             if at <= now {
