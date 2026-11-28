@@ -6,7 +6,7 @@ One binary, `factory`:
 
 - `factory lab` (also answers to `devlab`): leases phones, emulators and local stack slots between agents.
 - `factory review`: routes a code review to the first reviewer with quota left (Antigravity, then Codex, then Claude).
-- `factory wait ci|review|lead|lease`: blocks on the daemon, silently, until a PR's checks finish (or main's latest head's, with `wait ci main`), a review ends, a lead finishes or needs attention, or a lab lease is held no more, then prints one line. `wait ci` and `wait lead` take `--notify`: the command returns at once, and the daemon posts the line into the asking Claude Code session when the wait ends. That event delivery stays off until `[notify] enabled = true` in the config; [docs/notify-night.md](docs/notify-night.md) is the supervised-night checklist.
+- `factory wait ci|review|lead|lease`: blocks on the daemon, silently, until a PR's checks finish (or main's latest head's, with `wait ci main`), a review ends, a lead finishes or needs attention, or a lab lease is held no more, then prints one line. `wait lead --any <slug>…` waits on several leads and answers with the first to settle. `wait ci` and `wait lead` take `--notify`: the command returns at once, and the daemon posts the line into the asking Claude Code session when the wait ends. That event delivery stays off until `[notify] enabled = true` in the config; [docs/notify-night.md](docs/notify-night.md) is the supervised-night checklist.
 - `factory cutover`: hands the `devlab` name from today's TypeScript devlab to factory lab, and `--rollback` gives it back ([docs/cutover.md](docs/cutover.md)).
 - `factory lead`, `factory monitor`, `factory log`, `factory hook`, `factory status`.
 

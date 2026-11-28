@@ -136,17 +136,19 @@ fn run(command: Command, json: bool) -> ExitCode {
         Command::Wait {
             command:
                 WaitCommand::Lead {
-                    lead,
+                    leads,
+                    any,
                     timeout,
                     notify,
                 },
-        } => {
-            if notify {
-                lead::notify(&lead, timeout.unwrap_or(notify::TIMEOUT))
-            } else {
-                lead::wait(&lead, timeout.unwrap_or(WAIT_TIMEOUT))
-            }
-        }
+        } => match (leads.as_slice(), any) {
+            (_, true) => lead::wait_any(&leads, timeout.unwrap_or(WAIT_TIMEOUT)),
+            ([lead], false) if notify => lead::notify(lead, timeout.unwrap_or(notify::TIMEOUT)),
+            ([lead], false) => lead::wait(lead, timeout.unwrap_or(WAIT_TIMEOUT)),
+            _ => Err(output::Failure::usage(
+                "factory wait lead takes one lead; wait on several with --any",
+            )),
+        },
         Command::Wait {
             command:
                 WaitCommand::Ci {
@@ -178,6 +180,8 @@ fn run(command: Command, json: bool) -> ExitCode {
             tier,
             skill,
             escalation,
+            standalone,
+            follow_up,
         } => review::run(&review::Args {
             base,
             label,
@@ -187,6 +191,8 @@ fn run(command: Command, json: bool) -> ExitCode {
             tier,
             skill,
             escalation,
+            standalone,
+            follow_up,
         })
         // review.sh's failures said so, and factory-stats' classifier still matches the text.
         .map_err(|failure| Failure::new(failure.exit, format!("code-review: {}", failure.message))),

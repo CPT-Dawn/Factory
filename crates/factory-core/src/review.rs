@@ -66,14 +66,25 @@ impl<'a> Place<'a> {
             Some(rest) => (rest, true),
             None => (label, false),
         };
+        // One spelling per round: a prefix, and a number with no leading zero, so `t1-r02` is
+        // no second `t1-r2`.
         let parsed = rest.rsplit_once("-r").and_then(|(prefix, n)| {
             let digits = !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
-            Some((prefix, n.parse::<u32>().ok().filter(|_| digits)?))
+            let canonical = digits && !prefix.is_empty() && (n == "0" || !n.starts_with('0'));
+            Some((prefix, n.parse::<u32>().ok().filter(|_| canonical)?))
         });
         match parsed {
             Some((prefix, n)) if light => Place::Light { prefix, after: n },
             Some((prefix, n)) => Place::Round { prefix, n },
             None => Place::Single,
+        }
+    }
+
+    /// The prefix of a ticket's round or light review; none for a review on its own.
+    pub fn prefix(&self) -> Option<&'a str> {
+        match *self {
+            Place::Round { prefix, .. } | Place::Light { prefix, .. } => Some(prefix),
+            Place::Single => None,
         }
     }
 
@@ -88,12 +99,46 @@ impl<'a> Place<'a> {
     }
 }
 
-/// Holds a label to the round cap: rounds 1 to `CAP` always, the two after only for an
-/// escalation, the light review only after round `CAP` or `ESCALATION_CAP`. A refusal is the
-/// one line that says so and what to do instead.
-pub fn admit(label: &str, escalation: bool) -> Result<(), String> {
+/// What the caller asked of a review besides its label.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Asked<'a> {
+    /// An escalation's review, which may run rounds 3 and 4.
+    pub escalation: bool,
+    /// A review outside a ticket's rounds (a retro's), whose label names no round.
+    pub standalone: bool,
+    /// The follow-up issue a new round 1 reviews work for, past another prefix's cap.
+    pub follow_up: Option<&'a str>,
+}
+
+/// Holds a label to the round cap: a label names its round (`<prefix>-rN` or
+/// `<prefix>-rN-light`) unless the review is standalone; rounds 1 to `CAP` always, the two
+/// after only for an escalation, the light review only after round `CAP` or
+/// `ESCALATION_CAP`. A refusal is the one line that says so and what to do instead.
+pub fn admit(label: &str, asked: &Asked<'_>) -> Result<(), String> {
     let report = "report what is still open as open in your final report";
-    match Place::of(label) {
+    let escalation = asked.escalation;
+    let place = Place::of(label);
+    match place {
+        Place::Single if !asked.standalone => {
+            return Err(format!(
+                "{label} names no review round: label a ticket's review <prefix>-rN (<prefix>-rN-light after the last round), or pass --standalone for a review outside a ticket, such as a retro's"
+            ));
+        }
+        Place::Round { .. } | Place::Light { .. } if asked.standalone => {
+            return Err(format!(
+                "--standalone is for a review outside a ticket's rounds, not {label}"
+            ));
+        }
+        Place::Single | Place::Round { n: 2.., .. } | Place::Light { .. }
+            if asked.follow_up.is_some() =>
+        {
+            return Err(format!(
+                "--follow-up opens a follow-up issue's first round, <prefix>-r1, not {label}"
+            ));
+        }
+        _ => {}
+    }
+    match place {
         Place::Single if escalation => Err(format!(
             "--escalation is for rounds {} and {ESCALATION_CAP} of a label <prefix>-rN, not {label}",
             CAP + 1
@@ -118,6 +163,81 @@ pub fn admit(label: &str, escalation: bool) -> Result<(), String> {
             "{label}: a light review follows the last round, {prefix}-r{CAP} or an escalation's {prefix}-r{ESCALATION_CAP}"
         )),
         Place::Light { .. } => Ok(()),
+    }
+}
+
+/// A review the event ledger holds for a repo, one that ran to a report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Past<'a> {
+    pub label: &'a str,
+    /// The base it was asked to review from, as the caller named it.
+    pub base: &'a str,
+    /// The commit that base named then (short), empty in an event older than the field.
+    pub base_commit: &'a str,
+    /// The head it reviewed, as the event has it (short).
+    pub head: &'a str,
+}
+
+/// What the event ledger says about one repo's reviews: those that ran, and the prefixes a
+/// lead escalated (an `escalation` event naming the prefix).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct History<'a> {
+    pub repo: &'a str,
+    pub reviews: Vec<Past<'a>>,
+    pub escalated: Vec<&'a str>,
+}
+
+impl History<'_> {
+    /// Whether `prefix` has run the last review it may: its light review, round
+    /// `ESCALATION_CAP`, or round `CAP` when no lead escalated it.
+    pub fn capped(&self, prefix: &str) -> bool {
+        let escalated = self.escalated.contains(&prefix);
+        self.reviews.iter().any(|past| match Place::of(past.label) {
+            Place::Light { prefix: of, .. } => of == prefix,
+            Place::Round { prefix: of, n } => {
+                of == prefix && (n >= ESCALATION_CAP || (n >= CAP && !escalated))
+            }
+            Place::Single => false,
+        })
+    }
+}
+
+/// Holds a review to what the ledger says: `--escalation` only for a prefix a lead escalated,
+/// and a new round 1 or a standalone review never on work a prefix reviewed to its cap, unless
+/// it is a follow-up issue's. `same` says whether a past review's head is this review's work.
+pub fn hold(
+    label: &str,
+    asked: &Asked<'_>,
+    history: &History<'_>,
+    same: impl Fn(&Past<'_>) -> bool,
+) -> Result<(), String> {
+    let place = Place::of(label);
+    // Past round `CAP` is an escalation's, whether the caller says so or not.
+    let escalates = asked.escalation
+        || matches!(place, Place::Round { n, .. } | Place::Light { after: n, .. } if n > CAP);
+    if let Some(prefix) = place.prefix()
+        && escalates
+        && !history.escalated.contains(&prefix)
+    {
+        return Err(format!(
+            "--escalation needs an escalation event for {prefix} in the ledger, which the lead logs when it re-dispatches the ticket (factory log escalation repo={} prefix={prefix}): without one, report what is still open as open in your final report",
+            history.repo
+        ));
+    }
+    let fresh = matches!(place, Place::Single | Place::Round { n: 1, .. });
+    if !fresh || asked.follow_up.is_some() {
+        return Ok(());
+    }
+    let spent = history.reviews.iter().find_map(|past| {
+        let prefix = Place::of(past.label).prefix()?;
+        (history.capped(prefix) && same(past)).then_some((past, prefix))
+    });
+    match spent {
+        Some((past, prefix)) => Err(format!(
+            "{label}: {} was reviewed as {}, and {prefix} has used its review cap: file a follow-up issue for what is still open and review its work with --follow-up #<issue>",
+            past.head, past.label
+        )),
+        None => Ok(()),
     }
 }
 
@@ -877,6 +997,8 @@ pub struct Record<'a> {
     pub label: &'a str,
     pub round: u32,
     pub base: &'a str,
+    /// The commit the base named when the review ran.
+    pub base_commit: &'a str,
     pub head: &'a str,
     pub spec: &'a str,
     /// The pool that ran the review, logged as `backend` and `pool`.
@@ -906,6 +1028,8 @@ pub struct Record<'a> {
     pub findings: &'a str,
     /// On a fix round, the head the previous round reviewed, where its diff started.
     pub from: &'a str,
+    /// The follow-up issue a new round 1 reviews, past another prefix's cap.
+    pub follow_up: &'a str,
     /// What the report says, or why the run failed.
     pub result: Result<&'a Reading, &'a str>,
 }
@@ -923,10 +1047,12 @@ impl Record<'_> {
             format!("label={}", self.label),
             format!("round={}", self.round),
             format!("base={}", self.base),
+            format!("base_commit={}", short(self.base_commit)),
             format!("from={}", short(self.from)),
             format!("head={}", short(self.head)),
             format!("branch={}", self.branch),
             format!("spec={}", self.spec),
+            format!("follow_up={}", self.follow_up),
             format!("outcome={outcome}"),
             format!("verdict={verdict}"),
             format!("reason={reason}"),
@@ -1035,7 +1161,7 @@ mod tests {
     #[test]
     fn the_cap_admits_rounds_1_and_2_then_3_and_4_for_an_escalation_then_one_light_review() {
         for (label, escalation, admitted) in [
-            ("t1", false, true),
+            ("t1", false, false),
             ("t1", true, false),
             ("t1-r0", false, false),
             ("t1-r1", false, true),
@@ -1051,11 +1177,205 @@ mod tests {
             ("t1-r4-light", false, true),
             ("spec-x-r2", false, true),
         ] {
+            let ask = Asked {
+                escalation,
+                ..Asked::default()
+            };
             assert_eq!(
-                admit(label, escalation).is_ok(),
+                admit(label, &ask).is_ok(),
                 admitted,
                 "{label} escalation={escalation}: {:?}",
-                admit(label, escalation)
+                admit(label, &ask)
+            );
+        }
+    }
+
+    #[test]
+    fn a_label_with_no_round_runs_only_as_a_standalone_review() {
+        let standalone = Asked {
+            standalone: true,
+            ..Asked::default()
+        };
+        for label in [
+            "retro-lab",
+            "t434-r5-light-2",
+            "retro-lab-light2",
+            "t1-r",
+            "-r1",
+            "-r2-light",
+            "t1-r02",
+            "t1-r02-light",
+        ] {
+            assert_eq!(
+                admit(label, &Asked::default()),
+                Err(format!(
+                    "{label} names no review round: label a ticket's review <prefix>-rN (<prefix>-rN-light after the last round), or pass --standalone for a review outside a ticket, such as a retro's"
+                )),
+                "{label}"
+            );
+            assert_eq!(admit(label, &standalone), Ok(()), "{label}");
+        }
+        for label in ["t1-r1", "t1-r2-light"] {
+            assert_eq!(
+                admit(label, &standalone),
+                Err(format!(
+                    "--standalone is for a review outside a ticket's rounds, not {label}"
+                )),
+                "{label}"
+            );
+        }
+        let both = Asked {
+            standalone: true,
+            escalation: true,
+            ..Asked::default()
+        };
+        assert!(admit("retro", &both).is_err());
+        let follow_up = Asked {
+            standalone: true,
+            follow_up: Some("#7"),
+            ..Asked::default()
+        };
+        assert_eq!(
+            admit("retro", &follow_up),
+            Err(
+                "--follow-up opens a follow-up issue's first round, <prefix>-r1, not retro"
+                    .to_owned()
+            )
+        );
+    }
+
+    fn past<'a>(label: &'a str, head: &'a str) -> Past<'a> {
+        Past {
+            label,
+            base: "main",
+            base_commit: "",
+            head,
+        }
+    }
+
+    #[test]
+    fn a_prefix_uses_its_cap_at_round_2_round_4_once_escalated_or_its_light_review() {
+        let history = |labels: &[&'static str], escalated: &[&'static str]| History {
+            repo: "repo",
+            reviews: labels.iter().map(|label| past(label, "h")).collect(),
+            escalated: escalated.to_vec(),
+        };
+        for (labels, escalated, capped) in [
+            (&["t1-r1"][..], &[][..], false),
+            (&["t1-r1", "t1-r2"], &[], true),
+            (&["t1-r1", "t1-r2"], &["t1"], false),
+            (&["t1-r3", "t1-r4"], &["t1"], true),
+            (&["t1-r2-light"], &["t1"], true),
+            (&["t10-r2", "t1x-r2", "t1"], &[], false),
+        ] {
+            assert_eq!(
+                history(labels, escalated).capped("t1"),
+                capped,
+                "{labels:?} escalated {escalated:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn escalation_needs_the_leads_escalation_event_for_its_prefix() {
+        let asked = Asked {
+            escalation: true,
+            ..Asked::default()
+        };
+        let history = History {
+            repo: "repo",
+            reviews: vec![past("t1-r1", "a"), past("t1-r2", "b")],
+            escalated: vec!["t2"],
+        };
+        assert_eq!(
+            hold("t1-r3", &asked, &history, |_| false),
+            Err("--escalation needs an escalation event for t1 in the ledger, which the lead logs when it re-dispatches the ticket (factory log escalation repo=repo prefix=t1): without one, report what is still open as open in your final report".to_owned())
+        );
+        let escalated = History {
+            escalated: vec!["t1"],
+            ..history.clone()
+        };
+        assert_eq!(hold("t1-r3", &asked, &escalated, |_| false), Ok(()));
+        // A light review past round 2 is an escalation's too, flag or no flag.
+        for (label, asked) in [
+            ("t1-r2-light", asked),
+            ("t1-r4-light", asked),
+            ("t1-r4-light", Asked::default()),
+        ] {
+            assert!(
+                hold(label, &asked, &history, |_| false).is_err(),
+                "{label} {asked:?}"
+            );
+            assert_eq!(
+                hold(label, &asked, &escalated, |_| false),
+                Ok(()),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            hold("t1-r2-light", &Asked::default(), &history, |_| false),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_new_round_1_on_work_a_capped_prefix_reviewed_is_refused_unless_a_follow_up() {
+        let history = History {
+            repo: "repo",
+            reviews: vec![
+                past("t1-r1", "aaaa"),
+                past("t1-r2", "bbbb"),
+                past("t2-r1", "cccc"),
+            ],
+            escalated: vec![],
+        };
+        let refused = "t1fix-r1: bbbb was reviewed as t1-r2, and t1 has used its review cap: file a follow-up issue for what is still open and review its work with --follow-up #<issue>".to_owned();
+        let same = |head: &'static str| move |past: &Past<'_>| past.head == head;
+        assert_eq!(
+            hold("t1fix-r1", &Asked::default(), &history, same("bbbb")),
+            Err(refused)
+        );
+        assert!(hold("t1fix-r1", &Asked::default(), &history, same("aaaa")).is_err());
+        let standalone = Asked {
+            standalone: true,
+            ..Asked::default()
+        };
+        assert!(hold("retro", &standalone, &history, same("aaaa")).is_err());
+        // t2 has not used its cap, and later rounds continue their own work.
+        assert_eq!(
+            hold("t3-r1", &Asked::default(), &history, same("cccc")),
+            Ok(())
+        );
+        assert_eq!(
+            hold("t1-r2-light", &Asked::default(), &history, same("bbbb")),
+            Ok(())
+        );
+        let follow_up = Asked {
+            follow_up: Some("#9"),
+            ..Asked::default()
+        };
+        assert_eq!(hold("t9-r1", &follow_up, &history, same("bbbb")), Ok(()));
+    }
+
+    #[test]
+    fn a_follow_up_names_the_first_round_of_its_review() {
+        let follow_up = |label| {
+            admit(
+                label,
+                &Asked {
+                    follow_up: Some("#7"),
+                    ..Asked::default()
+                },
+            )
+        };
+        assert_eq!(follow_up("t1fix-r1"), Ok(()));
+        for label in ["t1fix-r2", "t1fix-r2-light"] {
+            assert_eq!(
+                follow_up(label),
+                Err(format!(
+                    "--follow-up opens a follow-up issue's first round, <prefix>-r1, not {label}"
+                )),
+                "{label}"
             );
         }
     }
@@ -1498,6 +1818,7 @@ diff --git a/README.md b/README.md
             label: "t1-r1",
             round: 1,
             base: "main",
+            base_commit: "0123456789abcdef",
             head: "abcdef0123456789",
             spec: "none",
             backend: "codex",
@@ -1517,6 +1838,7 @@ diff --git a/README.md b/README.md
             stream: "r.jsonl",
             findings: "r.findings.json",
             from: "",
+            follow_up: "",
             result,
         }
     }
@@ -1537,6 +1859,7 @@ diff --git a/README.md b/README.md
             "duration_s=7",
             "skipped=agy",
             "head=abcdef01",
+            "base_commit=01234567",
             "tier=standard",
             "tier_source=default",
             "pool=codex",

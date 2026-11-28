@@ -4,9 +4,12 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use factory_adapters::git::{GitRepo, Repo};
+use factory_core::duration;
 use factory_core::exit::Exit;
 use factory_core::lead::{self, lead_name};
 use serde_json::{Value, json};
@@ -138,6 +141,55 @@ pub fn wait(lead: &str, timeout: Duration) -> Result<Done, Failure> {
     let mut done = shown(&answer.lead, exit);
     done.json = serde_json::to_value(&answer).unwrap_or(Value::Null);
     Ok(done)
+}
+
+/// `factory wait lead --any`: one wait per lead, each held by the daemon as `wait` holds it,
+/// answered by the first that settles. A lead the daemon refuses fails the whole wait at once;
+/// the time runs out once every wait's has.
+pub fn wait_any(leads: &[String], timeout: Duration) -> Result<Done, Failure> {
+    let mut names: Vec<String> = Vec::new();
+    for lead in leads {
+        let name = lead_name(lead).map_err(|e| Failure::usage(e.to_string()))?;
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    for name in &names {
+        let (tx, name) = (tx.clone(), name.clone());
+        // Detached: the CLI exits with the first answer, and the others' connections close
+        // with it, which the daemon takes as their callers gone.
+        let worker = thread::Builder::new().spawn({
+            let name = name.clone();
+            move || {
+                let _ = tx.send(wait(&name, timeout));
+            }
+        });
+        if let Err(e) = worker {
+            return Err(Failure::new(
+                Exit::Precondition,
+                format!("could not start the wait on {name}: {e}; wait on fewer leads"),
+            ));
+        }
+    }
+    drop(tx);
+    let mut timed_out = 0;
+    while let Ok(answer) = rx.recv() {
+        match answer {
+            Err(failure) if failure.exit == Exit::Timeout => timed_out += 1,
+            answer => return answer,
+        }
+    }
+    let message = if timed_out == names.len() {
+        format!(
+            "none of {} settled within {}; wait again, or see factory lead list",
+            names.join(", "),
+            duration::show(timeout)
+        )
+    } else {
+        "a lead's wait ended without an answer; wait again".to_owned()
+    };
+    Err(Failure::new(Exit::Timeout, message))
 }
 
 /// `factory wait lead --notify`: registers the wait, and the daemon posts its line when it ends.

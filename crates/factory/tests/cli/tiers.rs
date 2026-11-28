@@ -1048,6 +1048,12 @@ fn round_2_reviews_only_the_fix_with_the_previous_report_and_logs_where_it_start
         "{event}"
     );
 
+    let name = lab.repo.file_name().unwrap().to_str().unwrap().to_owned();
+    let logged = lab.sandbox.factory_in(
+        &lab.repo,
+        &["log", "escalation", &format!("repo={name}"), "prefix=t10"],
+    );
+    assert_eq!(logged.code, 0, "{logged:?}");
     let again = lab.review(&[
         "base",
         "t10-r3",

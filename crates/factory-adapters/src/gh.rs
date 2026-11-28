@@ -39,6 +39,8 @@ pub trait Issues {
     /// The issue `issue` names (a number, or an issue URL) as Markdown: `# #<number> <title>`,
     /// a blank line, then its body.
     fn issue(&self, issue: &str) -> Result<String, GhError>;
+    /// The URL of the issue `issue` names: one issue under any spelling.
+    fn url(&self, issue: &str) -> Result<String, GhError>;
 }
 
 /// The issues `gh` on PATH sees from the working directory.
@@ -46,25 +48,37 @@ pub struct Gh;
 
 impl Issues for Gh {
     fn issue(&self, issue: &str) -> Result<String, GhError> {
-        let mut cmd = Command::new("gh");
-        cmd.args(["issue", "view", issue])
-            .args(["--json", "number,title,body", "--template", TEMPLATE])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let output = process::run(cmd, TIMEOUT).map_err(|e| GhError(e.to_string()))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GhError(
-                stderr
-                    .lines()
-                    .next()
-                    .unwrap_or("it failed and said nothing")
-                    .to_owned(),
-            ));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        view(
+            issue,
+            &["--json", "number,title,body", "--template", TEMPLATE],
+        )
     }
+
+    fn url(&self, issue: &str) -> Result<String, GhError> {
+        view(issue, &["--json", "url", "--jq", ".url"]).map(|url| url.trim().to_owned())
+    }
+}
+
+/// What `gh issue view <issue> <fields…>` prints, or the first line of its complaint.
+fn view(issue: &str, fields: &[&str]) -> Result<String, GhError> {
+    let mut cmd = Command::new("gh");
+    cmd.args(["issue", "view", issue])
+        .args(fields)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = process::run(cmd, TIMEOUT).map_err(|e| GhError(e.to_string()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(GhError(
+            stderr
+                .lines()
+                .next()
+                .unwrap_or("it failed and said nothing")
+                .to_owned(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Issues held in memory, for tests of code that fetches them.
@@ -72,6 +86,8 @@ impl Issues for Gh {
 pub struct FakeIssues {
     /// Each known issue, as the caller names it, and its Markdown.
     pub issues: Vec<(String, String)>,
+    /// Each known issue, as the caller names it, and its URL.
+    pub urls: Vec<(String, String)>,
 }
 
 impl Issues for FakeIssues {
@@ -80,6 +96,14 @@ impl Issues for FakeIssues {
             .iter()
             .find(|(known, _)| known == issue)
             .map(|(_, text)| text.clone())
+            .ok_or_else(|| GhError(format!("no issue {issue}")))
+    }
+
+    fn url(&self, issue: &str) -> Result<String, GhError> {
+        self.urls
+            .iter()
+            .find(|(known, _)| known == issue)
+            .map(|(_, url)| url.clone())
             .ok_or_else(|| GhError(format!("no issue {issue}")))
     }
 }

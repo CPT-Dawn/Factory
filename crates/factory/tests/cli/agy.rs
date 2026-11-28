@@ -263,7 +263,7 @@ fn an_empty_usage_bucket_skips_agy_until_it_resets() {
     sandbox.fake("agy", &agy(&usage(0.0, reset), &agy_writes(CLEAN_REPORT)));
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
 
-    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     let shown = shown(&out.stdout);
@@ -276,7 +276,7 @@ fn an_empty_usage_bucket_skips_agy_until_it_resets() {
     assert!(reviews_run(&sandbox).is_empty(), "agy never reviews");
     assert_eq!(event(&sandbox, 0)["fallback_from"], "agy");
 
-    let later = sandbox.factory_in(&repo, &["review", "main", "t2"]);
+    let later = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t2"]);
 
     assert_eq!(later.code, 0, "{later:?}");
     assert_eq!(
@@ -293,8 +293,8 @@ fn the_usage_query_is_cached_for_reviews_close_together() {
     let repo = sandbox.repo();
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
 
-    let first = sandbox.factory_in(&repo, &["review", "main", "t1"]);
-    let second = sandbox.factory_in(&repo, &["review", "main", "t2"]);
+    let first = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
+    let second = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t2"]);
 
     assert_eq!((first.code, second.code), (0, 0), "{first:?} {second:?}");
     assert_eq!(reviews_run(&sandbox).len(), 2);
@@ -314,7 +314,7 @@ fn a_model_in_another_group_is_checked_against_that_groups_quota() {
         &agy(&usage(0.0, in_two_hours()), &agy_writes(CLEAN_REPORT)),
     );
 
-    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     assert_eq!(shown(&out.stdout)["backend"], "agy-claude", "{out:?}");
@@ -336,8 +336,8 @@ fn an_inactive_sandbox_is_reported_and_agy_is_skipped() {
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
-    let json = sandbox.factory_in(&repo, &["review", "--json", "main", "t2"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
+    let json = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t2"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     assert_eq!(out.stdout.lines().count(), 1, "{out:?}");
@@ -380,7 +380,7 @@ fn agys_individual_quota_error_cools_it_down_until_its_reset_and_codex_reruns_th
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
 
     let before = now_millis();
-    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t1"]);
     let after_run = now_millis();
 
     assert_eq!(out.code, 0, "{out:?}");
@@ -399,7 +399,7 @@ fn agys_individual_quota_error_cools_it_down_until_its_reset_and_codex_reruns_th
     );
     assert_eq!(event(&sandbox, 0)["fallback_from"], "agy");
 
-    let later = sandbox.factory_in(&repo, &["review", "main", "t2"]);
+    let later = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t2"]);
 
     assert_eq!(later.code, 0, "{later:?}");
     assert_eq!(reviews_run(&sandbox).len(), 1, "agy is cooling down");
@@ -416,7 +416,7 @@ fn any_other_agy_exit_3_is_a_failed_review() {
     sandbox.fake("agy", &agy(&usage_left(), &failed));
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
@@ -442,7 +442,7 @@ fn a_print_timeout_ends_the_review_as_a_timeout() {
         ),
     );
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 124, "{out:?}");
     assert!(
@@ -511,7 +511,7 @@ fn agy_reviews_a_throwaway_checkout_of_the_head_so_its_writes_leave_the_callers_
     let head = sandbox.git(&repo, &["rev-parse", "HEAD"]);
     let before = status(&sandbox, &repo);
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     assert_eq!(
@@ -587,7 +587,7 @@ fn agy_reviews_inside_a_write_guard_that_leaves_only_its_checkout_its_log_and_it
     let repo = sandbox.repo();
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     let runs = guards_of(&sandbox, "agy");
@@ -708,7 +708,7 @@ fn an_api_key_review_reaches_no_session_bus() {
     );
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     assert!(
@@ -738,7 +738,7 @@ fn a_bus_proxy_that_cannot_start_skips_agy_in_its_words() {
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
 
-    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     assert!(
@@ -773,7 +773,7 @@ fn a_write_guard_that_cannot_start_skips_agy_and_codex_reviews() {
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
 
-    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     assert!(
@@ -809,7 +809,7 @@ fn with_no_user_namespaces_an_agy_only_chain_refuses_the_review_in_one_line() {
     sandbox.fake("bwrap", BWRAP_PASSES);
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stdout, "", "{out:?}");
@@ -846,7 +846,7 @@ fn agys_state_behind_a_symlink_is_given_back_where_it_lives() {
     std::os::unix::fs::symlink(&dotfiles, sandbox.path("home/.gemini")).unwrap();
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     let runs = guards_of(&sandbox, "agy");
@@ -868,7 +868,10 @@ fn agy_reviews_from_the_same_subdirectory_of_its_checkout() {
     sandbox.git(&repo, &["commit", "-q", "-m", "docs: add a spec"]);
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
 
-    let out = sandbox.factory_in(&repo.join("docs"), &["review", "main", "t1", "spec.md"]);
+    let out = sandbox.factory_in(
+        &repo.join("docs"),
+        &["review", "--standalone", "main", "t1", "spec.md"],
+    );
 
     assert_eq!(out.code, 0, "{out:?}");
     let cwd = agys_cwd(&sandbox);
@@ -887,7 +890,7 @@ fn agys_checkout_is_removed_after_a_print_timeout() {
     sandbox.fake("agy", &agy(&usage_left(), &agy_scribbles(&timed_out)));
     let before = status(&sandbox, &repo);
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 124, "{out:?}");
     assert!(!agys_cwd(&sandbox).exists(), "its checkout is removed");
@@ -905,7 +908,7 @@ fn a_checkout_left_by_a_review_that_died_is_swept() {
     fs::write(left.join("a.txt"), "left\n").unwrap();
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     assert!(!left.exists(), "the dead review's checkout is swept");
@@ -929,7 +932,7 @@ fn a_review_whose_sandbox_did_not_start_is_reported_and_codex_reruns_it() {
     );
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
 
-    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     let shown = shown(&out.stdout);
@@ -960,7 +963,7 @@ fn a_review_whose_log_never_says_its_sandbox_started_is_not_trusted() {
     );
     sandbox.fake("codex", "cat > /dev/null\nexit 1");
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
@@ -1013,7 +1016,7 @@ fn with_no_model_configured_the_quota_checked_is_that_of_the_model_chosen_in_agy
     );
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
 
-    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     let shown = shown(&out.stdout);
@@ -1040,7 +1043,7 @@ fn with_no_model_chosen_anywhere_the_quota_checked_is_that_of_agys_default_gemin
         );
         sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
 
-        let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+        let out = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t1"]);
 
         assert_eq!(out.code, 0, "{chosen:?}: {out:?}");
         assert_eq!(
@@ -1070,7 +1073,7 @@ fn the_subscription_login_keeps_any_api_key_away_from_agy() {
     );
     sandbox.fake("agy", &agy(&usage_left(), &agy_notes_the_key(CLEAN_REPORT)));
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     assert_eq!(
@@ -1097,7 +1100,7 @@ fn an_api_key_runs_agy_on_the_gemini_api_without_a_usage_query() {
         ),
     );
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     assert_eq!(
@@ -1124,7 +1127,7 @@ fn an_api_key_backend_without_a_key_is_skipped() {
     );
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
@@ -1145,7 +1148,7 @@ fn auth_is_refused_on_a_backend_other_than_agy() {
         "[[review.backend]]\ncli = \"codex\"\nauth = \"api-key\"\n",
     );
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
@@ -1162,8 +1165,8 @@ fn an_inactive_sandbox_stays_reported_when_the_next_backend_fails() {
     sandbox.fake("agy", &agy(&usage_left(), &agy_writes(CLEAN_REPORT)));
     sandbox.fake("codex", "cat > /dev/null\nexit 1");
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
-    let json = sandbox.factory_in(&repo, &["review", "--json", "main", "t2"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
+    let json = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t2"]);
 
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
@@ -1206,7 +1209,7 @@ fn a_cached_usage_whose_empty_bucket_has_reset_is_asked_again() {
         &agy_usage_changes(&usage(0.0, reset), &usage_left(), &agy_writes(CLEAN_REPORT)),
     );
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
-    let first = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+    let first = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t1"]);
     assert_eq!(shown(&first.stdout)["backend"], "codex", "{first:?}");
     // The daemon cools agy down until the reset the cached answer names; wait until it no
     // longer does.
@@ -1215,7 +1218,7 @@ fn a_cached_usage_whose_empty_bucket_has_reset_is_asked_again() {
         "agy cools down for good"
     );
 
-    let later = sandbox.factory_in(&repo, &["review", "--json", "main", "t2"]);
+    let later = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t2"]);
 
     assert_eq!(later.code, 0, "{later:?}");
     assert_eq!(shown(&later.stdout)["backend"], "agy", "{later:?}");
@@ -1251,7 +1254,7 @@ fn what_agy_leaves_running_at_its_print_timeout_is_killed() {
         &agy(&usage_left(), &format!("{straggler}{timed_out}")),
     );
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 124, "{out:?}");
     let pid = fs::read_to_string(sandbox.path("bin/agy.straggler")).unwrap();
@@ -1266,13 +1269,20 @@ fn a_timeout_longer_than_a_week_is_refused_before_any_backend_runs() {
 
     let out = sandbox.factory_in(
         &repo,
-        &["review", "--timeout", "18446744073709551615", "main", "t1"],
+        &[
+            "review",
+            "--standalone",
+            "--timeout",
+            "18446744073709551615",
+            "main",
+            "t1",
+        ],
     );
     configure(
         &sandbox,
         "[[review.backend]]\ncli = \"agy\"\ntimeout = 604801\n",
     );
-    let configured = sandbox.factory_in(&repo, &["review", "main", "t2"]);
+    let configured = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t2"]);
 
     assert_eq!(out.code, 2, "{out:?}");
     assert_eq!(
@@ -1333,7 +1343,7 @@ fn agy_out_of_quota_is_not_granted_again_while_the_review_waits_for_codex() {
         "i=0\nwhile [ ! -e \"$0.gate\" ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done\n";
     sandbox.fake("codex", &format!("{gate}{}", codex_writes(CLEAN_REPORT)));
     let review = |label: &str| {
-        let mut cmd = sandbox.factory_command(&["review", "--json", "main", label]);
+        let mut cmd = sandbox.factory_command(&["review", "--standalone", "--json", "main", label]);
         cmd.current_dir(&repo);
         spawn(cmd)
     };
@@ -1623,8 +1633,8 @@ fn a_second_bar_within_five_minutes_asks_agy_nothing_and_routing_asks_again_afte
 
     // A review asks on its own cache, which the daemon's display never fills, and keeps it for
     // 120 s: a second review close behind asks nothing, and one after them asks again.
-    let first = sandbox.factory_in(&repo, &["review", "main", "t1"]);
-    let second = sandbox.factory_in(&repo, &["review", "main", "t2"]);
+    let first = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
+    let second = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t2"]);
     assert_eq!((first.code, second.code), (0, 0), "{first:?} {second:?}");
     assert_eq!(usage_queries(&sandbox), 2, "{:?}", sandbox.calls("agy"));
     let cache = sandbox.path("state/factory/agy-usage.json");
@@ -1634,7 +1644,7 @@ fn a_second_bar_within_five_minutes_asks_agy_nothing_and_routing_asks_again_afte
         .open(&cache)
         .and_then(|file| file.set_modified(stale))
         .expect("age the routing cache");
-    let third = sandbox.factory_in(&repo, &["review", "main", "t3"]);
+    let third = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t3"]);
     assert_eq!(third.code, 0, "{third:?}");
     assert_eq!(usage_queries(&sandbox), 3, "{:?}", sandbox.calls("agy"));
 

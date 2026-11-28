@@ -74,9 +74,17 @@ pub enum Command {
         #[arg(long, value_name = "FILE")]
         skill: Option<PathBuf>,
         /// An escalation's review, which may run rounds 3 and 4 (every ticket gets rounds 1 and 2,
-        /// and one light review, <prefix>-r2-light, after the last)
+        /// and one light review, <prefix>-r2-light, after the last); needs the lead's
+        /// escalation event for the prefix in the ledger
         #[arg(long)]
         escalation: bool,
+        /// A review outside a ticket's rounds, such as a retro's: its label names no -rN round
+        #[arg(long, conflicts_with = "escalation")]
+        standalone: bool,
+        /// The follow-up issue a new round 1 reviews, when its work was reviewed under a prefix
+        /// that used its cap: #12, 12, owner/repo#12 or an issue URL
+        #[arg(long, value_name = "ISSUE")]
+        follow_up: Option<String>,
     },
     /// Answer a Claude Code hook: its JSON on stdin, its hook protocol on stdout
     Hook {
@@ -188,8 +196,12 @@ pub enum MonitorCommand {
 pub enum WaitCommand {
     /// Until the lead finishes (exit 0), blocks, asks or dies (exit 10)
     Lead {
-        /// The lead's slug, or lead-<slug>
-        lead: String,
+        /// The lead's slug, or lead-<slug>; several with --any
+        #[arg(required = true, value_name = "LEAD")]
+        leads: Vec<String>,
+        /// Until the first of the leads finishes, blocks, asks or dies, with its line
+        #[arg(long, conflicts_with = "notify")]
+        any: bool,
         /// Give up after this long with exit 124: seconds, or 90s, 9m or 1h [default: 9m,
         /// or 2h with --notify]
         #[arg(long, value_parser = duration)]
