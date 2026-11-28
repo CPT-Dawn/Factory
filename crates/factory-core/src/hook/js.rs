@@ -313,10 +313,12 @@ impl Nesting {
                 let after_dot = two_before.is_some_and(|b| tokens[b].tok == Tok::Punct('.'));
                 let callback = word(before)
                     .is_some_and(|w| TIMERS.contains(&w) || (after_dot && CALLBACKS.contains(&w)));
-                // A grouping `(` that starts a callback's argument, as in `.then((() => …))`: what
-                // it holds is that argument.
-                let starts_argument =
-                    before.is_some_and(|b| matches!(tokens[b].tok, Tok::Punct('(' | ',')));
+                // A grouping `(` in a callback's argument, as in `.then((() => …))` or
+                // `.then(ok ? (() => …) : f)`: no call, since an operator or the argument's start
+                // comes before it, and what it holds may be the callback.
+                let starts_argument = before.is_some_and(
+                    |b| matches!(tokens[b].tok, Tok::Punct(c) if !matches!(c, ')' | ']' | '}')),
+                );
                 let in_callback = matches!(
                     self.open.last(),
                     Some(Bracket {

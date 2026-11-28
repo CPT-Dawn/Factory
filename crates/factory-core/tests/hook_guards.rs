@@ -277,6 +277,8 @@ fn a_repl_script_that_waits_more_than_once_is_denied() {
         "p.then(x, (async () => { await $`factory wait ci 1` }))",
         "setTimeout((async () => { await $`factory wait ci 1` }), 10)",
         "p.then(((() => $`factory wait ci 1`)))",
+        "p.then(ok ? (() => $`factory wait ci 1`) : handler)",
+        "p.then(f || (r => $`factory wait ci 1`))",
     ];
     let calls: Vec<Value> = codes.iter().map(|c| repl(c)).collect();
     assert_denied_with(&calls, WAIT_FIX);
@@ -305,6 +307,8 @@ fn one_awaited_wait_and_mere_mentions_pass() {
         "p.then(handler, (await $`factory wait ci 1`).text())",
         "p.then((handler), (await $`factory wait ci 1`).text())",
         "p.then(((await $`factory wait ci 1`)), handler)",
+        "p.then(ok ? (await $`factory wait ci 1`).text() : handler)",
+        "p.then(f(x => x), (await $`factory wait ci 1`).text())",
         "p.then((a, b) => a);\nawait $`factory wait ci 1`",
         "await x.then(r => r.text());\nawait $`factory wait ci 1`",
     ];
