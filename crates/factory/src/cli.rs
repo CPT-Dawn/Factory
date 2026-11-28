@@ -74,9 +74,17 @@ pub enum Command {
         #[arg(long, value_name = "FILE")]
         skill: Option<PathBuf>,
         /// An escalation's review, which may run rounds 3 and 4 (every ticket gets rounds 1 and 2,
-        /// and one light review, <prefix>-r2-light, after the last)
+        /// and one light review, <prefix>-r2-light, after the last); needs the lead's
+        /// escalation event for the prefix in the ledger
         #[arg(long)]
         escalation: bool,
+        /// A review outside a ticket's rounds, such as a retro's: its label names no -rN round
+        #[arg(long, conflicts_with = "escalation")]
+        standalone: bool,
+        /// The follow-up issue a new round 1 reviews, when its work was reviewed under a prefix
+        /// that used its cap: #12, 12, owner/repo#12 or an issue URL
+        #[arg(long, value_name = "ISSUE")]
+        follow_up: Option<String>,
     },
     /// Answer a Claude Code hook: its JSON on stdin, its hook protocol on stdout
     Hook {

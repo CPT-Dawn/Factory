@@ -551,7 +551,7 @@ fn a_report_without_a_ledger_is_read_by_its_findings_and_verdict_lines() {
         ),
     );
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 10, "{out:?}");
     let report = sandbox.reviews().join("t1.md");
@@ -576,7 +576,7 @@ fn a_report_with_neither_ledger_nor_verdict_fails_with_exit_3_naming_it() {
     let repo = sandbox.repo();
     sandbox.fake("codex", &codex_writes("I looked around.\n"));
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
@@ -593,10 +593,15 @@ fn a_rerun_under_the_same_label_does_not_read_the_last_runs_report() {
     let sandbox = Sandbox::new();
     let repo = sandbox.repo();
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
-    assert_eq!(sandbox.factory_in(&repo, &["review", "main", "t1"]).code, 0);
+    assert_eq!(
+        sandbox
+            .factory_in(&repo, &["review", "--standalone", "main", "t1"])
+            .code,
+        0
+    );
     sandbox.fake("codex", "exit 0");
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 3, "{out:?}");
     assert!(
@@ -624,7 +629,7 @@ fn a_run_that_fails_before_the_reviewer_starts_logs_no_report_or_stream() {
     )
     .unwrap();
 
-    let out = sandbox.factory_in(&repo, &["review", "nope", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "nope", "t1"]);
 
     assert_eq!(out.code, 2, "{out:?}");
     let lines = sandbox.ledger_lines();
@@ -654,7 +659,7 @@ fn an_event_that_cannot_be_logged_fails_the_run_in_one_line_naming_the_report() 
     fs::create_dir_all(sandbox.ledger().parent().unwrap()).unwrap();
     std::os::unix::fs::symlink("/dev/full", sandbox.ledger()).unwrap();
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stdout, "", "{out:?}");
@@ -1112,6 +1117,7 @@ fn an_escalations_round_3_continues_round_2s_ledger_and_round_5_is_refused() {
     let sandbox = Sandbox::new();
     let repo = sandbox.repo();
 
+    escalate(&sandbox, &repo, "t1");
     let third = rounds(
         &sandbox,
         &repo,
@@ -1140,6 +1146,153 @@ fn an_escalations_round_3_continues_round_2s_ledger_and_round_5_is_refused() {
         fifth.stderr,
         "factory: code-review: t1-r5 is past the review cap (2 rounds, 4 for an escalation): report what is still open as open in your final report\n"
     );
+}
+
+/// Logs the escalation event the lead lands when it re-dispatches `prefix`'s ticket.
+fn escalate(sandbox: &Sandbox, repo: &std::path::Path, prefix: &str) {
+    let out = sandbox.factory_in(
+        repo,
+        &[
+            "log",
+            "escalation",
+            "repo=repo",
+            &format!("prefix={prefix}"),
+        ],
+    );
+    assert_eq!(out.code, 0, "{out:?}");
+}
+
+#[test]
+fn an_escalation_with_no_escalation_event_for_its_prefix_is_refused() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    escalate(&sandbox, &repo, "t2");
+
+    let out = rounds(
+        &sandbox,
+        &repo,
+        FINDINGS_REPORT,
+        &[&["t1-r1"], &["t1-r2"], &["t1-r3", "--escalation"]],
+    );
+
+    assert_eq!(out.code, 2, "{out:?}");
+    assert_eq!(
+        out.stderr,
+        "factory: code-review: --escalation needs an escalation event for t1 in the ledger, which the lead logs when it re-dispatches the ticket (factory log escalation repo=repo prefix=t1): without one, report what is still open as open in your final report\n"
+    );
+    assert_eq!(sandbox.calls("codex").len(), 2, "{out:?}");
+    assert!(!sandbox.reviews().join("t1-r3.bundle.md").exists());
+}
+
+#[test]
+fn a_label_with_no_round_is_refused_unless_the_review_is_standalone() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+
+    for label in ["retro-lab-light2", "t434-r5-light-2"] {
+        let out = sandbox.factory_in(&repo, &["review", "main", label]);
+        assert_eq!(out.code, 2, "{out:?}");
+        assert_eq!(
+            out.stderr,
+            format!(
+                "factory: code-review: {label} names no review round: label a ticket's review <prefix>-rN (<prefix>-rN-light after the last round), or pass --standalone for a review outside a ticket, such as a retro's\n"
+            )
+        );
+    }
+    assert!(sandbox.calls("codex").is_empty());
+
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "retro-lab"]);
+    assert_eq!(out.code, 0, "{out:?}");
+}
+
+#[test]
+fn a_new_round_1_on_work_a_prefix_reviewed_to_its_cap_needs_a_follow_up_issue() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    rounds(&sandbox, &repo, FINDINGS_REPORT, &[&["t1-r1"], &["t1-r2"]]);
+    let refused = |label: &str, out: &crate::support::Run| {
+        assert_eq!(out.code, 2, "{out:?}");
+        assert_eq!(out.stdout, "", "{out:?}");
+        assert!(
+            out.stderr
+                .starts_with(&format!("factory: code-review: {label}: ")),
+            "{out:?}"
+        );
+        assert!(
+            out.stderr.ends_with(
+                ", and t1 has used its review cap: file a follow-up issue for what is still open and review its work with --follow-up #<issue>\n"
+            ),
+            "{out:?}"
+        );
+    };
+
+    let same_head = sandbox.factory_in(&repo, &["review", "main", "t1fix-r1", "none"]);
+    refused("t1fix-r1", &same_head);
+    let retro = sandbox.factory_in(&repo, &["review", "--standalone", "main", "retro"]);
+    refused("retro", &retro);
+    // A commit that changes nothing is the same work.
+    sandbox.git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "chore: nothing"],
+    );
+    let empty_commit = sandbox.factory_in(&repo, &["review", "main", "t1again-r1", "none"]);
+    refused("t1again-r1", &empty_commit);
+    assert_eq!(sandbox.calls("codex").len(), 2);
+
+    sandbox.fake(
+        "gh",
+        "printf '# #7 Follow up t1\\n\\nWhat t1 left open.\\n'",
+    );
+    let follow_up = sandbox.factory_in(
+        &repo,
+        &["review", "main", "t1fix-r1", "none", "--follow-up", "#7"],
+    );
+    assert_eq!(follow_up.code, 10, "{follow_up:?}");
+    let event: Value = serde_json::from_str(sandbox.ledger_lines().last().unwrap()).unwrap();
+    assert_eq!(event["follow_up"], "7", "{event}");
+}
+
+#[test]
+fn a_follow_up_gh_cannot_fetch_or_that_is_the_spec_is_refused() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo();
+    sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
+    sandbox.fake(
+        "gh",
+        "echo 'GraphQL: Could not resolve to an issue' >&2; exit 1",
+    );
+
+    let missing = sandbox.factory_in(
+        &repo,
+        &["review", "main", "t1-r1", "none", "--follow-up", "#99"],
+    );
+    assert_eq!(missing.code, 2, "{missing:?}");
+    assert!(
+        missing.stderr.starts_with(
+            "factory: code-review: could not fetch follow-up issue #99 with gh: GraphQL: Could not resolve"
+        ),
+        "{missing:?}"
+    );
+    let spec = sandbox.factory_in(
+        &repo,
+        &["review", "main", "t1-r1", "#12", "--follow-up", "12"],
+    );
+    assert_eq!(spec.code, 2, "{spec:?}");
+    assert_eq!(
+        spec.stderr,
+        "factory: code-review: --follow-up names the new issue filed for what is still open, not the ticket under review (12)\n"
+    );
+    let junk = sandbox.factory_in(
+        &repo,
+        &["review", "main", "t1-r1", "none", "--follow-up", "soon"],
+    );
+    assert_eq!(junk.code, 2, "{junk:?}");
+    assert_eq!(
+        junk.stderr,
+        "factory: code-review: --follow-up names an issue (#12, 12, owner/repo#12 or an issue URL), got: soon\n"
+    );
+    assert!(sandbox.calls("codex").is_empty());
 }
 
 #[test]
@@ -1211,6 +1364,7 @@ fn a_round_on_a_new_branch_reviews_the_whole_diff_but_still_marks_the_round_befo
     sandbox.git(&repo, &["add", "."]);
     sandbox.git(&repo, &["commit", "-q", "-m", "feat: add c"]);
     sandbox.fake("codex", &codex_writes(SECOND_REPORT));
+    escalate(&sandbox, &repo, "t1");
 
     let out = sandbox.factory_in(&repo, &["review", "main", "t1-r3", "none", "--escalation"]);
 

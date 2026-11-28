@@ -159,7 +159,7 @@ fn claude_reviews_with_user_settings_only_and_no_plugins_or_mcp_servers() {
         ),
     );
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     let calls = sandbox.calls("claude");
@@ -202,7 +202,7 @@ fn the_config_file_sets_the_backend_order_model_and_effort() {
     );
     sandbox.fake("claude", &claude_writes(CLEAN_REPORT));
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     assert!(sandbox.calls("codex").is_empty(), "claude comes first");
@@ -225,7 +225,7 @@ fn the_config_file_sets_codexs_model_effort_and_timeout() {
     );
     sandbox.fake("codex", "exec sleep 30");
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 124, "{out:?}");
     assert!(
@@ -251,7 +251,7 @@ fn a_broken_config_is_refused_in_one_line_naming_the_file() {
         "[[review.backend]]\ncli = \"claude\"\nconcurrency = 0\n",
     );
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 3, "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
@@ -354,7 +354,7 @@ fn a_review_finding_its_backend_full_takes_the_next_one_when_configured_to() {
     let gate = gate(&sandbox);
     sandbox.fake("codex", &codex_waits_for(&gate, CLEAN_REPORT));
     sandbox.fake("claude", &claude_writes(CLEAN_REPORT));
-    let mut first = sandbox.factory_command(&["review", "main", "t1", "--json"]);
+    let mut first = sandbox.factory_command(&["review", "--standalone", "main", "t1", "--json"]);
     first.current_dir(&repo);
     let first = support::spawn(first);
     assert!(
@@ -362,7 +362,7 @@ fn a_review_finding_its_backend_full_takes_the_next_one_when_configured_to() {
         "codex never started"
     );
 
-    let second = sandbox.factory_in(&repo, &["review", "main", "t2", "--json"]);
+    let second = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t2", "--json"]);
 
     assert_eq!(second.code, 0, "{second:?}");
     let shown: Value = serde_json::from_str(&second.stdout).unwrap();
@@ -384,7 +384,7 @@ fn a_review_finding_its_backend_full_queues_for_it_when_configured_to() {
     sandbox.fake("codex", &codex_waits_for(&gate, CLEAN_REPORT));
     sandbox.fake("claude", &claude_writes(CLEAN_REPORT));
     let review = |label: &str| {
-        let mut cmd = sandbox.factory_command(&["review", "main", label, "--json"]);
+        let mut cmd = sandbox.factory_command(&["review", "--standalone", "main", label, "--json"]);
         cmd.current_dir(&repo);
         support::spawn(cmd)
     };
@@ -443,11 +443,11 @@ fn a_cooldown_outlives_a_daemon_restart() {
     let (reset, _) = reset_in_two_hours();
     sandbox.fake("codex", &codex_out_of_quota(&reset));
     sandbox.fake("claude", &claude_writes(CLEAN_REPORT));
-    let first = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let first = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
     assert_eq!(first.code, 0, "{first:?}");
 
     kill_daemon(&sandbox);
-    let later = sandbox.factory_in(&repo, &["review", "main", "t2", "--json"]);
+    let later = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t2", "--json"]);
 
     assert_eq!(later.code, 0, "{later:?}");
     let shown: Value = serde_json::from_str(&later.stdout).unwrap();
@@ -467,7 +467,7 @@ fn every_backend_out_of_quota_exits_75_naming_when_to_retry() {
     let (reset, until) = reset_in_two_hours();
     sandbox.fake("codex", &codex_out_of_quota(&reset));
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 75, "{out:?}");
     assert_eq!(out.stderr_lines().len(), 1, "{out:?}");
@@ -479,7 +479,7 @@ fn every_backend_out_of_quota_exits_75_naming_when_to_retry() {
     );
     let logged = event(&sandbox, 0);
     assert_eq!(logged["outcome"], "error", "{logged}");
-    let again = sandbox.factory_in(&repo, &["review", "main", "t2"]);
+    let again = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t2"]);
     assert_eq!(again.code, 75, "{again:?}");
     assert_eq!(
         sandbox.calls("codex").len(),
@@ -504,7 +504,7 @@ fn what_the_config_leaves_unset_is_left_to_codexs_own_config() {
     .unwrap();
     sandbox.fake("codex", &codex_writes(CLEAN_REPORT));
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     let argv = &sandbox.calls("codex")[0];
@@ -560,7 +560,7 @@ fn a_review_queued_when_the_daemon_stops_says_to_run_it_again() {
     let gate = gate(&sandbox);
     sandbox.fake("codex", &codex_waits_for(&gate, CLEAN_REPORT));
     let review = |label: &str| {
-        let mut cmd = sandbox.factory_command(&["review", "main", label]);
+        let mut cmd = sandbox.factory_command(&["review", "--standalone", "main", label]);
         cmd.current_dir(&repo);
         support::spawn(cmd)
     };
@@ -652,7 +652,7 @@ fn a_claude_quota_failure_cools_the_pool_and_the_chain_moves_to_the_next_backend
         let sandbox = Sandbox::new().env("TZ", "UTC");
         let repo = claude_fails_then_codex_reviews(&sandbox, failure);
 
-        let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+        let out = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t1"]);
 
         assert_eq!(out.code, 0, "{failure}: {out:?}");
         let shown: Value = serde_json::from_str(&out.stdout).unwrap();
@@ -669,7 +669,7 @@ fn a_claude_quota_failure_cools_the_pool_and_the_chain_moves_to_the_next_backend
             .and_then(|pools| pools.iter().find(|pool| pool["name"] == "claude"))
             .unwrap_or(&Value::Null);
         assert_eq!(claude["quota"], "cooling", "{failure}: {status}");
-        let later = sandbox.factory_in(&repo, &["review", "main", "t2"]);
+        let later = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t2"]);
         assert_eq!(later.code, 0, "{later:?}");
         assert_eq!(
             sandbox.calls("claude").len(),
@@ -689,7 +689,7 @@ fn a_named_claude_reset_ends_the_cooldown_and_without_one_it_lasts_an_hour() {
     );
     let repo = claude_fails_then_codex_reviews(&sandbox, &claude_fails(&named, false));
 
-    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     let shown: Value = serde_json::from_str(&out.stdout).unwrap();
@@ -711,7 +711,7 @@ fn a_named_claude_reset_ends_the_cooldown_and_without_one_it_lasts_an_hour() {
     )
     .unwrap_or(0);
 
-    let out = sandbox.factory_in(&repo, &["review", "--json", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "--json", "main", "t1"]);
 
     assert_eq!(out.code, 0, "{out:?}");
     let shown: Value = serde_json::from_str(&out.stdout).unwrap();
@@ -738,7 +738,7 @@ fn a_claude_failure_that_is_no_quota_still_exits_3_with_no_cooldown() {
         ),
     );
 
-    let out = sandbox.factory_in(&repo, &["review", "main", "t1"]);
+    let out = sandbox.factory_in(&repo, &["review", "--standalone", "main", "t1"]);
 
     assert_eq!(out.code, 3, "{out:?}");
     assert!(sandbox.calls("codex").is_empty(), "no fallback");
